@@ -1,0 +1,10 @@
+build/
+.cache/
+
+include/GL/
+include/GLFW/
+include/metal-cpp/
+
+compile_commands.json
+
+.DS_Store
