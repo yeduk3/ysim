@@ -58,7 +58,6 @@ struct Program
             {
                 std::cout << e;
             }
-            std::cout << std::endl;
 
             // Provide the infolog in whatever manor you deem best.
             // Exit with failure.
@@ -178,7 +177,7 @@ struct Program
         {
             std::cout << e;
         }
-        std::cout << std::endl;
+        exit(1);
     }
 
     void linkShader()

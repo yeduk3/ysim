@@ -9,6 +9,7 @@ struct SimParams {
     float kair;
     float kd;
     uint vertexNum;
+    float acctime;
 };
 
 
@@ -98,4 +99,72 @@ kernel void integrate(
 
     v[id] = vel;
     x[id] = pos;
+}
+
+inline float3 calc_spring(float3 p0, float3 v0, float3 p1, float3 v1, float rest_len, float ks, float kd) {
+    float3 dx = p1 - p0;
+    float3 dv = v1 - v0;
+    float len = length(dx);
+    if (len < 1e-7) return float3(0.0); // 0 나누기 방지
+    float3 ndx = dx / len;
+    return (ks * (len - rest_len) + kd * dot(dv, ndx)) * ndx;
+}
+
+
+
+struct ClothGridParams {
+    uint particleNum1D;
+    float stretchRest, shearRest, bendRest;
+    float kstretch, kshear, kbend;
+};
+
+kernel void compute_cloth_grid_forces_fast(
+    device const packed_float3* x [[buffer(0)]],
+    device const packed_float3* v [[buffer(1)]],
+    device packed_float3* f [[buffer(2)]],
+    device const float* m [[buffer(3)]],
+    constant SimParams& params [[buffer(5)]],
+    constant ClothGridParams& clothParams [[buffer(8)]],
+    uint id [[thread_position_in_grid]]
+) {
+    if (id >= params.vertexNum) return; 
+
+    uint N = clothParams.particleNum1D;
+
+    uint row = id / N;
+    uint col = id % N;
+
+    // packed_float3를 연산이 빠른 float3로 캐스팅하여 사용
+    float3 pos = x[id];
+    float3 vel = v[id];
+
+    // 1. 중력 & 공기 저항
+    float3 force = float3(0.0, params.G * m[id], 0.0) + vel * params.kair;
+
+    // 1D 인덱스를 구하는 람다 함수
+    auto get_idx = [N](uint r, uint c) { return r * N + c; };
+
+    // 2. 스프링 힘 (Gather) - 조건에 맞는 이웃이 있으면 힘을 누적합니다.
+    // [Stretch] 상하좌우
+    if (col > 0)    force += calc_spring(pos, vel, x[get_idx(row, col-1)], v[get_idx(row, col-1)], clothParams.stretchRest, clothParams.kstretch, params.kd);
+    if (col < N-1)  force += calc_spring(pos, vel, x[get_idx(row, col+1)], v[get_idx(row, col+1)], clothParams.stretchRest, clothParams.kstretch, params.kd);
+    if (row > 0)    force += calc_spring(pos, vel, x[get_idx(row-1, col)], v[get_idx(row-1, col)], clothParams.stretchRest, clothParams.kstretch, params.kd);
+    if (row < N-1)  force += calc_spring(pos, vel, x[get_idx(row+1, col)], v[get_idx(row+1, col)], clothParams.stretchRest, clothParams.kstretch, params.kd);
+
+    // [Shear] 대각선
+    if (col > 0 && row > 0)     force += calc_spring(pos, vel, x[get_idx(row-1, col-1)], v[get_idx(row-1, col-1)], clothParams.shearRest, clothParams.kshear, params.kd);
+    if (col < N-1 && row > 0)   force += calc_spring(pos, vel, x[get_idx(row-1, col+1)], v[get_idx(row-1, col+1)], clothParams.shearRest, clothParams.kshear, params.kd);
+    if (col > 0 && row < N-1)   force += calc_spring(pos, vel, x[get_idx(row+1, col-1)], v[get_idx(row+1, col-1)], clothParams.shearRest, clothParams.kshear, params.kd);
+    if (col < N-1 && row < N-1) force += calc_spring(pos, vel, x[get_idx(row+1, col+1)], v[get_idx(row+1, col+1)], clothParams.shearRest, clothParams.kshear, params.kd);
+
+    // [Bend] 2칸 너머
+    if (col > 1)    force += calc_spring(pos, vel, x[get_idx(row, col-2)], v[get_idx(row, col-2)], clothParams.bendRest, clothParams.kbend, params.kd);
+    if (col < N-2)  force += calc_spring(pos, vel, x[get_idx(row, col+2)], v[get_idx(row, col+2)], clothParams.bendRest, clothParams.kbend, params.kd);
+    if (row > 1)    force += calc_spring(pos, vel, x[get_idx(row-2, col)], v[get_idx(row-2, col)], clothParams.bendRest, clothParams.kbend, params.kd);
+    if (row < N-2)  force += calc_spring(pos, vel, x[get_idx(row+2, col)], v[get_idx(row+2, col)], clothParams.bendRest, clothParams.kbend, params.kd);
+
+    force += float3(1, 0, 1) * min(row * abs(col-col/2) * abs(cos(params.acctime/2.f)), 50.f);
+
+    // 내 메모리에만 기록!
+    f[id] = force;
 }

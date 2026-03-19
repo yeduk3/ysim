@@ -24,6 +24,11 @@ configure_file(
     COPYONLY
 )
 configure_file(
+    ${CMAKE_SOURCE_DIR}/src/shader/shader.geom
+    ${CMAKE_BINARY_DIR}/shader.geom
+    COPYONLY
+)
+configure_file(
     ${CMAKE_SOURCE_DIR}/src/shader/shader.frag
     ${CMAKE_BINARY_DIR}/shader.frag
     COPYONLY

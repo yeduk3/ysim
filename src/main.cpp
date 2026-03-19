@@ -1,5 +1,6 @@
 #include "Foundation/NSString.hpp"
 #include "Metal/MTLBuffer.hpp"
+#include "Metal/MTLComputePipeline.hpp"
 #include "YGLWindow.hpp"
 #include "camera.hpp"
 #include "program.hpp"
@@ -7,8 +8,10 @@
 
 #include <cstddef>
 #include <iostream>
+#include <iterator>
 #include <ratio>
 #include <type_traits>
+#include <typeindex>
 
 YGLWindow* window;
 
@@ -27,67 +30,58 @@ struct METAL : Backend {};
 #include <vector>
 #include <iostream>
 /// Static Memory Pool ///
-template <typename T>
-struct MemoryPool {
-    std::vector<T> pool;
-    size_t marker = 0;
-    MemoryPool() {}
-    MemoryPool(size_t N) : pool(N) {}
-    //T& operator[](size_t i) { return pool[i]; }
-    //T* data() { return pool.data(); }
-    T* alloc(size_t count) {
-        if(marker >= pool.size()) {
-            std::cout << "[Pool] Memory overflow" << std::endl;
-            exit(1);
-        }
-        T* ret = pool.data() + marker;
-        marker += count;
-        return ret;
-    }
-    T* zeros(size_t count) {
-        T* ret = alloc(count);
-        memset(ret, 0, count*sizeof(T));
-        return ret;
-    }
-    T* allocFill(size_t count, T fill) {
-        T* ret = alloc(count);
-        std::fill(ret, ret+count, fill);
-        return ret;
-    }
-};
 
+template <typename BE, typename PR>
+struct MemoryBlock {};
+
+template <typename PR>
+struct MemoryBlock<CPU, PR> {
+    PR* ptr;
+    size_t size;
+    MemoryBlock() : ptr(nullptr), size(0) {}
+};
 template <typename BE>
 struct ByteMemoryPool {};
 template <>
 struct ByteMemoryPool<CPU> {
     std::vector<char> pool;
     size_t marker = 0;
+    size_t capacity = 0;
     ByteMemoryPool() {}
-    ByteMemoryPool(size_t N) : pool(N) {}
+    ByteMemoryPool(size_t N) : pool(N), capacity(pool.size()) {}
     template <typename PR>
-    PR* alloc(size_t count) {
-        if(marker >= pool.size()) {
-            std::cout << "[Pool] Memory overflow" << std::endl;
-            exit(1);
-        }
+    MemoryBlock<CPU, PR> alloc(size_t count) {
+        MemoryBlock<CPU, PR> ret;
+        if (count == 0) return ret;
+
         size_t align = alignof(PR);
-        marker += (align - marker % align) % align; // byte align
-        PR* ret = reinterpret_cast<PR*>(pool.data() + marker);
-        marker += sizeof(PR)*count;
+        size_t alignedMarker = marker + ((align - (marker % align)) % align);
+        size_t bytes = sizeof(PR) * count;
+
+        if (alignedMarker + bytes > capacity) {
+            std::cout << "[Pool] Tried to allocate more than tha capacity" << std::endl;
+            return ret;
+        }
+
+        ret.ptr = reinterpret_cast<PR*>(pool.data() + alignedMarker);
+        ret.size = count;
+        marker = alignedMarker + bytes;
         return ret;
     }
     template <typename PR>
-    PR* zeros(size_t count) {
-        PR* ret = alloc<PR>(count);
-        memset(ret, 0, count*sizeof(PR));
+    MemoryBlock<CPU, PR> zeros(size_t count) {
+        auto ret = alloc<PR>(count);
+        memset(ret.ptr, 0, count*sizeof(PR));
         return ret;
     }
     template <typename PR>
-    PR* allocFill(size_t count, PR fill) {
-        PR* ret = alloc<PR>(count);
-        std::fill(ret, ret+count, fill);
+    MemoryBlock<CPU, PR> allocFill(size_t count, PR fill) {
+        auto ret = alloc<PR>(count);
+        std::fill(ret.ptr, ret.ptr+count, fill);
         return ret;
     }
+
+    char* bytePtr() { return pool.data(); }
 };
 
 #include <Metal/Metal.hpp>
@@ -99,11 +93,12 @@ struct MetalContext {
     }
 };
 template <typename PR>
-struct MetalMemoryBlock {
+struct MemoryBlock<METAL, PR> {
     MTL::Buffer* pool;
     size_t offset;
     PR* ptr;
-    MetalMemoryBlock() : pool(nullptr), offset(0), ptr(nullptr) {}
+    size_t size;
+    MemoryBlock() : pool(nullptr), offset(0), ptr(nullptr), size(0) {}
 };
 template <>
 struct ByteMemoryPool<METAL> {
@@ -132,31 +127,40 @@ struct ByteMemoryPool<METAL> {
         return *this;
     }
     template <typename PR>
-    MetalMemoryBlock<PR> alloc(size_t count) {
-        if(marker >= capacity) {
-            std::cout << "[Pool] Memory overflow" << std::endl;
-            exit(1);
+    MemoryBlock<METAL, PR> alloc(size_t count) {
+        MemoryBlock<METAL, PR> ret;
+        if (count == 0) return ret;
+
+        size_t bytes = sizeof(PR) * count;
+        size_t alignedBytes = (bytes + 255) & ~size_t(255);
+
+        if (marker + alignedBytes > capacity) {
+            std::cout << "[Pool] Tried to allocate more than tha capacity" << std::endl;
+            return ret;
         }
-        size_t aligned = (count*sizeof(PR) + 255) & ~255;
-        MetalMemoryBlock<PR> ret;
+
         ret.pool = pool;
         ret.offset = marker;
-        ret.ptr = reinterpret_cast<PR*>(reinterpret_cast<char*>(pool->contents())+marker);
-        marker += aligned;
+        ret.ptr = reinterpret_cast<PR*>(reinterpret_cast<char*>(pool->contents()) + marker);
+        ret.size = count;
+
+        marker += alignedBytes;
         return ret;
     }
     template <typename PR>
-    MetalMemoryBlock<PR> zeros(size_t count) {
+    MemoryBlock<METAL, PR> zeros(size_t count) {
         auto ret = alloc<PR>(count);
         memset(ret.ptr, 0, count*sizeof(PR));
         return ret;
     }
     template <typename PR>
-    MetalMemoryBlock<PR> allocFill(size_t count, PR fill) {
+    MemoryBlock<METAL, PR> allocFill(size_t count, PR fill) {
         auto ret = alloc<PR>(count);
         std::fill(ret.ptr, ret.ptr+count, fill);
         return ret;
     }
+
+    char* bytePtr() { return reinterpret_cast<char*>(pool->contents()); }
 };
 
 template <typename BE>
@@ -165,48 +169,162 @@ template <>
 struct FakeMemoryPool<CPU> {
     size_t marker = 0;
     template <typename PR>
-    PR* alloc(size_t count) { 
+    MemoryBlock<CPU, PR> alloc(size_t count) { 
         size_t align = alignof(PR);
         marker += (align - marker % align) % align;
         marker += count * sizeof(PR); 
-        return nullptr;
+        return MemoryBlock<CPU, PR>();
     }
     template <typename PR>
-    PR* zeros(size_t count) { return alloc<PR>(count); }
+    MemoryBlock<CPU, PR> zeros(size_t count) { return alloc<PR>(count); }
     template <typename PR>
-    PR* allocFill(size_t count, PR fill) { return alloc<PR>(count); }
+    MemoryBlock<CPU, PR> allocFill(size_t count, PR fill) { return alloc<PR>(count); }
 };
 template <>
 struct FakeMemoryPool<METAL> {
     size_t marker = 0;
     template <typename PR>
-    MetalMemoryBlock<PR> alloc(size_t count) { 
-        MetalMemoryBlock<PR> ret;
+    MemoryBlock<METAL, PR> alloc(size_t count) { 
+        MemoryBlock<METAL, PR> ret;
         marker += (count*sizeof(PR) + 255) & ~255;
         return ret;
     }
     template <typename PR>
-    MetalMemoryBlock<PR> zeros(size_t count) { return alloc<PR>(count); }
+    MemoryBlock<METAL, PR> zeros(size_t count) { return alloc<PR>(count); }
     template <typename PR>
-    MetalMemoryBlock<PR> allocFill(size_t count, PR fill) { return alloc<PR>(count); }
+    MemoryBlock<METAL, PR> allocFill(size_t count, PR fill) { return alloc<PR>(count); }
 };
 // TODO: Dynamic Memory Pool
-//template <typename T>
-//struct DynamicMemoryPool {
-//    std::vector<T> pool;
-//};
+template <typename BE>
+struct DynamicByteMemoryPool {
+    std::vector<ByteMemoryPool<BE>> poolList;
 
-template <typename T>
-struct ComputeMemoryPool : MemoryPool<T> {
-    ComputeMemoryPool(size_t N) : MemoryPool<T>(N) { }
-    void reset() { this->marker = 0; }
+    DynamicByteMemoryPool() {}
+    DynamicByteMemoryPool(size_t N) { poolList.emplace_back(N); }
+
+    template <typename PR>
+    size_t requiredBytes(size_t count) {
+        if constexpr (std::is_same_v<BE, CPU>) {
+            return sizeof(PR) * count + alignof(PR);
+        } else {
+            size_t bytes = sizeof(PR) * count;
+            return (bytes + 255) & ~size_t(255);
+        }
+    }
+
+    template <typename PR>
+    auto alloc(size_t count) {
+        size_t need = requiredBytes<PR>(count);
+        size_t minBoundSize = 1 << 20;
+
+        if (poolList.empty())
+            poolList.emplace_back(std::max<size_t>(need, minBoundSize));
+
+        auto ret = poolList.back().template alloc<PR>(count);
+        if (!ret.ptr) {
+            //std::cout << "[DynamicByteMemoryPool alloc] allocate new one" << std::endl;
+            poolList.emplace_back(std::max<size_t>(need, minBoundSize));
+            ret = poolList.back().template alloc<PR>(count);
+        }
+        return ret;
+    }
+
+    template <typename PR>
+    auto zeros(size_t count) {
+        auto ret = alloc<PR>(count);
+        if (ret.ptr) std::memset(ret.ptr, 0, sizeof(PR) * count);
+        return ret;
+    }
+    template <typename PR>
+    auto allocFill(size_t count, PR fill) {
+        auto ret = alloc<PR>(count);
+        if (ret.ptr) std::fill(ret.ptr, ret.ptr + count, fill);
+        return ret;
+    }
+
+    size_t totalUsedBytes() const {
+        size_t size = 0;
+        for (const auto& pool : poolList) size += pool.marker;
+        return size;
+    }
+    size_t totalCapacity() {
+        size_t capacity = 0;
+        for(const auto& pool : poolList) capacity += pool.capacity;
+        return capacity;
+    }
+
+    ByteMemoryPool<BE> pack() {
+        size_t totalBytes = totalUsedBytes();
+        ByteMemoryPool<BE> ret(totalBytes);
+
+        char* dst = ret.bytePtr();
+        size_t dstOffset = 0;
+
+        for (auto& srcPool : poolList) {
+            if (srcPool.marker == 0) continue;
+
+            char* src = srcPool.bytePtr();
+            std::memcpy(dst + dstOffset, src, srcPool.marker);
+            dstOffset += srcPool.marker;
+        }
+
+        ret.marker = totalBytes;
+        return ret;
+    }
+    void clear() { poolList.clear(); }
 };
+
+template <typename BE>
+struct DynamicMemoryAllocator {
+    DynamicByteMemoryPool<BE> pool;
+
+    DynamicMemoryAllocator() {}
+    DynamicMemoryAllocator(size_t N) : pool(N) {}
+
+    template <typename PR>
+    auto alloc(size_t count) { return pool.template alloc<PR>(count); }
+    template <typename PR>
+    auto zeros(size_t count) { return pool.template zeros<PR>(count); }
+    template <typename PR>
+    auto allocFill(size_t count, PR fill) { return pool.template allocFill<PR>(count, fill); }
+
+    // TODO: Pack complete
+    ByteMemoryPool<BE> pack() {
+        return pool.pack();
+    }
+};
+
+template <typename BE>
+struct GlobalAutoAllocator {
+    inline static DynamicMemoryAllocator<BE> globalPool;
+    inline static bool globalInitialized = false;
+
+    static void globalInitialize(size_t N) {
+        if(globalInitialized) return;
+        globalPool = DynamicMemoryAllocator<BE>(N); 
+        globalInitialized = true;
+    }
+
+    template <typename PR>
+    static MemoryBlock<BE, PR> alloc(size_t count) { return globalPool.template alloc<PR>(count); }
+    template <typename PR>
+    static MemoryBlock<BE, PR> zeros(size_t count) { return globalPool.template zeros<PR>(count); }
+    template <typename PR>
+    static MemoryBlock<BE, PR> allocFill(size_t count, PR fill) { return globalPool.template allocFill<PR>(count, fill); }
+};
+
+
+//template <typename T>
+//struct ComputeMemoryPool : MemoryPool<T> {
+//    ComputeMemoryPool(size_t N) : MemoryPool<T>(N) { }
+//    void reset() { this->marker = 0; }
+//};
 #include "tinym.hpp"
 
 using Precision = float;
 
 
-ComputeMemoryPool<Precision> computePool(100000000);
+//ComputeMemoryPool<Precision> computePool(100000000);
 
 
 /// TODO: Math ///
@@ -221,9 +339,22 @@ struct VectorBase<CPU, PR> {
     PR* ptr;
     size_t size;
     VectorBase() : /*data(nullptr, 0)*/ptr(nullptr), size(0) {}
-    VectorBase(PR* ptr, size_t size) : /*data(ptr, size)*/ptr(ptr), size(size) {}
+    VectorBase(size_t size) {
+        auto block = GlobalAutoAllocator<CPU>::template alloc<PR>(size);
+        this->ptr = block.ptr;
+        this->size = block.size;
+    }
+    VectorBase(size_t size, PR fill) {
+        MemoryBlock<CPU, PR> block;
+        if(fill == 0) block = GlobalAutoAllocator<CPU>::template zeros<PR>(size);
+        else block = GlobalAutoAllocator<CPU>::template allocFill<PR>(size, fill);
+        this->ptr = block.ptr;
+        this->size = block.size;
+    }
+    VectorBase(const MemoryBlock<CPU, PR>& block) : /*data(ptr, size)*/ptr(block.ptr), size(block.size) {}
     //void setZero() { data.setZero(); }
     auto map() { return Eigen::Map<Eigen::VectorX<PR>>(ptr, size); }
+    PR& operator[](Index index) { return ptr[index]; }
 };
 
 template <typename PR>
@@ -233,14 +364,28 @@ struct VectorBase<METAL, PR> {
     PR* ptr;
     size_t size;
     VectorBase() : pool(nullptr), offset(0), ptr(nullptr), size(0) {}
-    VectorBase(const MetalMemoryBlock<PR>& block, size_t size) : pool(block.pool), offset(block.offset), ptr(block.ptr), size(size) {}
+    VectorBase(size_t size) {
+        auto block = GlobalAutoAllocator<METAL>::template alloc<PR>(size);
+        this->pool = block.pool;
+        this->offset = block.offset;
+        this->ptr = block.ptr;
+        this->size = block.size;
+    }
+    VectorBase(size_t size, PR fill) {
+        MemoryBlock<METAL, PR> block;
+        if(fill == 0) block = GlobalAutoAllocator<METAL>::template zeros<PR>(size);
+        else block = GlobalAutoAllocator<METAL>::template allocFill<PR>(size, fill);
+        this->pool = block.pool;
+        this->offset = block.offset;
+        this->ptr = block.ptr;
+        this->size = block.size;
+    }
+    VectorBase(const MemoryBlock<METAL, PR>& block) : pool(block.pool), offset(block.offset), ptr(block.ptr), size(block.size) {}
     auto map() { return Eigen::Map<Eigen::VectorX<PR>>(ptr, size); }
+    PR& operator[](Index index) { return ptr[index]; }
 };
 
-//template <typename PR>
-//struct Vector<METAL, PR> {
-//    
-//};
+
 
 template <typename BE, typename PR>
 struct Matrix {};
@@ -268,6 +413,9 @@ struct SparseMatrix<CPU, PR> {
     }
     auto& map() { return data; }
 };
+
+
+
 
 
 
@@ -393,18 +541,290 @@ struct MeshGL<CPU> {
 
 
 template <typename BE, typename PR>
-struct Particle {};
+struct MeshState {
+    using Vector = VectorBase<BE, PR>;
+    Vector x, v, f, m, n;
+    template <typename InitializerParams>
+    void memoryAllocation(InitializerParams& params) {
+        Index numData = params.numPoints*3;
+        x = Vector(numData);
+        v = Vector(numData, 0);
+        f = Vector(numData, 0);
+        m = Vector(numData, params.mass);
+        n = Vector(numData);
+    }
+};
 
+template <typename BE, typename PR>
+struct MeshAdjacency {
+    using Vector = VectorBase<BE, PR>;
+    using Vectorui = VectorBase<BE, Index>;
+    //! Length: numPrimitives * numVerticesPerPrimitive
+    //! For constructing BVH.
+    Vectorui facets, edges;
+    //! Length: numPrimitives
+    //! Each index holds the rest area/length of corresponding primitive.
+    Vector restFacetAreas, restEdgeLengths, restOppLength;
+    Vectorui vertexAdjFacets, vertexAdjFacetsOffsets;
+    Vectorui vertexAdjEdges, vertexAdjEdgesOffsets;
+    //Vectorui edgeAdjEdges, edgeAdjEdgesOffsets;
+    Vectorui vertexOppVertices, vertexOppVerticesOffsets; // for spring
+    template <typename InitializerParams>
+    void memoryAllocation(InitializerParams& params) {
+        if(params.numFacets > 0) {
+            if(!facets.ptr) 
+                facets = Vectorui(params.numFacets*3);
+            if(!restFacetAreas.ptr) 
+                restFacetAreas = Vector(params.numFacets);
+        }
+        if(params.numEdges > 0) {
+            if(!edges.ptr) 
+                edges = Vectorui(params.numEdges*2);
+            if(!restEdgeLengths.ptr) 
+                restEdgeLengths = Vector(params.numEdges);
+        }
+        if(params.numPoints > 0) {
+            if(!vertexAdjFacetsOffsets.ptr)
+                vertexAdjFacetsOffsets = Vectorui(params.numPoints+1, 0);
+            if(!vertexAdjEdgesOffsets.ptr)
+                vertexAdjEdgesOffsets = Vectorui(params.numPoints+1, 0);
+            if(!vertexOppVerticesOffsets.ptr)
+                vertexOppVerticesOffsets = Vectorui(params.numPoints+1, 0);
+        }
+    }
+
+};
+
+struct EdgeInfo {
+    int v0=-1, v1=-1; // v0 < v1
+    int f0=-1, f1=-1; // f0: (v1, v0, o0), f1: (v0, v1, o1)
+    int o0=-1, o1=-1; // o0 in f0, o1 in f1
+};
+
+//! Suppose that the positions and facets are given
+template <typename BE, typename PR>
+struct MeshSpringInitializer {
+    using Vector = VectorBase<BE, PR>;
+
+    void initialize(MeshState<BE, PR>& state, MeshAdjacency<BE, PR>& adjacency) {
+        std::cout << "[MeshSpringInitializer initialize] start" << std::endl;
+        Index maxNumEdgeInfos = adjacency.facets.size;
+        Index numPoints = state.x.size/3;
+        ByteMemoryPool<BE> tempPool(2*maxNumEdgeInfos*sizeof(EdgeInfo) + numPoints*sizeof(Index));
+        VectorBase<BE, EdgeInfo> tempEdgeInfos(tempPool.template alloc<EdgeInfo>(maxNumEdgeInfos));
+        VectorBase<BE, EdgeInfo> edgeInfos(tempPool.template alloc<EdgeInfo>(maxNumEdgeInfos));
+        std::cout << "[MeshSpringInitializer initialize] temp vector allocated" << std::endl;
+        
+        Index numFacets = adjacency.facets.size/3;
+        Index eIdx = 0;
+        auto fillEdgeInfos = [&](Index edgeIndex, Index v0, Index v1, Index o0, Index f0) {
+            if(v0 > v1) {
+                Index temp = v0;
+                v0 = v1;
+                v1 = temp;
+            }
+
+            tempEdgeInfos[edgeIndex].v0 = v0;
+            tempEdgeInfos[edgeIndex].v1 = v1;
+            tempEdgeInfos[edgeIndex].o0 = o0;
+            tempEdgeInfos[edgeIndex].o1 = -1;
+            tempEdgeInfos[edgeIndex].f0 = f0;
+            tempEdgeInfos[edgeIndex].f1 = -1;
+
+        };
+        for(Index fid = 0; fid < numFacets; ++fid) {
+            Index fbase = fid*3;
+            Index v0 = adjacency.facets[fbase];
+            Index v1 = adjacency.facets[fbase+1];
+            Index v2 = adjacency.facets[fbase+2];
+
+            fillEdgeInfos(eIdx++, v0, v1, v2, fid);
+            fillEdgeInfos(eIdx++, v1, v2, v0, fid);
+            fillEdgeInfos(eIdx++, v2, v0, v1, fid);
+        }
+        std::cout << "[MeshSpringInitializer initialize] temp edges are filled" << std::endl;
+
+        std::sort(tempEdgeInfos.ptr, tempEdgeInfos.ptr+eIdx, [](EdgeInfo& a, EdgeInfo& b) {
+            return a.v0 < b.v0 || (a.v0 == b.v0 && a.v1 < b.v1);
+        });
+        std::cout << "[MeshSpringInitializer initialize] temp edges are sorted" << std::endl;
+        std::cout << " ---- test output ---- " << std::endl;
+        for(int i = 0; i < 10; i++) 
+            std::cout << tempEdgeInfos[i].v0 << ", " << tempEdgeInfos[i].v1 << " in facet id " << tempEdgeInfos[i].f0 << std::endl;
+
+        adjacency.edges[0] = tempEdgeInfos[0].v0;
+        adjacency.edges[1] = tempEdgeInfos[0].v1;
+        edgeInfos[0] = tempEdgeInfos[0];
+        Index edgeid = 0;
+        //Index
+        for(Index ei = 1; ei < eIdx; ++ei) {
+            Index edgeBase = edgeid*2;
+            if(tempEdgeInfos[ei].v0 != adjacency.edges[edgeBase] || tempEdgeInfos[ei].v1 != adjacency.edges[edgeBase+1]) {
+                edgeid++;
+                edgeBase = edgeid*2;
+                adjacency.edges[edgeBase  ] = tempEdgeInfos[ei].v0;
+                adjacency.edges[edgeBase+1] = tempEdgeInfos[ei].v1;
+
+                edgeInfos[edgeid] = tempEdgeInfos[ei];
+            } else {
+                edgeInfos[edgeid].o1 = tempEdgeInfos[ei].o0;
+                edgeInfos[edgeid].f1 = tempEdgeInfos[ei].f0;
+                adjacency.vertexOppVerticesOffsets[edgeInfos[edgeid].o0+1]++;
+                adjacency.vertexOppVerticesOffsets[edgeInfos[edgeid].o1+1]++;
+            }
+        }
+        Index edgeNum = edgeid+1;
+        for(int i = 0; i < 10; i++) 
+            std::cout << adjacency.edges[i*2] << ", " << adjacency.edges[i*2+1] << std::endl;
+
+        for(Index i = 1; i <= numPoints; ++i)
+            adjacency.vertexOppVerticesOffsets[i] += adjacency.vertexOppVerticesOffsets[i-1];
+        for(int i = 0; i < 10; i++) 
+            std::cout << adjacency.vertexOppVerticesOffsets[i] << std::endl;
+        std::cout << "..." << adjacency.vertexOppVerticesOffsets[numPoints] << std::endl;
+        for(Index i = 0; i < 10; i++)
+            std::cout << edgeInfos[i].v0 << " " << edgeInfos[i].v1 << " " << edgeInfos[i].o0 << " " << edgeInfos[i].o1 << " " << edgeInfos[i].f0 << " " << edgeInfos[i].f1 << std::endl;
+        
+        VectorBase<BE, Index> offset(tempPool.template zeros<Index>(numPoints));
+        std::cout << "[MeshSpringInitializer initialize] Offset allocated" << std::endl;
+        for(Index ei = 0; ei < edgeNum; ++ei) {
+            if(edgeInfos[ei].o1 == -1) continue;
+
+            Index o0 = edgeInfos[ei].o0;
+            Index o1 = edgeInfos[ei].o1;
+
+            Index o0base = offset[o0]+adjacency.vertexOppVerticesOffsets[o0];
+            Index o1base = offset[o1]+adjacency.vertexOppVerticesOffsets[o1];
+
+            adjacency.vertexOppVertices[o0base] = o1;
+            adjacency.vertexOppVertices[o1base] = o0;
+
+            offset[o0]++;
+            offset[o1]++;
+        }
+        std::cout << "[MeshSpringInitializer initialize] Opposite vertices set" << std::endl;
+
+        for(Index i = 0; i < 10; i++) {
+            std::cout << i << "-th opposite: ";
+            for(Index oi = adjacency.vertexOppVerticesOffsets[i]; oi < adjacency.vertexOppVerticesOffsets[i+1]; ++oi) {
+                std::cout << adjacency.vertexOppVertices[oi] << ", ";
+            }
+            std::cout << std::endl;
+        }
+    }
+};
+
+//! Special class for grid cloth
 template <typename PR>
-struct Particle<CPU, PR> {
-    using Vector = VectorBase<CPU, PR>;
-    Vector x, v, f, m;
-    template <typename PoolType>
-    void memoryAllocation(PoolType& pool, size_t dataNum, PR mass) {
-        x = Vector(pool.template alloc<PR>(dataNum), dataNum);
-        v = Vector(pool.template zeros<PR>(dataNum), dataNum);
-        f = Vector(pool.template zeros<PR>(dataNum), dataNum);
-        m = Vector(pool.template allocFill<PR>(dataNum, mass), dataNum);
+struct MeshGridSpringInitializerParams {
+    // Commons
+    Index numPoints, numFacets, numEdges;
+    PR mass;
+
+    // Specifics
+    Index particleNum1D;
+    PR size1D;
+    PR kstretch, kshear, kbend;
+    MeshGridSpringInitializerParams(Index particleNum1D, PR size1D, PR kstretch, PR kshear, PR kbend, PR mass)
+        : particleNum1D(particleNum1D), 
+        numPoints(particleNum1D*particleNum1D),
+        numFacets(2*(particleNum1D-1)*(particleNum1D-1)), 
+        numEdges(2*(particleNum1D-1)*particleNum1D+numFacets),
+        size1D(size1D), kstretch(kstretch), kshear(kshear), kbend(kbend), mass(mass) {}
+};
+
+template <typename BE, typename PR>
+struct MeshGridSpringInitializer {
+    MeshSpringInitializer<BE, PR> springInitializer;
+    MeshGridSpringInitializerParams<PR> params;
+
+    MeshGridSpringInitializer(const MeshGridSpringInitializerParams<PR>& params) : params(params) {}
+
+    void initialize(MeshState<BE, PR>& state, MeshAdjacency<BE, PR>& adjacency) {
+        std::cout << "[MeshGridSpringInitializer initialize] start" << std::endl;
+        PR halfSize = params.size1D / 2.0;
+        PR length = params.size1D/PR(params.particleNum1D-1);
+
+        for (Index row = 0; row < params.particleNum1D; ++row) {
+            for (Index col = 0; col < params.particleNum1D; ++col) {
+                Index base = (row*params.particleNum1D + col)*3; 
+                
+                PR px =  col*length - halfSize;
+                PR py = -row*length + halfSize;
+                PR pz = rand()/PR(RAND_MAX)/10000.f;
+                
+                state.x[base  ] = px;
+                state.x[base+1] = py;
+                state.x[base+2] = pz;
+            }
+        }
+        std::cout << "[MeshGridSpringInitializer initialize] position set" << std::endl;
+
+        Index fIdx = 0;
+        for (Index row = 0; row < params.particleNum1D - 1; ++row) {
+            for (Index col = 0; col < params.particleNum1D - 1; ++col) {
+                Index p00 = (row * params.particleNum1D + col);           
+                Index p10 = (row * params.particleNum1D + col + 1);       
+                Index p01 = ((row + 1) * params.particleNum1D + col);     
+                Index p11 = ((row + 1) * params.particleNum1D + col + 1); 
+
+                adjacency.facets[fIdx++] = p00; // p00
+                adjacency.facets[fIdx++] = p01; //  v   
+                adjacency.facets[fIdx++] = p11; // p01 > p11
+
+                adjacency.facets[fIdx++] = p00; // p00 < p10
+                adjacency.facets[fIdx++] = p11; //        ^
+                adjacency.facets[fIdx++] = p10; //       p11
+            }
+        }
+        std::cout << "[MeshGridSpringInitializer initialize] facets set" << std::endl;
+
+        springInitializer.initialize(state, adjacency);
+    }
+};
+
+
+struct MeshFileInitializer {
+    
+};
+
+
+struct GridClothBehavior {
+    
+};
+
+struct Material {};
+
+template <typename BE, typename PR>
+struct AdjacencyBuilder {
+    MeshState<BE, PR>& state;
+    MeshAdjacency<BE, PR>& adjacency;
+
+};
+
+template <typename BE, typename PR, typename MeshInitializer, typename Behavior, typename Material>
+struct GeneralMesh {
+    MeshState<BE, PR> state;
+    MeshAdjacency<BE, PR> adjacency;
+    MeshInitializer initializer;
+    Behavior behavior;
+    Material material;
+
+    MeshGL<CPU> mesh;
+
+    template <typename MeshInitializeParam>
+    GeneralMesh(const MeshInitializeParam& params) : initializer(params) {}
+
+    void memoryAllocation() {
+        state.memoryAllocation(initializer.params);
+        adjacency.memoryAllocation(initializer.params);
+    }
+
+    void initialize() {
+        memoryAllocation();
+
+        initializer.initialize(state, adjacency);
+        mesh = MeshGL<CPU>(state.x.size/3, state.x.ptr, adjacency.facets.size/3, adjacency.facets.ptr, state.n.ptr);
     }
 };
 
@@ -526,12 +946,12 @@ struct DeformableMeshGridInitializer : MeshInitializer<PR> {
     Index springCounter() { return springNum; }
 };
 
-template <typename PR>
-struct MeshFileInitializer : MeshInitializer<PR> {
-    void initilalize() {
-
-    }
-};
+//template <typename PR>
+//struct MeshFileInitializer : MeshInitializer<PR> {
+//    void initilalize() {
+//
+//    }
+//};
 
 template <typename BE, typename PR>
 struct DeformableMesh {
@@ -557,25 +977,24 @@ struct DeformableMesh {
     DeformableMesh(MeshInitializer<PR>* initializer, Index vertexNum, Index facetNum) 
         : initializer(initializer), vertexNum(vertexNum), facetNum(facetNum) {}
     ~DeformableMesh() { delete initializer; }
-    template <typename PoolType>
-    void memoryAllocation(PoolType& pool, PR mass=0.1) {
+
+    void memoryAllocation(PR mass=0.1) {
         if(x.ptr) return;
         Index vertexDataNum = vertexNum*3;
         Index facetDataNum = facetNum*3;
         Index springDataNum = initializer->springCounter()*2;
-        x = Vector(pool.template alloc<PR>(vertexDataNum), vertexDataNum);
-        v = Vector(pool.template zeros<PR>(vertexDataNum), vertexDataNum);
-        f = Vector(pool.template zeros<PR>(vertexDataNum), vertexDataNum);
-        m = Vector(pool.template allocFill<PR>(vertexDataNum, mass), vertexDataNum);
-        n = Vector(pool.template alloc<PR>(vertexDataNum), vertexDataNum);
-        facet = Vectorui(pool.template alloc<Index>(facetDataNum), facetDataNum);
-        fixedParticle = Vector(pool.template allocFill<PR>(vertexNum, 1), vertexNum);
-        springIndex = Vectorui(pool.template alloc<Index>(springDataNum), springDataNum);
-        springCoef = Vector(pool.template alloc<PR>(springDataNum), springDataNum);
+        x = Vector(vertexDataNum);
+        v = Vector(vertexDataNum, 0);
+        f = Vector(vertexDataNum, 0);
+        m = Vector(vertexDataNum, mass);
+        n = Vector(vertexDataNum);
+        facet = Vectorui(facetDataNum);
+        fixedParticle = Vector(vertexNum, 1);
+        springIndex = Vectorui(springDataNum);
+        springCoef = Vector(springDataNum);
     }
-    template <typename PoolType>
-    void initialize(PoolType& pool) {
-        memoryAllocation(pool);
+    void initialize() {
+        memoryAllocation();
         initializer->initializeGeometry(x.ptr, facet.ptr);
         initializer->initializeSpring(springIndex.ptr, springCoef.ptr);
         mesh = MeshGL<CPU>(vertexNum, x.ptr, facetNum, facet.ptr, n.ptr);
@@ -583,6 +1002,55 @@ struct DeformableMesh {
         
     }
 };
+
+template <typename BE, typename PR>
+struct SquareCloth {
+    using Vector = VectorBase<BE, PR>;
+    using Vectorui = VectorBase<BE, Index>;
+
+    MeshInitializer<PR>* initializer;
+
+    Vector x, v, f, m;
+    Vector n;
+    Vectorui facet;
+    Vector fixedParticle;
+
+    Index particleNum1D;
+    Index vertexNum, facetNum;
+
+    PR kstretch, kshear, kbend;
+    PR stretchRestLength, shearRestLength, bendRestLength;
+
+    MeshGL<CPU> mesh;
+
+    SquareCloth(MeshInitializer<PR>* initializer, Index particleNum1D, PR size1D, Index facetNum, PR kstretch, PR kshear, PR kbend) 
+        : initializer(initializer), particleNum1D(particleNum1D), vertexNum(particleNum1D*particleNum1D), facetNum(facetNum),
+        kstretch(kstretch), kshear(kshear), kbend(kbend),
+        stretchRestLength(size1D/PR(particleNum1D-1)), shearRestLength(stretchRestLength*std::sqrt(2)), bendRestLength(stretchRestLength*2)
+    {}
+    ~SquareCloth() { delete initializer; }
+
+    void memoryAllocation(PR mass=0.1) {
+        if(x.ptr) return;
+        Index vertexDataNum = vertexNum*3;
+        Index facetDataNum = facetNum*3;
+        x = Vector(vertexDataNum);
+        v = Vector(vertexDataNum, 0);
+        f = Vector(vertexDataNum, 0);
+        m = Vector(vertexDataNum, mass);
+        n = Vector(vertexDataNum);
+        facet = Vectorui(facetDataNum);
+        fixedParticle = Vector(vertexNum, 1);
+        std::cout << "[Square Cloth memoryAllocation] allocated" << std::endl;
+    }
+    void initialize() {
+        memoryAllocation();
+        initializer->initializeGeometry(x.ptr, facet.ptr);
+        mesh = MeshGL<CPU>(vertexNum, x.ptr, facetNum, facet.ptr, n.ptr);
+    }
+};
+
+
 
 struct Sphere {};
 
@@ -596,18 +1064,22 @@ struct Box {};
 
 template <typename BE, typename PR>
 struct SceneObject {
+    std::vector<SquareCloth<BE, PR>> squareClothes;
     std::vector<DeformableMesh<BE, PR>> deformableMeshes;
     std::vector<Plane> planes;
+    std::vector<GeneralMesh<BE, PR, MeshGridSpringInitializer<BE, PR>, GridClothBehavior, Material>> meshes;
 };
+
 
 
 struct IndexPair {
     union {
-        struct { size_t first, second; }; 
-        struct { size_t point, triangle; }; 
-        struct { size_t edge1, edge2; }; 
+        struct { Index first, second; }; 
+        struct { Index point, triangle; }; 
+        struct { Index edge1, edge2; }; 
     };
 };
+
 struct Collision {
     std::vector<IndexPair> ptPair;
     std::vector<IndexPair> eePair;
@@ -617,14 +1089,344 @@ struct Collision {
 struct SpatialHashing {
     
 };
-// TODO: BroadPhase, BVH
-struct BVH {
 
+
+// TODO: BroadPhase, BVH
+template <Index MODE, Index PRIMITIVE, typename PR>
+struct BVH {};
+enum BVHMODE {
+    LINEAR,
+    SAH,
 };
+enum BVHPRIMITIVE {
+    POINT = 1,
+    EDGE = 2,
+    TRIANGLE = 3,
+};
+
+struct AABB {
+    tinym::vec3 min, max;
+    AABB() : min(0), max(0) {}
+    AABB(tinym::vec3_view e1, tinym::vec3_view e2) : min(tinym::min(e1, e2)), max(tinym::max(e1, e2)) {}
+    AABB(tinym::vec3_view t1, tinym::vec3_view t2, tinym::vec3_view t3) : min(tinym::min(t1, t2, t3)), max(tinym::max(t1, t2, t3)) {}
+    void combine(const tinym::vec3_view a) {
+        min = tinym::min(a, min.v);
+        max = tinym::max(a, max.v);
+    }
+    void combine(const AABB& aabb) {
+        min = tinym::min(min, aabb.min);
+        max = tinym::max(max, aabb.max);
+    }
+    bool intersect(const AABB& aabb) const {
+        if (max.x < aabb.min.x || min.x > aabb.max.x) return false;
+        if (max.y < aabb.min.y || min.y > aabb.max.y) return false;
+        if (max.z < aabb.min.z || min.z > aabb.max.z) return false;
+        return true;
+    }
+};
+
 // TODO: BroadPhase, LBVH
-struct LBVH {
-    LBVH() {
+template <Index PRIMITIVE, typename PR>
+struct BVH<BVHMODE::LINEAR, PRIMITIVE, PR> {
+    struct MortonNode {
+        uint code; // Morton code, 32bit, 10bit per coordinate
+        uint index; // facet index
+    };
+    struct BVHNode {
+        AABB aabb;
+        int childA = -1, childB = -1;
+        BVHNode(MortonNode& mortonNode, VectorBase<METAL, PR>& pos, VectorBase<METAL, Index>& prim) {
+            Index base = mortonNode.index*PRIMITIVE;
+            if constexpr (PRIMITIVE == 2) {
+                Index vid1 = prim[base], vid2 = prim[base+1];
+                aabb = AABB(pos.ptr+vid1*3, pos.ptr+vid2*3);
+            } else if constexpr (PRIMITIVE == 3) {
+                Index vid1 = prim[base], vid2 = prim[base+1], vid3 = prim[base+2];
+                aabb = AABB(pos.ptr+vid1*3, pos.ptr+vid2*3, pos.ptr+vid3*3);
+            }
+            else aabb = AABB();
+        }
+        BVHNode(int childA, int childB) : childA(childA), childB(childB) {}
+    };
+
+    ByteMemoryPool<METAL> pool, tempPool;
+
+    VectorBase<METAL, PR> positions; // Length 3*N, N is the number of points
+    VectorBase<METAL, Index> primitives; // Length PRIMITIVE*M, M is the number of primitives.
+    VectorBase<METAL, MortonNode> mortons; // Length M, turn the each centers of the primitives into MortonNodes
+    VectorBase<METAL, MortonNode> mortonsTemp; // Length M, turn the each centers of the primitives into MortonNodes
+    VectorBase<METAL, BVHNode> tree; // Length 2*M-1, M leaf nodes, M-1 intermediate nodes.
+    VectorBase<METAL, IndexPair> collisions;
+    Index numCollisions = 0;
+
+    BVH() {
         // recieve all points, facets and edges;
+        
+    }
+
+    template <typename PoolType>
+    void memoryAllocation(PoolType& pool) {
+        Index numberOfPrimitives = primitives.size/PRIMITIVE;
+        size_t mortonsSize = numberOfPrimitives*sizeof(MortonNode);
+        size_t treeSize = (2*numberOfPrimitives-1)*sizeof(BVHNode);
+        mortons = VectorBase<METAL, MortonNode>(pool.template alloc<MortonNode>(numberOfPrimitives));
+        mortonsTemp = VectorBase<METAL, MortonNode>(pool.template alloc<MortonNode>(numberOfPrimitives));
+        tree = VectorBase<METAL, BVHNode>(pool.template alloc<BVHNode>(2*numberOfPrimitives-1));
+
+        // Below logic is too big i guess.
+        //Index numPoints = positions.size/3;
+        //collisions = VectorBase<METAL, IndexPair>(pool.template alloc<IndexPair>(numberOfPrimitives*numPoints), numberOfPrimitives*numPoints);
+    }
+
+    void build(VectorBase<METAL, PR>& pos, VectorBase<METAL, Index>& prim) {
+        //std::cout << "[BVH Build] Start" << std::endl;
+        positions = pos;
+        primitives = prim;
+        Index numberOfPrimitives = primitives.size/PRIMITIVE;
+        size_t mortonsSize = numberOfPrimitives*sizeof(MortonNode);
+        size_t treeSize = (2*numberOfPrimitives-1)*sizeof(BVHNode);
+        FakeMemoryPool<METAL> fakepool = FakeMemoryPool<METAL>();
+        memoryAllocation(fakepool);
+        //std::cout << "  - require pool size: " << fakepool.marker << std::endl;
+        pool = ByteMemoryPool<METAL>(fakepool.marker);
+        memoryAllocation(pool);
+        //std::cout << "  - pool allocated" << std::endl;
+
+        // [stage 1] compute biggest aabb
+        // input: each points
+        // output: biggest aabbs
+        //std::cout << "  - [Stage 1] Compute biggest AABB" << std::endl;
+        AABB sceneBox(positions.ptr, positions.ptr+3);
+        for(Index i = 6; i < positions.size; i+=3) sceneBox.combine(positions.ptr+i);
+        //std::cout << "  - [Stage 1] Scene Box Range: " << sceneBox.min << " to " << sceneBox.max << std::endl;
+        
+        // [stage 2] transform each center into morton code
+        // input: each elements' center. elements can be either triangles or edges
+        // output: each elements' morton code
+        //std::cout << "  - [Stage 2] Transform each center into morton code" << std::endl;
+        tinym::vec3 width = sceneBox.max - sceneBox.min;
+        auto expandBits = [](uint v) {
+            v = (v * 0x00010001u) & 0xFF0000FFu;
+            v = (v * 0x00000101u) & 0x0F00F00Fu;
+            v = (v * 0x00000011u) & 0xC30C30C3u;
+            v = (v * 0x00000005u) & 0x49249249u;
+            return v;
+        };
+        auto mortonCode = [&](const tinym::vec3& point) {
+            tinym::vec3 p = tinym::min(tinym::max(point*1024.f, tinym::vec3(0.f)), tinym::vec3(1023.f));
+            unsigned int xx = expandBits((unsigned int)p.x);
+            unsigned int yy = expandBits((unsigned int)p.y);
+            unsigned int zz = expandBits((unsigned int)p.z);
+            return xx * 4 + yy * 2 + zz;
+        };
+        for(Index pid = 0; pid < numberOfPrimitives; ++pid) {
+            Index base = pid*PRIMITIVE;
+            tinym::vec3 center(0);
+            for(Index k = 0; k < PRIMITIVE; ++k) {
+                Index vid = primitives[base + k];
+                center += tinym::vec3_view(positions.ptr + vid*3);
+            }
+            center = center/PRIMITIVE; // real center
+            center = (center - sceneBox.min)/width; // normalized center [0, 1]
+            mortons[pid].code = mortonCode(center);
+            mortons[pid].index = pid;
+        }
+        
+        // [stage 3] radix sort
+        // input: array of each elements' morton code
+        // output: sorted array of input
+        //std::cout << "  - [Stage 3] Radix sort" << std::endl;
+        auto radixSortByMortonCode = [](MortonNode* in, MortonNode* tmp, size_t n) {
+            constexpr int BITS_PER_PASS = 8;
+            constexpr int RADIX = 1 << BITS_PER_PASS; // 256
+            constexpr int MASK = RADIX - 1;
+
+            MortonNode* src = in;
+            MortonNode* dst = tmp;
+
+            for (int shift = 0; shift < 32; shift += BITS_PER_PASS) {
+                size_t count[RADIX] = {};
+
+                // 1. histogram
+                for (size_t i = 0; i < n; ++i) {
+                    unsigned bucket = (src[i].code >> shift) & MASK;
+                    count[bucket]++;
+                }
+
+                // 2. exclusive prefix sum
+                size_t offset[RADIX];
+                size_t sum = 0;
+                for (int b = 0; b < RADIX; ++b) {
+                    offset[b] = sum;
+                    sum += count[b];
+                }
+
+                // 3. stable scatter
+                for (size_t i = 0; i < n; ++i) {
+                    unsigned bucket = (src[i].code >> shift) & MASK;
+                    dst[offset[bucket]++] = src[i];
+                }
+
+                std::swap(src, dst);
+            }
+
+            // pass 횟수가 짝수면 in에, 홀수면 tmp에 최종 결과가 있을 수 있음
+            if (src != in) {
+                std::copy(src, src + n, in);
+            }
+        };
+        radixSortByMortonCode(mortons.ptr, mortonsTemp.ptr, numberOfPrimitives);
+
+        // [stage 4] build tree
+        // input: sorted array of elements' morton code
+        // output: linear bvh tree
+        //std::cout << "  - [Stage 4] Build tree" << std::endl;
+        auto clzSafe = [](unsigned int x) {
+            return x ? __builtin_clz(x) : 32;
+        };
+        auto findSplit = [&]( MortonNode* mortons,
+                       int           first,
+                       int           last) {
+            // Identical Morton codes => split the range in the middle.
+
+            unsigned int firstCode = mortons[first].code;
+            unsigned int lastCode = mortons[last].code;
+
+            if (firstCode == lastCode)
+                return (first + last) >> 1;
+
+            // Calculate the number of highest bits that are the same
+            // for all objects, using the count-leading-zeros intrinsic.
+
+            int commonPrefix = clzSafe(firstCode ^ lastCode);
+
+            // Use binary search to find where the next bit differs.
+            // Specifically, we are looking for the highest object that
+            // shares more than commonPrefix bits with the first one.
+
+            int split = first; // initial guess
+            int step = last - first;
+
+            do
+            {
+                step = (step + 1) >> 1; // exponential decrease
+                int newSplit = split + step; // proposed new position
+
+                if (newSplit < last)
+                {
+                    unsigned int splitCode = mortons[newSplit].code;
+                    int splitPrefix = clzSafe(firstCode ^ splitCode);
+                    if (splitPrefix > commonPrefix)
+                        split = newSplit; // accept proposal
+                }
+            }
+            while (step > 1);
+
+            return split;
+        };
+
+        auto determineRange = [&](MortonNode* mortons, Index numberOfPrimitives, Index index) {
+            auto delta = [&](int i, int j) {
+                if (j < 0 || j >= (int)numberOfPrimitives) return -1;
+
+                unsigned int codeA = mortons[i].code;
+                unsigned int codeB = mortons[j].code;
+
+                if (codeA != codeB)
+                    return clzSafe(codeA ^ codeB);
+
+                return 32 + clzSafe(mortons[i].index ^ mortons[j].index);
+            };
+
+            int d = (delta(index, index + 1) - delta(index, index - 1) >= 0) ? 1 : -1;
+            int deltaMin = delta(index, index - d);
+
+            int lmax = 2;
+            while (delta(index, index + lmax * d) > deltaMin) {
+                lmax <<= 1;
+            }
+
+            int l = 0;
+            for (int t = lmax >> 1; t >= 1; t >>= 1) {
+                if (delta(index, index + (l + t) * d) > deltaMin) {
+                    l += t;
+                }
+            }
+
+            int j = index + l * d;
+
+            if (d < 0) return tinym::vec3((float)j, (float)index, 0.0f);
+            else       return tinym::vec3((float)index, (float)j, 0.0f);
+        };
+
+        // construct leaf
+        //std::cout << "  - Leaf constructing" << std::endl;
+        for(Index i = 0; i < numberOfPrimitives; ++i) {
+            tree[numberOfPrimitives+i-1] = BVHNode(mortons[i], positions, primitives);
+        }
+
+        // construct intermediate
+        //std::cout << "  - intermediate constructing" << std::endl;
+        for(Index i = 0; i < numberOfPrimitives-1; ++i) {
+            tinym::vec3 range = determineRange(mortons.ptr, numberOfPrimitives, i); // = ?
+            Index first = range.x;
+            Index last = range.y;
+
+            Index split = findSplit(mortons.ptr, first, last);
+
+            int childA, childB;
+            if(split == first) childA = split + numberOfPrimitives-1; // leaf node index
+            else childA = split; // intermediate node
+            if(split+1 == last) childB = split+1 + numberOfPrimitives-1; // leaf node index
+            else childB = split+1; // intermediate node
+
+            tree[i] = BVHNode(childA, childB);
+        }
+
+        // set intermediate node's aabb
+        auto combineAABB = [&](auto&& self, BVHNode& node) -> void {
+            if(node.childA < 0 && node.childB < 0) return;
+            self(self, tree[node.childA]);
+            self(self, tree[node.childB]);
+            node.aabb = tree[node.childA].aabb;
+            node.aabb.combine(tree[node.childB].aabb);
+        };
+        //std::cout << "  - AABB combining for intermediate" << std::endl;
+        combineAABB(combineAABB, tree[0]);
+
+        //Index l = 0;
+        //std::cout << "Tree test: " << std::endl;
+        //for(Index i = 0; i < 5; i++) {
+        //    std::cout << tree[l].aabb.min << ", " << tree[l].aabb.max << std::endl;;
+        //    l = tree[l].childA;
+        //}
+    }
+    
+    void queryAABB(const AABB& aabb, const BVHNode& node) {
+        if(! node.aabb.intersect(aabb)) return;
+        
+        if(node.childA < 0 && node.childB < 0) { // leaf
+            //collisions[numCollisions].point = 
+        }
+
+        if(node.childA > 0) queryAABB(aabb, tree[node.childA]);
+        if(node.childB > 0) queryAABB(aabb, tree[node.childB]);
+        
+    }
+
+    VectorBase<METAL, IndexPair> queryAABB(const AABB& aabb) {
+        // tree 탐색
+        queryAABB(aabb, tree[0]);
+        return collisions;
+    }
+
+
+    VectorBase<METAL, IndexPair> queryPoint(tinym::vec3_view pointPtr, PR queryMargin) {
+        tinym::vec3 min(pointPtr[0]-queryMargin, pointPtr[1]-queryMargin, pointPtr[2]-queryMargin);
+        tinym::vec3 max(pointPtr[0]+queryMargin, pointPtr[1]+queryMargin, pointPtr[2]+queryMargin);
+        AABB pointAABB(min, max);
+        
+        return queryAABB(pointAABB);
     }
 };
 
@@ -652,14 +1454,20 @@ template <typename BroadPhase, typename NarrowPhase>
 struct CollisionPipeline {
     BroadPhase broadPhase;
     NarrowPhase narrowPhase;
+
 };
 
 template <typename BE, typename PR, typename System>
 struct Simulator {
     System& system;
 
-    ByteMemoryPool<BE> pool;
+    //ByteMemoryPool<BE> pool;
+    //DynamicMemoryAllocator<BE> pool;
     SceneObject<BE, PR> sceneObjects;
+
+    using BroadPhase = BVH<BVHMODE::LINEAR, BVHPRIMITIVE::TRIANGLE, PR>;
+    using NarrowPhase = BruteForce<METAL, PR>;
+    CollisionPipeline<BroadPhase, NarrowPhase> collisionPipeline;
 
     Simulator(System& system) : system(system) {}
 
@@ -678,37 +1486,61 @@ struct Simulator {
         );
     }
 
+    void addClothGridFast(size_t particleNum1D = 200, PR size1D = 100, PR kstretch=1e5, PR kshear=1e5, PR kbend=3e5) {
+        //particleNum1D(particleNum1D), particleNum2D(particleNum1D*particleNum1D), particleDataNum(particleNum2D*3),{
+        //size1D(size1D), stretchRestLength(size1D/PR(particleNum1D-1)), shearRestLength(stretchRestLength*std::sqrt(2)), bendRestLength(stretchRestLength*2) 
+        sceneObjects.squareClothes.emplace_back(
+                new DeformableMeshGridInitializer<PR>(particleNum1D, size1D, kstretch, kshear, kbend),
+                particleNum1D, // particleNum1D
+                size1D, // size1D
+                (particleNum1D-1)*(particleNum1D-1)*2, // facetNum
+                kstretch, kshear, kbend
+        );
+    }
 
-    template <typename PoolType>
-    void memoryAllocation(PoolType& pool) {
-        for(auto& deformableMesh : sceneObjects.deformableMeshes) deformableMesh.memoryAllocation(pool);
+    void addGeneralMesh(size_t particleNum1D = 200, PR size1D = 100, PR kstretch=1e5, PR kshear=1e5, PR kbend=3e5, PR mass=0.1) {
+        sceneObjects.meshes.emplace_back(
+            MeshGridSpringInitializerParams<PR>(particleNum1D, size1D, kstretch, kshear, kbend, mass)
+        );
+
+    };
+
+    void memoryAllocation() {
+        for(auto& squareCloth : sceneObjects.squareClothes) squareCloth.memoryAllocation();
+        for(auto& deformableMesh : sceneObjects.deformableMeshes) deformableMesh.memoryAllocation();
         //for(auto& plane : sceneObjects.planes) plane.memoryAllocation(pool);
+        for(auto& mesh : sceneObjects.meshes) mesh.memoryAllocation();
     }
 
 
     void initialize() {
-        auto fakePool = FakeMemoryPool<BE>();
-        memoryAllocation(fakePool);
-        std::cout << "[Simulator Init] "<< fakePool.marker << " Bytes are needed for Memory Pool" << std::endl;
-
-        pool = ByteMemoryPool<BE>(fakePool.marker);
+        GlobalAutoAllocator<BE>::globalInitialize(1<<20);
         std::cout << "[Simulator Init] Memory pool allocated" << std::endl;
-        //system.initialize(pool);
-        //memoryAllocation(pool);
 
-        for(auto& deformableMesh : sceneObjects.deformableMeshes) 
-            deformableMesh.initialize(pool);
+        for(auto& squareCloth : sceneObjects.squareClothes) squareCloth.initialize();
+        if(sceneObjects.squareClothes.size() > 0) std::cout << "[Simulator Init] square clothes(fast grid cloth) objects are initialized" << std::endl;
+        for(auto& deformableMesh : sceneObjects.deformableMeshes) deformableMesh.initialize();
+        if(sceneObjects.deformableMeshes.size() > 0) std::cout << "[Simulator Init] deformableMesh objects are initialized" << std::endl;
         for(auto& plane : sceneObjects.planes) {}
+        for(auto& mesh : sceneObjects.meshes) mesh.initialize();
+        if(sceneObjects.meshes.size() > 0) std::cout << "[Simulator Init] general mesh objects are initialized" << std::endl;
+
+        std::cout << "[Simulator Init] All scene objects are initialized" << std::endl;
             
     }
 
     void update() {
+        //std::cout << "[Simulator Update] Start update" << std::endl;
         system.update(sceneObjects);
+
+        //collisionPipeline.broadPhase.build(sceneObjects.squareClothes[0].x, sceneObjects.squareClothes[0].facet);
+        //std::cout << "[Simulator Update] Finished update" << std::endl;
     }
     
     void draw() {
         //system.draw();
 
+        for(auto& squareCloth : sceneObjects.squareClothes) squareCloth.mesh.draw();
         for(auto& deformableMesh : sceneObjects.deformableMeshes) deformableMesh.mesh.draw();
     }
 };
@@ -898,11 +1730,12 @@ struct ExplicitSystem<CPU, PR> {
 
     ExplicitSystem(PR h=1/PR(60), Index subSteps=50) : h(h), subSteps(subSteps), subh(h/subSteps) {}
 
-    void initialize(SceneObject<CPU, PR>& sceneObjects) {
-        std::cout << "[System Creation] Try to create Explicit System..." << std::endl;
-    }
+    //void initialize(SceneObject<CPU, PR>& sceneObjects) {
+    //    std::cout << "[System Creation] Try to create Explicit System..." << std::endl;
+    //}
 
     void clearForce(SceneObject<CPU, PR>& sceneObjects) { 
+        for(SquareCloth<CPU, PR>& squareCloth : sceneObjects.squareClothes) squareCloth.f.map().setZero(); 
         for(DeformableMesh<CPU, PR>& deformableMesh : sceneObjects.deformableMeshes) deformableMesh.f.map().setZero(); 
     }
     
@@ -946,11 +1779,68 @@ struct ExplicitSystem<CPU, PR> {
                         deformableMesh.springCoef.map()[i*2+1]
                 );
             }
-        }
+        } // deformableMeshes
+        for(SquareCloth<CPU, PR>& squareCloth : sceneObjects.squareClothes) {
+            Eigen::Map<Eigen::Matrix<PR, 3, Eigen::Dynamic>> X(squareCloth.x.ptr, 3, squareCloth.vertexNum);
+            Eigen::Map<Eigen::Matrix<PR, 3, Eigen::Dynamic>> V(squareCloth.v.ptr, 3, squareCloth.vertexNum);
+            Eigen::Map<Eigen::Matrix<PR, 3, Eigen::Dynamic>> F(squareCloth.f.ptr, 3, squareCloth.vertexNum);
+            Eigen::Map<Eigen::Matrix<PR, 3, Eigen::Dynamic>> M(squareCloth.m.ptr, 3, squareCloth.vertexNum);
+            
+            // add gravity
+            F.row(1) += G * M.row(1);
+
+            // add air drag
+            F += V * kair;
+
+            // add spring
+            // 스프링 포스 계산용 람다 함수 (인자로 ID를 받습니다)
+            auto addSpringForce = [&](size_t idA, size_t idB, PR restLength, PR kspring) {
+                // .col()을 쓰면 Eigen::Vector3f 처럼 다룰 수 있습니다!
+                auto dx = X.col(idB) - X.col(idA); 
+                
+                PR len = dx.norm();
+                if (len < 1E-9) return; // 0 나누기 방지
+
+                auto dv = V.col(idB) - V.col(idA);
+                auto ndx = dx / len;
+                auto sf = (kspring * (len - restLength) + kd * dv.dot(ndx)) * ndx;
+
+                // 작용-반작용 법칙: A에는 더하고 B에는 뺍니다 (제자리 갱신)
+                F.col(idA) += sf;
+                F.col(idB) -= sf;
+            };
+            for(size_t pid = 0; pid < squareCloth.vertexNum; pid++) {
+                auto col = pid % squareCloth.particleNum1D;
+                auto row = pid / squareCloth.particleNum1D;
+                
+                // stretch
+                if(col < squareCloth.particleNum1D-1) addSpringForce(pid, pid+1, squareCloth.stretchRestLength, squareCloth.kstretch); // right
+                if(row < squareCloth.particleNum1D-1) addSpringForce(pid, pid+squareCloth.particleNum1D, squareCloth.stretchRestLength, squareCloth.kstretch); // bottom
+                // shear
+                if(col < squareCloth.particleNum1D-1 && row < squareCloth.particleNum1D-1) addSpringForce(pid, pid+squareCloth.particleNum1D+1, squareCloth.shearRestLength, squareCloth.kshear); // right-bottom
+                if(col > 0 && row < squareCloth.particleNum1D-1) addSpringForce(pid, pid+squareCloth.particleNum1D-1, squareCloth.shearRestLength, squareCloth.kshear); // left-bottom
+                // bend
+                if(col < squareCloth.particleNum1D-2) addSpringForce(pid, pid+2, squareCloth.bendRestLength, squareCloth.kbend); // right-riht
+                if(row < squareCloth.particleNum1D-2) addSpringForce(pid, pid+2*squareCloth.particleNum1D, squareCloth.bendRestLength, squareCloth.kbend); // bottom-bottom
+            }
+        } // SquareCloth
     }
     
     void update(SceneObject<CPU, PR>& sceneObjects) {
         for(size_t i = 0; i < subSteps; i++) {
+            clearForce(sceneObjects);
+            addForce(sceneObjects);
+            for(SquareCloth<CPU, PR>& squareCloth : sceneObjects.squareClothes) {
+                Eigen::Map<Eigen::Matrix<PR, 3, Eigen::Dynamic>> X(squareCloth.x.ptr, 3, squareCloth.vertexNum);
+                Eigen::Map<Eigen::Matrix<PR, 3, Eigen::Dynamic>> V(squareCloth.v.ptr, 3, squareCloth.vertexNum);
+                Eigen::Map<Eigen::Matrix<PR, 3, Eigen::Dynamic>> F(squareCloth.f.ptr, 3, squareCloth.vertexNum);
+                Eigen::Map<Eigen::Matrix<PR, 3, Eigen::Dynamic>> M(squareCloth.m.ptr, 3, squareCloth.vertexNum);
+
+                Eigen::Map<Eigen::Matrix<PR, 1, Eigen::Dynamic>> Mask(squareCloth.fixedParticle.ptr, 1, squareCloth.vertexNum);
+
+                V.array() += (F.array() / M.array()).rowwise() * Mask.array() * subh;
+                X.array() += V.array().rowwise() * Mask.array() * subh;
+            }
             for(DeformableMesh<CPU, PR>& deformableMesh : sceneObjects.deformableMeshes) {
                 Eigen::Map<Eigen::Matrix<PR, 3, Eigen::Dynamic>> X(deformableMesh.x.ptr, 3, deformableMesh.vertexNum);
                 Eigen::Map<Eigen::Matrix<PR, 3, Eigen::Dynamic>> V(deformableMesh.v.ptr, 3, deformableMesh.vertexNum);
@@ -959,14 +1849,12 @@ struct ExplicitSystem<CPU, PR> {
 
                 Eigen::Map<Eigen::Matrix<PR, 1, Eigen::Dynamic>> Mask(deformableMesh.fixedParticle.ptr, 1, deformableMesh.vertexNum);
 
-                clearForce(sceneObjects);
-                addForce(sceneObjects);
-
                 V.array() += (F.array() / M.array()).rowwise() * Mask.array() * subh;
                 X.array() += V.array().rowwise() * Mask.array() * subh;
-
             }
         }
+        for(SquareCloth<CPU, PR>& squareCloth : sceneObjects.squareClothes) 
+            squareCloth.mesh.updateBuffer(squareCloth.x.ptr);
         for(DeformableMesh<CPU, PR>& deformableMesh : sceneObjects.deformableMeshes) 
             deformableMesh.mesh.updateBuffer(deformableMesh.x.ptr);
     }
@@ -985,6 +1873,7 @@ struct ExplicitSystem<METAL, PR> {
     MTL::ComputePipelineState* forcePSO;
     MTL::ComputePipelineState* springForcePSO;
     MTL::ComputePipelineState* integratePSO;
+    MTL::ComputePipelineState* clothGridFastForcePSO;
 
     // Sim vars
     PR h = 1/PR(60);
@@ -993,6 +1882,7 @@ struct ExplicitSystem<METAL, PR> {
     PR G = -980; // in cm/s^2
     PR kair = -0.1;
     PR kd = 0.1;
+    PR acctime = 0;
     // TODO: bending은 더 강하게 줘야할 듯. - 교수님
 
 
@@ -1053,6 +1943,19 @@ struct ExplicitSystem<METAL, PR> {
             std::cout << "[Metal Error] Failed to create Pipeline State! integratePSO\n";
             exit(1);
         }
+
+        NS::String* clothGridFastForceFuncName = NS::String::string("compute_cloth_grid_forces_fast", NS::UTF8StringEncoding);
+        MTL::Function* clothGridFastForceFunc = library->newFunction(clothGridFastForceFuncName);
+        if (!clothGridFastForceFunc) {
+            std::cout << "[Metal Error] Failed to find compute_forces function!\n";
+            exit(1);
+        }
+        // create a PSO
+        clothGridFastForcePSO = device->newComputePipelineState(clothGridFastForceFunc, &error);
+        if (!clothGridFastForcePSO) {
+            std::cout << "[Metal Error] Failed to create Pipeline State! clothGridFastForcePSO\n";
+            exit(1);
+        }
         
         // release all temporal objects
         library->release();
@@ -1061,13 +1964,22 @@ struct ExplicitSystem<METAL, PR> {
         forceFunc->release();
         integrateFuncName->release();
         integrateFunc->release();
+        springForceFuncName->release();
+        springForceFunc->release();
+        clothGridFastForceFuncName->release();
+        clothGridFastForceFunc->release();
     }
     
-    // 1. C++에도 파라미터 구조체를 정의해 둡니다. (메모리 구조 일치)
-// 💡 아주 심플해진 범용 파라미터
     struct SimParams {
         float subh, G, kair, kd;
         uint vertexNum; 
+        float acctime;
+    };
+
+    struct ClothGridParams {
+        uint particleNum1D;
+        float stretchRest, shearRest, bendRest;
+        float kstretch, kshear, kbend;
     };
 
     // 2. update() 함수 수정
@@ -1077,7 +1989,7 @@ struct ExplicitSystem<METAL, PR> {
 
         for(auto& deformableMesh : sceneObjects.deformableMeshes) {
             // 변수들을 패킹합니다.
-            SimParams params = { subh, G, kair, kd, (uint)deformableMesh.vertexNum };
+            SimParams params = { subh, G, kair, kd, (uint)deformableMesh.vertexNum, acctime };
 
             // [버퍼는 루프 밖에서 딱 한 번만 바인딩합니다!]
             computeEncoder->setBuffer(deformableMesh.x.pool, deformableMesh.x.offset, 0);
@@ -1114,13 +2026,49 @@ struct ExplicitSystem<METAL, PR> {
                     computeEncoder->dispatchThreads(gridSize, threadGroupSize);
                 }
             }
+        } // deformableMeshes
+        for(auto& squareCloth : sceneObjects.squareClothes) {
+            SimParams params = { subh, G, kair, kd, (uint)squareCloth.vertexNum, acctime };
+            ClothGridParams clothParams = { 
+                squareCloth.particleNum1D, 
+                squareCloth.stretchRestLength, squareCloth.shearRestLength, squareCloth.bendRestLength,
+                squareCloth.kstretch, squareCloth.kshear, squareCloth.kbend
+            };
 
-            computeEncoder->endEncoding();
-            commandBuffer->commit();
-            commandBuffer->waitUntilCompleted(); // 전체 30스텝이 다 끝날 때까지 CPU는 휴식
-        //cloth.updateBuffer(x.ptr);
-        }
+            // [버퍼는 루프 밖에서 딱 한 번만 바인딩합니다!]
+            computeEncoder->setBuffer(squareCloth.x.pool, squareCloth.x.offset, 0);
+            computeEncoder->setBuffer(squareCloth.v.pool, squareCloth.v.offset, 1);
+            computeEncoder->setBuffer(squareCloth.f.pool, squareCloth.f.offset, 2);
+            computeEncoder->setBuffer(squareCloth.m.pool, squareCloth.m.offset, 3);
+            computeEncoder->setBuffer(squareCloth.fixedParticle.pool, squareCloth.fixedParticle.offset, 4);
+            
+            // 4KB 이하의 작은 데이터는 버퍼를 안 만들고 setBytes로 즉시 꽂을 수 있습니다.
+            computeEncoder->setBytes(&params, sizeof(SimParams), 5);
+            computeEncoder->setBytes(&clothParams, sizeof(ClothGridParams), 8);
 
+            for(size_t i = 0; i < subSteps; i++) {
+                { // force overwrite with gravity + air drag + spring
+                    MTL::Size gridSize = MTL::Size(squareCloth.vertexNum, 1, 1);
+                    MTL::Size threadGroupSize = MTL::Size(std::min((size_t)clothGridFastForcePSO->maxTotalThreadsPerThreadgroup(), (size_t)squareCloth.vertexNum), 1, 1);
+                    computeEncoder->setComputePipelineState(clothGridFastForcePSO);
+                    computeEncoder->dispatchThreads(gridSize, threadGroupSize);
+                }
+                { // integration
+                    MTL::Size gridSize = MTL::Size(squareCloth.vertexNum, 1, 1);
+                    MTL::Size threadGroupSize = MTL::Size(std::min((size_t)integratePSO->maxTotalThreadsPerThreadgroup(), (size_t)squareCloth.vertexNum), 1, 1);
+                    computeEncoder->setComputePipelineState(integratePSO);
+                    computeEncoder->dispatchThreads(gridSize, threadGroupSize);
+                }
+            }
+            acctime += h;
+        } // squareClothes
+
+        computeEncoder->endEncoding();
+        commandBuffer->commit();
+        commandBuffer->waitUntilCompleted();
+        
+        for(auto& squareCloth : sceneObjects.squareClothes) 
+            squareCloth.mesh.updateBuffer(squareCloth.x.ptr);
         for(auto& deformableMesh : sceneObjects.deformableMeshes) 
             deformableMesh.mesh.updateBuffer(deformableMesh.x.ptr);
 
@@ -1140,204 +2088,21 @@ constexpr int groundN = 1;
 
 
 #include <chrono> // 시간 관련 라이브러리
-void addTest_CPU() {
-    std::cout << "----- Start: Addition Test -----" << std::endl;
-    constexpr size_t num = 100000;
-    std::cout << "----- Info: Vec size = (" << num << ") -----" << std::endl;
-    MemoryPool<float> pool(num*10);
-
-    auto start = std::chrono::steady_clock::now();
-    VectorBase<CPU, float> x(pool.zeros(num), num);
-    VectorBase<CPU, float> y(pool.zeros(num), num);
-    VectorBase<CPU, float> c(pool.alloc(num), num);
-    c.map() = x.map()+y.map();
-    //std::cout << "Vector c: " << c.data << std::endl;
-    auto end = std::chrono::steady_clock::now();
-    auto diff = std::chrono::duration_cast<std::chrono::microseconds>(end-start);
-    float dummy = c.map()[0];
-    std::cout << "Ex1 on my Vec: " << diff.count() << " us" << std::endl;
-
-    start = std::chrono::steady_clock::now();
-    float* mem1 = pool.zeros(num);
-    for(int i = 0; i < num; i++) *(mem1+i) = i;
-    float* mem2 = pool.zeros(num);
-    for(int i = 0; i < num; i++) *(mem2+i) = i+num;
-    VectorBase<CPU, float> x1(mem1, num);
-    VectorBase<CPU, float> x2(mem2, num);
-    c.map() = x1.map()+x2.map();
-    end = std::chrono::steady_clock::now();
-    diff = std::chrono::duration_cast<std::chrono::microseconds>(end-start);
-    dummy += c.map()[0];
-    std::cout << "Ex2 on my Vec: " << diff.count() << " us" << std::endl;
-    //std::cout << "Vector c1: " << c1.data << std::endl;
-
-    start = std::chrono::steady_clock::now();
-    Eigen::VectorXf xe1 = Eigen::VectorXf::Zero(num), xe2 = Eigen::VectorXf::Zero(num);
-    Eigen::VectorXf ce1 = xe1+xe2;
-    end = std::chrono::steady_clock::now();
-    diff = std::chrono::duration_cast<std::chrono::microseconds>(end-start);
-    std::cout << "Ex1 on Eigen: " << diff.count() << " us" << std::endl;
-    dummy += ce1[0];
-
-    start = std::chrono::steady_clock::now();
-    Eigen::VectorXf xe3(num), xe4(num);
-    for(int i = 0; i < num; i++) xe3.coeffRef(i) = i;
-    for(int i = 0; i < num; i++) xe4.coeffRef(i) = i+num;
-    Eigen::VectorXf ce2 = xe3+xe4;
-    end = std::chrono::steady_clock::now();
-    diff = std::chrono::duration_cast<std::chrono::microseconds>(end-start);
-    dummy += ce2[0];
-    std::cout << "Ex2 on Eigen: " << diff.count() << " us" << std::endl;
-
-    std::cout<< "dummy: " << dummy << std::endl;
-    std::cout << "----- End: Addition Test -----" << std::endl << std::endl;
-}
-void mulTest_CPU() {
-    std::cout << "----- Start: MV Multiplication Test -----" << std::endl;
-    constexpr size_t num = 300;
-    std::cout << "----- Info: Mat size = (" << num << "x" << num << ") * Vec size = (" << num << ") -----" << std::endl;
-    constexpr size_t num2 = num*num;
-    MemoryPool<float> pool(num2*10);
-
-    auto start = std::chrono::steady_clock::now();
-    Matrix<CPU, float> m(pool.zeros(num2), num, num);
-    VectorBase<CPU, float> a(pool.zeros(num), num);
-    VectorBase<CPU, float> b(pool.alloc(num), num);
-    b.map() = m.map()*a.map();
-    auto end = std::chrono::steady_clock::now();
-    auto diff = std::chrono::duration_cast<std::chrono::microseconds>(end-start);
-    float dummy = b.map()[0];
-    std::cout << "Ex1 on my Mat*Vec: " << diff.count() << " us" << std::endl;
-
-    start = std::chrono::steady_clock::now();
-    float* mem1 = pool.zeros(num2);
-    for(size_t i = 0; i < num2; i++) *(mem1+i) = i;
-    Matrix<CPU, float> m2(mem1, num, num);
-    float* mem2 = pool.zeros(num);
-    for(size_t i = 0; i < num; i++) *(mem2+i) = i;
-    VectorBase<CPU, float> a2(mem2, num);
-    b.map() = m2.map()*a2.map();
-    end = std::chrono::steady_clock::now();
-    diff = std::chrono::duration_cast<std::chrono::microseconds>(end-start);
-    dummy = b.map()[0];
-    std::cout << "Ex2 on my Mat*Vec: " << diff.count() << " us" << std::endl;
-
-
-    // --- 여기서부터 채워진 Eigen 테스트 부분입니다 ---
-    start = std::chrono::steady_clock::now();
-    Eigen::MatrixXf me1 = Eigen::MatrixXf::Zero(num, num);
-    Eigen::VectorXf ae1 = Eigen::VectorXf::Zero(num);
-    Eigen::VectorXf be1 = me1 * ae1;
-    end = std::chrono::steady_clock::now();
-    diff = std::chrono::duration_cast<std::chrono::microseconds>(end-start);
-    dummy += be1[0];
-    std::cout << "Ex1 on Eigen: " << diff.count() << " us" << std::endl;
-
-    start = std::chrono::steady_clock::now();
-    Eigen::MatrixXf me2(num, num);
-    // Eigen의 내부 1차원 배열 포인터(data())를 이용해 mem1, mem2와 완벽히 동일한 방식으로 초기화합니다.
-    for(size_t i = 0; i < num2; i++) *(me2.data() + i) = i;
-    Eigen::VectorXf ae2(num);
-    for(size_t i = 0; i < num; i++) *(ae2.data() + i) = i;
-    Eigen::VectorXf be2 = me2 * ae2;
-    end = std::chrono::steady_clock::now();
-    diff = std::chrono::duration_cast<std::chrono::microseconds>(end-start);
-    dummy += be2[0];
-    std::cout << "Ex2 on Eigen: " << diff.count() << " us" << std::endl;
-
-    // 컴파일러의 Dead Code Elimination 최적화를 막기 위한 더미 출력
-    std::cout << "dummy: " << dummy << std::endl;
-    std::cout << "----- End: MV Multiplication Test -----" << std::endl << std::endl;
-}
-#include <random>
-void sparseMatrixMulTest_CPU() {
-    std::cout << "----- Start: SMV Multiplication Test -----" << std::endl;
-    constexpr size_t size = 10000;
-    constexpr float nnzratio = 0.1;
-    constexpr size_t nnz = size * size * nnzratio; 
-    std::cout << "----- Info: Sparse Mat size = (" << size << "x" << size << ") * Vec size = (" << size << "), non-zeros ratio = " << nnzratio << " -----" << std::endl;
-    // 1000 * 1000 의 10% = 100,000 개의 0이 아닌 요소(Non-zeros)
-
-    // 1. 임의의 Triplet 데이터 생성 (타이머 바깥에서 준비)
-    std::vector<Eigen::Triplet<float>> triplets;
-    triplets.reserve(nnz);
-    
-    // 고정 시드를 사용하여 매번 동일한 패턴의 난수 생성
-    std::mt19937 gen(42); 
-    std::uniform_int_distribution<int> dist(0, size - 1);
-    std::uniform_real_distribution<float> val_dist(-1.0f, 1.0f);
-
-    for (size_t i = 0; i < nnz; ++i) {
-        triplets.emplace_back(dist(gen), dist(gen), val_dist(gen));
-    }
-
-    MemoryPool<float> pool(size * 10);
-    float dummy = 0.0f;
-
-    // ==========================================
-    // Ex1: 내 커스텀 SparseMatrix & Vector 연산
-    // ==========================================
-    // 데이터 세팅
-    SparseMatrix<CPU, float> mySm(triplets, size, size);
-    float* memX = pool.zeros(size);
-    for(int i = 0; i < size; i++) memX[i] = 1.0f; // 벡터를 1.0으로 초기화
-    VectorBase<CPU, float> myX(memX, size);
-    VectorBase<CPU, float> myRes(pool.alloc(size), size);
-
-    auto start = std::chrono::steady_clock::now();
-    
-    // 행렬-벡터 곱셈 실행
-    myRes.map() = mySm.map() * myX.map();
-    
-    auto end = std::chrono::steady_clock::now();
-    auto diff = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
-    std::cout << "Sparse * Vec on my Struct: " << diff.count() << " us" << std::endl;
-    dummy += myRes.map()[0];
-
-    // ==========================================
-    // Ex2: 순수 Eigen SparseMatrix & Vector 연산
-    // ==========================================
-    // 데이터 세팅
-    Eigen::SparseMatrix<float> eigenSm(size, size);
-    eigenSm.setFromTriplets(triplets.begin(), triplets.end());
-    Eigen::VectorXf eigenX = Eigen::VectorXf::Ones(size);
-
-    start = std::chrono::steady_clock::now();
-    
-    // 행렬-벡터 곱셈 실행
-    Eigen::VectorXf eigenRes = eigenSm * eigenX;
-    
-    end = std::chrono::steady_clock::now();
-    diff = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
-    std::cout << "Sparse * Vec on pure Eigen: " << diff.count() << " us" << std::endl;
-    dummy += eigenRes[0];
-
-    std::cout << "dummy: " << dummy << std::endl;
-    std::cout << "----- End: SMV Multiplication Test -----" << std::endl << std::endl;
-}
-
-void test() {
-    addTest_CPU();
-    mulTest_CPU();
-    sparseMatrixMulTest_CPU();
-}
 
 
 int main() {
     
     std::cout << "Render" << std::endl;
 
-    window = new YGLWindow(640, 480, "ysim");
-
-    // Test
-    //test();
+    //window = new YGLWindow(640, 480, "ysim");
+    window = new YGLWindow(1600, 900, "ysim");
 
 
     // Add Ground
     
 
     // Add Cloth
-//#define METAL_SYSTEM
+#define METAL_SYSTEM
 
 #ifdef METAL_SYSTEM
     using Backend = METAL;
@@ -1347,23 +2112,36 @@ int main() {
 
     //ByteMemoryPool<METAL> pool(50*1024*1024*sizeof(Precision));
     Precision h = 1/Precision(60);
-    Index subSteps = 50;
+    Index subSteps = 40;
     ExplicitSystem<Backend, Precision> system(h, subSteps);
     Simulator<Backend, Precision, ExplicitSystem<Backend, Precision>> simulator(system);
     //system.initialize(pool);
 
+    //Index particleNum1D = 20;
+    //Precision size1D = 100;
+    //Precision kstretch = 2e3;
+    //Precision kshear = 2e3;
+    //Precision kbend = 4e3;
     Index particleNum1D = 200;
     Precision size1D = 100;
     Precision kstretch = 1e5;
     Precision kshear = 1e5;
     Precision kbend = 2e5;
-    simulator.addClothGrid(particleNum1D, size1D, kstretch, kshear, kbend);
+    //simulator.addClothGrid(particleNum1D, size1D, kstretch, kshear, kbend);
+    simulator.addClothGridFast(particleNum1D, size1D, kstretch, kshear, kbend);
+    //simulator.addGeneralMesh(particleNum1D, size1D, kstretch, kshear, kbend);
 
     simulator.initialize();
 
 #ifdef USE_MEMORY_POOL
-    simulator.sceneObjects.deformableMeshes[0].fixedParticle.map()[0] = 0.f;
-    simulator.sceneObjects.deformableMeshes[0].fixedParticle.map()[particleNum1D-1] = 0.f;
+    if(simulator.sceneObjects.squareClothes.size() > 0) {
+        simulator.sceneObjects.squareClothes[0].fixedParticle.map()[0] = 0.f;
+        simulator.sceneObjects.squareClothes[0].fixedParticle.map()[particleNum1D-1] = 0.f;
+    }
+    if(simulator.sceneObjects.deformableMeshes.size() > 0) {
+        simulator.sceneObjects.deformableMeshes[0].fixedParticle.map()[0] = 0.f;
+        simulator.sceneObjects.deformableMeshes[0].fixedParticle.map()[particleNum1D-1] = 0.f;
+    }
     //system.fixedParticle.map()[0] = 0.f;
     //system.fixedParticle.map()[system.particleNum1D-1] = 0.f;
     //simulator.system.fixedParticle.map()[0] = 0.f;
@@ -1377,7 +2155,7 @@ int main() {
 
 
     Program shader;
-    shader.loadShader("shader.vert", "shader.frag");
+    shader.loadShader("shader.vert", "shader.geom", "shader.frag");
 
     camera.setPosition(tinym::vec3(0, 0, 200));
 
@@ -1395,10 +2173,16 @@ int main() {
 #ifdef USE_MEMORY_POOL
         } else if(key == GLFW_KEY_1 && action == GLFW_PRESS) {
             //sys->fixedParticle.map()[0] = !((bool)sys->fixedParticle.map()[0]);
-            simulator->sceneObjects.deformableMeshes[0].fixedParticle.map()[0] = !((bool)simulator->sceneObjects.deformableMeshes[0].fixedParticle.map()[0]);
+            if(simulator->sceneObjects.squareClothes.size() > 0) 
+                simulator->sceneObjects.squareClothes[0].fixedParticle.map()[0] = !((bool)simulator->sceneObjects.squareClothes[0].fixedParticle.map()[0]);
+            if(simulator->sceneObjects.deformableMeshes.size() > 0) 
+                simulator->sceneObjects.deformableMeshes[0].fixedParticle.map()[0] = !((bool)simulator->sceneObjects.deformableMeshes[0].fixedParticle.map()[0]);
         } else if(key == GLFW_KEY_2 && action == GLFW_PRESS) {
             //sys->fixedParticle.map()[sys->particleNum1D-1] = !((bool)sys->fixedParticle.map()[sys->particleNum1D-1]);
-            simulator->sceneObjects.deformableMeshes[0].fixedParticle.map()[200-1] = !((bool)simulator->sceneObjects.deformableMeshes[0].fixedParticle.map()[200-1]);
+            if(simulator->sceneObjects.squareClothes.size() > 0) 
+                simulator->sceneObjects.squareClothes[0].fixedParticle.map()[200-1] = !((bool)simulator->sceneObjects.squareClothes[0].fixedParticle.map()[200-1]);
+            if(simulator->sceneObjects.deformableMeshes.size() > 0) 
+                simulator->sceneObjects.deformableMeshes[0].fixedParticle.map()[200-1] = !((bool)simulator->sceneObjects.deformableMeshes[0].fixedParticle.map()[200-1]);
         }
 #else
         } else if(key == GLFW_KEY_1 && action == GLFW_PRESS) {
@@ -1424,7 +2208,7 @@ int main() {
         auto renderingStart = std::chrono::high_resolution_clock::now();
         shader.use();
         glViewport(0, 0, window->width(), window->height());
-        glClearColor(0, 0, 0.3, 0);
+        glClearColor(0, 0, 0, 0);
         glEnable(GL_DEPTH_TEST);
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
         //float M[16] = {1, 0, 0, 0,   0, 1, 0, 0,   0, 0, 1, 0,   0, -0.5, 0, 1};
@@ -1434,6 +2218,14 @@ int main() {
         shader.setUniform("M", M);
         shader.setUniform("V", V);
         shader.setUniform("P", camera.perspective(window->aspect(), 0.1f, 1000.f));
+        auto w = window->width()/2;
+        auto h = window->height()/2;
+        tinym::mat4 viewport = tinym::mat4(
+                tinym::vec4(w,0.0f,0.0f,0.0f),
+                tinym::vec4(0.0f,h,0.0f,0.0f),
+                tinym::vec4(0.0f,0.0f,1.0f,0.0f),
+                tinym::vec4(w+0, h+0, 0.0f, 1.0f));
+        shader.setUniform("ViewportMatrix", viewport);
         glfwSwapInterval(1);
 
         //system.draw();

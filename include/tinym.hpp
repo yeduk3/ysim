@@ -6,25 +6,41 @@
 
 #include <cmath>
 #include <cstring>
+#include <ostream>
 
 namespace tinym {
 
 using T = float;
 
+struct vec3_view {
+    T* ptr;
+    vec3_view(T* ptr) : ptr(ptr) {}
+    T& operator[](int i) { return ptr[i]; }
+    const T& operator[](int i) const { return ptr[i]; }
+};
 struct vec3 {
     union {
         struct { T x, y, z; };
         T v[3];
     };
     vec3() : x(0), y(0), z(0) {}
+    vec3(T a) : x(a), y(a), z(a) {}
     vec3(T x, T y, T z) : x(x), y(y), z(z) {}
 
     T& operator[](int i) { return v[i]; }
     const T& operator[](int i) const { return v[i]; }
+    
+    operator vec3_view() { return vec3_view(v); }
+    operator const vec3_view() const { return vec3_view(const_cast<T*>(v)); }
 
     vec3 operator-(const vec3& v) const { return vec3(x - v.x, y - v.y, z - v.z); }
     vec3 operator+(const vec3& v) const { return vec3(x + v.x, y + v.y, z + v.z); }
+    vec3 operator/(const vec3& v) const { return vec3(x/v.x, y/v.y, z/v.z); }
     vec3 operator*(float s) const { return vec3(x * s, y * s, z * s); }
+    vec3& operator+=(const vec3_view& v) { 
+        x += v[0]; y += v[1]; z += v[2];
+        return *this;
+    }
     float norm() const { return std::sqrt(x*x + y*y + z*z); }
     vec3 normalize() const {
         float n = norm();
@@ -35,7 +51,13 @@ struct vec3 {
     vec3 cross(const vec3& v) const {
         return vec3(y*v.z - z*v.y, z*v.x - x*v.z, x*v.y - y*v.x);
     }
+
+    friend std::ostream& operator<<(std::ostream& os, const vec3& v) {
+        os << '(' << v.x << ", " << v.y << ", " << v.z << ')';
+        return os;
+    }
 };
+
 
 struct vec4 {
     union {
@@ -83,6 +105,9 @@ struct mat4 {
         c[0][1] = 0; c[1][1] = d; c[2][1] = 0; c[3][1] = 0;
         c[0][2] = 0; c[1][2] = 0; c[2][2] = d; c[3][2] = 0;
         c[0][3] = 0; c[1][3] = 0; c[2][3] = 0; c[3][3] = d;
+    }
+    mat4(vec4 c0, vec4 c1, vec4 c2, vec4 c3) {
+        c[0] = c0; c[1] = c1; c[2] = c2; c[3] = c3;
     }
     vec4& operator[](int i) { return c[i]; }
     mat4 operator*(const mat4& rhs) const {
@@ -170,6 +195,29 @@ inline const T* value_ptr(const vec3& v3) { return v3.v; }
 inline const T* value_ptr(const vec4& v4) { return v4.v; }
 inline const T* value_ptr(const mat3& m3) { return m3.v; }
 inline const T* value_ptr(const mat4& m4) { return m4.v; }
+
+
+inline vec3 min(const vec3_view& a, const vec3_view& b) {
+    vec3 ret;
+    ret.x = a[0] > b[0] ? b[0] : a[0];
+    ret.y = a[1] > b[1] ? b[1] : a[1];
+    ret.z = a[2] > b[2] ? b[2] : a[2];
+    return ret;
+}
+inline vec3 min(const vec3_view& a, const vec3_view& b, const vec3_view& c) {
+    return min(min(a, b).v, c);
+}
+
+inline vec3 max(const vec3_view& a, const vec3_view& b) {
+    vec3 ret;
+    ret.x = a[0] < b[0] ? b[0] : a[0];
+    ret.y = a[1] < b[1] ? b[1] : a[1];
+    ret.z = a[2] < b[2] ? b[2] : a[2];
+    return ret;
+}
+inline vec3 max(const vec3_view& a, const vec3_view& b, const vec3_view& c) {
+    return max(max(a, b).v, c);
+}
 
 }; // end namespace
 

@@ -1,14 +1,15 @@
 #version 410 core
 
-in vec3 Normal;
-in vec4 VPos;
+in vec3 GNormal;
+in vec4 GPosition;
+noperspective in vec3 GEdgeDistance;
 
 out vec4 FragColor;
 
-uniform vec3 lightPosition = vec3(10, 10, 5);
+uniform vec3 lightPosition = vec3(50, 50, 30);
 uniform mat4 V;
-uniform vec3 lightColor = vec3(160);
-uniform vec3 diffuseColor = vec3(10);
+uniform vec3 lightColor = vec3(160, 0, 0);
+uniform vec3 diffuseColor = vec3(10, 0, 0);
 uniform vec3 specularColor = vec3(0.3);
 uniform float shininess = 2.f;
 
@@ -17,9 +18,9 @@ vec4 phong() {
     
     
     vec4 lp = V * vec4(lightPosition, 1);
-    vec3 l = lp.xyz/lp.w - VPos.xyz/VPos.w;
+    vec3 l = lp.xyz/lp.w - GPosition.xyz/GPosition.w;
     vec3 L = normalize(l);
-    vec3 N = normalize(Normal);
+    vec3 N = normalize(GNormal);
     if (!gl_FrontFacing) {
         N = -N;
     }
@@ -35,7 +36,17 @@ vec4 phong() {
     return vec4(pow(color, vec3(1/2.2)), 1);
 }
 
+uniform float LineWidth = 0.1;
+uniform vec4 LineColor = vec4(0, 0, 0, 1);
+
 void main() {
     FragColor = phong();
+    //FragColor = vec4(0,0,0,1);
+
+    // Wireframe
+    float d = min( GEdgeDistance.x, GEdgeDistance.y );
+    d = min( d, GEdgeDistance.z );
+    float mixVal = smoothstep( LineWidth - 1, LineWidth + 1, d);
+    FragColor = mix( LineColor, FragColor, mixVal );
 }
 
