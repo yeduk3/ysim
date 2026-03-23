@@ -4,7 +4,7 @@
 
 #include <GL/glew.h> // GLuint
 
-#include <glm/glm.hpp> // vec3
+#include "./tinym.hpp"
 
 #include <vector>
 #include <iostream>
@@ -20,9 +20,9 @@ struct ObjData
     {
         std::string materialName;
 
-        glm::vec3 ambientColor;
-        glm::vec3 diffuseColor;
-        glm::vec3 specularColor;
+        tinym::vec3 ambientColor;
+        tinym::vec3 diffuseColor;
+        tinym::vec3 specularColor;
 
         MtlData(const std::string mName) : materialName(mName) {}
 
@@ -46,17 +46,17 @@ struct ObjData
     GLuint nNormals = 0;
     GLuint nSyncedNormals = 0;
     GLuint nTextures = 0;
-    glm::vec3 maxPos;
-    glm::vec3 minPos;
-    glm::vec3 center;
-    glm::vec3 scale;
+    tinym::vec3 maxPos;
+    tinym::vec3 minPos;
+    tinym::vec3 center;
+    tinym::vec3 scale;
 
-    std::vector<glm::vec3> vertices;
-    std::vector<glm::vec2> texCoords;
-    std::vector<glm::vec3> normals;
-    std::vector<glm::vec3> syncedNormals;
-    std::vector<glm::u16vec3> elements3;
-    std::vector<glm::u16vec4> elements4;
+    std::vector<tinym::vec3> vertices;
+    std::vector<tinym::vec3> texCoords;
+    std::vector<tinym::vec3> normals;
+    std::vector<tinym::vec3> syncedNormals;
+    std::vector<tinym::vec3ui> elements3;
+    std::vector<tinym::vec4ui> elements4;
 
     std::vector<MtlData> materialData;
     
@@ -64,7 +64,7 @@ struct ObjData
     GLuint vertexBuffer, syncedNormalBuffer, element3Buffer, texCoordBuffer;
     bool isOk = false;
     
-    glm::mat4 modelMat;
+    tinym::mat4 modelMat;
 
     void setPrefix(const std::string &prefixName) {
         if(prefixName.length() == 0) {
@@ -115,8 +115,8 @@ struct ObjData
     
     void loadObject(const std::string &objFileName) {
         isOk = false;
-        maxPos = glm::vec3(-987654321);
-        minPos = glm::vec3( 987654321);
+        maxPos = tinym::vec3(-987654321.f);
+        minPos = tinym::vec3( 987654321.f);
         fileName = objFileName;
 
         std::fstream file(prefix + objFileName);
@@ -157,7 +157,7 @@ struct ObjData
             } else if (type == "vt") {
                 float tx, ty;
                 file >> tx >> ty;
-                this->texCoords.push_back({tx, ty});
+                this->texCoords.push_back({tx, ty, 0});
             } else if (type == "vn") {
                 float nx, ny, nz;
                 file >> nx >> ny >> nz;
@@ -186,7 +186,7 @@ struct ObjData
 
         this->nVertices = (int)this->vertices.size();
 
-        std::vector<std::vector<glm::vec3>> sNormals(this->nVertices);
+        std::vector<std::vector<tinym::vec3>> sNormals(this->nVertices);
 
         bool hasNormal = false;
         for (auto f : faces) {
@@ -223,7 +223,7 @@ struct ObjData
             }
 
             if (elem.size() == 4) {
-                this->elements4.push_back({elem[0], elem[1], elem[2], elem[3]});
+                //this->elements4.push_back({elem[0], elem[1], elem[2], elem[3]});
                 this->elements3.push_back({elem[0], elem[1], elem[2]});
                 this->elements3.push_back({elem[0], elem[2], elem[3]});
             } else if (elem.size() == 3)
@@ -237,10 +237,10 @@ struct ObjData
         
         if(!hasNormal) {
             for (auto& e : elements3) {
-                glm::vec3 p0 = vertices[e.x];
-                glm::vec3 p1 = vertices[e.y];
-                glm::vec3 p2 = vertices[e.z];
-                glm::vec3 n = glm::normalize(glm::cross(p1-p0, p2-p0));
+                tinym::vec3 p0 = vertices[e.x];
+                tinym::vec3 p1 = vertices[e.y];
+                tinym::vec3 p2 = vertices[e.z];
+                tinym::vec3 n = tinym::normalize(tinym::cross(p1-p0, p2-p0));
                 sNormals[e.x].push_back(n);
                 sNormals[e.y].push_back(n);
                 sNormals[e.z].push_back(n);
@@ -248,7 +248,7 @@ struct ObjData
         }
         
         for (auto sn : sNormals) {
-            glm::vec3 sum(0);
+            tinym::vec3 sum(0);
             for (auto n : sn)
                 sum += n;
             sum /= sn.size();
@@ -284,11 +284,148 @@ struct ObjData
         return;
     }
 
+
     void loadObject(const std::string &prefixName,
                     const std::string &objFileName) {
         this->setPrefix(prefixName);
         return this->loadObject(objFileName);
     }
+
+    //template <typename T, typename Index>
+    //void loadObjectDirect(
+    //        const std::string &prefixName,
+    //        const std::string &objFileName,
+    //        T* posPtr,
+    //        Index* facetPtr) {
+
+    //    std::fstream file(prefix + objFileName);
+    //    if (!file.is_open()) {
+    //        std::cerr << "No .obj file" << std::endl;
+    //        return;
+    //    }
+    //    std::cout << "Read " << prefix + objFileName << std::endl;
+
+    //    std::vector<std::string> faces;
+
+    //    Index vdataid = 0;
+
+    //    std::string type;
+    //    while (!file.eof()) {
+    //        file >> type;
+    //        if (file.eof())
+    //            break;
+    //        if (type == "mtllib") {
+    //            file >> this->materialFile;
+    //            this->loadMtl(this->materialFile);
+    //        } else if (type == "usemtl") {
+    //            file >> this->material;
+    //        } else if (type == "o" || type == "g") {
+    //            std::string dummy;
+    //            if (!std::getline(file, dummy)) {
+    //                std::cerr << "Group/Object line skipping failed!" << std::endl;
+    //            }
+    //        } else if (type == "v") {
+    //            float x, y, z;
+    //            file >> x >> y >> z;
+    //            //this->vertices.push_back({x, y, z});
+    //            posPtr[vdataid++] = x;
+    //            posPtr[vdataid++] = y;
+    //            posPtr[vdataid++] = z;
+    //        } else if (type == "vt") {
+    //            // ignore
+    //            float tx, ty;
+    //            file >> tx >> ty;
+    //        } else if (type == "vn") {
+    //            // ignore
+    //            float nx, ny, nz;
+    //            file >> nx >> ny >> nz;
+    //        } else if (type == "f") {
+    //            std::string f;
+    //            std::getline(file, f);
+
+    //            faces.push_back(f);
+    //        } else if (type == "l") {
+    //            // not in this case
+    //            if (!file.ignore(std::numeric_limits<std::streamsize>::max(),
+    //                             file.widen('\n'))) {
+    //                std::cerr << "Line polygon skip!" << std::endl;
+    //            }
+    //        } else {
+    //            if (!file.ignore(std::numeric_limits<std::streamsize>::max(),
+    //                             file.widen('\n'))) {
+    //                std::cerr << "Weird situation! input " << type
+    //                          << " is not supported." << std::endl;
+    //                return;
+    //            }
+    //        }
+    //        // std::cout << "Processing type " << type << std::endl;
+    //    }
+
+    //    this->nVertices = (int)this->vertices.size();
+
+    //    //std::vector<std::vector<tinym::vec3>> sNormals(this->nVertices);
+
+    //    Index fdataid = 0;
+    //    //bool hasNormal = false;
+    //    for (auto f : faces) {
+    //        // case by case?
+    //        std::vector<uint> elem;
+
+    //        std::regex re("-?\\d+(/-?\\d+|/)*");
+    //        auto start = std::sregex_iterator(f.begin(), f.end(), re);
+    //        auto end = std::sregex_iterator();
+    //        while (start != end) {
+    //            std::string str = start->str();
+    //            int slashCount = 0;
+    //            for(auto& c : str) if(c == '/') slashCount++;
+    //            if(slashCount == 2) { // v/t/n or v//n
+    //                GLint vertex = std::stoi(str.substr(0, str.find('/'))) - 1;
+    //                if(vertex < 0) vertex += vertices.size(); // -1 to be the last index
+    //                elem.push_back(vertex);
+
+    //                GLint normal = std::stoi(str.substr(str.find_last_of('/') + 1)) - 1;
+    //                if(normal < 0) normal += normals.size();
+    //                //sNormals[vertex].push_back(this->normals[normal]);
+    //                //hasNormal = true;
+    //            }
+    //            else if(slashCount == 1) { // v/t
+    //                GLint vertex = std::stoi(str.substr(0, str.find('/'))) - 1;
+    //                if(vertex < 0) vertex += vertices.size(); // -1 to be the last index
+    //                elem.push_back(vertex);
+    //            } else if(slashCount == 0) { // no slash, only vertices
+    //                GLint vertex = std::stoi(str) - 1;
+    //                if(vertex < 0) vertex += vertices.size();
+    //                elem.push_back(vertex);
+    //            }
+    //            start++;
+    //        }
+
+    //        if (elem.size() == 4) {
+    //            //this->elements4.push_back({elem[0], elem[1], elem[2], elem[3]});
+    //            //this->elements3.push_back({elem[0], elem[1], elem[2]});
+    //            //this->elements3.push_back({elem[0], elem[2], elem[3]});
+    //            facetPtr[fdataid++] = elem[0];
+    //            facetPtr[fdataid++] = elem[1];
+    //            facetPtr[fdataid++] = elem[2];
+    //            facetPtr[fdataid++] = elem[0];
+    //            facetPtr[fdataid++] = elem[2];
+    //            facetPtr[fdataid++] = elem[3];
+    //        } else if (elem.size() == 3) {
+    //            //this->elements3.push_back({elem[0], elem[1], elem[2]});
+    //            facetPtr[fdataid++] = elem[0];
+    //            facetPtr[fdataid++] = elem[1];
+    //            facetPtr[fdataid++] = elem[2];
+    //        } else {
+    //            std::cerr << "Weird situation! f elements size is not 3 or 4."
+    //                      << std::endl;
+    //            return;
+    //        }
+    //    }
+    //    file.close();
+    //    
+    //    std::cout << "--- Wavefront Object Loaded Directly ---" << std::endl;
+    //}
+    
 
     // not completed. cannot use.
     void writeObject(const std::string& outFileName) {
@@ -316,17 +453,16 @@ struct ObjData
             glGenBuffers(1, &vertexBuffer);
             glBindBuffer(GL_ARRAY_BUFFER, vertexBuffer);
             glBufferData(GL_ARRAY_BUFFER,
-                         nVertices * sizeof(glm::vec3),
+                         nVertices * sizeof(tinym::vec3),
                          vertices.data(),
                          GL_STATIC_DRAW);
-    MeshGL() {}
             glEnableVertexAttribArray(0);
             glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), 0);
             
             glGenBuffers(1, &syncedNormalBuffer);
             glBindBuffer(GL_ARRAY_BUFFER, syncedNormalBuffer);
             glBufferData(GL_ARRAY_BUFFER,
-                         nSyncedNormals * sizeof(glm::vec3),
+                         nSyncedNormals * sizeof(tinym::vec3),
                          syncedNormals.data(),
                          GL_STATIC_DRAW);
             glEnableVertexAttribArray(1);
@@ -336,7 +472,7 @@ struct ObjData
                 glGenBuffers(1, &texCoordBuffer);
                 glBindBuffer(GL_ARRAY_BUFFER, texCoordBuffer);
                 glBufferData(GL_ARRAY_BUFFER,
-                             nTextures * sizeof(glm::vec2),
+                             nTextures * sizeof(tinym::vec3),
                              texCoords.data(),
                              GL_STATIC_DRAW);
                 glEnableVertexAttribArray(2);
@@ -346,7 +482,7 @@ struct ObjData
             glGenBuffers(1, &element3Buffer);
             glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, element3Buffer);
             glBufferData(GL_ELEMENT_ARRAY_BUFFER,
-                         nElements3 * sizeof(glm::u16vec3),
+                         nElements3 * sizeof(tinym::vec3ui),
                          elements3.data(),
                          GL_STATIC_DRAW);
 
@@ -355,7 +491,7 @@ struct ObjData
     }
     
     void adjustCenter(bool invScaling = false) {
-        float sf = glm::max(scale.x, glm::max(scale.y, scale.z));
+        float sf = tinym::max(scale);
         for(int i = 0; i < vertices.size(); i++) {
             vertices[i] -= center;
             if(invScaling) vertices[i] /= sf;

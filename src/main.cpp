@@ -4,7 +4,7 @@
 #include "YGLWindow.hpp"
 #include "camera.hpp"
 #include "program.hpp"
-
+#include "objreader.hpp"
 
 #include <cstddef>
 #include <iostream>
@@ -12,6 +12,7 @@
 #include <ratio>
 #include <type_traits>
 #include <typeindex>
+#include <set>
 
 YGLWindow* window;
 
@@ -90,6 +91,67 @@ struct MetalContext {
         // C++의 static 변수는 프로그램 실행 중 딱 한 번만 초기화됩니다!
         static MTL::Device* device = MTL::CreateSystemDefaultDevice();
         return device;
+    }
+    static MTL::Library* getLibrary() {
+        static MTL::Library* library = nullptr;
+
+        if (!library) {
+            NS::Error* error = nullptr;
+
+            auto path = NS::String::string("physics.metallib", NS::UTF8StringEncoding);
+
+            library = getDevice()->newLibrary(path, &error);
+
+            if (!library) {
+                std::cout << "[Metal Error] Failed to load metallib!\n";
+                if (error) {
+                    std::cout << error->localizedDescription()->utf8String() << std::endl;
+                }
+                exit(1);
+            }
+
+            path->release();
+        }
+
+        return library;
+    }
+    static MTL::Function* getFunction(const char* name) {
+        static std::unordered_map<std::string, MTL::Function*> cache;
+
+        auto it = cache.find(name);
+        if (it != cache.end()) return it->second;
+
+        auto nsName = NS::String::string(name, NS::UTF8StringEncoding);
+        auto func = getLibrary()->newFunction(nsName);
+
+        if (!func) {
+            std::cout << "[Metal Error] Failed to load function: " << name << "\n";
+            exit(1);
+        }
+
+        cache[name] = func;
+        nsName->release();
+
+        return func;
+    }
+    static MTL::ComputePipelineState* getPSO(const char* name) {
+        static std::unordered_map<std::string, MTL::ComputePipelineState*> cache;
+
+        auto it = cache.find(name);
+        if (it != cache.end()) return it->second;
+
+        NS::Error* error = nullptr;
+        auto func = getFunction(name);
+
+        auto pso = getDevice()->newComputePipelineState(func, &error);
+
+        if (!pso) {
+            std::cout << "[Metal Error] PSO creation failed: " << name << "\n";
+            exit(1);
+        }
+
+        cache[name] = pso;
+        return pso;
     }
 };
 template <typename PR>
@@ -539,6 +601,40 @@ struct MeshGL<CPU> {
     }
 };
 
+enum struct BehaviorType {
+    TriangularCloth,
+    FastGridCloth,
+    Elastic,
+    Rigid,
+    Fluid,
+    Generator,
+};
+
+enum struct InitializerType {
+    MeshGridSpring,
+    MeshFile,
+
+};
+
+
+template <typename BE, typename PR>
+struct Constraints {
+    VectorBase<BE, PR> fixedParticles;
+
+    template <typename InitializerParams>
+    void memoryAllocation(InitializerParams& params) {
+        if(fixedParticles.ptr) return;
+        fixedParticles = VectorBase<BE, PR>(params.numPoints, 1);
+    }
+
+    void fixParticle(Index id) { fixedParticles[id] = PR(0); }
+    void releaseParticle(Index id) { fixedParticles[id] = PR(1); }
+};
+
+template <typename BE, typename PR>
+struct ExternalForces {
+    VectorBase<BE, PR> externalForces;
+};
 
 template <typename BE, typename PR>
 struct MeshState {
@@ -546,6 +642,7 @@ struct MeshState {
     Vector x, v, f, m, n;
     template <typename InitializerParams>
     void memoryAllocation(InitializerParams& params) {
+        if(x.ptr) return;
         Index numData = params.numPoints*3;
         x = Vector(numData);
         v = Vector(numData, 0);
@@ -564,13 +661,14 @@ struct MeshAdjacency {
     Vectorui facets, edges;
     //! Length: numPrimitives
     //! Each index holds the rest area/length of corresponding primitive.
-    Vector restFacetAreas, restEdgeLengths, restOppLength;
+    Vector restFacetAreas, restEdgeLengths, restOppLengths;
     Vectorui vertexAdjFacets, vertexAdjFacetsOffsets;
     Vectorui vertexAdjEdges, vertexAdjEdgesOffsets;
     //Vectorui edgeAdjEdges, edgeAdjEdgesOffsets;
     Vectorui vertexOppVertices, vertexOppVerticesOffsets; // for spring
     template <typename InitializerParams>
     void memoryAllocation(InitializerParams& params) {
+        if(facets.ptr) return;
         if(params.numFacets > 0) {
             if(!facets.ptr) 
                 facets = Vectorui(params.numFacets*3);
@@ -592,7 +690,6 @@ struct MeshAdjacency {
                 vertexOppVerticesOffsets = Vectorui(params.numPoints+1, 0);
         }
     }
-
 };
 
 struct EdgeInfo {
@@ -601,21 +698,78 @@ struct EdgeInfo {
     int o0=-1, o1=-1; // o0 in f0, o1 in f1
 };
 
+template <typename BE, typename PR>
+struct GeneralMeshInitializer {
+    virtual ~GeneralMeshInitializer() = default;
+    virtual void initialize(MeshState<BE, PR>& state, MeshAdjacency<BE, PR>& adjacency, Constraints<BE, PR>& constraints) = 0;
+};
 //! Suppose that the positions and facets are given
 template <typename BE, typename PR>
-struct MeshSpringInitializer {
+struct MeshAdjacencyInitializer {
     using Vector = VectorBase<BE, PR>;
 
-    void initialize(MeshState<BE, PR>& state, MeshAdjacency<BE, PR>& adjacency) {
+    static void initialize(MeshState<BE, PR>& state, MeshAdjacency<BE, PR>& adjacency, Constraints<BE, PR>& constraints) {
         std::cout << "[MeshSpringInitializer initialize] start" << std::endl;
         Index maxNumEdgeInfos = adjacency.facets.size;
         Index numPoints = state.x.size/3;
-        ByteMemoryPool<BE> tempPool(2*maxNumEdgeInfos*sizeof(EdgeInfo) + numPoints*sizeof(Index));
+        DynamicMemoryAllocator<BE> tempPool;
         VectorBase<BE, EdgeInfo> tempEdgeInfos(tempPool.template alloc<EdgeInfo>(maxNumEdgeInfos));
         VectorBase<BE, EdgeInfo> edgeInfos(tempPool.template alloc<EdgeInfo>(maxNumEdgeInfos));
         std::cout << "[MeshSpringInitializer initialize] temp vector allocated" << std::endl;
+
+        // vertex adj facets
         
         Index numFacets = adjacency.facets.size/3;
+        
+        for(Index fid = 0; fid < numFacets; fid++) {
+            Index fbase = fid*3;
+            Index a = adjacency.facets[fbase];
+            Index b = adjacency.facets[fbase+1];
+            Index c = adjacency.facets[fbase+2];
+
+            adjacency.vertexAdjFacetsOffsets[a+1]++;
+            adjacency.vertexAdjFacetsOffsets[b+1]++;
+            adjacency.vertexAdjFacetsOffsets[c+1]++;
+        }
+
+        for(Index vid = 0; vid < numPoints; ++vid) 
+            adjacency.vertexAdjFacetsOffsets[vid+1] += adjacency.vertexAdjFacetsOffsets[vid];
+
+        std::cout << "[MeshSpringInitializer initialize] vertex adj facets offsets set" << std::endl;
+
+        adjacency.vertexAdjFacets = VectorBase<BE, Index>(adjacency.vertexAdjFacetsOffsets[numPoints]);
+        
+        VectorBase<BE, Index> offsets(tempPool.template zeros<Index>(numPoints));
+        for(Index fid = 0; fid < numFacets; ++fid) {
+            Index fbase = fid*3;
+            Index v0 = adjacency.facets[fbase];
+            Index v1 = adjacency.facets[fbase+1];
+            Index v2 = adjacency.facets[fbase+2];
+
+            Index v0base = offsets[v0]+adjacency.vertexAdjFacetsOffsets[v0];
+            Index v1base = offsets[v1]+adjacency.vertexAdjFacetsOffsets[v1];
+            Index v2base = offsets[v2]+adjacency.vertexAdjFacetsOffsets[v2];
+
+            adjacency.vertexAdjFacets[v0base] = fid;
+            adjacency.vertexAdjFacets[v1base] = fid;
+            adjacency.vertexAdjFacets[v2base] = fid;
+
+            offsets[v0]++;
+            offsets[v1]++;
+            offsets[v2]++;
+        }
+        std::cout << "[MeshSpringInitializer initialize] vertex adjacent facets set" << std::endl;
+        for(Index i = 0; i < 10; ++i) {
+            std::cout << i << "-th adjacent facets: ";
+            for(Index fi = adjacency.vertexAdjFacetsOffsets[i]; fi < adjacency.vertexAdjFacetsOffsets[i+1]; ++fi) {
+                std::cout << adjacency.vertexAdjFacets[fi] << ", ";
+            }
+            std::cout << std::endl;
+        }
+
+
+        
+        // Fill temp edge infos (opposite edges are inserted twice)
         Index eIdx = 0;
         auto fillEdgeInfos = [&](Index edgeIndex, Index v0, Index v1, Index o0, Index f0) {
             if(v0 > v1) {
@@ -644,6 +798,7 @@ struct MeshSpringInitializer {
         }
         std::cout << "[MeshSpringInitializer initialize] temp edges are filled" << std::endl;
 
+        // Sort the temp edge infos to reduce
         std::sort(tempEdgeInfos.ptr, tempEdgeInfos.ptr+eIdx, [](EdgeInfo& a, EdgeInfo& b) {
             return a.v0 < b.v0 || (a.v0 == b.v0 && a.v1 < b.v1);
         });
@@ -652,18 +807,34 @@ struct MeshSpringInitializer {
         for(int i = 0; i < 10; i++) 
             std::cout << tempEdgeInfos[i].v0 << ", " << tempEdgeInfos[i].v1 << " in facet id " << tempEdgeInfos[i].f0 << std::endl;
 
+        // Reduce temp edge infos into unique edge infos
+        // And initialize restEdgeLengths
+        auto edgeLength = [&](Index vid0, Index vid1) {
+            auto v0 = tinym::vec3_view(state.x.ptr+vid0*3);
+            auto v1 = tinym::vec3_view(state.x.ptr+vid1*3);
+            auto l = v1-v0;
+            return l.norm();
+        };
         adjacency.edges[0] = tempEdgeInfos[0].v0;
         adjacency.edges[1] = tempEdgeInfos[0].v1;
         edgeInfos[0] = tempEdgeInfos[0];
         Index edgeid = 0;
+        adjacency.restEdgeLengths[edgeid] = edgeLength(tempEdgeInfos[0].v0, tempEdgeInfos[0].v1);
+        adjacency.vertexAdjEdgesOffsets[tempEdgeInfos[0].v0+1]++;
+        adjacency.vertexAdjEdgesOffsets[tempEdgeInfos[0].v1+1]++;
         //Index
         for(Index ei = 1; ei < eIdx; ++ei) {
             Index edgeBase = edgeid*2;
             if(tempEdgeInfos[ei].v0 != adjacency.edges[edgeBase] || tempEdgeInfos[ei].v1 != adjacency.edges[edgeBase+1]) {
                 edgeid++;
                 edgeBase = edgeid*2;
+
                 adjacency.edges[edgeBase  ] = tempEdgeInfos[ei].v0;
                 adjacency.edges[edgeBase+1] = tempEdgeInfos[ei].v1;
+                
+                adjacency.restEdgeLengths[edgeid] = edgeLength(tempEdgeInfos[ei].v0, tempEdgeInfos[ei].v1);
+                adjacency.vertexAdjEdgesOffsets[tempEdgeInfos[ei].v0+1]++;
+                adjacency.vertexAdjEdgesOffsets[tempEdgeInfos[ei].v1+1]++;
 
                 edgeInfos[edgeid] = tempEdgeInfos[ei];
             } else {
@@ -674,33 +845,68 @@ struct MeshSpringInitializer {
             }
         }
         Index edgeNum = edgeid+1;
-        for(int i = 0; i < 10; i++) 
-            std::cout << adjacency.edges[i*2] << ", " << adjacency.edges[i*2+1] << std::endl;
+        for(int i = 0; i < 10; i++) {
+            std::cout << adjacency.edges[i*2] << ", " << adjacency.edges[i*2+1] << ": " << adjacency.restEdgeLengths[i] << std::endl;
+            //Index vid0 = adjacency.edges[i*2];
+            //Index vid1 = adjacency.edges[i*2+1];
+            //std::cout << state.x[vid0*3] << ", " << state.x[vid0*3+1] << ", " << state.x[vid0*3+2] << std::endl;
+            //std::cout << state.x[vid1*3] << ", " << state.x[vid1*3+1] << ", " << state.x[vid1*3+2] << std::endl;
+        }
 
-        for(Index i = 1; i <= numPoints; ++i)
-            adjacency.vertexOppVerticesOffsets[i] += adjacency.vertexOppVerticesOffsets[i-1];
+        for(Index i = 0; i < numPoints; ++i) {
+            adjacency.vertexOppVerticesOffsets[i+1] += adjacency.vertexOppVerticesOffsets[i];
+            adjacency.vertexAdjEdgesOffsets[i+1] += adjacency.vertexAdjEdgesOffsets[i];
+        }
+        std::cout << "vertexOppVerticesOffsets: " << std::endl;
         for(int i = 0; i < 10; i++) 
             std::cout << adjacency.vertexOppVerticesOffsets[i] << std::endl;
         std::cout << "..." << adjacency.vertexOppVerticesOffsets[numPoints] << std::endl;
+        std::cout << "vertexAdjEdgesOffsets: " << std::endl;
+        for(int i = 0; i < 10; i++) 
+            std::cout << adjacency.vertexAdjEdgesOffsets[i] << std::endl;
+        std::cout << "..." << adjacency.vertexAdjEdgesOffsets[numPoints] << std::endl;
+        std::cout << "edgeInfos: " << std::endl;
         for(Index i = 0; i < 10; i++)
             std::cout << edgeInfos[i].v0 << " " << edgeInfos[i].v1 << " " << edgeInfos[i].o0 << " " << edgeInfos[i].o1 << " " << edgeInfos[i].f0 << " " << edgeInfos[i].f1 << std::endl;
+
         
-        VectorBase<BE, Index> offset(tempPool.template zeros<Index>(numPoints));
-        std::cout << "[MeshSpringInitializer initialize] Offset allocated" << std::endl;
+        // set vertexOppVertices and vertexAdjEdges
+        VectorBase<BE, Index> oppOffsets(tempPool.template zeros<Index>(numPoints));
+        VectorBase<BE, Index> adjOffsets(tempPool.template zeros<Index>(numPoints));
+        std::cout << "[MeshSpringInitializer initialize] oppOffsets allocated" << std::endl;
+        adjacency.vertexOppVertices = VectorBase<BE, Index>(adjacency.vertexOppVerticesOffsets[numPoints], 0);
+        adjacency.restOppLengths = VectorBase<BE, PR>(adjacency.vertexOppVerticesOffsets[numPoints]);
+        adjacency.vertexAdjEdges = VectorBase<BE, Index>(adjacency.vertexAdjEdgesOffsets[numPoints], 0);
+        std::cout << "[MeshSpringInitializer initialize] vertex opposite vertices allocated" << std::endl;
         for(Index ei = 0; ei < edgeNum; ++ei) {
-            if(edgeInfos[ei].o1 == -1) continue;
+            if(edgeInfos[ei].o1 != -1) {
+                Index o0 = edgeInfos[ei].o0;
+                Index o1 = edgeInfos[ei].o1;
 
-            Index o0 = edgeInfos[ei].o0;
-            Index o1 = edgeInfos[ei].o1;
+                Index o0base = oppOffsets[o0]+adjacency.vertexOppVerticesOffsets[o0];
+                Index o1base = oppOffsets[o1]+adjacency.vertexOppVerticesOffsets[o1];
 
-            Index o0base = offset[o0]+adjacency.vertexOppVerticesOffsets[o0];
-            Index o1base = offset[o1]+adjacency.vertexOppVerticesOffsets[o1];
+                adjacency.vertexOppVertices[o0base] = o1;
+                adjacency.vertexOppVertices[o1base] = o0;
 
-            adjacency.vertexOppVertices[o0base] = o1;
-            adjacency.vertexOppVertices[o1base] = o0;
+                adjacency.restOppLengths[o0base] = edgeLength(o0, o1);
+                adjacency.restOppLengths[o1base] = edgeLength(o0, o1);
 
-            offset[o0]++;
-            offset[o1]++;
+                oppOffsets[o0]++;
+                oppOffsets[o1]++;
+            }
+
+            Index v0 = edgeInfos[ei].v0;
+            Index v1 = edgeInfos[ei].v1;
+
+            Index v0base = adjOffsets[v0]+adjacency.vertexAdjEdgesOffsets[v0];
+            Index v1base = adjOffsets[v1]+adjacency.vertexAdjEdgesOffsets[v1];
+
+            adjacency.vertexAdjEdges[v0base] = ei;
+            adjacency.vertexAdjEdges[v1base] = ei;
+
+            adjOffsets[v0]++;
+            adjOffsets[v1]++;
         }
         std::cout << "[MeshSpringInitializer initialize] Opposite vertices set" << std::endl;
 
@@ -708,6 +914,13 @@ struct MeshSpringInitializer {
             std::cout << i << "-th opposite: ";
             for(Index oi = adjacency.vertexOppVerticesOffsets[i]; oi < adjacency.vertexOppVerticesOffsets[i+1]; ++oi) {
                 std::cout << adjacency.vertexOppVertices[oi] << ", ";
+            }
+            std::cout << std::endl;
+        }
+        for(Index i = 0; i < 10; i++) {
+            std::cout << i << "-th adj edges: ";
+            for(Index ei = adjacency.vertexAdjEdgesOffsets[i]; ei < adjacency.vertexAdjEdgesOffsets[i+1]; ++ei) {
+                std::cout << adjacency.vertexAdjEdges[ei] << ", ";
             }
             std::cout << std::endl;
         }
@@ -724,30 +937,34 @@ struct MeshGridSpringInitializerParams {
     // Specifics
     Index particleNum1D;
     PR size1D;
-    PR kstretch, kshear, kbend;
-    MeshGridSpringInitializerParams(Index particleNum1D, PR size1D, PR kstretch, PR kshear, PR kbend, PR mass)
+    MeshGridSpringInitializerParams(Index particleNum1D, PR size1D, PR mass)
         : particleNum1D(particleNum1D), 
         numPoints(particleNum1D*particleNum1D),
         numFacets(2*(particleNum1D-1)*(particleNum1D-1)), 
         numEdges(2*(particleNum1D-1)*particleNum1D+numFacets),
-        size1D(size1D), kstretch(kstretch), kshear(kshear), kbend(kbend), mass(mass) {}
+        size1D(size1D), mass(mass) {}
 };
 
 template <typename BE, typename PR>
-struct MeshGridSpringInitializer {
-    MeshSpringInitializer<BE, PR> springInitializer;
-    MeshGridSpringInitializerParams<PR> params;
+struct MeshGridSpringInitializer : GeneralMeshInitializer<BE, PR> {
+    using ParamsType = MeshGridSpringInitializerParams<PR>;
+    ParamsType params;
 
-    MeshGridSpringInitializer(const MeshGridSpringInitializerParams<PR>& params) : params(params) {}
+    MeshGridSpringInitializer(ParamsType params) : params(params) {}
 
-    void initialize(MeshState<BE, PR>& state, MeshAdjacency<BE, PR>& adjacency) {
+    void initialize(MeshState<BE, PR>& state, MeshAdjacency<BE, PR>& adjacency, Constraints<BE, PR>& constraints) {
         std::cout << "[MeshGridSpringInitializer initialize] start" << std::endl;
+        
+        state.memoryAllocation(params); // numPoints
+        adjacency.memoryAllocation(params); // numPoints, numFacets, numEdges
+        constraints.memoryAllocation(params); // numPoints
+
         PR halfSize = params.size1D / 2.0;
         PR length = params.size1D/PR(params.particleNum1D-1);
 
-        for (Index row = 0; row < params.particleNum1D; ++row) {
-            for (Index col = 0; col < params.particleNum1D; ++col) {
-                Index base = (row*params.particleNum1D + col)*3; 
+        for (int row = 0; row < params.particleNum1D; ++row) {
+            for (int col = 0; col < params.particleNum1D; ++col) {
+                int base = (row*params.particleNum1D + col)*3; 
                 
                 PR px =  col*length - halfSize;
                 PR py = -row*length + halfSize;
@@ -760,71 +977,224 @@ struct MeshGridSpringInitializer {
         }
         std::cout << "[MeshGridSpringInitializer initialize] position set" << std::endl;
 
+        
+        //Index fIdx = 0;
+        //for (Index row = 0; row < params.particleNum1D - 1; ++row) {
+        //    for (Index col = 0; col < params.particleNum1D - 1; ++col) {
+        //        Index p00 = (row * params.particleNum1D + col);           
+        //        Index p10 = (row * params.particleNum1D + col + 1);       
+        //        Index p01 = ((row + 1) * params.particleNum1D + col);     
+        //        Index p11 = ((row + 1) * params.particleNum1D + col + 1); 
+        //
+        //        adjacency.vertexAdjFacetsOffsets[p00+1]++;
+        //        adjacency.vertexAdjFacetsOffsets[p01+1]++;
+        //        adjacency.vertexAdjFacetsOffsets[p11+1]++;
+        //        adjacency.facets[fIdx++] = p00; // p00
+        //        adjacency.facets[fIdx++] = p01; //  v   
+        //        adjacency.facets[fIdx++] = p11; // p01 > p11
+        //
+        //        adjacency.vertexAdjFacetsOffsets[p00+1]++;
+        //        adjacency.vertexAdjFacetsOffsets[p11+1]++;
+        //        adjacency.vertexAdjFacetsOffsets[p10+1]++;
+        //        adjacency.facets[fIdx++] = p00; // p00 < p10
+        //        adjacency.facets[fIdx++] = p11; //        ^
+        //        adjacency.facets[fIdx++] = p10; //       p11
+        //    }
+        //}
+
+        if(adjacency.vertexAdjFacets.ptr) return;
+
         Index fIdx = 0;
         for (Index row = 0; row < params.particleNum1D - 1; ++row) {
             for (Index col = 0; col < params.particleNum1D - 1; ++col) {
-                Index p00 = (row * params.particleNum1D + col);           
-                Index p10 = (row * params.particleNum1D + col + 1);       
-                Index p01 = ((row + 1) * params.particleNum1D + col);     
-                Index p11 = ((row + 1) * params.particleNum1D + col + 1); 
+                Index p00 = (row * params.particleNum1D + col);
+                Index p10 = (row * params.particleNum1D + col + 1);
+                Index p01 = ((row + 1) * params.particleNum1D + col);
+                Index p11 = ((row + 1) * params.particleNum1D + col + 1);
+                // p00   p10
+                //
+                // p01   p11
 
-                adjacency.facets[fIdx++] = p00; // p00
-                adjacency.facets[fIdx++] = p01; //  v   
-                adjacency.facets[fIdx++] = p11; // p01 > p11
+                auto addFacet = [&](Index a, Index b, Index c) {
+                    adjacency.facets[fIdx++] = a;
+                    adjacency.facets[fIdx++] = b;
+                    adjacency.facets[fIdx++] = c;
+                };
 
-                adjacency.facets[fIdx++] = p00; // p00 < p10
-                adjacency.facets[fIdx++] = p11; //        ^
-                adjacency.facets[fIdx++] = p10; //       p11
+                if (((row + col) & 1) == 0) {
+                    // diagonal: p00 - p11
+                    addFacet(p00, p01, p11);
+                    addFacet(p00, p11, p10);
+                } else {
+                    // diagonal: p10 - p01
+                    addFacet(p00, p01, p10);
+                    addFacet(p10, p01, p11);
+                }
             }
         }
         std::cout << "[MeshGridSpringInitializer initialize] facets set" << std::endl;
 
-        springInitializer.initialize(state, adjacency);
+
+        MeshAdjacencyInitializer<BE, PR>::initialize(state, adjacency, constraints);
+    }
+};
+
+template <typename PR>
+struct MeshFileInitializerParams {
+    // Commons
+    Index numPoints, numFacets, numEdges;
+    PR mass;
+
+
+    // Specifics
+    std::string prefix, fileName;
+    PR scale;
+
+    MeshFileInitializerParams(std::string prefix, std::string fileName, PR scale, PR mass) 
+        : prefix(prefix), fileName(fileName), scale(scale), mass(mass) {}
+};
+
+template <typename BE, typename PR>
+struct MeshFileInitializer : GeneralMeshInitializer<BE, PR> {
+    using ParamsType = MeshFileInitializerParams<PR>;
+    ParamsType params;
+    ObjData data;
+
+    MeshFileInitializer(ParamsType params) : params(params) {
+        data.loadObject(params.prefix, params.fileName);
+
+        this->params.numPoints = data.nVertices;
+        this->params.numFacets = data.nElements3;
+
+        std::set<std::pair<int,int>> edges;
+        for (const auto& face : data.elements3) {
+            int n = 3;
+            for (int i = 0; i < n; ++i) {
+                int a = face[i];
+                int b = face[(i + 1) % n];
+
+                if (a > b) std::swap(a, b);
+                edges.insert({a, b});
+            }
+        }
+        this->params.numEdges = edges.size();
+    }
+
+    void initialize(MeshState<BE, PR>& state, MeshAdjacency<BE, PR>& adjacency, Constraints<BE, PR>& constraints) override {
+        state.memoryAllocation(params); // numPoints
+        adjacency.memoryAllocation(params); // numPoints, numFacets, numEdges
+        constraints.memoryAllocation(params); // numPoints
+
+        for(Index vid = 0; vid < params.numPoints; vid++) {
+            Index vbase = vid*3;
+            state.x[vbase  ] = data.vertices[vid].x*params.scale;
+            state.x[vbase+1] = data.vertices[vid].y*params.scale;
+            state.x[vbase+2] = data.vertices[vid].z*params.scale;
+        }
+
+        if(adjacency.vertexAdjFacets.ptr) return;
+        for(Index fid = 0; fid < params.numFacets; fid++) {
+            Index fbase = fid*3;
+            adjacency.facets[fbase  ] = data.elements3[fid].x;
+            adjacency.facets[fbase+1] = data.elements3[fid].y;
+            adjacency.facets[fbase+2] = data.elements3[fid].z;
+        }
+
+        MeshAdjacencyInitializer<BE, PR>::initialize(state, adjacency, constraints);
     }
 };
 
 
-struct MeshFileInitializer {
-    
-};
 
+//! Force accumulator
+template <typename BE, typename PR>
+struct TriangularClothBehavior {};
 
-struct GridClothBehavior {
-    
+template <typename PR>
+struct TriangularClothBehavior<METAL, PR> {
+
+    static MTL::ComputePipelineState* getPSO() {
+        static MTL::ComputePipelineState* pso = nullptr;
+        if (!pso) {
+            pso = MetalContext::getPSO("compute_tri_spring_forces");
+        }
+        return pso;
+    }
+
+    template <typename SimParams, typename ClothParams>
+    static void setBuffer(
+            MeshState<METAL, PR>& state, 
+            MeshAdjacency<METAL, PR>& adjacency, 
+            Constraints<METAL, PR>& constraints, 
+            ExternalForces<METAL, PR>& externalForces,
+            SimParams& simParams,
+            ClothParams& clothParams,
+            MTL::ComputeCommandEncoder* encoder) {
+        // state
+        encoder->setBuffer(state.x.pool, state.x.offset, 0);
+        encoder->setBuffer(state.v.pool, state.v.offset, 1);
+        encoder->setBuffer(state.f.pool, state.f.offset, 2);
+        encoder->setBuffer(state.m.pool, state.m.offset, 3);
+        // constraints
+        encoder->setBuffer(constraints.fixedParticles.pool, constraints.fixedParticles.offset, 4);
+        // external forces
+        encoder->setBuffer(externalForces.externalForces.pool, externalForces.externalForces.offset, 5);
+        //simulation parameters
+        encoder->setBytes(&simParams, sizeof(SimParams), 6);
+        encoder->setBytes(&clothParams, sizeof(ClothParams), 7);
+        // adjacency
+        encoder->setBuffer(adjacency.edges.pool, adjacency.edges.offset, 8);
+        encoder->setBuffer(adjacency.facets.pool, adjacency.facets.offset, 9);
+        // stretch springs
+        encoder->setBuffer(adjacency.vertexAdjEdges.pool, adjacency.vertexAdjEdges.offset, 10);
+        encoder->setBuffer(adjacency.vertexAdjEdgesOffsets.pool, adjacency.vertexAdjEdgesOffsets.offset, 11);
+        encoder->setBuffer(adjacency.restEdgeLengths.pool, adjacency.restEdgeLengths.offset, 12);
+        // bend springs
+        encoder->setBuffer(adjacency.vertexOppVertices.pool, adjacency.vertexOppVertices.offset, 13);
+        encoder->setBuffer(adjacency.vertexOppVerticesOffsets.pool, adjacency.vertexOppVerticesOffsets.offset, 14);
+        encoder->setBuffer(adjacency.restOppLengths.pool, adjacency.restOppLengths.offset, 15);
+    }
+
+    static void update(MeshState<METAL, PR>& state, MTL::ComputeCommandEncoder* encoder) {
+        auto* pso = getPSO();
+        size_t vertexNum = state.x.size/3;
+        MTL::Size gridSize = MTL::Size(vertexNum, 1, 1);
+        MTL::Size threadGroupSize = MTL::Size(std::min((size_t)pso->maxTotalThreadsPerThreadgroup(), vertexNum), 1, 1);
+        encoder->setComputePipelineState(pso);
+        encoder->dispatchThreads(gridSize, threadGroupSize);
+    }
 };
 
 struct Material {};
 
-template <typename BE, typename PR>
-struct AdjacencyBuilder {
-    MeshState<BE, PR>& state;
-    MeshAdjacency<BE, PR>& adjacency;
-
+template <typename PR>
+struct BehaviorParams {
+    PR slot0;
+    PR slot1;
+    PR slot2;
+    BehaviorParams(PR s0, PR s1, PR s2) : slot0(s0), slot1(s1), slot2(s2) {}
 };
 
-template <typename BE, typename PR, typename MeshInitializer, typename Behavior, typename Material>
+template <typename BE, typename PR>
 struct GeneralMesh {
     MeshState<BE, PR> state;
     MeshAdjacency<BE, PR> adjacency;
-    MeshInitializer initializer;
-    Behavior behavior;
+    GeneralMeshInitializer<BE, PR>* initializer;
+    BehaviorType behaviorType;
+    BehaviorParams<PR> behaviorParams;
     Material material;
+    Constraints<BE, PR> constraints;
+    ExternalForces<BE, PR> externalForces;
 
-    MeshGL<CPU> mesh;
+    MeshGL<CPU> meshGL;
 
-    template <typename MeshInitializeParam>
-    GeneralMesh(const MeshInitializeParam& params) : initializer(params) {}
-
-    void memoryAllocation() {
-        state.memoryAllocation(initializer.params);
-        adjacency.memoryAllocation(initializer.params);
-    }
+    GeneralMesh(GeneralMeshInitializer<BE, PR>* initializer, BehaviorType behaviorType, BehaviorParams<PR> behaviorParams) 
+    : initializer(initializer), behaviorType(behaviorType), behaviorParams(behaviorParams) {}
+    ~GeneralMesh() { delete initializer; }
 
     void initialize() {
-        memoryAllocation();
-
-        initializer.initialize(state, adjacency);
-        mesh = MeshGL<CPU>(state.x.size/3, state.x.ptr, adjacency.facets.size/3, adjacency.facets.ptr, state.n.ptr);
+        initializer->initialize(state, adjacency, constraints);
+        meshGL = MeshGL<CPU>(state.x.size/3, state.x.ptr, adjacency.facets.size/3, adjacency.facets.ptr, state.n.ptr);
     }
 };
 
@@ -946,12 +1316,6 @@ struct DeformableMeshGridInitializer : MeshInitializer<PR> {
     Index springCounter() { return springNum; }
 };
 
-//template <typename PR>
-//struct MeshFileInitializer : MeshInitializer<PR> {
-//    void initilalize() {
-//
-//    }
-//};
 
 template <typename BE, typename PR>
 struct DeformableMesh {
@@ -1067,7 +1431,7 @@ struct SceneObject {
     std::vector<SquareCloth<BE, PR>> squareClothes;
     std::vector<DeformableMesh<BE, PR>> deformableMeshes;
     std::vector<Plane> planes;
-    std::vector<GeneralMesh<BE, PR, MeshGridSpringInitializer<BE, PR>, GridClothBehavior, Material>> meshes;
+    std::vector<GeneralMesh<BE, PR>> meshes;
 };
 
 
@@ -1109,9 +1473,9 @@ struct AABB {
     AABB() : min(0), max(0) {}
     AABB(tinym::vec3_view e1, tinym::vec3_view e2) : min(tinym::min(e1, e2)), max(tinym::max(e1, e2)) {}
     AABB(tinym::vec3_view t1, tinym::vec3_view t2, tinym::vec3_view t3) : min(tinym::min(t1, t2, t3)), max(tinym::max(t1, t2, t3)) {}
-    void combine(const tinym::vec3_view a) {
-        min = tinym::min(a, min.v);
-        max = tinym::max(a, max.v);
+    void combine(const tinym::vec3_view& a) {
+        min = tinym::min(a, min);
+        max = tinym::max(a, max);
     }
     void combine(const AABB& aabb) {
         min = tinym::min(min, aabb.min);
@@ -1469,11 +1833,18 @@ struct Simulator {
     using NarrowPhase = BruteForce<METAL, PR>;
     CollisionPipeline<BroadPhase, NarrowPhase> collisionPipeline;
 
+
+    // sim viewer?
+    bool pause = true;
+
     Simulator(System& system) : system(system) {}
 
-    template <typename FileReader>
-    void addCloth(FileReader& reader) {
-
+    void addClothFile(std::string prefix, std::string fileName, PR scale, PR kstretch=1e5, PR kshear=1e5, PR kbend=3e5, PR mass=0.1) {
+        sceneObjects.meshes.emplace_back(
+                new MeshFileInitializer<BE, PR>({prefix, fileName, scale, mass}),
+                BehaviorType::TriangularCloth,
+                BehaviorParams<PR>(kstretch, kshear, kbend)
+                );
     };
 
     void addClothGrid(size_t particleNum1D = 200, PR size1D = 100, PR kstretch=1e5, PR kshear=1e5, PR kbend=3e5) {
@@ -1498,9 +1869,11 @@ struct Simulator {
         );
     }
 
-    void addGeneralMesh(size_t particleNum1D = 200, PR size1D = 100, PR kstretch=1e5, PR kshear=1e5, PR kbend=3e5, PR mass=0.1) {
+    void addGeneralMesh(Index particleNum1D = 200, PR size1D = 100, PR kstretch=1e5, PR kshear=1e5, PR kbend=3e5, PR mass=0.1) {
         sceneObjects.meshes.emplace_back(
-            MeshGridSpringInitializerParams<PR>(particleNum1D, size1D, kstretch, kshear, kbend, mass)
+            new MeshGridSpringInitializer<BE, PR>({particleNum1D, size1D, mass}),
+            BehaviorType::TriangularCloth,
+            BehaviorParams<PR>(kstretch, kshear, kbend)
         );
 
     };
@@ -1530,6 +1903,7 @@ struct Simulator {
     }
 
     void update() {
+        if(pause) return;
         //std::cout << "[Simulator Update] Start update" << std::endl;
         system.update(sceneObjects);
 
@@ -1542,180 +1916,13 @@ struct Simulator {
 
         for(auto& squareCloth : sceneObjects.squareClothes) squareCloth.mesh.draw();
         for(auto& deformableMesh : sceneObjects.deformableMeshes) deformableMesh.mesh.draw();
+        for(auto& mesh : sceneObjects.meshes) mesh.meshGL.draw();
     }
 };
 
 
 template <typename BE, typename PR>
 struct ExplicitSystem {};
-#define USE_MEMORY_POOL
-#ifndef USE_MEMORY_POOL
-template <typename PR>
-struct ExplicitSystem<CPU, PR> {
-    // VectorBase를 더 이상 사용하지 않습니다!
-
-    size_t particleNum1D, particleNum2D, particleDataNum;
-    
-    // 💡 개별적인 힙(Heap) 메모리를 가지는 Eigen 행렬들로 직접 정의합니다.
-    Eigen::Matrix<PR, 3, Eigen::Dynamic> X, V, F, M, N;
-    Eigen::Matrix<PR, 1, Eigen::Dynamic> fixedParticle;
-    std::vector<unsigned int> facet; // 인덱스 배열도 std::vector로 독립 할당
-
-    PR mass = 0.1;
-    PR h = 1/PR(60);
-    size_t subSteps = 40;
-    PR subh = h/subSteps;
-    PR G = -980; // in cm/s^2
-    PR kair = -0.1;
-    PR ks = 1e5, kd = 0.1;
-    PR size1D;
-    PR stretchRestLength, shearRestLength, bendRestLength;
-
-    MeshGL<CPU> cloth;
-
-    ExplicitSystem(size_t particleNum1D = 200, PR size1D = 100) 
-        : particleNum1D(particleNum1D), particleNum2D(particleNum1D*particleNum1D), particleDataNum(particleNum2D*3),
-        size1D(size1D), stretchRestLength(size1D/PR(particleNum1D-1)), shearRestLength(stretchRestLength*std::sqrt(2)), bendRestLength(stretchRestLength*2) {}
-
-    // Simulator와의 호환성을 위해 PoolType을 받지만, 실제로는 안 씁니다.
-    template <typename PoolType>
-    void initialize(PoolType& pool) {
-        std::cout << "[System Creation] Try to create Explicit System (Eigen Native)..." << std::endl;
-        
-        memoryAllocation(pool); // Eigen 내부 할당
-        initCloth();
-
-        size_t fIdx = 0;
-        for (size_t row = 0; row < particleNum1D - 1; ++row) {
-            for (size_t col = 0; col < particleNum1D - 1; ++col) {
-                unsigned int p00 = (row * particleNum1D + col);          
-                unsigned int p10 = (row * particleNum1D + col + 1);       
-                unsigned int p01 = ((row + 1) * particleNum1D + col);     
-                unsigned int p11 = ((row + 1) * particleNum1D + col + 1); 
-
-                facet[fIdx++] = p00;
-                facet[fIdx++] = p10;
-                facet[fIdx++] = p11;
-
-                facet[fIdx++] = p00;
-                facet[fIdx++] = p11;
-                facet[fIdx++] = p01;
-            }
-        }
-
-        std::cout << "[System Creation] Facet index computed" << std::endl;
-
-        // 💡 Eigen::Matrix는 열 우선(Column-major)이므로 .data()를 호출하면 OpenGL VBO 구조와 완벽히 호환되는 1차원 포인터가 나옵니다.
-        cloth = MeshGL<CPU>(particleNum2D, X.data(), facet.size()/3, facet.data(), N.data());
-        
-        std::cout << "[System Creation] Explicit System Created" << std::endl;
-    }
-
-    template <typename PoolType>
-    void memoryAllocation(PoolType& pool) {
-        // 넘어온 pool 파라미터는 무시하고, Eigen 라이브러리의 자체 동적 할당을 사용합니다.
-        // 각각이 운영체제의 힙 영역 어딘가에 산발적으로 할당됩니다.
-        X.resize(3, particleNum2D); X.setZero();
-        V.resize(3, particleNum2D); V.setZero();
-        F.resize(3, particleNum2D); F.setZero();
-        M.resize(3, particleNum2D); M.setConstant(mass);
-        N.resize(3, particleNum2D); N.setZero();
-
-        size_t numQuads = (particleNum1D - 1) * (particleNum1D - 1);
-        size_t numFacetIndices = numQuads * 6; 
-        facet.resize(numFacetIndices);
-
-        fixedParticle.resize(1, particleNum2D); 
-        fixedParticle.setConstant(1.0f);
-    }
-
-    void initCloth() {
-        // 이미 X가 Eigen 객체이므로 Map이 필요 없습니다.
-        PR halfSize = size1D / 2.0;
-
-        for (int row = 0; row < particleNum1D; ++row) {
-            for (int col = 0; col < particleNum1D; ++col) {
-                int pid = row * particleNum1D + col; 
-                
-                PR px = col * stretchRestLength - halfSize;
-                PR py = -row * stretchRestLength + halfSize;
-                PR pz = rand()/PR(RAND_MAX)/10000.f;
-                
-                X.col(pid) << px, py, pz;
-            }
-        }
-    }
-
-    void initClothHorz() {
-        PR halfSize = size1D / 2.0;
-
-        for (int row = 0; row < particleNum1D; ++row) {
-            for (int col = 0; col < particleNum1D; ++col) {
-                int pid = row * particleNum1D + col; 
-                
-                PR px = col * stretchRestLength - halfSize;
-                PR pz = row * stretchRestLength - halfSize;
-                PR py = rand()/PR(RAND_MAX)/10000.f;
-                
-                X.col(pid) << px, py, pz;
-            }
-        }
-    }
-
-    void clearForce() { 
-        F.setZero(); // Map 없이 바로 호출
-    }
-    
-    void addForce() {
-        // Map 객체 생성 과정도 필요 없어졌습니다.
-        F.row(1).array() += G * M.row(1).array();
-        F += V * kair;
-
-        auto addSpringForce = [&](size_t idA, size_t idB, PR restLength) {
-            auto dx = X.col(idB) - X.col(idA); 
-            
-            PR len = dx.norm();
-            if (len < 1E-9) return;
-
-            auto dv = (V.col(idB) - V.col(idA)).cwiseAbs();
-            auto ndx = dx / len;
-            auto sf = (ks * (len - restLength) + kd * dv.dot(ndx)) * ndx;
-
-            F.col(idA) += sf;
-            F.col(idB) -= sf;
-        };
-
-        for(size_t pid = 0; pid < particleNum2D; pid++) {
-            auto col = pid % particleNum1D;
-            auto row = pid / particleNum1D;
-
-            if(col < particleNum1D-1) addSpringForce(pid, pid+1, stretchRestLength); 
-            if(row < particleNum1D-1) addSpringForce(pid, pid+particleNum1D, stretchRestLength); 
-            if(col < particleNum1D-1 && row < particleNum1D-1) addSpringForce(pid, pid+particleNum1D+1, shearRestLength); 
-            if(col > 0 && row < particleNum1D-1) addSpringForce(pid, pid+particleNum1D-1, shearRestLength); 
-            if(col < particleNum1D-2) addSpringForce(pid, pid+2, bendRestLength); 
-            if(row < particleNum1D-2) addSpringForce(pid, pid+2*particleNum1D, bendRestLength); 
-        }
-    }
-
-    void update() {
-        for(size_t i = 0; i < subSteps; i++) {
-            clearForce();
-            addForce();
-
-            // Map 객체를 만들지 않으므로 코드가 더 직관적이 되었습니다.
-            V.array() += (F.array() / M.array()).rowwise() * fixedParticle.array() * subh;
-            X.array() += V.array().rowwise() * fixedParticle.array() * subh;
-        }
-
-        cloth.updateBuffer(X.data());
-    }
-
-    void draw() {
-        cloth.draw();
-    }
-};
-#else
 template <typename PR>
 struct ExplicitSystem<CPU, PR> {
     using Vector = VectorBase<CPU, PR>;
@@ -1857,9 +2064,10 @@ struct ExplicitSystem<CPU, PR> {
             squareCloth.mesh.updateBuffer(squareCloth.x.ptr);
         for(DeformableMesh<CPU, PR>& deformableMesh : sceneObjects.deformableMeshes) 
             deformableMesh.mesh.updateBuffer(deformableMesh.x.ptr);
+        for(auto& mesh : sceneObjects.meshes)
+            mesh.meshGL.updateBuffer(mesh.state.x.ptr);
     }
 };
-#endif
 
 
 template <typename PR>
@@ -1897,77 +2105,13 @@ struct ExplicitSystem<METAL, PR> {
         commandQueue = device->newCommandQueue();
 
         std::cout << "  - Creating a new command pipeline state object (PSO)..." << std::endl;
-        NS::Error* error = nullptr;
         // find own metal kernel library
-        NS::String* libPath = NS::String::string("physics.metallib", NS::UTF8StringEncoding);
-        MTL::Library* library = device->newLibrary(libPath, &error);
-        if (!library) {
-            std::cout << "[Metal Error] Failed to load physics.metallib!\n";
-            exit(1);
-        }
+
         // find desired kernel
-        NS::String* forceFuncName = NS::String::string("compute_forces", NS::UTF8StringEncoding);
-        MTL::Function* forceFunc = library->newFunction(forceFuncName);
-        if (!forceFunc) {
-            std::cout << "[Metal Error] Failed to find compute_forces function!\n";
-            exit(1);
-        }
-        // create a PSO (Heavy...)
-        forcePSO = device->newComputePipelineState(forceFunc, &error);
-        if (!forcePSO) {
-            std::cout << "[Metal Error] Failed to create Pipeline State! forcePSO\n";
-            exit(1);
-        }
-
-        NS::String* springForceFuncName = NS::String::string("compute_spring_forces", NS::UTF8StringEncoding);
-        MTL::Function* springForceFunc = library->newFunction(springForceFuncName);
-        if(!springForceFunc) {
-            std::cout << "[Metal Error] Failed to create Pipeline State! forcePSO\n";
-            exit(1);
-        }
-        springForcePSO = device->newComputePipelineState(springForceFunc, &error);
-        if (!springForcePSO) {
-            std::cout << "[Metal Error] Failed to create Pipeline State! forcePSO\n";
-            exit(1);
-        }
-
-        NS::String* integrateFuncName = NS::String::string("integrate", NS::UTF8StringEncoding);
-        MTL::Function* integrateFunc = library->newFunction(integrateFuncName);
-        if (!integrateFunc) {
-            std::cout << "[Metal Error] Failed to find compute_forces function!\n";
-            exit(1);
-        }
-        // create a PSO (Heavy...)
-        integratePSO = device->newComputePipelineState(integrateFunc, &error);
-        if (!integratePSO) {
-            std::cout << "[Metal Error] Failed to create Pipeline State! integratePSO\n";
-            exit(1);
-        }
-
-        NS::String* clothGridFastForceFuncName = NS::String::string("compute_cloth_grid_forces_fast", NS::UTF8StringEncoding);
-        MTL::Function* clothGridFastForceFunc = library->newFunction(clothGridFastForceFuncName);
-        if (!clothGridFastForceFunc) {
-            std::cout << "[Metal Error] Failed to find compute_forces function!\n";
-            exit(1);
-        }
-        // create a PSO
-        clothGridFastForcePSO = device->newComputePipelineState(clothGridFastForceFunc, &error);
-        if (!clothGridFastForcePSO) {
-            std::cout << "[Metal Error] Failed to create Pipeline State! clothGridFastForcePSO\n";
-            exit(1);
-        }
-        
-        // release all temporal objects
-        library->release();
-        libPath->release();
-        forceFuncName->release();
-        forceFunc->release();
-        integrateFuncName->release();
-        integrateFunc->release();
-        springForceFuncName->release();
-        springForceFunc->release();
-        clothGridFastForceFuncName->release();
-        clothGridFastForceFunc->release();
+        forcePSO = MetalContext::getPSO("compute_forces");
+        springForcePSO = MetalContext::getPSO("compute_spring_forces");
+        integratePSO = MetalContext::getPSO("integrate");
+        clothGridFastForcePSO = MetalContext::getPSO("compute_cloth_grid_forces_fast");
     }
     
     struct SimParams {
@@ -1979,6 +2123,9 @@ struct ExplicitSystem<METAL, PR> {
     struct ClothGridParams {
         uint particleNum1D;
         float stretchRest, shearRest, bendRest;
+        float kstretch, kshear, kbend;
+    };
+    struct ClothParams {
         float kstretch, kshear, kbend;
     };
 
@@ -1999,10 +2146,10 @@ struct ExplicitSystem<METAL, PR> {
             computeEncoder->setBuffer(deformableMesh.fixedParticle.pool, deformableMesh.fixedParticle.offset, 4);
             
             // 4KB 이하의 작은 데이터는 버퍼를 안 만들고 setBytes로 즉시 꽂을 수 있습니다.
-            computeEncoder->setBytes(&params, sizeof(SimParams), 5);
+            computeEncoder->setBytes(&params, sizeof(SimParams), 6);
 
-            computeEncoder->setBuffer(deformableMesh.springIndex.pool, deformableMesh.springIndex.offset, 6);
-            computeEncoder->setBuffer(deformableMesh.springCoef.pool, deformableMesh.springCoef.offset, 7);
+            computeEncoder->setBuffer(deformableMesh.springIndex.pool, deformableMesh.springIndex.offset, 10);
+            computeEncoder->setBuffer(deformableMesh.springCoef.pool, deformableMesh.springCoef.offset, 11);
 
 
             // 💡 서브스텝 만큼 GPU 파이프라인을 교차 실행합니다!
@@ -2043,8 +2190,8 @@ struct ExplicitSystem<METAL, PR> {
             computeEncoder->setBuffer(squareCloth.fixedParticle.pool, squareCloth.fixedParticle.offset, 4);
             
             // 4KB 이하의 작은 데이터는 버퍼를 안 만들고 setBytes로 즉시 꽂을 수 있습니다.
-            computeEncoder->setBytes(&params, sizeof(SimParams), 5);
-            computeEncoder->setBytes(&clothParams, sizeof(ClothGridParams), 8);
+            computeEncoder->setBytes(&params, sizeof(SimParams), 6);
+            computeEncoder->setBytes(&clothParams, sizeof(ClothGridParams), 7);
 
             for(size_t i = 0; i < subSteps; i++) {
                 { // force overwrite with gravity + air drag + spring
@@ -2060,18 +2207,53 @@ struct ExplicitSystem<METAL, PR> {
                     computeEncoder->dispatchThreads(gridSize, threadGroupSize);
                 }
             }
-            acctime += h;
         } // squareClothes
+        for(auto& mesh : sceneObjects.meshes) {
 
+            SimParams params = { subh, G, kair, kd, (uint)mesh.state.x.size/3, acctime };
+
+            BehaviorParams<PR> clothParams = mesh.behaviorParams;
+
+            switch(mesh.behaviorType) {
+                case BehaviorType::TriangularCloth:
+                    TriangularClothBehavior<METAL, PR>::setBuffer(
+                        mesh.state,
+                        mesh.adjacency,
+                        mesh.constraints,
+                        mesh.externalForces,
+                        params,
+                        clothParams,
+                        computeEncoder);
+                    break;
+                case BehaviorType::FastGridCloth:
+                case BehaviorType::Elastic:
+                case BehaviorType::Rigid:
+                case BehaviorType::Fluid:
+                case BehaviorType::Generator:
+                default: break;
+            }
+            for(size_t i = 0; i < subSteps; i++) {
+                TriangularClothBehavior<METAL, PR>::update(mesh.state, computeEncoder);
+
+                { // integration
+                    MTL::Size gridSize = MTL::Size(mesh.state.x.size/3, 1, 1);
+                    MTL::Size threadGroupSize = MTL::Size(std::min((size_t)integratePSO->maxTotalThreadsPerThreadgroup(), (size_t)mesh.state.x.size/3), 1, 1);
+                    computeEncoder->setComputePipelineState(integratePSO);
+                    computeEncoder->dispatchThreads(gridSize, threadGroupSize);
+                }
+            }
+        }
         computeEncoder->endEncoding();
         commandBuffer->commit();
         commandBuffer->waitUntilCompleted();
         
+        acctime += h;
         for(auto& squareCloth : sceneObjects.squareClothes) 
             squareCloth.mesh.updateBuffer(squareCloth.x.ptr);
         for(auto& deformableMesh : sceneObjects.deformableMeshes) 
             deformableMesh.mesh.updateBuffer(deformableMesh.x.ptr);
-
+        for(auto& mesh : sceneObjects.meshes)
+            mesh.meshGL.updateBuffer(mesh.state.x.ptr);
     }
 };
 
@@ -2115,7 +2297,7 @@ int main() {
     Index subSteps = 40;
     ExplicitSystem<Backend, Precision> system(h, subSteps);
     Simulator<Backend, Precision, ExplicitSystem<Backend, Precision>> simulator(system);
-    //system.initialize(pool);
+    std::cout << "[Main] simulator created" << std::endl;
 
     //Index particleNum1D = 20;
     //Precision size1D = 100;
@@ -2127,13 +2309,16 @@ int main() {
     Precision kstretch = 1e5;
     Precision kshear = 1e5;
     Precision kbend = 2e5;
-    //simulator.addClothGrid(particleNum1D, size1D, kstretch, kshear, kbend);
-    simulator.addClothGridFast(particleNum1D, size1D, kstretch, kshear, kbend);
-    //simulator.addGeneralMesh(particleNum1D, size1D, kstretch, kshear, kbend);
+    Precision mass = 0.1;
+    //simulator.addClothGrid(particleNum1D, size1D, kstretch, kshear, kbend, mass);
+    //simulator.addClothGridFast(particleNum1D, size1D, kstretch, kshear, kbend, mass);
+    //simulator.addGeneralMesh(particleNum1D, size1D, kstretch/2, kshear, kbend/2, mass);
+    simulator.addClothFile("src/assets", "teapot.obj", 15, 1e4, 0, 2e4, mass);
+    std::cout << "[Main] mesh added to scene" << std::endl;
 
     simulator.initialize();
+    std::cout << "[Main] simulator is initialized" << std::endl;
 
-#ifdef USE_MEMORY_POOL
     if(simulator.sceneObjects.squareClothes.size() > 0) {
         simulator.sceneObjects.squareClothes[0].fixedParticle.map()[0] = 0.f;
         simulator.sceneObjects.squareClothes[0].fixedParticle.map()[particleNum1D-1] = 0.f;
@@ -2142,14 +2327,11 @@ int main() {
         simulator.sceneObjects.deformableMeshes[0].fixedParticle.map()[0] = 0.f;
         simulator.sceneObjects.deformableMeshes[0].fixedParticle.map()[particleNum1D-1] = 0.f;
     }
-    //system.fixedParticle.map()[0] = 0.f;
-    //system.fixedParticle.map()[system.particleNum1D-1] = 0.f;
-    //simulator.system.fixedParticle.map()[0] = 0.f;
-    //simulator.system.fixedParticle.map()[simulator.system.particleNum1D-1] = 0.f;
-#else
-    simulator.system.fixedParticle[0] = 0.f;
-    simulator.system.fixedParticle[simulator.system.particleNum1D-1] = 0.f;
-#endif
+    if(simulator.sceneObjects.meshes.size() > 0) {
+        simulator.sceneObjects.meshes[0].constraints.fixParticle(0);
+        simulator.sceneObjects.meshes[0].constraints.fixParticle(particleNum1D-1);
+    }
+
 
 
 
@@ -2168,9 +2350,9 @@ int main() {
 
         if(key == GLFW_KEY_0 && action == GLFW_PRESS) {
             //sys->initCloth();
+            simulator->initialize();
         } else if(key == GLFW_KEY_9 && action == GLFW_PRESS) {
             //sys->initClothHorz();
-#ifdef USE_MEMORY_POOL
         } else if(key == GLFW_KEY_1 && action == GLFW_PRESS) {
             //sys->fixedParticle.map()[0] = !((bool)sys->fixedParticle.map()[0]);
             if(simulator->sceneObjects.squareClothes.size() > 0) 
@@ -2183,14 +2365,10 @@ int main() {
                 simulator->sceneObjects.squareClothes[0].fixedParticle.map()[200-1] = !((bool)simulator->sceneObjects.squareClothes[0].fixedParticle.map()[200-1]);
             if(simulator->sceneObjects.deformableMeshes.size() > 0) 
                 simulator->sceneObjects.deformableMeshes[0].fixedParticle.map()[200-1] = !((bool)simulator->sceneObjects.deformableMeshes[0].fixedParticle.map()[200-1]);
+        } else if(key == GLFW_KEY_SPACE && action == GLFW_PRESS) {
+            simulator->pause = !(simulator->pause);
         }
-#else
-        } else if(key == GLFW_KEY_1 && action == GLFW_PRESS) {
-            sys->fixedParticle[0] = !((bool)sys->fixedParticle[0]);
-        } else if(key == GLFW_KEY_2 && action == GLFW_PRESS) {
-            sys->fixedParticle[sys->particleNum1D-1] = !((bool)sys->fixedParticle[sys->particleNum1D-1]);
-        }
-#endif
+
     };
     glfwSetKeyCallback(window->getGLFWWindow(), keyCallback);
 

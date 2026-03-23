@@ -7,111 +7,145 @@
 #include <cmath>
 #include <cstring>
 #include <ostream>
+#include <type_traits>
 
 namespace tinym {
 
-using T = float;
+//using T = float;
 
-struct vec3_view {
+template <typename T>
+struct vec3_view_base {
     T* ptr;
-    vec3_view(T* ptr) : ptr(ptr) {}
+    vec3_view_base(T* ptr) : ptr(ptr) {}
     T& operator[](int i) { return ptr[i]; }
     const T& operator[](int i) const { return ptr[i]; }
 };
-struct vec3 {
+template <typename T>
+struct vec3_base {
     union {
         struct { T x, y, z; };
+        struct { T r, g, b; };
         T v[3];
     };
-    vec3() : x(0), y(0), z(0) {}
-    vec3(T a) : x(a), y(a), z(a) {}
-    vec3(T x, T y, T z) : x(x), y(y), z(z) {}
+    vec3_base() : x(0), y(0), z(0) {}
+    vec3_base(T a) : x(a), y(a), z(a) {}
+    vec3_base(T x, T y, T z) : x(x), y(y), z(z) {}
 
     T& operator[](int i) { return v[i]; }
     const T& operator[](int i) const { return v[i]; }
     
-    operator vec3_view() { return vec3_view(v); }
-    operator const vec3_view() const { return vec3_view(const_cast<T*>(v)); }
+    operator vec3_view_base<T>() { return vec3_view_base<T>(v); }
+    //operator const vec3_view_base<T>() const { return vec3_view_base<T>(const_cast<T*>(v)); }
 
-    vec3 operator-(const vec3& v) const { return vec3(x - v.x, y - v.y, z - v.z); }
-    vec3 operator+(const vec3& v) const { return vec3(x + v.x, y + v.y, z + v.z); }
-    vec3 operator/(const vec3& v) const { return vec3(x/v.x, y/v.y, z/v.z); }
-    vec3 operator*(float s) const { return vec3(x * s, y * s, z * s); }
-    vec3& operator+=(const vec3_view& v) { 
+    vec3_base operator-(const vec3_base& v) const { return vec3_base(x - v.x, y - v.y, z - v.z); }
+    vec3_base operator+(const vec3_base& v) const { return vec3_base(x + v.x, y + v.y, z + v.z); }
+    vec3_base operator/(const vec3_base& v) const { return vec3_base(x/v.x, y/v.y, z/v.z); }
+    vec3_base operator/(const float& v) const { return vec3_base(x/v, y/v, z/v); }
+    vec3_base operator*(float s) const { return vec3_base(x * s, y * s, z * s); }
+    vec3_base& operator+=(const vec3_view_base<T>& v) { 
         x += v[0]; y += v[1]; z += v[2];
         return *this;
     }
+    vec3_base& operator/=(const float& s) {
+        x /= s; y /= s; z /= s;
+        return *this;
+    }
+    vec3_base& operator-=(const vec3_view_base<T>& v) {
+        x -= v[0]; y -= v[1]; z -= v[2];
+        return *this;
+    }
     float norm() const { return std::sqrt(x*x + y*y + z*z); }
-    vec3 normalize() const {
+    vec3_base normalize() const {
         float n = norm();
-        return n > 0.0f ? vec3(x/n, y/n, z/n) : vec3();
+        return n > 0.0f ? vec3_base(x/n, y/n, z/n) : vec3_base();
     }
     
-    float dot(const vec3& v) const { return x*v.x + y*v.y + z*v.z; }
-    vec3 cross(const vec3& v) const {
-        return vec3(y*v.z - z*v.y, z*v.x - x*v.z, x*v.y - y*v.x);
+    float dot(const vec3_base& v) const { return x*v.x + y*v.y + z*v.z; }
+    vec3_base cross(const vec3_base& v) const {
+        return vec3_base(y*v.z - z*v.y, z*v.x - x*v.z, x*v.y - y*v.x);
     }
 
-    friend std::ostream& operator<<(std::ostream& os, const vec3& v) {
+    friend std::ostream& operator<<(std::ostream& os, const vec3_base& v) {
         os << '(' << v.x << ", " << v.y << ", " << v.z << ')';
         return os;
     }
 };
 
+using vec3 = vec3_base<float>;
+using vec3ui = vec3_base<uint>;
+using vec3_view = vec3_view_base<float>;
 
-struct vec4 {
+inline vec3 operator-(const vec3_view& a, const vec3_view& b) {
+    return vec3(a[0]-b[0], a[1]-b[1], a[2]-b[2]);
+}
+inline vec3 normalize(const vec3& a) {
+    return a.normalize();
+}
+inline vec3 cross(const vec3& a, const vec3& b) {
+    return a.cross(b);
+}
+
+template <typename T>
+struct vec4_base {
     union {
         struct { T x, y, z, w; };
         T v[4];
     };
-    vec4() : x(0), y(0), z(0), w(0) {}
-    vec4(T x, T y, T z, T w) : x(x), y(y), z(z), w(w) {}
-    vec4(const vec3& v, T w) : x(v.x), y(v.y), z(v.z), w(w) {}
+    vec4_base() : x(0), y(0), z(0), w(0) {}
+    vec4_base(T x, T y, T z, T w) : x(x), y(y), z(z), w(w) {}
+    vec4_base(const vec3_base<T>& v, T w) : x(v.x), y(v.y), z(v.z), w(w) {}
 
-    operator vec3() const { return vec3(x, y, z); }
+    operator vec3() const { return vec3_base<T>(x, y, z); }
     T& operator[](int i) { return v[i]; }
     const T& operator[](int i) const { return v[i]; }
-    vec4& operator+=(const vec4& o) {
+    vec4_base& operator+=(const vec4_base& o) {
         for(int row = 0; row < 4; row++)
             this->v[row] += o[row];
         return *this;
     }
-    vec4 operator*(float s) const { return vec4(x*s, y*s, z*s, w*s); }
+    vec4_base operator*(float s) const { return vec4_base(x*s, y*s, z*s, w*s); }
 };
 
-struct mat3 {
+using vec4 = vec4_base<float>;
+using vec4ui = vec4_base<uint>;
+
+template <typename T>
+struct mat3_base {
     union {
-        vec3 c[3];
+        vec3_base<T> c[3];
         T v[9];
     };
-    mat3(vec3& c0, vec3& c1, vec3& c2) {
+    mat3_base(vec3_base<T>& c0, vec3_base<T>& c1, vec3_base<T>& c2) {
         c[0] = c0; c[1] = c1; c[2] = c2;
     }
-    mat3(vec4& c0, vec4& c1, vec4& c2) {
+    mat3_base(vec4_base<T>& c0, vec4_base<T>& c1, vec4_base<T>& c2) {
         c[0] = c0; c[1] = c1; c[2] = c2;
     }
 };
 
-struct mat4 {
+using mat3 = mat3_base<float>;
+
+template <typename T>
+struct mat4_base {
     union {
-        vec4 c[4];
+        vec4_base<T> c[4];
         T v[16];
     };
-    mat4() {
+    mat4_base() {
         memset(v, 0, sizeof(v));
     }
-    mat4(T d) {
+    mat4_base(T d) {
         c[0][0] = d; c[1][0] = 0; c[2][0] = 0; c[3][0] = 0;
         c[0][1] = 0; c[1][1] = d; c[2][1] = 0; c[3][1] = 0;
         c[0][2] = 0; c[1][2] = 0; c[2][2] = d; c[3][2] = 0;
         c[0][3] = 0; c[1][3] = 0; c[2][3] = 0; c[3][3] = d;
     }
-    mat4(vec4 c0, vec4 c1, vec4 c2, vec4 c3) {
+    mat4_base(vec4_base<T> c0, vec4_base<T> c1, vec4_base<T> c2, vec4_base<T> c3) {
         c[0] = c0; c[1] = c1; c[2] = c2; c[3] = c3;
     }
-    vec4& operator[](int i) { return c[i]; }
-    mat4 operator*(const mat4& rhs) const {
-        mat4 res;
+    vec4_base<T>& operator[](int i) { return c[i]; }
+    mat4_base operator*(const mat4_base& rhs) const {
+        mat4_base res;
         for (int c = 0; c < 4; ++c) {
             for (int r = 0; r < 4; ++r) {
                 for (int i = 0; i < 4; ++i) {
@@ -121,8 +155,8 @@ struct mat4 {
         }
         return res;
     }
-    vec4 operator*(const vec4& v) const {
-        return vec4(
+    vec4_base<T> operator*(const vec4_base<T>& v) const {
+        return vec4_base<T>(
             c[0].x*v.x + c[1].x*v.y + c[2].x*v.z + c[3].x*v.w,
             c[0].y*v.x + c[1].y*v.y + c[2].y*v.z + c[3].y*v.w,
             c[0].z*v.x + c[1].z*v.y + c[2].z*v.z + c[3].z*v.w,
@@ -130,6 +164,8 @@ struct mat4 {
         );
     }
 };
+
+using mat4 = mat4_base<float>;
 
 
 // 3. 카메라 View 행렬 생성 (LookAt)
@@ -191,32 +227,116 @@ inline tinym::mat4 rotate(float angle, const tinym::vec3& axis) {
     return res;
 }
 
-inline const T* value_ptr(const vec3& v3) { return v3.v; }
-inline const T* value_ptr(const vec4& v4) { return v4.v; }
-inline const T* value_ptr(const mat3& m3) { return m3.v; }
-inline const T* value_ptr(const mat4& m4) { return m4.v; }
+template <typename T>
+inline const T* value_ptr(const vec3_base<T>& v3) { return v3.v; }
+template <typename T>
+inline const T* value_ptr(const vec4_base<T>& v4) { return v4.v; }
+template <typename T>
+inline const T* value_ptr(const mat3_base<T>& m3) { return m3.v; }
+template <typename T>
+inline const T* value_ptr(const mat4_base<T>& m4) { return m4.v; }
 
+template <typename T>
+inline T min(const vec3_base<T>& v) {
+    T m = v.x;
+    if(m > v.y) m = v.y;
+    if(m > v.z) m = v.z;
+    return m;
+}
+template <typename T>
+inline T max(const vec3_base<T>& v) {
+    T m = v.x;
+    if(m < v.y) m = v.y;
+    if(m < v.z) m = v.z;
+    return m;
+}
 
-inline vec3 min(const vec3_view& a, const vec3_view& b) {
-    vec3 ret;
-    ret.x = a[0] > b[0] ? b[0] : a[0];
-    ret.y = a[1] > b[1] ? b[1] : a[1];
-    ret.z = a[2] > b[2] ? b[2] : a[2];
+template <typename>
+struct is_vec3_like : std::false_type {};
+
+template <typename T>
+struct is_vec3_like<vec3_base<T>> : std::true_type {};
+
+template <typename T>
+struct is_vec3_like<vec3_view_base<T>> : std::true_type {};
+
+template <typename T>
+inline constexpr bool is_vec3_like_v =
+    is_vec3_like<std::remove_cv_t<std::remove_reference_t<T>>>::value;
+
+template <typename>
+struct vec3_scalar;
+
+template <typename T>
+struct vec3_scalar<vec3_base<T>> { using type = T; };
+
+template <typename T>
+struct vec3_scalar<vec3_view_base<T>> { using type = T; };
+
+template <typename T>
+using vec3_scalar_t =
+    typename vec3_scalar<std::remove_cv_t<std::remove_reference_t<T>>>::type;
+
+template <
+    typename A, typename B,
+    typename = std::enable_if_t<
+        is_vec3_like_v<A> &&
+        is_vec3_like_v<B> &&
+        std::is_same_v<vec3_scalar_t<A>, vec3_scalar_t<B>>
+    >
+>
+inline vec3_base<vec3_scalar_t<A>> min(const A& a, const B& b) {
+    using T = vec3_scalar_t<A>;
+    vec3_base<T> ret;
+    ret[0] = a[0] > b[0] ? b[0] : a[0];
+    ret[1] = a[1] > b[1] ? b[1] : a[1];
+    ret[2] = a[2] > b[2] ? b[2] : a[2];
     return ret;
 }
-inline vec3 min(const vec3_view& a, const vec3_view& b, const vec3_view& c) {
-    return min(min(a, b).v, c);
-}
 
-inline vec3 max(const vec3_view& a, const vec3_view& b) {
-    vec3 ret;
-    ret.x = a[0] < b[0] ? b[0] : a[0];
-    ret.y = a[1] < b[1] ? b[1] : a[1];
-    ret.z = a[2] < b[2] ? b[2] : a[2];
+template <
+    typename A, typename B,
+    typename = std::enable_if_t<
+        is_vec3_like_v<A> &&
+        is_vec3_like_v<B> &&
+        std::is_same_v<vec3_scalar_t<A>, vec3_scalar_t<B>>
+    >
+>
+inline vec3_base<vec3_scalar_t<A>> max(const A& a, const B& b) {
+    using T = vec3_scalar_t<A>;
+    vec3_base<T> ret;
+    ret[0] = a[0] < b[0] ? b[0] : a[0];
+    ret[1] = a[1] < b[1] ? b[1] : a[1];
+    ret[2] = a[2] < b[2] ? b[2] : a[2];
     return ret;
 }
-inline vec3 max(const vec3_view& a, const vec3_view& b, const vec3_view& c) {
-    return max(max(a, b).v, c);
+
+template <
+    typename A, typename B, typename C,
+    typename = std::enable_if_t<
+        is_vec3_like_v<A> &&
+        is_vec3_like_v<B> &&
+        is_vec3_like_v<C> &&
+        std::is_same_v<vec3_scalar_t<A>, vec3_scalar_t<B>> &&
+        std::is_same_v<vec3_scalar_t<A>, vec3_scalar_t<C>>
+    >
+>
+inline vec3_base<vec3_scalar_t<A>> min(const A& a, const B& b, const C& c) {
+    return min(min(a, b), c);
+}
+
+template <
+    typename A, typename B, typename C,
+    typename = std::enable_if_t<
+        is_vec3_like_v<A> &&
+        is_vec3_like_v<B> &&
+        is_vec3_like_v<C> &&
+        std::is_same_v<vec3_scalar_t<A>, vec3_scalar_t<B>> &&
+        std::is_same_v<vec3_scalar_t<A>, vec3_scalar_t<C>>
+    >
+>
+inline vec3_base<vec3_scalar_t<A>> max(const A& a, const B& b, const C& c) {
+    return max(max(a, b), c);
 }
 
 }; // end namespace

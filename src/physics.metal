@@ -21,7 +21,7 @@ kernel void compute_forces(
     device const packed_float3* v [[buffer(1)]],
     device packed_float3* f [[buffer(2)]],
     device const float* m [[buffer(3)]],
-    constant SimParams& params [[buffer(5)]],
+    constant SimParams& params [[buffer(6)]],
     uint id [[thread_position_in_grid]]
 ) {
     if (id >= params.vertexNum) return; 
@@ -33,12 +33,12 @@ kernel void compute_forces(
 }
 
 kernel void compute_spring_forces(
-    device const uint2* springIndices [[buffer(6)]],
-    device const float2* springParams [[buffer(7)]],
     device const packed_float3* x [[buffer(0)]],
     device const packed_float3* v [[buffer(1)]],
     device atomic_float* f_flat [[buffer(2)]],      
-    constant SimParams& params [[buffer(5)]],
+    constant SimParams& params [[buffer(6)]],
+    device const uint2* springIndices [[buffer(10)]],
+    device const float2* springParams [[buffer(11)]],
     uint id [[thread_position_in_grid]]
 ) {
     // 1. 스프링 정보 읽기
@@ -82,7 +82,7 @@ kernel void integrate(
     device const packed_float3* f [[buffer(2)]],
     device const float* m [[buffer(3)]],
     device const float* fixedParticle [[buffer(4)]],
-    constant SimParams& params [[buffer(5)]],
+    constant SimParams& params [[buffer(6)]],
     uint id [[thread_position_in_grid]]
 ) {
     if (id >= params.vertexNum) return; 
@@ -123,8 +123,8 @@ kernel void compute_cloth_grid_forces_fast(
     device const packed_float3* v [[buffer(1)]],
     device packed_float3* f [[buffer(2)]],
     device const float* m [[buffer(3)]],
-    constant SimParams& params [[buffer(5)]],
-    constant ClothGridParams& clothParams [[buffer(8)]],
+    constant SimParams& params [[buffer(6)]],
+    constant ClothGridParams& clothParams [[buffer(7)]],
     uint id [[thread_position_in_grid]]
 ) {
     if (id >= params.vertexNum) return; 
@@ -166,5 +166,68 @@ kernel void compute_cloth_grid_forces_fast(
     force += float3(1, 0, 1) * min(row * abs(col-col/2) * abs(cos(params.acctime/2.f)), 50.f);
 
     // 내 메모리에만 기록!
+    f[id] = force;
+}
+
+struct ClothParams {
+    float kstretch, kshear, kbend;
+};
+
+kernel void compute_tri_spring_forces(
+    // state
+    device const packed_float3* x [[buffer(0)]],
+    device const packed_float3* v [[buffer(1)]],
+    device packed_float3* f [[buffer(2)]],
+    device const float* m [[buffer(3)]],
+    // constraints
+    device const float* fixedParticles [[buffer(4)]],
+    // external forces
+    device packed_float3* externalForces [[buffer(5)]],
+    // simulation parameters
+    constant SimParams& simParams [[buffer(6)]],
+    constant ClothParams& clothParams [[buffer(7)]],
+    // adjacency
+    device const uint2* edges [[buffer(8)]],
+    device const uint* facets [[buffer(9)]],
+    // stretch springs
+    device const uint* vertexAdjEdges [[buffer(10)]],
+    device const uint* vertexAdjEdgesOffsets [[buffer(11)]],
+    device const float* restEdgeLengths [[buffer(12)]],
+    // bend springs
+    device const uint* vertexOppVertices [[buffer(13)]],
+    device const uint* vertexOppVerticesOffsets [[buffer(14)]],
+    device const float* restOppLengths [[buffer(15)]],
+    uint id [[thread_position_in_grid]]
+) {
+    if (id >= simParams.vertexNum) return; 
+
+    float3 pos = x[id];
+    float3 vel = v[id];
+    
+    float3 force = float3(0.0, simParams.G * m[id], 0.0) + vel * simParams.kair;
+
+    // stretch
+    uint adjEdgesStart = vertexAdjEdgesOffsets[id];
+    uint adjEdgesEnd   = vertexAdjEdgesOffsets[id+1];
+    for(uint i = adjEdgesStart; i < adjEdgesEnd; ++i) {
+        uint edgeid = vertexAdjEdges[i];
+        uint e0 = edges[edgeid].x;
+        uint e1 = edges[edgeid].y;
+        uint other = 0;
+        if(e0 == id) other = e1;
+        else other = e0;
+
+        force += calc_spring(pos, vel, x[other], v[other], restEdgeLengths[edgeid], clothParams.kstretch, simParams.kd);
+    }
+
+    // bend
+    uint oppVerticesStart = vertexOppVerticesOffsets[id];
+    uint oppVerticesEnd   = vertexOppVerticesOffsets[id+1];
+    for(uint i = oppVerticesStart; i < oppVerticesEnd; ++i) {
+        uint other = vertexOppVertices[i];
+
+        force += calc_spring(pos, vel, x[other], v[other], restOppLengths[i], clothParams.kbend, simParams.kd);
+    }
+
     f[id] = force;
 }
