@@ -1125,8 +1125,7 @@ struct BroadCollision {
 struct NarrowCollision {
     IndexPair indexPair;
     IndexPair objPair;
-    tinym::vec3 collisionNormal;
-    float distance;
+    tinym::vec4 collisionNormalAndDistance;
 };
 
 template <typename BE, typename PR>
@@ -1140,6 +1139,9 @@ struct Constraints {
     VectorBase<BE, BroadCollision> broadCollisions;
     VectorBase<BE, NarrowCollision> narrowCollisions;
 
+    VectorBase<BE, NarrowCollision> vertexColPrims;
+    VectorBase<BE, Index> vertexColPrimsOffsets;
+
     void memoryAllocation(Index numPoints) {
         if(fixedParticles.ptr) return;
         fixedParticles = VectorBase<BE, PR>(numPoints, 1);
@@ -1147,6 +1149,9 @@ struct Constraints {
         maxNumCollisions = numPoints * approxColPerVertex;
         broadCollisions = VectorBase<BE, BroadCollision>(maxNumCollisions);
         narrowCollisions = VectorBase<BE, NarrowCollision>(maxNumCollisions);
+
+        vertexColPrims = VectorBase<BE, NarrowCollision>(maxNumCollisions);
+        vertexColPrimsOffsets = VectorBase<BE, Index>(numPoints+1, 0);
     }
 
     void fixParticle(Index id) { fixedParticles[id] = PR(0); }
@@ -1178,29 +1183,32 @@ struct TriangularClothBehavior<METAL, PR> {
             SimParams& simParams,
             ClothParams& clothParams,
             MTL::ComputeCommandEncoder* encoder) {
-        // state
-        encoder->setBuffer(state.x.pool, state.x.offset, 0);
-        encoder->setBuffer(state.v.pool, state.v.offset, 1);
-        encoder->setBuffer(state.f.pool, state.f.offset, 2);
-        encoder->setBuffer(state.m.pool, state.m.offset, 3);
-        // constraints
-        encoder->setBuffer(constraints.fixedParticles.pool, constraints.fixedParticles.offset, 4);
-        // external forces
-        encoder->setBuffer(externalForces.externalForces.pool, externalForces.externalForces.offset, 5);
-        //simulation parameters
-        encoder->setBytes(&simParams, sizeof(SimParams), 6);
-        encoder->setBytes(&clothParams, sizeof(ClothParams), 7);
-        // adjacency
-        encoder->setBuffer(adjacency.edges.pool, adjacency.edges.offset, 8);
-        encoder->setBuffer(adjacency.facets.pool, adjacency.facets.offset, 9);
-        // stretch springs
-        encoder->setBuffer(adjacency.vertexAdjEdges.pool, adjacency.vertexAdjEdges.offset, 10);
-        encoder->setBuffer(adjacency.vertexAdjEdgesOffsets.pool, adjacency.vertexAdjEdgesOffsets.offset, 11);
-        encoder->setBuffer(adjacency.restEdgeLengths.pool, adjacency.restEdgeLengths.offset, 12);
-        // bend springs
-        encoder->setBuffer(adjacency.vertexOppVertices.pool, adjacency.vertexOppVertices.offset, 13);
-        encoder->setBuffer(adjacency.vertexOppVerticesOffsets.pool, adjacency.vertexOppVerticesOffsets.offset, 14);
-        encoder->setBuffer(adjacency.restOppLengths.pool, adjacency.restOppLengths.offset, 15);
+        Index offset = 0;
+        // state 0-3
+        encoder->setBuffer(state.x.pool, state.x.offset, offset++);
+        encoder->setBuffer(state.v.pool, state.v.offset, offset++);
+        encoder->setBuffer(state.f.pool, state.f.offset, offset++);
+        encoder->setBuffer(state.m.pool, state.m.offset, offset++);
+        // constraints 4-6
+        encoder->setBuffer(constraints.fixedParticles.pool, constraints.fixedParticles.offset, offset++);
+        encoder->setBuffer(constraints.vertexColPrims.pool, constraints.vertexColPrims.offset, offset++);
+        encoder->setBuffer(constraints.vertexColPrimsOffsets.pool, constraints.vertexColPrimsOffsets.offset, offset++);
+        // external forces 7
+        encoder->setBuffer(externalForces.externalForces.pool, externalForces.externalForces.offset, offset++);
+        //simulation parameters 8-9
+        encoder->setBytes(&simParams, sizeof(SimParams), offset++);
+        encoder->setBytes(&clothParams, sizeof(ClothParams), offset++);
+        // adjacency 10-11
+        encoder->setBuffer(adjacency.edges.pool, adjacency.edges.offset, offset++);
+        encoder->setBuffer(adjacency.facets.pool, adjacency.facets.offset, offset++);
+        // stretch springs 12-14
+        encoder->setBuffer(adjacency.vertexAdjEdges.pool, adjacency.vertexAdjEdges.offset, offset++);
+        encoder->setBuffer(adjacency.vertexAdjEdgesOffsets.pool, adjacency.vertexAdjEdgesOffsets.offset, offset++);
+        encoder->setBuffer(adjacency.restEdgeLengths.pool, adjacency.restEdgeLengths.offset, offset++);
+        // bend springs 15-17
+        encoder->setBuffer(adjacency.vertexOppVertices.pool, adjacency.vertexOppVertices.offset, offset++);
+        encoder->setBuffer(adjacency.vertexOppVerticesOffsets.pool, adjacency.vertexOppVerticesOffsets.offset, offset++);
+        encoder->setBuffer(adjacency.restOppLengths.pool, adjacency.restOppLengths.offset, offset++);
     }
 
     static void update(MeshState<METAL, PR>& state, MTL::ComputeCommandEncoder* encoder) {
@@ -1543,13 +1551,54 @@ struct AABB {
     }
 };
 
-template <typename BE, typename PR>
-struct AABBQuery {
-    AABB aabb;
-    Index qid; // querying point or edge
-    Index qobjid; // who is querying
-    GeneralMesh<BE, PR>* qmesh;
+struct alignas(32) AABB4 {
+    union {
+        struct {
+            tinym::vec3f1i v0, v1;
+        };
+        struct {
+            tinym::vec3 min;
+            int i0;
+            tinym::vec3 max;
+            int i1;
+        };
+    };
+    AABB4() : v0(0), v1(0) {}
+    AABB4(tinym::vec3_view e0, tinym::vec3_view e1) : min(tinym::min(e0, e1)), i0(0), max(tinym::max(e0, e1)), i1(0) {}
+    AABB4(tinym::vec3_view t0, tinym::vec3_view t1, tinym::vec3_view t2) : min(tinym::min(t0, t1, t2)), i0(0), max(tinym::max(t0, t1, t2)), i1(0) {}
+    void combine(const tinym::vec3_view& v) {
+        min = tinym::min(v, min);
+        max = tinym::max(v, max);
+        return;
+    }
+    void combine(const AABB4& aabb) {
+        min = tinym::min(min, aabb.min);
+        max = tinym::max(max, aabb.max);
+        return;
+    }
+    bool intersect(const AABB4& aabb) const {
+        if (max.x < aabb.min.x || min.x > aabb.max.x) return false;
+        if (max.y < aabb.min.y || min.y > aabb.max.y) return false;
+        if (max.z < aabb.min.z || min.z > aabb.max.z) return false;
+        return true;
+    }
 };
+
+//template <typename BE, typename PR>
+//struct AABBQuery {
+//    AABB aabb;
+//    Index qid; // querying point or edge
+//    Index qobjid; // who is querying
+//    GeneralMesh<BE, PR>* qmesh;
+//};
+
+//template <typename BE, typename PR>
+//struct AABB4Query {
+//    AABB4 aabb;
+//    //Index qid; // querying point or edge
+//    //Index qobjid; // who is querying
+//    //GeneralMesh<BE, PR>* qmesh;
+//};
 
 // TODO: BroadPhase, LBVH
 template <Index PRIMITIVE, typename PR>
@@ -1558,22 +1607,52 @@ struct BVH<BVHMODE::LINEAR, PRIMITIVE, PR> {
         uint code; // Morton code, 32bit, 10bit per coordinate
         uint index; // facet index
     };
+    //struct BVHNode {
+    //    AABB aabb;
+    //    int childA = -1, childB = -1;
+    //    int pid = -1;
+    //    // constructor for leaf nodes.
+    //    BVHNode(MortonNode& mortonNode, VectorBase<METAL, PR>& pos, VectorBase<METAL, Index>& prim) {
+    //        Index base = mortonNode.index*PRIMITIVE;
+    //        if constexpr (PRIMITIVE == 2) {
+    //            Index vid1 = prim[base], vid2 = prim[base+1];
+    //            aabb = AABB(pos.ptr+vid1*3, pos.ptr+vid2*3);
+    //        } else if constexpr (PRIMITIVE == 3) {
+    //            Index vid1 = prim[base], vid2 = prim[base+1], vid3 = prim[base+2];
+    //            aabb = AABB(pos.ptr+vid1*3, pos.ptr+vid2*3, pos.ptr+vid3*3);
+    //        }
+    //        else aabb = AABB();
+    //        pid = mortonNode.index;
+    //    }
+    //    // constructor for intermediate nodes. Their AABBs are combined lazily.
+    //    BVHNode(int childA, int childB) : childA(childA), childB(childB) {}
+    //};
+
     struct BVHNode {
-        AABB aabb;
-        int childA = -1, childB = -1;
-        int pid = -1;
+        union {
+            AABB4 aabb;
+            struct alignas(32) {
+                tinym::vec3 min;
+                int childA; // -2 if leaf, -1 if no child, nonnegative if intermediate
+                tinym::vec3 max;
+                int childB; // -1 if no child, nonnegative if intermediate
+            };
+        };
+        //int childA = -1, childB = -1;
+        //int pid = -1;
         // constructor for leaf nodes.
         BVHNode(MortonNode& mortonNode, VectorBase<METAL, PR>& pos, VectorBase<METAL, Index>& prim) {
             Index base = mortonNode.index*PRIMITIVE;
             if constexpr (PRIMITIVE == 2) {
-                Index vid1 = prim[base], vid2 = prim[base+1];
-                aabb = AABB(pos.ptr+vid1*3, pos.ptr+vid2*3);
+                Index vid0 = prim[base], vid1 = prim[base+1];
+                aabb = AABB4(pos.ptr+vid0*3, pos.ptr+vid1*3);
             } else if constexpr (PRIMITIVE == 3) {
-                Index vid1 = prim[base], vid2 = prim[base+1], vid3 = prim[base+2];
-                aabb = AABB(pos.ptr+vid1*3, pos.ptr+vid2*3, pos.ptr+vid3*3);
+                Index vid0 = prim[base], vid1 = prim[base+1], vid2 = prim[base+2];
+                aabb = AABB4(pos.ptr+vid0*3, pos.ptr+vid1*3, pos.ptr+vid2*3);
             }
-            else aabb = AABB();
-            pid = mortonNode.index;
+            else aabb = AABB4();
+            childA = -1;
+            childB = mortonNode.index;
         }
         // constructor for intermediate nodes. Their AABBs are combined lazily.
         BVHNode(int childA, int childB) : childA(childA), childB(childB) {}
@@ -1618,7 +1697,7 @@ struct BVH<BVHMODE::LINEAR, PRIMITIVE, PR> {
         // input: each points
         // output: biggest aabbs
         //std::cout << "  - [Stage 1] Compute biggest AABB" << std::endl;
-        AABB sceneBox(positions.ptr, positions.ptr+3);
+        AABB4 sceneBox(positions.ptr, positions.ptr+3);
         for(Index i = 6; i < positions.size; i+=3) sceneBox.combine(positions.ptr+i);
         //std::cout << "  - [Stage 1] Scene Box Range: " << sceneBox.min << " to " << sceneBox.max << std::endl;
         
@@ -1807,10 +1886,11 @@ struct BVH<BVHMODE::LINEAR, PRIMITIVE, PR> {
 
         // set intermediate node's aabb
         auto combineAABB = [&](auto&& self, BVHNode& node) -> void {
-            if(node.childA < 0 && node.childB < 0) return;
+            if(node.childA == -1) return;
             self(self, tree[node.childA]);
             self(self, tree[node.childB]);
-            node.aabb = tree[node.childA].aabb;
+            node.aabb.min = tree[node.childA].aabb.min;
+            node.aabb.max = tree[node.childA].aabb.max;
             node.aabb.combine(tree[node.childB].aabb);
         };
         //std::cout << "  - AABB combining for intermediate" << std::endl;
@@ -1824,26 +1904,28 @@ struct BVH<BVHMODE::LINEAR, PRIMITIVE, PR> {
         //}
     }
     
-    void queryAABB(const AABBQuery<METAL, PR>& query, const BVHNode& node) {
-        if(! node.aabb.intersect(query.aabb)) return;
+    void queryAABB(const AABB4& queryBox, const BVHNode& node) {
+        if(! node.aabb.intersect(queryBox)) return;
 
-        auto& c = query.qmesh->constraints;
+        auto* qmesh = SceneObject<METAL, PR>::findById(queryBox.i1);
+        auto& c = qmesh->constraints;
         if(c.numBroadCollisions >= c.maxNumCollisions) return;
         
-        if(node.childA < 0 && node.childB < 0) { // leaf
-            c.broadCollisions[c.numBroadCollisions].indexPair = {query.qid, (Index)node.pid}; // conversion is safe since it is leaf
-            c.broadCollisions[c.numBroadCollisions].objPair = {query.qobjid, (Index)objid};
+        if(node.childA == -1) { // leaf
+            c.broadCollisions[c.numBroadCollisions].indexPair = {(Index)queryBox.i0, (Index)node.childB}; // conversion is safe since it is leaf
+            c.broadCollisions[c.numBroadCollisions].objPair = {(Index)queryBox.i1, (Index)objid};
             c.numBroadCollisions++;
+            return;
         }
 
-        if(node.childA > 0) queryAABB(query, tree[node.childA]);
-        if(node.childB > 0) queryAABB(query, tree[node.childB]);
+        if(node.childA > 0) queryAABB(queryBox, tree[node.childA]);
+        if(node.childB > 0) queryAABB(queryBox, tree[node.childB]);
         
     }
 
-    void queryAABB(const AABBQuery<METAL, PR>& query) {
+    void queryAABB(const AABB4& queryBox) {
         // tree 탐색
-        queryAABB(query, tree[0]);
+        queryAABB(queryBox, tree[0]);
     }
 
     template <typename ObjType>
@@ -1859,13 +1941,16 @@ struct BVH<BVHMODE::LINEAR, PRIMITIVE, PR> {
         }
 
         tinym::vec3_view pointPtr(qobj->state.x.ptr + pid*3);
-        AABBQuery<METAL, PR> query;
+        //AABBQuery<METAL, PR> query;
         tinym::vec3 min(pointPtr[0]-queryMargin, pointPtr[1]-queryMargin, pointPtr[2]-queryMargin);
         tinym::vec3 max(pointPtr[0]+queryMargin, pointPtr[1]+queryMargin, pointPtr[2]+queryMargin);
-        query.aabb = AABB(min, max);
-        query.qid = (Index)pid;
-        query.qobjid = (Index)qobj->id;
-        query.qmesh = qobj;
+        AABB4 query(min, max);
+        query.i0 = pid;
+        query.i1 = qobj->id;
+        //query.aabb = AABB4(min, max);
+        //query.aabb.minAndChildA.i = (Index)pid;
+        //query.aabb.maxAndChildB.i = (Index)qobj->id;
+        //query.qmesh = qobj;
 
         
         queryAABB(query);
@@ -1878,7 +1963,7 @@ struct BVH<BVHMODE::LINEAR, PRIMITIVE, PR> {
         qmesh->constraints.numBroadCollisions = 0; // clear the previous collisions.
 
         for(Index vid = 0; vid < numPoints; ++vid) {
-            Index vbase = vid*3;
+            //Index vbase = vid*3;
 
             queryPoint(vid, qmesh, queryMargin);
         }
@@ -1895,7 +1980,7 @@ struct BVH<BVHMODE::LINEAR, PRIMITIVE, PR> {
             Index linebase = nodeid*12;
             Index vbase = linebase*2;
             Index elebase = vbase*3; // base of each element
-            AABB aabb = tree[nodeid].aabb;
+            AABB4 aabb = tree[nodeid].aabb;
 
             auto addLine = [&](const tinym::vec3& a, const tinym::vec3& b) {
                 debugBoxLines[elebase++] = a.x;
@@ -1950,8 +2035,6 @@ struct BruteForce<CPU, PR> {
 
 template <typename PR>
 struct BruteForce<METAL, PR> {
-    //Index numNarrowCollisions = 0;
-    //VectorBase<METAL, NarrowCollision> narrowCollisions;
 
     void narrow(
             VectorBase<METAL, BroadCollision>& ptCollisions, 
@@ -2024,9 +2107,39 @@ struct BruteForce<METAL, PR> {
             PR a = 1-b-c;
 
             if(a >= 0 && b >= 0 && c >= 0) { // inside plane
-                constraints.narrowCollisions[constraints.numNarrowCollisions] = {{point, triangle}, {queryObjId, targetObjId}, n, l};
+                constraints.narrowCollisions[constraints.numNarrowCollisions] = {{point, triangle}, {queryObjId, targetObjId}, {n, l}};
                 constraints.numNarrowCollisions++;
             }
+        }
+    }
+
+    void narrowAndSortByVertices(
+            VectorBase<METAL, BroadCollision>& ptCollisions, 
+            Index numCollisions,
+            MeshAdjacency<METAL, PR>& adjacency,
+            Constraints<METAL, PR>& constraints,
+            PR radius) {
+        narrow(ptCollisions, numCollisions, adjacency, constraints, radius);
+
+        constraints.vertexColPrimsOffsets.map().setZero();
+        constraints.vertexColPrims.map().setZero();
+
+        for(Index i = 0; i < constraints.numNarrowCollisions; ++i) {
+            Index pid = constraints.narrowCollisions[i].indexPair.point;
+            constraints.vertexColPrimsOffsets[pid+1]++;
+        }
+
+        for(Index i = 1; i < constraints.vertexColPrimsOffsets.size; ++i) 
+            constraints.vertexColPrimsOffsets[i] += constraints.vertexColPrimsOffsets[i-1];
+
+        DynamicMemoryAllocator<METAL> tempPool;
+        VectorBase<METAL, Index> offsets(tempPool.template zeros<Index>(constraints.vertexColPrimsOffsets.size-1));
+        
+        for(Index i = 0; i < constraints.numNarrowCollisions; ++i) {
+            Index pid = constraints.narrowCollisions[i].indexPair.point;
+            Index base = offsets[pid]+constraints.vertexColPrimsOffsets[pid];
+            constraints.vertexColPrims[base] = constraints.narrowCollisions[i];
+            offsets[pid]++;
         }
     }
 };
@@ -2035,7 +2148,6 @@ template <typename BroadPhase, typename NarrowPhase>
 struct CollisionPipeline {
     BroadPhase broadPhase;
     NarrowPhase narrowPhase;
-
 };
 
 template <typename BE, typename PR, typename System>
@@ -2137,7 +2249,7 @@ struct Simulator {
                     << c.broadCollisions[i].indexPair.triangle << std::endl;
             }
 
-            collisionPipeline.narrowPhase.narrow(
+            collisionPipeline.narrowPhase.narrowAndSortByVertices(
                     c.broadCollisions,
                     c.numBroadCollisions,
                     mesh->adjacency,
@@ -2145,18 +2257,40 @@ struct Simulator {
                     0.002);
 
             std::cout << "Narrowed self collision detected: (" << c.numNarrowCollisions << "/" << c.maxNumCollisions << ")\n";
-            for(Index i = 0; i < 5; ++i) {
+            Index min = 5 < c.numNarrowCollisions ? 5 : c.numNarrowCollisions;
+            for(Index i = 0; i < min; ++i) {
                 std::cout << "  - Collision " << i << ": point " 
                     << c.narrowCollisions[i].indexPair.point
                     << " and triangle "
                     << c.narrowCollisions[i].indexPair.triangle 
                     << " and normal " 
-                    << '(' << c.narrowCollisions[i].collisionNormal.x 
-                    << ", " << c.narrowCollisions[i].collisionNormal.y 
-                    << ", " << c.narrowCollisions[i].collisionNormal.z << ')'
+                    << '(' << c.narrowCollisions[i].collisionNormalAndDistance.x 
+                    << ", " << c.narrowCollisions[i].collisionNormalAndDistance.y 
+                    << ", " << c.narrowCollisions[i].collisionNormalAndDistance.z << ')'
                     << " and distance " 
-                    << c.narrowCollisions[i].distance
+                    << c.narrowCollisions[i].collisionNormalAndDistance.w
                     << std::endl;
+            }
+            std::cout << "Narrowed self collision sorted: (" << c.numNarrowCollisions << "/" << c.maxNumCollisions << ")\n";
+            Index count = 0;
+            for(Index i = 0; i < c.vertexColPrimsOffsets.size-1; ++i) {
+                if(count >= min) break;
+                if(c.vertexColPrimsOffsets[i] == c.vertexColPrimsOffsets[i+1]) continue;
+                for(Index j = c.vertexColPrimsOffsets[i]; j < c.vertexColPrimsOffsets[i+1]; ++j) {
+                    if(count >= min) break;
+                    std::cout << "  - Collision " << j << ": point " 
+                        << c.vertexColPrims[j].indexPair.point
+                        << " and triangle "
+                        << c.vertexColPrims[j].indexPair.triangle 
+                        << " and normal " 
+                        << '(' << c.vertexColPrims[j].collisionNormalAndDistance.x 
+                        << ", " << c.vertexColPrims[j].collisionNormalAndDistance.y 
+                        << ", " << c.vertexColPrims[j].collisionNormalAndDistance.z << ')'
+                        << " and distance " 
+                        << c.vertexColPrims[j].collisionNormalAndDistance.w
+                        << std::endl;
+                    count++;
+                }
             }
         }
 

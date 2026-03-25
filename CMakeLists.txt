@@ -34,19 +34,32 @@ endif()
 
 
 # --- 2. .metal 소스 코드를 .metallib 로 컴파일하는 커스텀 규칙 ---
-# 이 과정을 통해 physics.metal이 컴파일되어 실행 파일 옆에 배치됩니다.
-set(METAL_SOURCE ${CMAKE_CURRENT_SOURCE_DIR}/src/physics.metal)
-set(METAL_LIBRARY ${CMAKE_CURRENT_BINARY_DIR}/physics.metallib)
+file(GLOB METAL_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/src/metal/*.metal")
+
+set(METAL_AIR_FILES "")
+foreach(METAL_SOURCE ${METAL_SOURCES})
+    get_filename_component(METAL_NAME ${METAL_SOURCE} NAME_WE)
+    set(AIR_FILE ${CMAKE_CURRENT_BINARY_DIR}/${METAL_NAME}.air)
+
+    add_custom_command(
+        OUTPUT ${AIR_FILE}
+        COMMAND xcrun -sdk macosx metal -c ${METAL_SOURCE} -o ${AIR_FILE}
+        DEPENDS ${METAL_SOURCE}
+        COMMENT "Compiling ${METAL_NAME}.metal -> ${METAL_NAME}.air"
+    )
+
+    list(APPEND METAL_AIR_FILES ${AIR_FILE})
+endforeach()
+
+set(METAL_LIBRARY ${CMAKE_CURRENT_BINARY_DIR}/default.metallib)
 
 add_custom_command(
     OUTPUT ${METAL_LIBRARY}
-    COMMAND xcrun -sdk macosx metal -c ${METAL_SOURCE} -o ${CMAKE_CURRENT_BINARY_DIR}/physics.air
-    COMMAND xcrun -sdk macosx metallib ${CMAKE_CURRENT_BINARY_DIR}/physics.air -o ${METAL_LIBRARY}
-    DEPENDS ${METAL_SOURCE}
-    COMMENT "Compiling Metal Compute Kernel..."
+    COMMAND xcrun -sdk macosx metallib ${METAL_AIR_FILES} -o ${METAL_LIBRARY}
+    DEPENDS ${METAL_AIR_FILES}
+    COMMENT "Linking Metal library ${METAL_LIBRARY}"
 )
 
-# 메인 타겟이 Metal 라이브러리 컴파일에 의존하도록 설정
 add_custom_target(MetalKernels ALL DEPENDS ${METAL_LIBRARY})
 
 # 4. src 폴더의 CMakeLists.txt 실행

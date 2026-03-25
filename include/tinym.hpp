@@ -339,7 +339,35 @@ inline vec3_base<vec3_scalar_t<A>> max(const A& a, const B& b, const C& c) {
     return max(max(a, b), c);
 }
 
+
+
+// special type
+
+struct alignas(16) vec3f1i {
+    union {
+        struct {
+            vec3 v;
+            int i;
+        };
+        struct {
+            float x, y, z;
+            int w;
+        };
+    };
+    vec3f1i(float s) : v(s), i(0) {}
+    vec3f1i(vec3 v) : v(v), i(0) {}
+    vec3f1i(vec3 v, int i) : v(v), i(i) {}
+
+    operator vec3() { return v; }
+};
+static_assert(sizeof(vec3f1i) == 16);
+
+
+
+
+
 }; // end namespace
+
 
 
 #endif

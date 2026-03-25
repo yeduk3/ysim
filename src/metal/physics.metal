@@ -72,6 +72,11 @@ kernel void compute_spring_forces(
 }
 
 
+struct NarrowCollision {
+    uint2 indexPair;     // 혹은 네 구조에 맞는 형태
+    uint2 objPair;
+    float4 collisionNormalAndDistance;
+};
 
 // ========================================================
 // [커널 2] 위치와 속도만 업데이트하는 파이프라인
@@ -82,7 +87,9 @@ kernel void integrate(
     device const packed_float3* f [[buffer(2)]],
     device const float* m [[buffer(3)]],
     device const float* fixedParticle [[buffer(4)]],
-    constant SimParams& params [[buffer(6)]],
+    device const NarrowCollision* vertColPrims [[buffer(5)]],
+    device const uint* vertColPrimsOffsets [[buffer(6)]],
+    constant SimParams& params [[buffer(8)]],
     uint id [[thread_position_in_grid]]
 ) {
     if (id >= params.vertexNum) return; 
@@ -95,6 +102,30 @@ kernel void integrate(
     float3 force = f[id];
 
     vel += (params.subh * force / m[id]) * mask;
+
+    // apply collision constraints
+    uint begin = vertColPrimsOffsets[id];
+    uint end   = vertColPrimsOffsets[id + 1];
+
+    for (uint i = begin; i < end; ++i) {
+        float3 n = vertColPrims[i].collisionNormalAndDistance.xyz;
+
+        float nlen2 = dot(n, n);
+        if (nlen2 < 1e-12f) continue;
+
+        // 안전하게 normalize
+        n *= rsqrt(nlen2);
+
+        float vn = dot(vel, n);
+
+        // normal 방향으로 파고드는 속도만 제거
+        if (vn < 0.0f) {
+            vel -= vn * n;
+        }
+    }
+
+
+
     pos += (params.subh * vel) * mask;
 
     v[id] = vel;
@@ -123,8 +154,8 @@ kernel void compute_cloth_grid_forces_fast(
     device const packed_float3* v [[buffer(1)]],
     device packed_float3* f [[buffer(2)]],
     device const float* m [[buffer(3)]],
-    constant SimParams& params [[buffer(6)]],
-    constant ClothGridParams& clothParams [[buffer(7)]],
+    constant SimParams& params [[buffer(8)]],
+    constant ClothGridParams& clothParams [[buffer(9)]],
     uint id [[thread_position_in_grid]]
 ) {
     if (id >= params.vertexNum) return; 
@@ -182,21 +213,21 @@ kernel void compute_tri_spring_forces(
     // constraints
     device const float* fixedParticles [[buffer(4)]],
     // external forces
-    device packed_float3* externalForces [[buffer(5)]],
+    device packed_float3* externalForces [[buffer(7)]],
     // simulation parameters
-    constant SimParams& simParams [[buffer(6)]],
-    constant ClothParams& clothParams [[buffer(7)]],
+    constant SimParams& simParams [[buffer(8)]],
+    constant ClothParams& clothParams [[buffer(9)]],
     // adjacency
-    device const uint2* edges [[buffer(8)]],
-    device const uint* facets [[buffer(9)]],
+    device const uint2* edges [[buffer(10)]],
+    device const uint* facets [[buffer(11)]],
     // stretch springs
-    device const uint* vertexAdjEdges [[buffer(10)]],
-    device const uint* vertexAdjEdgesOffsets [[buffer(11)]],
-    device const float* restEdgeLengths [[buffer(12)]],
+    device const uint* vertexAdjEdges [[buffer(12)]],
+    device const uint* vertexAdjEdgesOffsets [[buffer(13)]],
+    device const float* restEdgeLengths [[buffer(14)]],
     // bend springs
-    device const uint* vertexOppVertices [[buffer(13)]],
-    device const uint* vertexOppVerticesOffsets [[buffer(14)]],
-    device const float* restOppLengths [[buffer(15)]],
+    device const uint* vertexOppVertices [[buffer(15)]],
+    device const uint* vertexOppVerticesOffsets [[buffer(16)]],
+    device const float* restOppLengths [[buffer(17)]],
     uint id [[thread_position_in_grid]]
 ) {
     if (id >= simParams.vertexNum) return; 
