@@ -1,5 +1,6 @@
 #include "Foundation/NSString.hpp"
 #include "Metal/MTLBuffer.hpp"
+#include "Metal/MTLComputeCommandEncoder.hpp"
 #include "Metal/MTLComputePipeline.hpp"
 #include "YGLWindow.hpp"
 #include "camera.hpp"
@@ -86,24 +87,47 @@ struct ByteMemoryPool<CPU> {
 };
 
 #include <Metal/Metal.hpp>
-struct MetalContext {
+struct MetalGlobalContext {
     static MTL::Device* getDevice() {
         // C++의 static 변수는 프로그램 실행 중 딱 한 번만 초기화됩니다!
         static MTL::Device* device = MTL::CreateSystemDefaultDevice();
         return device;
     }
+    static MTL::CommandQueue* getCommandQueue() {
+        static MTL::CommandQueue* commandQueue = getDevice()->newCommandQueue();
+        return commandQueue;
+    }
+    inline static MTL::CommandBuffer* commandBuffer = nullptr;
+    inline static MTL::ComputeCommandEncoder* computeCommandEncoder = nullptr;
+    static MTL::ComputeCommandEncoder* getComputeCommandEncoderer() {
+        if (computeCommandEncoder) return computeCommandEncoder;
+        commandBuffer = getCommandQueue()->commandBuffer();
+        computeCommandEncoder = commandBuffer->computeCommandEncoder();
+        return computeCommandEncoder;
+    }
+    static void commitAndWait() {
+        computeCommandEncoder->endEncoding();
+        commandBuffer->commit();
+        commandBuffer->waitUntilCompleted();
+
+        commandBuffer = nullptr;
+        computeCommandEncoder = nullptr;
+    }
+
+};
+struct MetalPhysicsContext {
     static MTL::Library* getLibrary() {
         static MTL::Library* library = nullptr;
 
         if (!library) {
             NS::Error* error = nullptr;
 
-            auto path = NS::String::string("physics.metallib", NS::UTF8StringEncoding);
+            auto path = NS::String::string("default.metallib", NS::UTF8StringEncoding);
 
-            library = getDevice()->newLibrary(path, &error);
+            library = MetalGlobalContext::getDevice()->newLibrary(path, &error);
 
             if (!library) {
-                std::cout << "[Metal Error] Failed to load metallib!\n";
+                std::cout << "[Metal Error] Failed to load " << path->utf8String() << "!\n";
                 if (error) {
                     std::cout << error->localizedDescription()->utf8String() << std::endl;
                 }
@@ -143,7 +167,7 @@ struct MetalContext {
         NS::Error* error = nullptr;
         auto func = getFunction(name);
 
-        auto pso = getDevice()->newComputePipelineState(func, &error);
+        auto pso = MetalGlobalContext::getDevice()->newComputePipelineState(func, &error);
 
         if (!pso) {
             std::cout << "[Metal Error] PSO creation failed: " << name << "\n";
@@ -154,6 +178,76 @@ struct MetalContext {
         return pso;
     }
 };
+
+struct MetalBVHContext {
+    static MTL::Library* getLibrary() {
+        static MTL::Library* library = nullptr;
+
+        if (!library) {
+            NS::Error* error = nullptr;
+
+            auto path = NS::String::string("default.metallib", NS::UTF8StringEncoding);
+
+            library = MetalGlobalContext::getDevice()->newLibrary(path, &error);
+
+            if (!library) {
+                std::cout << "[Metal Error] Failed to load " << path->utf8String() << "!\n";
+                if (error) {
+                    std::cout << error->localizedDescription()->utf8String() << std::endl;
+                }
+                exit(1);
+            }
+
+            path->release();
+        }
+
+        return library;
+    }
+    static MTL::Function* getFunction(const char* name) {
+        static std::unordered_map<std::string, MTL::Function*> cache;
+
+        auto it = cache.find(name);
+        if (it != cache.end()) return it->second;
+
+        auto nsName = NS::String::string(name, NS::UTF8StringEncoding);
+        auto func = getLibrary()->newFunction(nsName);
+
+        if (!func) {
+            std::cout << "[Metal Error] Failed to load function: " << name << "\n";
+            exit(1);
+        }
+
+        cache[name] = func;
+        nsName->release();
+
+        return func;
+    }
+    static MTL::ComputePipelineState* getPSO(const char* name) {
+        static std::unordered_map<std::string, MTL::ComputePipelineState*> cache;
+
+        auto it = cache.find(name);
+        if (it != cache.end()) return it->second;
+
+        NS::Error* error = nullptr;
+        auto func = getFunction(name);
+
+        auto pso = MetalGlobalContext::getDevice()->newComputePipelineState(func, &error);
+
+        if (!pso) {
+            std::cout << "[Metal Error] PSO creation failed: " << name << "\n";
+            exit(1);
+        }
+
+        cache[name] = pso;
+        return pso;
+    }
+};
+
+
+
+
+
+
 template <typename PR>
 struct MemoryBlock<METAL, PR> {
     MTL::Buffer* pool;
@@ -169,7 +263,7 @@ struct ByteMemoryPool<METAL> {
     size_t marker = 0;
     size_t capacity = 0;
     ByteMemoryPool() : device(nullptr), pool(nullptr), marker(0), capacity(0) {}
-    ByteMemoryPool(size_t N) : device(MetalContext::getDevice()), capacity(N) {
+    ByteMemoryPool(size_t N) : device(MetalGlobalContext::getDevice()), capacity(N) {
         pool = device->newBuffer(N, MTL::ResourceStorageModeShared);
     }
     ByteMemoryPool(ByteMemoryPool&& other) noexcept
@@ -1169,7 +1263,7 @@ struct TriangularClothBehavior<METAL, PR> {
     static MTL::ComputePipelineState* getPSO() {
         static MTL::ComputePipelineState* pso = nullptr;
         if (!pso) {
-            pso = MetalContext::getPSO("compute_tri_spring_forces");
+            pso = MetalPhysicsContext::getPSO("compute_tri_spring_forces");
         }
         return pso;
     }
@@ -1672,19 +1766,230 @@ struct BVH<BVHMODE::LINEAR, PRIMITIVE, PR> {
     VectorBase<METAL, PR> debugBoxLines;
     int objid; // who made this tree
 
+    MTL::ComputePipelineState* fillMortonPSO;
+
     BVH() {
         // recieve all points, facets and edges;
-        
+        fillMortonPSO = MetalBVHContext::getPSO("fillMortons");
     }
 
     void memoryAllocation() {
-        Index numberOfPrimitives = primitives.size/PRIMITIVE;
-        mortons = VectorBase<METAL, MortonNode>(numberOfPrimitives);
-        mortonsTemp = VectorBase<METAL, MortonNode>(numberOfPrimitives);
-        tree = VectorBase<METAL, BVHNode>(2*numberOfPrimitives-1);
+        Index numPrimitives = primitives.size/PRIMITIVE;
+        mortons = VectorBase<METAL, MortonNode>(numPrimitives);
+        mortonsTemp = VectorBase<METAL, MortonNode>(numPrimitives);
+        tree = VectorBase<METAL, BVHNode>(2*numPrimitives-1);
     }
 
     void build(int oid, VectorBase<METAL, PR>& pos, VectorBase<METAL, Index>& prim) {
+        //std::cout << "[BVH Build] Memory allocated, BVH build start" << std::endl;
+        objid = oid;
+        positions = pos;
+        primitives = prim;
+        //std::cout << "[BVH Build] positions and primitives are assigned" << std::endl;
+        Index numPrimitives = primitives.size/PRIMITIVE;
+        if(!tree.ptr) memoryAllocation();
+
+        // [stage 1] compute biggest aabb
+        // input: each points
+        // output: biggest aabbs
+        //std::cout << "  - [Stage 1] Compute biggest AABB" << std::endl;
+        AABB4 sceneBox(positions.ptr, positions.ptr+3);
+        for(Index i = 6; i < positions.size; i+=3) sceneBox.combine(positions.ptr+i);
+        sceneBox.i0 = numPrimitives;
+        //std::cout << "  - [Stage 1] Scene Box Range: " << sceneBox.min << " to " << sceneBox.max << std::endl;
+        
+        // [stage 2] transform each center into morton code
+        // input: each elements' center. elements can be either triangles or edges
+        // output: each elements' morton code
+        //std::cout << "  - [Stage 2] Transform each center into morton code" << std::endl;
+        auto* encoder = MetalGlobalContext::getComputeCommandEncoderer();
+        encoder->setBuffer(positions.pool, positions.offset, 0);
+        encoder->setBuffer(primitives.pool, primitives.offset, 1);
+        encoder->setBytes(&sceneBox, sizeof(AABB4), 2);
+        encoder->setBuffer(mortons.pool, mortons.offset, 3);
+
+        {
+            MTL::Size gridSize = MTL::Size(numPrimitives, 1, 1);
+            MTL::Size threadGroupSize = MTL::Size(std::min((Index)fillMortonPSO->maxTotalThreadsPerThreadgroup(), numPrimitives), 1, 1);
+            encoder->setComputePipelineState(fillMortonPSO);
+            encoder->dispatchThreads(gridSize, threadGroupSize);
+        }
+
+        MetalGlobalContext::commitAndWait();
+        
+        
+        // [stage 3] radix sort
+        // input: array of each elements' morton code
+        // output: sorted array of input
+        //std::cout << "  - [Stage 3] Radix sort" << std::endl;
+        auto radixSortByMortonCode = [](MortonNode* in, MortonNode* tmp, size_t n) {
+            constexpr int BITS_PER_PASS = 8;
+            constexpr int RADIX = 1 << BITS_PER_PASS; // 256
+            constexpr int MASK = RADIX - 1;
+
+            MortonNode* src = in;
+            MortonNode* dst = tmp;
+
+            for (int shift = 0; shift < 32; shift += BITS_PER_PASS) {
+                size_t count[RADIX] = {};
+
+                // 1. histogram
+                for (size_t i = 0; i < n; ++i) {
+                    unsigned bucket = (src[i].code >> shift) & MASK;
+                    count[bucket]++;
+                }
+
+                // 2. exclusive prefix sum
+                size_t offset[RADIX];
+                size_t sum = 0;
+                for (int b = 0; b < RADIX; ++b) {
+                    offset[b] = sum;
+                    sum += count[b];
+                }
+
+                // 3. stable scatter
+                for (size_t i = 0; i < n; ++i) {
+                    unsigned bucket = (src[i].code >> shift) & MASK;
+                    dst[offset[bucket]++] = src[i];
+                }
+
+                std::swap(src, dst);
+            }
+
+            // pass 횟수가 짝수면 in에, 홀수면 tmp에 최종 결과가 있을 수 있음
+            if (src != in) {
+                std::copy(src, src + n, in);
+            }
+        };
+        radixSortByMortonCode(mortons.ptr, mortonsTemp.ptr, numPrimitives);
+
+        // [stage 4] build tree
+        // input: sorted array of elements' morton code
+        // output: linear bvh tree
+        //std::cout << "  - [Stage 4] Build tree" << std::endl;
+        auto clzSafe = [](unsigned int x) {
+            return x ? __builtin_clz(x) : 32;
+        };
+        auto findSplit = [&]( MortonNode* mortons,
+                       int           first,
+                       int           last) {
+            // Identical Morton codes => split the range in the middle.
+
+            unsigned int firstCode = mortons[first].code;
+            unsigned int lastCode = mortons[last].code;
+
+            if (firstCode == lastCode)
+                return (first + last) >> 1;
+
+            // Calculate the number of highest bits that are the same
+            // for all objects, using the count-leading-zeros intrinsic.
+
+            int commonPrefix = clzSafe(firstCode ^ lastCode);
+
+            // Use binary search to find where the next bit differs.
+            // Specifically, we are looking for the highest object that
+            // shares more than commonPrefix bits with the first one.
+
+            int split = first; // initial guess
+            int step = last - first;
+
+            do
+            {
+                step = (step + 1) >> 1; // exponential decrease
+                int newSplit = split + step; // proposed new position
+
+                if (newSplit < last)
+                {
+                    unsigned int splitCode = mortons[newSplit].code;
+                    int splitPrefix = clzSafe(firstCode ^ splitCode);
+                    if (splitPrefix > commonPrefix)
+                        split = newSplit; // accept proposal
+                }
+            }
+            while (step > 1);
+
+            return split;
+        };
+
+        auto determineRange = [&](MortonNode* mortons, Index numberOfPrimitives, Index index) {
+            auto delta = [&](int i, int j) {
+                if (j < 0 || j >= (int)numberOfPrimitives) return -1;
+
+                unsigned int codeA = mortons[i].code;
+                unsigned int codeB = mortons[j].code;
+
+                if (codeA != codeB)
+                    return clzSafe(codeA ^ codeB);
+
+                return 32 + clzSafe(mortons[i].index ^ mortons[j].index);
+            };
+
+            int d = (delta(index, index + 1) - delta(index, index - 1) >= 0) ? 1 : -1;
+            int deltaMin = delta(index, index - d);
+
+            int lmax = 2;
+            while (delta(index, index + lmax * d) > deltaMin) {
+                lmax <<= 1;
+            }
+
+            int l = 0;
+            for (int t = lmax >> 1; t >= 1; t >>= 1) {
+                if (delta(index, index + (l + t) * d) > deltaMin) {
+                    l += t;
+                }
+            }
+
+            int j = index + l * d;
+
+            if (d < 0) return tinym::vec3((float)j, (float)index, 0.0f);
+            else       return tinym::vec3((float)index, (float)j, 0.0f);
+        };
+
+        // construct leaf
+        //std::cout << "  - Leaf constructing" << std::endl;
+        for(Index i = 0; i < numPrimitives; ++i) {
+            tree[numPrimitives+i-1] = BVHNode(mortons[i], positions, primitives);
+        }
+
+        // construct intermediate
+        //std::cout << "  - intermediate constructing" << std::endl;
+        for(Index i = 0; i < numPrimitives-1; ++i) {
+            tinym::vec3 range = determineRange(mortons.ptr, numPrimitives, i); // = ?
+            Index first = range.x;
+            Index last = range.y;
+
+            Index split = findSplit(mortons.ptr, first, last);
+
+            int childA, childB;
+            if(split == first) childA = split + numPrimitives-1; // leaf node index
+            else childA = split; // intermediate node
+            if(split+1 == last) childB = split+1 + numPrimitives-1; // leaf node index
+            else childB = split+1; // intermediate node
+
+            tree[i] = BVHNode(childA, childB);
+        }
+
+        // set intermediate node's aabb
+        auto combineAABB = [&](auto&& self, BVHNode& node) -> void {
+            if(node.childA == -1) return;
+            self(self, tree[node.childA]);
+            self(self, tree[node.childB]);
+            node.aabb.min = tree[node.childA].aabb.min;
+            node.aabb.max = tree[node.childA].aabb.max;
+            node.aabb.combine(tree[node.childB].aabb);
+        };
+        //std::cout << "  - AABB combining for intermediate" << std::endl;
+        combineAABB(combineAABB, tree[0]);
+
+        //Index l = 0;
+        //std::cout << "Tree test: " << std::endl;
+        //for(Index i = 0; i < 5; i++) {
+        //    std::cout << tree[l].aabb.min << ", " << tree[l].aabb.max << std::endl;;
+        //    l = tree[l].childA;
+        //}
+    }
+
+    void buildCPU(int oid, VectorBase<METAL, PR>& pos, VectorBase<METAL, Index>& prim) {
         //std::cout << "[BVH Build] Memory allocated, BVH build start" << std::endl;
         objid = oid;
         positions = pos;
@@ -2238,6 +2543,7 @@ struct Simulator {
             auto* mesh = SceneObject<BE, PR>::findById(0);
 
             collisionPipeline.broadPhase.build(mesh->id, mesh->state.x, mesh->adjacency.facets);
+            //collisionPipeline.broadPhase.buildCPU(mesh->id, mesh->state.x, mesh->adjacency.facets);
             collisionPipeline.broadPhase.checkSelfCollisions(0.005);
 
             auto& c = mesh->constraints;
@@ -2471,7 +2777,6 @@ struct ExplicitSystem<METAL, PR> {
     using Vectorui = VectorBase<METAL, unsigned int>;
 
     // Metal vars
-    MTL::Device* device;
     MTL::CommandQueue* commandQueue;
     MTL::ComputePipelineState* forcePSO;
     MTL::ComputePipelineState* springForcePSO;
@@ -2490,23 +2795,23 @@ struct ExplicitSystem<METAL, PR> {
 
 
     ExplicitSystem(PR h=1/PR(60), Index subSteps=50) 
-        : device(MetalContext::getDevice()), h(h), subSteps(subSteps), subh(h/subSteps) {
+        : h(h), subSteps(subSteps), subh(h/subSteps) {
         std::cout << "[System Creation] Try to create Explicit System..." << std::endl;
         std::cout << "  - Connecting device..." << std::endl;
         //device = MTL::CreateSystemDefaultDevice();
         //pool = ByteMemoryPool<METAL>(device, 50*1024*1024*sizeof(PR));
 
         std::cout << "  - Creating a new command queue..." << std::endl;
-        commandQueue = device->newCommandQueue();
+        commandQueue = MetalGlobalContext::getCommandQueue();
 
         std::cout << "  - Creating a new command pipeline state object (PSO)..." << std::endl;
         // find own metal kernel library
 
         // find desired kernel
-        forcePSO = MetalContext::getPSO("compute_forces");
-        springForcePSO = MetalContext::getPSO("compute_spring_forces");
-        integratePSO = MetalContext::getPSO("integrate");
-        clothGridFastForcePSO = MetalContext::getPSO("compute_cloth_grid_forces_fast");
+        forcePSO = MetalPhysicsContext::getPSO("compute_forces");
+        springForcePSO = MetalPhysicsContext::getPSO("compute_spring_forces");
+        integratePSO = MetalPhysicsContext::getPSO("integrate");
+        clothGridFastForcePSO = MetalPhysicsContext::getPSO("compute_cloth_grid_forces_fast");
     }
     
     struct SimParams {
