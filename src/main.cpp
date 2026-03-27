@@ -11,6 +11,7 @@
 #include <iostream>
 #include <iterator>
 #include <ratio>
+#include <string>
 #include <type_traits>
 #include <typeindex>
 #include <set>
@@ -86,6 +87,9 @@ struct ByteMemoryPool<CPU> {
     char* bytePtr() { return pool.data(); }
 };
 
+template <typename BE, typename PR>
+struct VectorBase {};
+
 #include <Metal/Metal.hpp>
 struct MetalGlobalContext {
     static MTL::Device* getDevice() {
@@ -99,11 +103,25 @@ struct MetalGlobalContext {
     }
     inline static MTL::CommandBuffer* commandBuffer = nullptr;
     inline static MTL::ComputeCommandEncoder* computeCommandEncoder = nullptr;
-    static MTL::ComputeCommandEncoder* getComputeCommandEncoderer() {
+    static MTL::ComputeCommandEncoder* getComputeCommandEncoder() {
         if (computeCommandEncoder) return computeCommandEncoder;
         commandBuffer = getCommandQueue()->commandBuffer();
         computeCommandEncoder = commandBuffer->computeCommandEncoder();
         return computeCommandEncoder;
+    }
+    template <typename BE, typename PR>
+    static void setBuffer(const VectorBase<BE, PR>& vec, Index index) {
+        getComputeCommandEncoder()->setBuffer(vec.pool, vec.offset, index);
+    }
+    template <typename PR>
+    static void setBytes(const PR& data, Index index) {
+        getComputeCommandEncoder()->setBytes(&data, sizeof(PR), index);
+    }
+    static void dispatchThreads(MTL::ComputePipelineState* pso, Index numThreads) {
+        MTL::Size gridSize = MTL::Size(numThreads, 1, 1);
+        MTL::Size threadGroupSize = MTL::Size(std::min((Index)pso->maxTotalThreadsPerThreadgroup(), numThreads), 1, 1);
+        getComputeCommandEncoder()->setComputePipelineState(pso);
+        getComputeCommandEncoder()->dispatchThreads(gridSize, threadGroupSize);
     }
     static void commitAndWait() {
         computeCommandEncoder->endEncoding();
@@ -242,7 +260,6 @@ struct MetalBVHContext {
         return pso;
     }
 };
-
 
 
 
@@ -486,8 +503,6 @@ using Precision = float;
 /// TODO: Math ///
 #include <Eigen/Dense>
 
-template <typename BE, typename PR>
-struct VectorBase {};
 
 template <typename PR>
 struct VectorBase<CPU, PR> {
@@ -733,11 +748,18 @@ struct DebugLineGL<CPU> {
 };
 
 
+// General Mesh Deinfe!
+
+template <typename BE, typename PR>
+struct GeneralMesh;
+
+
 enum struct BehaviorType {
     TriangularCloth,
     FastGridCloth,
     Elastic,
     Rigid,
+    Float,
     Fluid,
     Generator,
 };
@@ -1046,9 +1068,15 @@ struct MeshAdjacencyInitializer {
     }
 };
 
+enum struct PlaneDirection {
+    XYPlane,
+    YZPlane,
+    XZPlane,
+};
+
 //! Special class for grid cloth
 template <typename PR>
-struct MeshGridSpringInitializerParams {
+struct MeshGridInitializerParams {
     // Commons
     Index numPoints, numFacets, numEdges;
     PR mass;
@@ -1056,20 +1084,25 @@ struct MeshGridSpringInitializerParams {
     // Specifics
     Index particleNum1D;
     PR size1D;
-    MeshGridSpringInitializerParams(Index particleNum1D, PR size1D, PR mass)
-        : particleNum1D(particleNum1D), 
+    bool jiggle;
+    PlaneDirection dir;
+    tinym::vec3 center;
+
+    MeshGridInitializerParams(PlaneDirection dir, tinym::vec3 center, Index particleNum1D, PR size1D, PR mass, bool jiggle)
+        : dir(dir), center(center),
+        particleNum1D(particleNum1D), 
         numPoints(particleNum1D*particleNum1D),
         numFacets(2*(particleNum1D-1)*(particleNum1D-1)), 
         numEdges(2*(particleNum1D-1)*particleNum1D+numFacets),
-        size1D(size1D), mass(mass) {}
+        size1D(size1D), mass(mass), jiggle(jiggle) {}
 };
 
 template <typename BE, typename PR>
-struct MeshGridSpringInitializer : GeneralMeshInitializer<BE, PR> {
-    using ParamsType = MeshGridSpringInitializerParams<PR>;
+struct MeshGridInitializer : GeneralMeshInitializer<BE, PR> {
+    using ParamsType = MeshGridInitializerParams<PR>;
     ParamsType params;
 
-    MeshGridSpringInitializer(ParamsType params) : params(params) {}
+    MeshGridInitializer(ParamsType params) : params(params) {}
 
     void initialize(MeshState<BE, PR>& state, MeshAdjacency<BE, PR>& adjacency) {
         std::cout << "[MeshGridSpringInitializer initialize] start" << std::endl;
@@ -1086,11 +1119,26 @@ struct MeshGridSpringInitializer : GeneralMeshInitializer<BE, PR> {
                 
                 PR px =  col*length - halfSize;
                 PR py = -row*length + halfSize;
-                PR pz = rand()/PR(RAND_MAX)/10000.f;
+                PR pz = params.jiggle ? rand()/PR(RAND_MAX)/10000.f : 0.f;
                 
-                state.x[base  ] = px;
-                state.x[base+1] = py;
-                state.x[base+2] = pz;
+                switch(params.dir) {
+                    case PlaneDirection::XYPlane:
+                        state.x[base  ] = px+params.center.x;
+                        state.x[base+1] = py+params.center.y;
+                        state.x[base+2] = pz+params.center.z;
+                        break;
+                    case PlaneDirection::YZPlane:
+                        state.x[base  ] = pz+params.center.x;
+                        state.x[base+1] = px+params.center.y;
+                        state.x[base+2] = py+params.center.z;
+                        break;
+                    case PlaneDirection::XZPlane:
+                        state.x[base  ] = px+params.center.x;
+                        state.x[base+1] = pz+params.center.y;
+                        state.x[base+2] = py+params.center.z;
+                        break;
+                    default: break;
+                }
             }
         }
         std::cout << "[MeshGridSpringInitializer initialize] position set" << std::endl;
@@ -1197,7 +1245,7 @@ struct MeshFileInitializer : GeneralMeshInitializer<BE, PR> {
 };
 
 
-struct IndexPair {
+struct alignas(8) IndexPair {
     union {
         struct { Index query, target; }; 
         struct { Index point, triangle; }; 
@@ -1210,10 +1258,9 @@ enum struct ShapeType : uint {
     Plane,
 };
 
-struct BroadCollision {
+struct alignas(16) BroadCollision {
     IndexPair indexPair;
     IndexPair objPair;
-    ShapeType type;
 };
 
 struct NarrowCollision {
@@ -1227,7 +1274,8 @@ struct Constraints {
     VectorBase<BE, PR> fixedParticles;
 
     Index maxNumCollisions = 0;
-    Index numBroadCollisions = 0;
+    //Index numBroadCollisions = 0;
+    VectorBase<BE, Index> numBroadCollisions;
     Index numNarrowCollisions = 0;
     Index approxColPerVertex = 15;
     VectorBase<BE, BroadCollision> broadCollisions;
@@ -1241,6 +1289,8 @@ struct Constraints {
         fixedParticles = VectorBase<BE, PR>(numPoints, 1);
 
         maxNumCollisions = numPoints * approxColPerVertex;
+        numBroadCollisions = VectorBase<BE, Index>(1);
+
         broadCollisions = VectorBase<BE, BroadCollision>(maxNumCollisions);
         narrowCollisions = VectorBase<BE, NarrowCollision>(maxNumCollisions);
 
@@ -1252,6 +1302,26 @@ struct Constraints {
     void releaseParticle(Index id) { fixedParticles[id] = PR(1); }
 };
 
+template <typename PR>
+struct ClothBehaviorParams {
+    PR stretch, shear, bend;
+};
+
+template <typename PR>
+struct FastGridClothBehaviorParams {
+    uint particleNum1D;
+    PR stretchRest, shearRest, bendRest;
+    PR kstretch, kshear, kbend;
+};
+
+template <typename PR>
+struct FloatBehaviorParams {};
+
+template <typename PR>
+using BehaviorParams = std::variant<
+    ClothBehaviorParams<PR>, 
+    FastGridClothBehaviorParams<PR>
+>;
 
 //! Force accumulator
 template <typename BE, typename PR>
@@ -1268,62 +1338,101 @@ struct TriangularClothBehavior<METAL, PR> {
         return pso;
     }
 
-    template <typename SimParams, typename ClothParams>
+    template <typename SimParams>
     static void setBuffer(
-            MeshState<METAL, PR>& state, 
-            MeshAdjacency<METAL, PR>& adjacency, 
-            Constraints<METAL, PR>& constraints, 
-            ExternalForces<METAL, PR>& externalForces,
-            SimParams& simParams,
-            ClothParams& clothParams,
-            MTL::ComputeCommandEncoder* encoder) {
+            GeneralMesh<METAL, PR>& mesh,
+            SimParams& simParams) {
         Index offset = 0;
         // state 0-3
-        encoder->setBuffer(state.x.pool, state.x.offset, offset++);
-        encoder->setBuffer(state.v.pool, state.v.offset, offset++);
-        encoder->setBuffer(state.f.pool, state.f.offset, offset++);
-        encoder->setBuffer(state.m.pool, state.m.offset, offset++);
+        MetalGlobalContext::setBuffer(mesh.state.x, offset++);
+        MetalGlobalContext::setBuffer(mesh.state.v, offset++);
+        MetalGlobalContext::setBuffer(mesh.state.f, offset++);
+        MetalGlobalContext::setBuffer(mesh.state.m, offset++);
         // constraints 4-6
-        encoder->setBuffer(constraints.fixedParticles.pool, constraints.fixedParticles.offset, offset++);
-        encoder->setBuffer(constraints.vertexColPrims.pool, constraints.vertexColPrims.offset, offset++);
-        encoder->setBuffer(constraints.vertexColPrimsOffsets.pool, constraints.vertexColPrimsOffsets.offset, offset++);
+        MetalGlobalContext::setBuffer(mesh.constraints.fixedParticles, offset++);
+        MetalGlobalContext::setBuffer(mesh.constraints.vertexColPrims, offset++);
+        MetalGlobalContext::setBuffer(mesh.constraints.vertexColPrimsOffsets, offset++);
         // external forces 7
-        encoder->setBuffer(externalForces.externalForces.pool, externalForces.externalForces.offset, offset++);
+        MetalGlobalContext::setBuffer(mesh.externalForces.externalForces, offset++);
         //simulation parameters 8-9
-        encoder->setBytes(&simParams, sizeof(SimParams), offset++);
-        encoder->setBytes(&clothParams, sizeof(ClothParams), offset++);
+        MetalGlobalContext::setBytes(simParams, offset++);
+        MetalGlobalContext::setBytes(std::get<ClothBehaviorParams<PR>>(mesh.behaviorParams), offset++);
         // adjacency 10-11
-        encoder->setBuffer(adjacency.edges.pool, adjacency.edges.offset, offset++);
-        encoder->setBuffer(adjacency.facets.pool, adjacency.facets.offset, offset++);
+        MetalGlobalContext::setBuffer(mesh.adjacency.edges, offset++);
+        MetalGlobalContext::setBuffer(mesh.adjacency.facets, offset++);
         // stretch springs 12-14
-        encoder->setBuffer(adjacency.vertexAdjEdges.pool, adjacency.vertexAdjEdges.offset, offset++);
-        encoder->setBuffer(adjacency.vertexAdjEdgesOffsets.pool, adjacency.vertexAdjEdgesOffsets.offset, offset++);
-        encoder->setBuffer(adjacency.restEdgeLengths.pool, adjacency.restEdgeLengths.offset, offset++);
+        MetalGlobalContext::setBuffer(mesh.adjacency.vertexAdjEdges, offset++);
+        MetalGlobalContext::setBuffer(mesh.adjacency.vertexAdjEdgesOffsets, offset++);
+        MetalGlobalContext::setBuffer(mesh.adjacency.restEdgeLengths, offset++);
         // bend springs 15-17
-        encoder->setBuffer(adjacency.vertexOppVertices.pool, adjacency.vertexOppVertices.offset, offset++);
-        encoder->setBuffer(adjacency.vertexOppVerticesOffsets.pool, adjacency.vertexOppVerticesOffsets.offset, offset++);
-        encoder->setBuffer(adjacency.restOppLengths.pool, adjacency.restOppLengths.offset, offset++);
+        MetalGlobalContext::setBuffer(mesh.adjacency.vertexOppVertices, offset++);
+        MetalGlobalContext::setBuffer(mesh.adjacency.vertexOppVerticesOffsets, offset++);
+        MetalGlobalContext::setBuffer(mesh.adjacency.restOppLengths, offset++);
     }
 
-    static void update(MeshState<METAL, PR>& state, MTL::ComputeCommandEncoder* encoder) {
+    static void update(MeshState<METAL, PR>& state) {
         auto* pso = getPSO();
         size_t vertexNum = state.x.size/3;
-        MTL::Size gridSize = MTL::Size(vertexNum, 1, 1);
-        MTL::Size threadGroupSize = MTL::Size(std::min((size_t)pso->maxTotalThreadsPerThreadgroup(), vertexNum), 1, 1);
-        encoder->setComputePipelineState(pso);
-        encoder->dispatchThreads(gridSize, threadGroupSize);
+        MetalGlobalContext::dispatchThreads(pso, vertexNum);
+    }
+};
+
+template <typename BE, typename PR>
+struct FastGridClothBehavior {};
+
+template <typename PR>
+struct FastGridClothBehavior<METAL, PR> {
+    static MTL::ComputePipelineState* getPSO() {
+        static MTL::ComputePipelineState* pso = nullptr;
+        if (!pso) {
+            pso = MetalPhysicsContext::getPSO("compute_cloth_grid_forces_fast");
+        }
+        return pso;
+    }
+
+    template <typename SimParams>
+    static void setBuffer(
+            GeneralMesh<METAL, PR>& mesh,
+            SimParams& simParams) {
+        Index offset = 0;
+        // state 0-3
+        MetalGlobalContext::setBuffer(mesh.state.x, offset++);
+        MetalGlobalContext::setBuffer(mesh.state.v, offset++);
+        MetalGlobalContext::setBuffer(mesh.state.f, offset++);
+        MetalGlobalContext::setBuffer(mesh.state.m, offset++);
+        // constraints 4-6
+        MetalGlobalContext::setBuffer(mesh.constraints.fixedParticles, offset++);
+        MetalGlobalContext::setBuffer(mesh.constraints.vertexColPrims, offset++);
+        MetalGlobalContext::setBuffer(mesh.constraints.vertexColPrimsOffsets, offset++);
+        // external forces 7
+        MetalGlobalContext::setBuffer(mesh.externalForces.externalForces, offset++);
+        //simulation parameters 8-9
+        MetalGlobalContext::setBytes(simParams, offset++);
+        MetalGlobalContext::setBytes(std::get<FastGridClothBehaviorParams<PR>>(mesh.behaviorParams), offset++);
+        //// adjacency 10-11
+        //MetalGlobalContext::setBuffer(mesh.adjacency.edges, offset++);
+        //MetalGlobalContext::setBuffer(mesh.adjacency.facets, offset++);
+        //// stretch springs 12-14
+        //MetalGlobalContext::setBuffer(mesh.adjacency.vertexAdjEdges, offset++);
+        //MetalGlobalContext::setBuffer(mesh.adjacency.vertexAdjEdgesOffsets, offset++);
+        //MetalGlobalContext::setBuffer(mesh.adjacency.restEdgeLengths, offset++);
+        //// bend springs 15-17
+        //MetalGlobalContext::setBuffer(mesh.adjacency.vertexOppVertices, offset++);
+        //MetalGlobalContext::setBuffer(mesh.adjacency.vertexOppVerticesOffsets, offset++);
+        //MetalGlobalContext::setBuffer(mesh.adjacency.restOppLengths, offset++);
+    }
+
+    static void update(MeshState<METAL, PR>& state) {
+        auto* pso = getPSO();
+        size_t vertexNum = state.x.size/3;
+        MetalGlobalContext::dispatchThreads(pso, vertexNum);
     }
 };
 
 struct Material {};
 
-template <typename PR>
-struct BehaviorParams {
-    PR slot0;
-    PR slot1;
-    PR slot2;
-    BehaviorParams(PR s0, PR s1, PR s2) : slot0(s0), slot1(s1), slot2(s2) {}
-};
+
+
 
 template <typename BE, typename PR>
 struct GeneralMesh {
@@ -1343,13 +1452,33 @@ struct GeneralMesh {
 
     GeneralMesh(GeneralMeshInitializer<BE, PR>* initializer, BehaviorType behaviorType, BehaviorParams<PR> behaviorParams) 
     : initializer(initializer), behaviorType(behaviorType), behaviorParams(behaviorParams) {}
+    GeneralMesh(GeneralMesh&& other) noexcept
+        : id(other.id),
+          state(std::move(other.state)),
+          adjacency(std::move(other.adjacency)),
+          initializer(other.initializer),
+          behaviorType(other.behaviorType),
+          behaviorParams(other.behaviorParams),
+          material(std::move(other.material)),
+          constraints(std::move(other.constraints)),
+          externalForces(std::move(other.externalForces)),
+          meshGL(std::move(other.meshGL)) 
+    {
+        other.initializer = nullptr;
+    }
     ~GeneralMesh() { delete initializer; }
 
     void initialize() {
+        std::cout << "  - [GeneralMesh initialize] id " << id << " try to initialize\n";
+        std::cout << "  - [GeneralMesh initialize] initializer " << initializer << "\n";
         initializer->initialize(state, adjacency);
+        std::cout << "  - [GeneralMesh initialize] id " << id << " initializer init\n";
         constraints.memoryAllocation(state.x.size/3);
+        std::cout << "  - [GeneralMesh initialize] id " << id << " constraints init\n";
         meshGL = MeshGL<CPU>(state.x.size/3, state.x.ptr, adjacency.facets.size/3, adjacency.facets.ptr, state.n.ptr);
+        std::cout << "  - [GeneralMesh initialize] id " << id << " meshGL init. finished.\n";
     }
+
 };
 
 //template <typename PR>
@@ -1677,51 +1806,17 @@ struct alignas(32) AABB4 {
         return true;
     }
 };
+static_assert(sizeof(AABB4) == 32);
 
-//template <typename BE, typename PR>
-//struct AABBQuery {
-//    AABB aabb;
-//    Index qid; // querying point or edge
-//    Index qobjid; // who is querying
-//    GeneralMesh<BE, PR>* qmesh;
-//};
-
-//template <typename BE, typename PR>
-//struct AABB4Query {
-//    AABB4 aabb;
-//    //Index qid; // querying point or edge
-//    //Index qobjid; // who is querying
-//    //GeneralMesh<BE, PR>* qmesh;
-//};
 
 // TODO: BroadPhase, LBVH
 template <Index PRIMITIVE, typename PR>
 struct BVH<BVHMODE::LINEAR, PRIMITIVE, PR> {
-    struct MortonNode {
+    struct alignas(8) MortonNode {
         uint code; // Morton code, 32bit, 10bit per coordinate
         uint index; // facet index
     };
-    //struct BVHNode {
-    //    AABB aabb;
-    //    int childA = -1, childB = -1;
-    //    int pid = -1;
-    //    // constructor for leaf nodes.
-    //    BVHNode(MortonNode& mortonNode, VectorBase<METAL, PR>& pos, VectorBase<METAL, Index>& prim) {
-    //        Index base = mortonNode.index*PRIMITIVE;
-    //        if constexpr (PRIMITIVE == 2) {
-    //            Index vid1 = prim[base], vid2 = prim[base+1];
-    //            aabb = AABB(pos.ptr+vid1*3, pos.ptr+vid2*3);
-    //        } else if constexpr (PRIMITIVE == 3) {
-    //            Index vid1 = prim[base], vid2 = prim[base+1], vid3 = prim[base+2];
-    //            aabb = AABB(pos.ptr+vid1*3, pos.ptr+vid2*3, pos.ptr+vid3*3);
-    //        }
-    //        else aabb = AABB();
-    //        pid = mortonNode.index;
-    //    }
-    //    // constructor for intermediate nodes. Their AABBs are combined lazily.
-    //    BVHNode(int childA, int childB) : childA(childA), childB(childB) {}
-    //};
-
+    static_assert(sizeof(MortonNode) == 8);
     struct BVHNode {
         union {
             AABB4 aabb;
@@ -1751,26 +1846,37 @@ struct BVH<BVHMODE::LINEAR, PRIMITIVE, PR> {
         // constructor for intermediate nodes. Their AABBs are combined lazily.
         BVHNode(int childA, int childB) : childA(childA), childB(childB) {}
     };
-
-    ByteMemoryPool<METAL> pool, tempPool;
+    static_assert(sizeof(BVHNode) == 32);
+    struct QueryFlag {
+        uint32_t stackOverflow;
+        uint32_t collisionOverflow;
+    };
 
     VectorBase<METAL, PR> positions; // Length 3*N, N is the number of points
     VectorBase<METAL, Index> primitives; // Length PRIMITIVE*M, M is the number of primitives.
     VectorBase<METAL, MortonNode> mortons; // Length M, turn the each centers of the primitives into MortonNodes
     VectorBase<METAL, MortonNode> mortonsTemp; // Length M, turn the each centers of the primitives into MortonNodes
     VectorBase<METAL, BVHNode> tree; // Length 2*M-1, M leaf nodes, M-1 intermediate nodes.
+    VectorBase<METAL, int> treeParent; // Length 2*M-1, M leaf nodes, M-1 intermediate nodes.
     //VectorBase<METAL, BroadCollision> collisions;
     //Index numCollisions = 0, maxNumCollisions;
 
     DebugLineGL<CPU> debugBox;
     VectorBase<METAL, PR> debugBoxLines;
     int objid; // who made this tree
+    VectorBase<METAL, QueryFlag> qFlag;
 
     MTL::ComputePipelineState* fillMortonPSO;
+    MTL::ComputePipelineState* buildTriTreePSO;
+    MTL::ComputePipelineState* bottomUpBoxesPSO;
+    MTL::ComputePipelineState* queryPointsPSO;
 
     BVH() {
         // recieve all points, facets and edges;
         fillMortonPSO = MetalBVHContext::getPSO("fillMortons");
+        buildTriTreePSO = MetalBVHContext::getPSO("buildTriTree");
+        bottomUpBoxesPSO = MetalBVHContext::getPSO("bottomUpBoxes");
+        queryPointsPSO = MetalBVHContext::getPSO("queryPoints");
     }
 
     void memoryAllocation() {
@@ -1778,6 +1884,8 @@ struct BVH<BVHMODE::LINEAR, PRIMITIVE, PR> {
         mortons = VectorBase<METAL, MortonNode>(numPrimitives);
         mortonsTemp = VectorBase<METAL, MortonNode>(numPrimitives);
         tree = VectorBase<METAL, BVHNode>(2*numPrimitives-1);
+        treeParent = VectorBase<METAL, int>(2*numPrimitives-1);
+        qFlag = VectorBase<METAL, QueryFlag>(1);
     }
 
     void build(int oid, VectorBase<METAL, PR>& pos, VectorBase<METAL, Index>& prim) {
@@ -1802,19 +1910,12 @@ struct BVH<BVHMODE::LINEAR, PRIMITIVE, PR> {
         // input: each elements' center. elements can be either triangles or edges
         // output: each elements' morton code
         //std::cout << "  - [Stage 2] Transform each center into morton code" << std::endl;
-        auto* encoder = MetalGlobalContext::getComputeCommandEncoderer();
-        encoder->setBuffer(positions.pool, positions.offset, 0);
-        encoder->setBuffer(primitives.pool, primitives.offset, 1);
-        encoder->setBytes(&sceneBox, sizeof(AABB4), 2);
-        encoder->setBuffer(mortons.pool, mortons.offset, 3);
+        MetalGlobalContext::setBuffer(positions, 0);
+        MetalGlobalContext::setBuffer(primitives, 1);
+        MetalGlobalContext::setBytes(sceneBox, 2);
+        MetalGlobalContext::setBuffer(mortons, 3);
 
-        {
-            MTL::Size gridSize = MTL::Size(numPrimitives, 1, 1);
-            MTL::Size threadGroupSize = MTL::Size(std::min((Index)fillMortonPSO->maxTotalThreadsPerThreadgroup(), numPrimitives), 1, 1);
-            encoder->setComputePipelineState(fillMortonPSO);
-            encoder->dispatchThreads(gridSize, threadGroupSize);
-        }
-
+        MetalGlobalContext::dispatchThreads(fillMortonPSO, numPrimitives);
         MetalGlobalContext::commitAndWait();
         
         
@@ -1863,130 +1964,50 @@ struct BVH<BVHMODE::LINEAR, PRIMITIVE, PR> {
         };
         radixSortByMortonCode(mortons.ptr, mortonsTemp.ptr, numPrimitives);
 
+        //encoder->setThreadgroupMemoryLength(?, NS::UInteger index)
+        
+
         // [stage 4] build tree
         // input: sorted array of elements' morton code
         // output: linear bvh tree
         //std::cout << "  - [Stage 4] Build tree" << std::endl;
-        auto clzSafe = [](unsigned int x) {
-            return x ? __builtin_clz(x) : 32;
-        };
-        auto findSplit = [&]( MortonNode* mortons,
-                       int           first,
-                       int           last) {
-            // Identical Morton codes => split the range in the middle.
+        MetalGlobalContext::setBuffer(positions, 0);
+        MetalGlobalContext::setBuffer(primitives, 1);
+        MetalGlobalContext::setBytes(sceneBox, 2);
+        MetalGlobalContext::setBuffer(mortons, 3);
+        MetalGlobalContext::setBuffer(tree, 4);
+        MetalGlobalContext::setBuffer(treeParent, 5);
 
-            unsigned int firstCode = mortons[first].code;
-            unsigned int lastCode = mortons[last].code;
-
-            if (firstCode == lastCode)
-                return (first + last) >> 1;
-
-            // Calculate the number of highest bits that are the same
-            // for all objects, using the count-leading-zeros intrinsic.
-
-            int commonPrefix = clzSafe(firstCode ^ lastCode);
-
-            // Use binary search to find where the next bit differs.
-            // Specifically, we are looking for the highest object that
-            // shares more than commonPrefix bits with the first one.
-
-            int split = first; // initial guess
-            int step = last - first;
-
-            do
-            {
-                step = (step + 1) >> 1; // exponential decrease
-                int newSplit = split + step; // proposed new position
-
-                if (newSplit < last)
-                {
-                    unsigned int splitCode = mortons[newSplit].code;
-                    int splitPrefix = clzSafe(firstCode ^ splitCode);
-                    if (splitPrefix > commonPrefix)
-                        split = newSplit; // accept proposal
-                }
-            }
-            while (step > 1);
-
-            return split;
-        };
-
-        auto determineRange = [&](MortonNode* mortons, Index numberOfPrimitives, Index index) {
-            auto delta = [&](int i, int j) {
-                if (j < 0 || j >= (int)numberOfPrimitives) return -1;
-
-                unsigned int codeA = mortons[i].code;
-                unsigned int codeB = mortons[j].code;
-
-                if (codeA != codeB)
-                    return clzSafe(codeA ^ codeB);
-
-                return 32 + clzSafe(mortons[i].index ^ mortons[j].index);
-            };
-
-            int d = (delta(index, index + 1) - delta(index, index - 1) >= 0) ? 1 : -1;
-            int deltaMin = delta(index, index - d);
-
-            int lmax = 2;
-            while (delta(index, index + lmax * d) > deltaMin) {
-                lmax <<= 1;
-            }
-
-            int l = 0;
-            for (int t = lmax >> 1; t >= 1; t >>= 1) {
-                if (delta(index, index + (l + t) * d) > deltaMin) {
-                    l += t;
-                }
-            }
-
-            int j = index + l * d;
-
-            if (d < 0) return tinym::vec3((float)j, (float)index, 0.0f);
-            else       return tinym::vec3((float)index, (float)j, 0.0f);
-        };
-
-        // construct leaf
-        //std::cout << "  - Leaf constructing" << std::endl;
-        for(Index i = 0; i < numPrimitives; ++i) {
-            tree[numPrimitives+i-1] = BVHNode(mortons[i], positions, primitives);
-        }
-
-        // construct intermediate
-        //std::cout << "  - intermediate constructing" << std::endl;
-        for(Index i = 0; i < numPrimitives-1; ++i) {
-            tinym::vec3 range = determineRange(mortons.ptr, numPrimitives, i); // = ?
-            Index first = range.x;
-            Index last = range.y;
-
-            Index split = findSplit(mortons.ptr, first, last);
-
-            int childA, childB;
-            if(split == first) childA = split + numPrimitives-1; // leaf node index
-            else childA = split; // intermediate node
-            if(split+1 == last) childB = split+1 + numPrimitives-1; // leaf node index
-            else childB = split+1; // intermediate node
-
-            tree[i] = BVHNode(childA, childB);
-        }
+        MetalGlobalContext::dispatchThreads(buildTriTreePSO, numPrimitives);
+        MetalGlobalContext::commitAndWait();
 
         // set intermediate node's aabb
+        //std::cout << "  - AABB combining for intermediate" << std::endl;
         auto combineAABB = [&](auto&& self, BVHNode& node) -> void {
-            if(node.childA == -1) return;
+            if(node.childA < 0) return;
             self(self, tree[node.childA]);
             self(self, tree[node.childB]);
             node.aabb.min = tree[node.childA].aabb.min;
             node.aabb.max = tree[node.childA].aabb.max;
             node.aabb.combine(tree[node.childB].aabb);
         };
-        //std::cout << "  - AABB combining for intermediate" << std::endl;
         combineAABB(combineAABB, tree[0]);
 
-        //Index l = 0;
-        //std::cout << "Tree test: " << std::endl;
-        //for(Index i = 0; i < 5; i++) {
-        //    std::cout << tree[l].aabb.min << ", " << tree[l].aabb.max << std::endl;;
-        //    l = tree[l].childA;
-        //}
+        //DynamicMemoryAllocator<METAL> tempPool;
+        //VectorBase<METAL, uint> treeVisitCounts(tempPool.template zeros<uint>(numPrimitives - 1));
+        //MetalGlobalContext::setBuffer(treeVisitCounts, 6);
+
+        //MetalGlobalContext::dispatchThreads(bottomUpBoxesPSO, numPrimitives);
+        //MetalGlobalContext::commitAndWait();
+
+        int l = 0;
+        std::cout << "Tree test: " << std::endl;
+        for(Index i = 0; i < 5; i++) {
+            std::cout << "node " << l << ": " <<  tree[l].aabb.min << ", " << tree[l].aabb.max << " and ";
+            l = tree[l].childA;
+            std::cout << " next is " << l << std::endl;
+            if(l < 0) break;
+        }
     }
 
     void buildCPU(int oid, VectorBase<METAL, PR>& pos, VectorBase<METAL, Index>& prim) {
@@ -2191,7 +2212,7 @@ struct BVH<BVHMODE::LINEAR, PRIMITIVE, PR> {
 
         // set intermediate node's aabb
         auto combineAABB = [&](auto&& self, BVHNode& node) -> void {
-            if(node.childA == -1) return;
+            if(node.childA < 0) return;
             self(self, tree[node.childA]);
             self(self, tree[node.childB]);
             node.aabb.min = tree[node.childA].aabb.min;
@@ -2201,12 +2222,15 @@ struct BVH<BVHMODE::LINEAR, PRIMITIVE, PR> {
         //std::cout << "  - AABB combining for intermediate" << std::endl;
         combineAABB(combineAABB, tree[0]);
 
-        //Index l = 0;
-        //std::cout << "Tree test: " << std::endl;
-        //for(Index i = 0; i < 5; i++) {
-        //    std::cout << tree[l].aabb.min << ", " << tree[l].aabb.max << std::endl;;
-        //    l = tree[l].childA;
-        //}
+
+        int l = 0;
+        std::cout << "Tree test: " << std::endl;
+        for(Index i = 0; i < 5; i++) {
+            std::cout << "node " << l << ": " <<  tree[l].aabb.min << ", " << tree[l].aabb.max << " and ";
+            l = tree[l].childA;
+            std::cout << " next is " << l << std::endl;
+            if(l < 0) break;
+        }
     }
     
     void queryAABB(const AABB4& queryBox, const BVHNode& node) {
@@ -2214,12 +2238,20 @@ struct BVH<BVHMODE::LINEAR, PRIMITIVE, PR> {
 
         auto* qmesh = SceneObject<METAL, PR>::findById(queryBox.i1);
         auto& c = qmesh->constraints;
-        if(c.numBroadCollisions >= c.maxNumCollisions) return;
+        if(c.numBroadCollisions[0] >= c.maxNumCollisions) return;
         
         if(node.childA == -1) { // leaf
-            c.broadCollisions[c.numBroadCollisions].indexPair = {(Index)queryBox.i0, (Index)node.childB}; // conversion is safe since it is leaf
-            c.broadCollisions[c.numBroadCollisions].objPair = {(Index)queryBox.i1, (Index)objid};
-            c.numBroadCollisions++;
+        Index fid = (Index)node.childB;
+        Index fbase = fid * 3;
+        Index f0 = primitives[fbase];
+        Index f1 = primitives[fbase + 1];
+        Index f2 = primitives[fbase + 2];
+        Index pid = (Index)queryBox.i0;
+
+        if (pid == f0 || pid == f1 || pid == f2) return;
+            c.broadCollisions[c.numBroadCollisions[0]].indexPair = {(Index)queryBox.i0, (Index)node.childB}; // conversion is safe since it is leaf
+            c.broadCollisions[c.numBroadCollisions[0]].objPair = {(Index)queryBox.i1, (Index)objid};
+            c.numBroadCollisions[0]++;
             return;
         }
 
@@ -2234,9 +2266,9 @@ struct BVH<BVHMODE::LINEAR, PRIMITIVE, PR> {
     }
 
     template <typename ObjType>
-    void queryPoint(int pid, ObjType* qobj, PR queryMargin) {
+    void queryPointCPU(int pid, ObjType* qobj, PR queryMargin) {
         Constraints<METAL, PR>& c = qobj->constraints;
-        if(c.numBroadCollisions >= c.maxNumCollisions) {
+        if(c.numBroadCollisions[0] >= c.maxNumCollisions) {
             //std::cout << "Too many collisions are occurs. Some collisions will be ignored.\n";
             return;
         }
@@ -2262,17 +2294,59 @@ struct BVH<BVHMODE::LINEAR, PRIMITIVE, PR> {
         return;
     }
 
-    void checkSelfCollisions(PR queryMargin) {
+    void checkSelfCollisionsCPU(PR queryMargin) {
         Index numPoints = positions.size/3;
         auto* qmesh = SceneObject<METAL, PR>::findById(objid); // self query.
-        qmesh->constraints.numBroadCollisions = 0; // clear the previous collisions.
+        qmesh->constraints.numBroadCollisions[0] = 0; // clear the previous collisions.
 
         for(Index vid = 0; vid < numPoints; ++vid) {
             //Index vbase = vid*3;
 
-            queryPoint(vid, qmesh, queryMargin);
+            queryPointCPU(vid, qmesh, queryMargin);
         }
     }
+
+    struct QueryPointsParams {
+        float queryMargin;
+        uint32_t numPoints;
+        uint32_t qObjId;
+        uint32_t tObjId;
+        uint32_t maxNumCollisions;
+    };
+    void queryPoints(Index qObjId, PR queryMargin) {
+        auto* qmesh = SceneObject<METAL, PR>::findById(qObjId);
+        auto& pos = qmesh->state.x;
+        Index numPoints = pos.size/3;
+        auto& constraints = qmesh->constraints;
+        QueryPointsParams qParams = {queryMargin, numPoints, qObjId, (Index)objid, constraints.maxNumCollisions};
+        auto& broadCols = constraints.broadCollisions;
+        auto& numBroadCols = constraints.numBroadCollisions;
+
+        MetalGlobalContext::setBuffer(pos, 0);
+        MetalGlobalContext::setBuffer(primitives, 1);
+        MetalGlobalContext::setBuffer(tree, 2);
+        MetalGlobalContext::setBytes(qParams, 3);
+        MetalGlobalContext::setBuffer(broadCols, 4);
+        MetalGlobalContext::setBuffer(numBroadCols, 5);
+        MetalGlobalContext::setBuffer(qFlag, 6);
+
+        std::cout << "Dispatched\n";
+        MetalGlobalContext::dispatchThreads(queryPointsPSO, numPoints);
+        MetalGlobalContext::commitAndWait();
+        std::cout << "found\n";
+        if(qFlag[0].stackOverflow) std::cout << "[QueryPoints] query stack overflowed\n";
+        if(qFlag[0].collisionOverflow) std::cout << "[QueryPoints] collision buffer overflowed\n";
+    }
+    void checkSelfCollisions(PR queryMargin) {
+        auto* qmesh = SceneObject<METAL, PR>::findById(objid); // self query.
+        qmesh->constraints.numBroadCollisions[0] = 0; // clear the previous collisions.
+        qFlag[0].stackOverflow = 0;
+        qFlag[0].collisionOverflow = 0;
+
+        queryPoints(objid, queryMargin);
+    }
+
+
 
     void showBox() {
         Index numLines = tree.size*12;
@@ -2349,6 +2423,7 @@ struct BruteForce<METAL, PR> {
             PR radius) {
         if(!constraints.narrowCollisions.ptr) constraints.narrowCollisions = VectorBase<METAL, NarrowCollision>(ptCollisions.size);
         else constraints.numNarrowCollisions = 0;
+        numCollisions = std::min(constraints.numBroadCollisions[0], constraints.maxNumCollisions);
         for(Index cid = 0; cid < numCollisions; ++cid) {
             // check if the pairs are really close than the radius.
             auto& point = ptCollisions[cid].indexPair.point;
@@ -2452,6 +2527,7 @@ struct BruteForce<METAL, PR> {
 template <typename BroadPhase, typename NarrowPhase>
 struct CollisionPipeline {
     BroadPhase broadPhase;
+    BroadPhase broadPhaseTest;
     NarrowPhase narrowPhase;
 };
 
@@ -2477,7 +2553,7 @@ struct Simulator {
         sceneObjects.addGeneralMesh(
                 new MeshFileInitializer<BE, PR>({prefix, fileName, scale, mass}),
                 BehaviorType::TriangularCloth,
-                BehaviorParams<PR>(kstretch, kshear, kbend)
+                ClothBehaviorParams<PR>{kstretch, kshear, kbend}
                 );
     };
 
@@ -2491,25 +2567,65 @@ struct Simulator {
         );
     }
 
-    void addClothGridFast(size_t particleNum1D = 200, PR size1D = 100, PR kstretch=1e5, PR kshear=1e5, PR kbend=3e5) {
+    void addClothGridFast(Index particleNum1D = 200, PR size1D = 100, PR kstretch=1e5, PR kshear=1e5, PR kbend=3e5, PR mass=0.1) {
         //particleNum1D(particleNum1D), particleNum2D(particleNum1D*particleNum1D), particleDataNum(particleNum2D*3),{
         //size1D(size1D), stretchRestLength(size1D/PR(particleNum1D-1)), shearRestLength(stretchRestLength*std::sqrt(2)), bendRestLength(stretchRestLength*2) 
-        sceneObjects.squareClothes.emplace_back(
-                new DeformableMeshGridInitializer<PR>(particleNum1D, size1D, kstretch, kshear, kbend),
-                particleNum1D, // particleNum1D
-                size1D, // size1D
-                (particleNum1D-1)*(particleNum1D-1)*2, // facetNum
-                kstretch, kshear, kbend
+        //sceneObjects.squareClothes.emplace_back(
+        //        new DeformableMeshGridInitializer<PR>(particleNum1D, size1D, kstretch, kshear, kbend),
+        //        particleNum1D, // particleNum1D
+        //        size1D, // size1D
+        //        (particleNum1D-1)*(particleNum1D-1)*2, // facetNum
+        //        kstretch, kshear, kbend
+        //);
+        sceneObjects.addGeneralMesh(
+            new MeshGridInitializer<BE, PR>({
+                PlaneDirection::XYPlane,
+                tinym::vec3(0),
+                particleNum1D,
+                size1D,
+                mass,
+                true
+            }),
+            BehaviorType::FastGridCloth, 
+            FastGridClothBehaviorParams<PR>{
+                particleNum1D, 
+                size1D/particleNum1D,
+                size1D/particleNum1D*std::sqrtf(2),
+                size1D/particleNum1D*2,
+                kstretch, 
+                kshear, 
+                kbend
+            }
         );
     }
 
     void addGeneralMesh(Index particleNum1D = 200, PR size1D = 100, PR kstretch=1e5, PR kshear=1e5, PR kbend=3e5, PR mass=0.1) {
         sceneObjects.addGeneralMesh(
-            new MeshGridSpringInitializer<BE, PR>({particleNum1D, size1D, mass}),
+            new MeshGridInitializer<BE, PR>({
+                PlaneDirection::XYPlane, 
+                tinym::vec3(0),
+                particleNum1D, 
+                size1D, 
+                mass, 
+                true // jiggle
+            }),
             BehaviorType::TriangularCloth,
-            BehaviorParams<PR>(kstretch, kshear, kbend)
+            ClothBehaviorParams<PR>{kstretch, kshear, kbend}
         );
-
+    };
+    void addGround(PlaneDirection dir, tinym::vec3 center, PR size1D, PR mass=0.1) {
+        sceneObjects.addGeneralMesh(
+            new MeshGridInitializer<BE, PR>({
+                dir, 
+                center, 
+                2, 
+                size1D, 
+                mass, 
+                false // jiggle
+            }),
+            BehaviorType::Float,
+            FloatBehaviorParams<PR>{}
+        );
     };
 
     void memoryAllocation() {
@@ -2529,7 +2645,11 @@ struct Simulator {
         //for(auto& deformableMesh : sceneObjects.deformableMeshes) deformableMesh.initialize();
         //if(sceneObjects.deformableMeshes.size() > 0) std::cout << "[Simulator Init] deformableMesh objects are initialized" << std::endl;
         for(auto& plane : sceneObjects.planes) {}
-        for(auto& mesh : sceneObjects.meshes) mesh.initialize();
+        for(auto& mesh : sceneObjects.meshes) {
+            std::cout << "  - try to initialize mesh " << mesh.id << "\n";
+            mesh.initialize();
+            std::cout << "  - mesh " << mesh.id << " is initialized\n";
+        }
         if(sceneObjects.meshes.size() > 0) std::cout << "[Simulator Init] general mesh objects are initialized" << std::endl;
 
         std::cout << "[Simulator Init] All scene objects are initialized" << std::endl;
@@ -2543,11 +2663,10 @@ struct Simulator {
             auto* mesh = SceneObject<BE, PR>::findById(0);
 
             collisionPipeline.broadPhase.build(mesh->id, mesh->state.x, mesh->adjacency.facets);
-            //collisionPipeline.broadPhase.buildCPU(mesh->id, mesh->state.x, mesh->adjacency.facets);
             collisionPipeline.broadPhase.checkSelfCollisions(0.005);
 
             auto& c = mesh->constraints;
-            std::cout << "Self collision detected: (" << c.numBroadCollisions << "/" << c.maxNumCollisions << ")\n";
+            std::cout << "Self collision detected: (" << c.numBroadCollisions[0] << "/" << c.maxNumCollisions << ")\n";
             for(Index i = 0; i < 5; ++i) {
                 std::cout << "  - Collision " << i << ": point " 
                     << c.broadCollisions[i].indexPair.point
@@ -2557,7 +2676,7 @@ struct Simulator {
 
             collisionPipeline.narrowPhase.narrowAndSortByVertices(
                     c.broadCollisions,
-                    c.numBroadCollisions,
+                    c.numBroadCollisions[0],
                     mesh->adjacency,
                     c,
                     0.002);
@@ -2777,7 +2896,6 @@ struct ExplicitSystem<METAL, PR> {
     using Vectorui = VectorBase<METAL, unsigned int>;
 
     // Metal vars
-    MTL::CommandQueue* commandQueue;
     MTL::ComputePipelineState* forcePSO;
     MTL::ComputePipelineState* springForcePSO;
     MTL::ComputePipelineState* integratePSO;
@@ -2800,9 +2918,6 @@ struct ExplicitSystem<METAL, PR> {
         std::cout << "  - Connecting device..." << std::endl;
         //device = MTL::CreateSystemDefaultDevice();
         //pool = ByteMemoryPool<METAL>(device, 50*1024*1024*sizeof(PR));
-
-        std::cout << "  - Creating a new command queue..." << std::endl;
-        commandQueue = MetalGlobalContext::getCommandQueue();
 
         std::cout << "  - Creating a new command pipeline state object (PSO)..." << std::endl;
         // find own metal kernel library
@@ -2831,8 +2946,6 @@ struct ExplicitSystem<METAL, PR> {
 
     // 2. update() 함수 수정
     void update(SceneObject<METAL, PR>& sceneObjects) {
-        MTL::CommandBuffer* commandBuffer = commandQueue->commandBuffer();
-        MTL::ComputeCommandEncoder* computeEncoder = commandBuffer->computeCommandEncoder();
 
         //for(auto& deformableMesh : sceneObjects.deformableMeshes) {
         //    // 변수들을 패킹합니다.
@@ -2883,49 +2996,34 @@ struct ExplicitSystem<METAL, PR> {
             };
 
             // [버퍼는 루프 밖에서 딱 한 번만 바인딩합니다!]
-            computeEncoder->setBuffer(squareCloth.x.pool, squareCloth.x.offset, 0);
-            computeEncoder->setBuffer(squareCloth.v.pool, squareCloth.v.offset, 1);
-            computeEncoder->setBuffer(squareCloth.f.pool, squareCloth.f.offset, 2);
-            computeEncoder->setBuffer(squareCloth.m.pool, squareCloth.m.offset, 3);
-            computeEncoder->setBuffer(squareCloth.fixedParticle.pool, squareCloth.fixedParticle.offset, 4);
+            MetalGlobalContext::setBuffer(squareCloth.x, 0);
+            MetalGlobalContext::setBuffer(squareCloth.v, 1);
+            MetalGlobalContext::setBuffer(squareCloth.f, 2);
+            MetalGlobalContext::setBuffer(squareCloth.m, 3);
+            MetalGlobalContext::setBuffer(squareCloth.fixedParticle, 4);
             
             // 4KB 이하의 작은 데이터는 버퍼를 안 만들고 setBytes로 즉시 꽂을 수 있습니다.
-            computeEncoder->setBytes(&params, sizeof(SimParams), 6);
-            computeEncoder->setBytes(&clothParams, sizeof(ClothGridParams), 7);
+            MetalGlobalContext::setBytes(params, 8);
+            MetalGlobalContext::setBytes(clothParams, 9);
 
             for(size_t i = 0; i < subSteps; i++) {
-                { // force overwrite with gravity + air drag + spring
-                    MTL::Size gridSize = MTL::Size(squareCloth.vertexNum, 1, 1);
-                    MTL::Size threadGroupSize = MTL::Size(std::min((size_t)clothGridFastForcePSO->maxTotalThreadsPerThreadgroup(), (size_t)squareCloth.vertexNum), 1, 1);
-                    computeEncoder->setComputePipelineState(clothGridFastForcePSO);
-                    computeEncoder->dispatchThreads(gridSize, threadGroupSize);
-                }
-                { // integration
-                    MTL::Size gridSize = MTL::Size(squareCloth.vertexNum, 1, 1);
-                    MTL::Size threadGroupSize = MTL::Size(std::min((size_t)integratePSO->maxTotalThreadsPerThreadgroup(), (size_t)squareCloth.vertexNum), 1, 1);
-                    computeEncoder->setComputePipelineState(integratePSO);
-                    computeEncoder->dispatchThreads(gridSize, threadGroupSize);
-                }
+                MetalGlobalContext::dispatchThreads(clothGridFastForcePSO, squareCloth.vertexNum);
+                MetalGlobalContext::dispatchThreads(integratePSO, squareCloth.vertexNum);
             }
         } // squareClothes
         for(auto& mesh : sceneObjects.meshes) {
 
             SimParams params = { subh, G, kair, kd, (uint)mesh.state.x.size/3, acctime };
 
-            BehaviorParams<PR> clothParams = mesh.behaviorParams;
+            //BehaviorParams<PR> clothParams = mesh.behaviorParams;
 
             switch(mesh.behaviorType) {
                 case BehaviorType::TriangularCloth:
-                    TriangularClothBehavior<METAL, PR>::setBuffer(
-                        mesh.state,
-                        mesh.adjacency,
-                        mesh.constraints,
-                        mesh.externalForces,
-                        params,
-                        clothParams,
-                        computeEncoder);
+                    TriangularClothBehavior<METAL, PR>::setBuffer(mesh, params);
                     break;
                 case BehaviorType::FastGridCloth:
+                    FastGridClothBehavior<METAL, PR>::setBuffer(mesh, params);
+                    break;
                 case BehaviorType::Elastic:
                 case BehaviorType::Rigid:
                 case BehaviorType::Fluid:
@@ -2933,19 +3031,24 @@ struct ExplicitSystem<METAL, PR> {
                 default: break;
             }
             for(size_t i = 0; i < subSteps; i++) {
-                TriangularClothBehavior<METAL, PR>::update(mesh.state, computeEncoder);
+            switch(mesh.behaviorType) {
+                case BehaviorType::TriangularCloth:
+                TriangularClothBehavior<METAL, PR>::update(mesh.state);
+                    break;
+                case BehaviorType::FastGridCloth:
+                    FastGridClothBehavior<METAL, PR>::update(mesh.state);
+                    break;
+                case BehaviorType::Elastic:
+                case BehaviorType::Rigid:
+                case BehaviorType::Fluid:
+                case BehaviorType::Generator:
+                default: break;
+            }
 
-                { // integration
-                    MTL::Size gridSize = MTL::Size(mesh.state.x.size/3, 1, 1);
-                    MTL::Size threadGroupSize = MTL::Size(std::min((size_t)integratePSO->maxTotalThreadsPerThreadgroup(), (size_t)mesh.state.x.size/3), 1, 1);
-                    computeEncoder->setComputePipelineState(integratePSO);
-                    computeEncoder->dispatchThreads(gridSize, threadGroupSize);
-                }
+                MetalGlobalContext::dispatchThreads(integratePSO, mesh.state.x.size/3);
             }
         }
-        computeEncoder->endEncoding();
-        commandBuffer->commit();
-        commandBuffer->waitUntilCompleted();
+        MetalGlobalContext::commitAndWait();
         
         acctime += h;
         for(auto& squareCloth : sceneObjects.squareClothes) 
@@ -2994,7 +3097,7 @@ int main() {
 
     //ByteMemoryPool<METAL> pool(50*1024*1024*sizeof(Precision));
     Precision h = 1/Precision(60);
-    Index subSteps = 40;
+    Index subSteps = 60;
     ExplicitSystem<Backend, Precision> system(h, subSteps);
     Simulator<Backend, Precision, ExplicitSystem<Backend, Precision>> simulator(system);
     std::cout << "[Main] simulator created" << std::endl;
@@ -3006,15 +3109,17 @@ int main() {
     //Precision kbend = 4e3;
     Index particleNum1D = 200;
     Precision size1D = 100;
-    Precision kstretch = 1e5;
+    Precision kstretch = 2e5;
     Precision kshear = 1e5;
-    Precision kbend = 2e5;
+    Precision kbend = 4e5;
     Precision mass = 0.1;
     //simulator.addClothGrid(particleNum1D, size1D, kstretch, kshear, kbend, mass);
-    //simulator.addClothGridFast(particleNum1D, size1D, kstretch, kshear, kbend, mass);
+    simulator.addClothGridFast(particleNum1D, size1D, kstretch, kshear, kbend, mass);
     //simulator.addGeneralMesh(particleNum1D, size1D, kstretch/2, kshear, kbend/2, mass);
     //simulator.addClothFile("src/assets", "teapot.obj", 15, 1e4, 0, 2e4, mass);
-    simulator.addClothFile("src/assets", "horse-gallop-01.obj", 80, 1e4, 0, 2e4, mass);
+    //simulator.addClothFile("src/assets", "horse-gallop-01.obj", 80, 1e4, 0, 2e4, mass);
+    //simulator.addGround(PlaneDirection::XZPlane, tinym::vec3(0, -100, 0), 500);
+    
     std::cout << "[Main] mesh added to scene" << std::endl;
 
     simulator.initialize();
@@ -3050,17 +3155,28 @@ int main() {
     Program debugLineShader;
     debugLineShader.loadShader("line.vert", "line.frag");
 
+    bool debugBoxes = true;
+
     std::cout << "[Main] programs are loaded" << std::endl;
 
 
-    camera.setPosition(tinym::vec3(0, 0, 200));
+    camera.setPosition(tinym::vec3(0, 0, 500));
 
     camera.glfwSetCallbacks(window->getGLFWWindow());
 
+    struct CallbacksDataPack {
+        Simulator<Backend, Precision, ExplicitSystem<Backend, Precision>>* simulator;
+        bool* debugBoxes;
+    };
+    CallbacksDataPack pack = {&simulator, &debugBoxes};
+
     //glfwSetWindowUserPointer(window->getGLFWWindow(), &system);
-    glfwSetWindowUserPointer(window->getGLFWWindow(), &(simulator));
+    glfwSetWindowUserPointer(window->getGLFWWindow(), &(pack));
     auto keyCallback = [](GLFWwindow* window, int key, int scancode, int action, int mods) {
-        auto* simulator = static_cast<Simulator<Backend, Precision, ExplicitSystem<Backend, Precision>>*>(glfwGetWindowUserPointer(window));
+
+        auto* pack = static_cast<CallbacksDataPack*>(glfwGetWindowUserPointer(window));
+        auto* simulator = pack->simulator;
+        auto* debugBoxes = pack->debugBoxes;
 
         if(key == GLFW_KEY_0 && action == GLFW_PRESS) {
             //sys->initCloth();
@@ -3071,16 +3187,22 @@ int main() {
             //sys->fixedParticle.map()[0] = !((bool)sys->fixedParticle.map()[0]);
             if(simulator->sceneObjects.squareClothes.size() > 0) 
                 simulator->sceneObjects.squareClothes[0].fixedParticle.map()[0] = !((bool)simulator->sceneObjects.squareClothes[0].fixedParticle.map()[0]);
+            if(simulator->sceneObjects.meshes.size() > 0)
+                simulator->sceneObjects.meshes[0].constraints.fixedParticles[0] = !((bool)simulator->sceneObjects.meshes[0].constraints.fixedParticles[0]);
             //if(simulator->sceneObjects.deformableMeshes.size() > 0) 
             //    simulator->sceneObjects.deformableMeshes[0].fixedParticle.map()[0] = !((bool)simulator->sceneObjects.deformableMeshes[0].fixedParticle.map()[0]);
         } else if(key == GLFW_KEY_2 && action == GLFW_PRESS) {
             //sys->fixedParticle.map()[sys->particleNum1D-1] = !((bool)sys->fixedParticle.map()[sys->particleNum1D-1]);
             if(simulator->sceneObjects.squareClothes.size() > 0) 
                 simulator->sceneObjects.squareClothes[0].fixedParticle.map()[200-1] = !((bool)simulator->sceneObjects.squareClothes[0].fixedParticle.map()[200-1]);
+            if(simulator->sceneObjects.meshes.size() > 0)
+                simulator->sceneObjects.meshes[0].constraints.fixedParticles[200-1] = !((bool)simulator->sceneObjects.meshes[0].constraints.fixedParticles[200-1]);
             //if(simulator->sceneObjects.deformableMeshes.size() > 0) 
             //    simulator->sceneObjects.deformableMeshes[0].fixedParticle.map()[200-1] = !((bool)simulator->sceneObjects.deformableMeshes[0].fixedParticle.map()[200-1]);
         } else if(key == GLFW_KEY_SPACE && action == GLFW_PRESS) {
             simulator->pause = !(simulator->pause);
+        } else if(key == GLFW_KEY_D && action == GLFW_PRESS) {
+            *debugBoxes = !(*debugBoxes);
         }
 
     };
@@ -3126,11 +3248,13 @@ int main() {
         //system.draw();
         simulator.draw();
 
-        debugLineShader.use();
-        debugLineShader.setUniform("V", V);
-        debugLineShader.setUniform("P", P);
-        glLineWidth(2.5f);
-        simulator.debugLines();
+        if(debugBoxes) {
+            debugLineShader.use();
+            debugLineShader.setUniform("V", V);
+            debugLineShader.setUniform("P", P);
+            glLineWidth(2.5f);
+            simulator.debugLines();
+        }
 
         auto renderingEnd = std::chrono::high_resolution_clock::now();
         double renderingTime = std::chrono::duration<double, std::milli>(renderingEnd - renderingStart).count();
