@@ -122,6 +122,13 @@ kernel void integrate(
         if (vn < 0.0f) {
             vel -= vn * n;
         }
+
+        float distance = vertColPrims[i].collisionNormalAndDistance.w;
+        float thickness = 0.5f;
+
+        if (distance < thickness) {
+            pos += (thickness - distance) * n;
+        }
     }
 
 
@@ -194,7 +201,7 @@ kernel void compute_cloth_grid_forces_fast(
     if (row > 1)    force += calc_spring(pos, vel, x[get_idx(row-2, col)], v[get_idx(row-2, col)], clothParams.bendRest, clothParams.kbend, params.kd);
     if (row < N-2)  force += calc_spring(pos, vel, x[get_idx(row+2, col)], v[get_idx(row+2, col)], clothParams.bendRest, clothParams.kbend, params.kd);
 
-    force += float3(1, 0, 1) * min(row * abs(col-col/2) * abs(cos(params.acctime/2.f)), 50.f);
+    //force += float3(1, 0, 1) * min(row * abs(col-col/2) * abs(cos(params.acctime/2.f)), 50.f);
 
     // 내 메모리에만 기록!
     f[id] = force;

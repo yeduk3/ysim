@@ -38,6 +38,7 @@ struct vec3_base {
     //operator const vec3_view_base<T>() const { return vec3_view_base<T>(const_cast<T*>(v)); }
 
     vec3_base operator-(const vec3_base& v) const { return vec3_base(x - v.x, y - v.y, z - v.z); }
+    vec3_base operator-() const { return vec3_base(-x, -y, -z); }
     vec3_base operator+(const vec3_base& v) const { return vec3_base(x + v.x, y + v.y, z + v.z); }
     vec3_base operator/(const vec3_base& v) const { return vec3_base(x/v.x, y/v.y, z/v.z); }
     vec3_base operator/(const float& v) const { return vec3_base(x/v, y/v, z/v); }
@@ -77,6 +78,12 @@ using vec3_view = vec3_view_base<float>;
 
 inline vec3 operator-(const vec3_view& a, const vec3_view& b) {
     return vec3(a[0]-b[0], a[1]-b[1], a[2]-b[2]);
+}
+inline vec3 operator+(const vec3_view& a, const vec3_view& b) {
+    return vec3(a[0]+b[0], a[1]+b[1], a[2]+b[2]);
+}
+inline vec3 operator*(const vec3_view& a, const float& s) {
+    return vec3(a[0]*s, a[1]*s, a[2]*s);
 }
 inline vec3 normalize(const vec3& a) {
     return a.normalize();

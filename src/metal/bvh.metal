@@ -37,7 +37,7 @@ inline uint mortonCode(const float3 point) {
     return x*4 + y*2 + z;
 }
 
-kernel void fillMortons(
+kernel void fillMortons_Tri(
     device const packed_float3* x [[buffer(0)]],
     device const packed_uint3* facets [[buffer(1)]],
     constant AABB4& sceneBox [[buffer(2)]],
@@ -53,6 +53,28 @@ kernel void fillMortons(
     float3 x2 = x[facet.z];
 
     float3 center = (x0+x1+x2)/3.0f;
+    float3 width = max(sceneBox.max - sceneBox.min, float3(1e-8f));
+    center = (center-sceneBox.min)/width;
+
+    mortons[id].code = mortonCode(center);
+    mortons[id].index = id;
+}
+
+kernel void fillMortons_Edge(
+    device const packed_float3* x [[buffer(0)]],
+    device const packed_uint2* edges [[buffer(1)]],
+    constant AABB4& sceneBox [[buffer(2)]],
+    device MortonNode* mortons [[buffer(3)]],
+    uint id [[thread_position_in_grid]]
+) {
+    uint numPrimitives = (uint)sceneBox._pad0;
+    if (id >= numPrimitives) return;
+    
+    uint2 edge = edges[id];
+    float3 x0 = x[edge.x];
+    float3 x1 = x[edge.y];
+
+    float3 center = (x0+x1)/2.0f;
     float3 width = max(sceneBox.max - sceneBox.min, float3(1e-8f));
     center = (center-sceneBox.min)/width;
 
@@ -151,7 +173,7 @@ inline int2 determineRange(
     else      return int2(index, j);
 }
 
-kernel void buildTriTree(
+kernel void buildTree_Tri(
     device const packed_float3* x [[buffer(0)]],
     device const packed_uint3* facets [[buffer(1)]],
     constant AABB4& sceneBox [[buffer(2)]],
@@ -195,6 +217,49 @@ kernel void buildTriTree(
     treeParent[childB] = id;
 }
 
+
+kernel void buildTree_Edge(
+    device const packed_float3* x [[buffer(0)]],
+    device const packed_uint2* edges [[buffer(1)]],
+    constant AABB4& sceneBox [[buffer(2)]],
+    device const MortonNode* mortons [[buffer(3)]],
+    device BVHNode* tree [[buffer(4)]],
+    device int* treeParent [[buffer(5)]],
+    uint id [[thread_position_in_grid]]
+) {
+    int numPrimitives = sceneBox._pad0;
+    int idx = (int)id;
+
+    // leaf nodes
+    if (idx >= numPrimitives) return;
+
+    int eid = mortons[id].index;
+    uint2 edge = edges[eid];
+    float3 v0 = x[edge.x];
+    float3 v1 = x[edge.y];
+    int leafid = numPrimitives+idx-1;
+    tree[leafid].min = min(v0, v1);
+    tree[leafid].childA = -1;
+    tree[leafid].max = max(v0, v1);
+    tree[leafid].childB = eid;
+
+    // intermediate nodes
+    if(idx == numPrimitives-1) return;
+
+    int2 range = determineRange(mortons, numPrimitives, idx);
+    uint split = findSplit(mortons, range.x, range.y);
+
+    int childA, childB;
+    if((int)split == range.x) childA = split+numPrimitives-1;
+    else                      childA = split;
+    if((int)split+1 == range.y) childB = split+numPrimitives;
+    else                        childB = split+1;
+
+    tree[id].childA = childA;
+    tree[id].childB = childB;
+    treeParent[childA] = id;
+    treeParent[childB] = id;
+}
 
 kernel void bottomUpBoxes(
     constant AABB4& sceneBox [[buffer(2)]],
@@ -249,6 +314,8 @@ kernel void bottomUpBoxes(
 struct BroadCollision {
     uint2 indexPair;
     uint2 objPair;
+    uint2 behaviorPair;
+    uint2 shapePair;
 };
 
 
@@ -267,6 +334,10 @@ struct QueryPointsParams {
     uint qObjId;
     uint tObjId;
     uint maxNumCollisions;
+    uint qBehavior;
+    uint tBehavior;
+    uint qShape;
+    uint tShape;
 };
 
 
@@ -274,6 +345,113 @@ struct QueryFlag {
     uint stackOverflow;
     uint collisionOverflow;
 };
+
+//kernel void queryPoints(
+//    device const packed_float3* x [[buffer(0)]],
+//    device const packed_uint3* facets [[buffer(1)]],
+//    device const BVHNode* tree [[buffer(2)]],
+//    constant QueryPointsParams& qParams [[buffer(3)]],
+//    device BroadCollision* broadCollisions [[buffer(4)]],
+//    device atomic_uint* numBroadCollisions [[buffer(5)]],
+//    device QueryFlag* qFlag [[buffer(6)]],
+//    uint id [[thread_position_in_grid]]
+//) {
+//    if(id >= qParams.numPoints) return;
+//
+//    float3 pos = x[id];
+//    float3 margin = float3(qParams.queryMargin);
+//    float3 qmin = pos-margin;
+//    float3 qmax = pos+margin;
+//
+//    const int stackDepth = 64;
+//
+//    int stack[stackDepth];
+//    int sp = 0;
+//    stack[sp++] = 0;
+//
+//    while(sp > 0) {
+//        int nodeid = stack[--sp];
+//        BVHNode node = tree[nodeid];
+//
+//        if (!intersectAABB(qmin, qmax, node))
+//            continue;
+//
+//        if (node.childA < 0) { // leaf
+//            uint fid = (uint)node.childB;
+//            uint3 facet = facets[fid];
+//            if(id == facet.x || id == facet.y || id == facet.z) continue;
+//
+//            uint idx = atomic_fetch_add_explicit(numBroadCollisions, 1u, memory_order_relaxed);
+//            if(idx >= qParams.maxNumCollisions) {
+//                qFlag[0].collisionOverflow = 1u;
+//                continue;
+//            }
+//            broadCollisions[idx].indexPair = {id, fid};
+//            broadCollisions[idx].objPair = {qParams.qObjId, qParams.tObjId};
+//            broadCollisions[idx].behaviorPair = {qParams.qBehavior, qParams.tBehavior};
+//            broadCollisions[idx].shapePair = {qParams.qShape, qParams.tShape};
+//            continue;
+//        }
+//        if (sp + 2 > stackDepth) {
+//            qFlag[0].stackOverflow = 1u;
+//            continue;
+//        }
+//
+//        stack[sp++] = node.childA;
+//        stack[sp++] = node.childB;
+//    }
+//}
+
+
+void queryAABB(
+    const float3 qmin, 
+    const float3 qmax, 
+    device const packed_uint3* facets,
+    device const BVHNode* tree,
+    constant QueryPointsParams& qParams,
+    device BroadCollision* broadCollisions,
+    device atomic_uint* numBroadCollisions,
+    device QueryFlag* qFlag,
+    uint id
+) {
+    const int stackDepth = 64;
+
+    int stack[stackDepth];
+    int sp = 0;
+    stack[sp++] = 0;
+
+    while(sp > 0) {
+        int nodeid = stack[--sp];
+        BVHNode node = tree[nodeid];
+
+        if (!intersectAABB(qmin, qmax, node))
+            continue;
+
+        if (node.childA < 0) { // leaf
+            uint fid = (uint)node.childB;
+            uint3 facet = facets[fid];
+            if(qParams.qObjId == qParams.tObjId && (id == facet.x || id == facet.y || id == facet.z)) continue;
+
+            uint idx = atomic_fetch_add_explicit(numBroadCollisions, 1u, memory_order_relaxed);
+            if(idx >= qParams.maxNumCollisions) {
+                qFlag[0].collisionOverflow = 1u;
+                continue;
+            }
+            broadCollisions[idx].indexPair = {id, fid};
+            broadCollisions[idx].objPair = {qParams.qObjId, qParams.tObjId};
+            broadCollisions[idx].behaviorPair = {qParams.qBehavior, qParams.tBehavior};
+            broadCollisions[idx].shapePair = {qParams.qShape, qParams.tShape};
+            continue;
+        }
+        if (sp + 2 > stackDepth) {
+            qFlag[0].stackOverflow = 1u;
+            continue;
+        }
+
+        stack[sp++] = node.childA;
+        stack[sp++] = node.childB;
+    }
+}
 
 kernel void queryPoints(
     device const packed_float3* x [[buffer(0)]],
@@ -292,39 +470,5 @@ kernel void queryPoints(
     float3 qmin = pos-margin;
     float3 qmax = pos+margin;
 
-    const int stackDepth = 64;
-
-    int stack[stackDepth];
-    int sp = 0;
-    stack[sp++] = 0;
-
-    while(sp > 0) {
-        int nodeid = stack[--sp];
-        BVHNode node = tree[nodeid];
-
-        if (!intersectAABB(qmin, qmax, node))
-            continue;
-
-        if (node.childA < 0) { // leaf
-            uint fid = (uint)node.childB;
-            uint3 facet = facets[fid];
-            if(id == facet.x || id == facet.y || id == facet.z) continue;
-
-            uint idx = atomic_fetch_add_explicit(numBroadCollisions, 1u, memory_order_relaxed);
-            if(idx >= qParams.maxNumCollisions) {
-                qFlag[0].collisionOverflow = 1u;
-                continue;
-            }
-            broadCollisions[idx].indexPair = {id, fid};
-            broadCollisions[idx].objPair = {qParams.qObjId, qParams.tObjId};
-            continue;
-        }
-        if (sp + 2 > stackDepth) {
-            qFlag[0].stackOverflow = 1u;
-            continue;
-        }
-
-        stack[sp++] = node.childA;
-        stack[sp++] = node.childB;
-    }
+    queryAABB(qmin, qmax, facets, tree, qParams, broadCollisions, numBroadCollisions, qFlag, id);
 }

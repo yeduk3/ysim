@@ -714,14 +714,68 @@ template <typename BE>
 struct DebugLineGL {};
 template <>
 struct DebugLineGL<CPU> {
+    GLuint vao = 0;
+    GLuint vertexBuffer = 0;
+
+    float* vertexPtr = nullptr;
+    size_t vertexNum = 0;
+    size_t capacityVertices = 0;
+
+    DebugLineGL() = default;
+
+    DebugLineGL(size_t vertexNum, float* vertexPtr)
+        : vertexPtr(vertexPtr), vertexNum(vertexNum), capacityVertices(vertexNum) {
+        glGenVertexArrays(1, &vao);
+        glBindVertexArray(vao);
+
+        glGenBuffers(1, &vertexBuffer);
+        glBindBuffer(GL_ARRAY_BUFFER, vertexBuffer);
+        glBufferData(GL_ARRAY_BUFFER,
+                     capacityVertices * sizeof(float) * 3,
+                     vertexPtr,
+                     GL_DYNAMIC_DRAW);
+        glEnableVertexAttribArray(0);
+        glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), 0);
+    }
+
+    void updateBuffer(float* newVertexPtr, size_t newVertexNum = 0) {
+        if (newVertexNum > 0) vertexNum = newVertexNum;
+        vertexPtr = newVertexPtr;
+
+        glBindBuffer(GL_ARRAY_BUFFER, vertexBuffer);
+
+        if (vertexNum > capacityVertices) {
+            capacityVertices = vertexNum;
+            glBufferData(GL_ARRAY_BUFFER,
+                         capacityVertices * sizeof(float) * 3,
+                         vertexPtr,
+                         GL_DYNAMIC_DRAW);
+        } else {
+            glBufferSubData(GL_ARRAY_BUFFER,
+                            0,
+                            vertexNum * sizeof(float) * 3,
+                            vertexPtr);
+        }
+    }
+
+    void draw() {
+        glBindVertexArray(vao);
+        glDrawArrays(GL_LINES, 0, vertexNum);
+    }
+};
+
+template <typename BE>
+struct DebugPointGL {};
+template <>
+struct DebugPointGL<CPU> {
     GLuint vao;
     GLuint vertexBuffer;
 
     float* vertexPtr;
     size_t vertexNum;
 
-    DebugLineGL() : vertexPtr(nullptr), vertexNum(0) {}
-    DebugLineGL(size_t vertexNum, float* vertexPtr) : vertexNum(vertexNum), vertexPtr(vertexPtr) {
+    DebugPointGL() : vertexPtr(nullptr), vertexNum(0) {}
+    DebugPointGL(size_t vertexNum, float* vertexPtr) : vertexNum(vertexNum), vertexPtr(vertexPtr) {
         glGenVertexArrays(1, &vao);
         glBindVertexArray(vao);
         
@@ -743,7 +797,7 @@ struct DebugLineGL<CPU> {
     void draw() {
         glBindVertexArray(vao);
         
-        glDrawArrays(GL_LINES, 0, vertexNum);
+        glDrawArrays(GL_POINTS, 0, vertexNum);
     }
 };
 
@@ -754,7 +808,7 @@ template <typename BE, typename PR>
 struct GeneralMesh;
 
 
-enum struct BehaviorType {
+enum struct BehaviorType : Index {
     TriangularCloth,
     FastGridCloth,
     Elastic,
@@ -764,7 +818,7 @@ enum struct BehaviorType {
     Generator,
 };
 
-enum struct InitializerType {
+enum struct InitializerType : Index {
     MeshGridSpring,
     MeshFile,
 
@@ -1068,7 +1122,7 @@ struct MeshAdjacencyInitializer {
     }
 };
 
-enum struct PlaneDirection {
+enum struct PlaneDirection : Index {
     XYPlane,
     YZPlane,
     XZPlane,
@@ -1130,12 +1184,12 @@ struct MeshGridInitializer : GeneralMeshInitializer<BE, PR> {
                     case PlaneDirection::YZPlane:
                         state.x[base  ] = pz+params.center.x;
                         state.x[base+1] = px+params.center.y;
-                        state.x[base+2] = py+params.center.z;
+                        state.x[base+2] = -py+params.center.z;
                         break;
                     case PlaneDirection::XZPlane:
                         state.x[base  ] = px+params.center.x;
                         state.x[base+1] = pz+params.center.y;
-                        state.x[base+2] = py+params.center.z;
+                        state.x[base+2] = -py+params.center.z;
                         break;
                     default: break;
                 }
@@ -1162,11 +1216,11 @@ struct MeshGridInitializer : GeneralMeshInitializer<BE, PR> {
                     adjacency.facets[fIdx++] = c;
                 };
 
-                if (((row + col) & 1) == 0) {
+                if (((row + col) & 1) == 0) { // even
                     // diagonal: p00 - p11
                     addFacet(p00, p01, p11);
                     addFacet(p00, p11, p10);
-                } else {
+                } else { // odd
                     // diagonal: p10 - p01
                     addFacet(p00, p01, p10);
                     addFacet(p10, p01, p11);
@@ -1251,22 +1305,31 @@ struct alignas(8) IndexPair {
         struct { Index point, triangle; }; 
         struct { Index edge1, edge2; };
     };
+
+    bool operator<(const IndexPair& o) const {
+        if(query == o.query) return target < o.target;
+        return query < o.query;
+    }
 };
 
-enum struct ShapeType : uint {
+enum struct ShapeType : Index {
     Mesh, // each collisions are checked in a particle way
     Plane,
 };
 
-struct alignas(16) BroadCollision {
+struct alignas(32) BroadCollision {
     IndexPair indexPair;
     IndexPair objPair;
+    IndexPair behaviorPair;
+    IndexPair shapePair;
 };
 
 struct NarrowCollision {
     IndexPair indexPair;
     IndexPair objPair;
     tinym::vec4 collisionNormalAndDistance;
+    IndexPair behaviorPair;
+    IndexPair shapePair;
 };
 
 template <typename BE, typename PR>
@@ -1284,6 +1347,9 @@ struct Constraints {
     VectorBase<BE, NarrowCollision> vertexColPrims;
     VectorBase<BE, Index> vertexColPrimsOffsets;
 
+    private:
+
+    public:
     void memoryAllocation(Index numPoints) {
         if(fixedParticles.ptr) return;
         fixedParticles = VectorBase<BE, PR>(numPoints, 1);
@@ -1300,6 +1366,7 @@ struct Constraints {
 
     void fixParticle(Index id) { fixedParticles[id] = PR(0); }
     void releaseParticle(Index id) { fixedParticles[id] = PR(1); }
+
 };
 
 template <typename PR>
@@ -1320,7 +1387,8 @@ struct FloatBehaviorParams {};
 template <typename PR>
 using BehaviorParams = std::variant<
     ClothBehaviorParams<PR>, 
-    FastGridClothBehaviorParams<PR>
+    FastGridClothBehaviorParams<PR>,
+    FloatBehaviorParams<PR>
 >;
 
 //! Force accumulator
@@ -1443,12 +1511,21 @@ struct GeneralMesh {
     MeshAdjacency<BE, PR> adjacency;
     GeneralMeshInitializer<BE, PR>* initializer;
     BehaviorType behaviorType;
+    ShapeType shapeType = ShapeType::Mesh;
     BehaviorParams<PR> behaviorParams;
     Material material;
     Constraints<BE, PR> constraints;
     ExternalForces<BE, PR> externalForces;
 
     MeshGL<CPU> meshGL;
+
+
+    // debug
+    DebugLineGL<CPU> debugSelfCollisions;
+    DebugLineGL<CPU> debugObjCollisions;
+    VectorBase<BE, PR> debugSelfCollisionNormals;
+    VectorBase<BE, PR> debugObjCollisionNormals;
+
 
     GeneralMesh(GeneralMeshInitializer<BE, PR>* initializer, BehaviorType behaviorType, BehaviorParams<PR> behaviorParams) 
     : initializer(initializer), behaviorType(behaviorType), behaviorParams(behaviorParams) {}
@@ -1479,223 +1556,62 @@ struct GeneralMesh {
         std::cout << "  - [GeneralMesh initialize] id " << id << " meshGL init. finished.\n";
     }
 
-};
 
-//template <typename PR>
-//struct Spring {
-//    Index a, b;
-//    PR restLength;
-//    PR kspring;
-//    Spring(Index a, Index b, PR restLength, PR kspring) : a(a), b(b), restLength(restLength), kspring(kspring) {}
-//};
+    void prepareDebugCollisions() {
+        if(constraints.numNarrowCollisions <= 0) return;
 
-template <typename PR>
-struct MeshInitializer {
-    virtual ~MeshInitializer() = default;
-    virtual void initializeGeometry(PR* xptr, Index* facetptr) = 0;
-    virtual void initializeSpring(Index* springIndex, PR* springCoef) = 0;
-    virtual Index springCounter() = 0;
-};
-
-template <typename PR>
-struct DeformableMeshGridInitializer : MeshInitializer<PR> {
-    Index particleNum1D, vertexNum;
-    PR size1D;
-    PR kstretch, kshear, kbend;
-    PR stretchRestLength, shearRestLength, bendRestLength;
-    Index springNum;
-
-    DeformableMeshGridInitializer(Index particleNum1D, PR size1D, PR kstretch, PR kshear, PR kbend)
-        : particleNum1D(particleNum1D), vertexNum(particleNum1D*particleNum1D), size1D(size1D), kstretch(kstretch), kshear(kshear), kbend(kbend), 
-          stretchRestLength(size1D/PR(particleNum1D-1)), shearRestLength(stretchRestLength*std::sqrt(2)), bendRestLength(bendRestLength = stretchRestLength*2),
-          springNum((particleNum1D-1)*particleNum1D*2 + (particleNum1D-1)*(particleNum1D-1)*2 + (particleNum1D-2)*particleNum1D*2) {}
-
-    void initializeGeometry(PR* xptr, Index* facetptr) {
-        Eigen::Map<Eigen::Matrix<PR, 3, Eigen::Dynamic>> X(xptr, 3, vertexNum);
-        
-        PR halfSize = size1D / 2.0;
-
-        for (int row = 0; row < particleNum1D; ++row) {
-            for (int col = 0; col < particleNum1D; ++col) {
-                int pid = row * particleNum1D + col; 
-                
-                PR px = col * stretchRestLength - halfSize;
-                PR py = -row * stretchRestLength + halfSize;
-                PR pz = rand()/PR(RAND_MAX)/10000.f;
-                
-                X.col(pid) << px, py, pz;
-            }
+        if(!debugSelfCollisionNormals.ptr) {
+            debugSelfCollisionNormals = VectorBase<BE, PR>(constraints.maxNumCollisions*6);
+            debugObjCollisionNormals = VectorBase<BE, PR>(constraints.maxNumCollisions*6);
         }
 
-        Index fIdx = 0;
-        for (Index row = 0; row < particleNum1D - 1; ++row) {
-            for (Index col = 0; col < particleNum1D - 1; ++col) {
-                Index p00 = (row * particleNum1D + col);           
-                Index p10 = (row * particleNum1D + col + 1);       
-                Index p01 = ((row + 1) * particleNum1D + col);     
-                Index p11 = ((row + 1) * particleNum1D + col + 1); 
+        Index selfBase = 0;
+        Index objBase = 0;
+        for(Index cid = 0; cid < constraints.numNarrowCollisions; ++cid) {
+            NarrowCollision& nc = constraints.narrowCollisions[cid];
 
-                facetptr[fIdx++] = p00;
-                facetptr[fIdx++] = p10;
-                facetptr[fIdx++] = p11;
+            tinym::vec3_view v(state.x.ptr + nc.indexPair.point*3);
+            tinym::vec3_view n(nc.collisionNormalAndDistance.v);
+            tinym::vec3 t = v+n*20.f;
 
-                facetptr[fIdx++] = p00;
-                facetptr[fIdx++] = p11;
-                facetptr[fIdx++] = p01;
+            if(nc.objPair.query == nc.objPair.target) {
+                debugSelfCollisionNormals[selfBase  ] = v[0];
+                debugSelfCollisionNormals[selfBase+1] = v[1];
+                debugSelfCollisionNormals[selfBase+2] = v[2];
+                debugSelfCollisionNormals[selfBase+3] = t[0];
+                debugSelfCollisionNormals[selfBase+4] = t[1];
+                debugSelfCollisionNormals[selfBase+5] = t[2];
+                selfBase += 6;
+            }
+            else {
+                debugObjCollisionNormals[objBase  ] = v[0];
+                debugObjCollisionNormals[objBase+1] = v[1];
+                debugObjCollisionNormals[objBase+2] = v[2];
+                debugObjCollisionNormals[objBase+3] = t[0];
+                debugObjCollisionNormals[objBase+4] = t[1];
+                debugObjCollisionNormals[objBase+5] = t[2];
+                objBase += 6;
             }
         }
-    }
-
-    void initializeSpring(Index* springIndexPtr, PR* springCoefPtr) {
-        auto springIndex = Eigen::Map<Eigen::VectorX<Index>>(springIndexPtr, springNum*2);
-        auto springCoef = Eigen::Map<Eigen::VectorX<PR>>(springCoefPtr, springNum*2);
-        Index sid = 0;
-        for(size_t pid = 0; pid < vertexNum; pid++) {
-            auto col = pid % particleNum1D;
-            auto row = pid / particleNum1D;
-
-            // stretch
-            if(col < particleNum1D-1) {
-                //springs.emplace_back(pid, pid+1, stretchRestLength, kstretch); // right
-                springIndex(sid*2) = pid; springIndex(sid*2+1) = pid+1;
-                springCoef(sid*2) = stretchRestLength; springCoef(sid*2+1) = kstretch;
-                sid++;
-            }
-            if(row < particleNum1D-1) {
-                //springs.emplace_back(pid, pid+particleNum1D, stretchRestLength, kstretch); // bottom
-                springIndex(sid*2) = pid; springIndex(sid*2+1) = pid+particleNum1D;
-                springCoef(sid*2) = stretchRestLength; springCoef(sid*2+1) = kstretch;
-                sid++;
-            }
-            // shear
-            if(col < particleNum1D-1 && row < particleNum1D-1) {
-                ///springs.emplace_back(pid, pid+particleNum1D+1, shearRestLength, kshear); // right-bottom
-                springIndex(sid*2) = pid; springIndex(sid*2+1) = pid+particleNum1D+1;
-                springCoef(sid*2) = shearRestLength; springCoef(sid*2+1) = kshear;
-                sid++;
-            }
-            if(col > 0 && row < particleNum1D-1) {
-                //springs.emplace_back(pid, pid+particleNum1D-1, shearRestLength, kshear); // left-bottom
-                springIndex(sid*2) = pid; springIndex(sid*2+1) = pid+particleNum1D-1;
-                springCoef(sid*2) = shearRestLength; springCoef(sid*2+1) = kshear;
-                sid++;
-            }
-            // bend
-            if(col < particleNum1D-2) {
-                //springs.emplace_back(pid, pid+2, bendRestLength, kbend); // right-riht
-                springIndex(sid*2) = pid; springIndex(sid*2+1) = pid+2;
-                springCoef(sid*2) = bendRestLength; springCoef(sid*2+1) = kbend;
-                sid++;
-            }
-            if(row < particleNum1D-2) {
-                //springs.emplace_back(pid, pid+2*particleNum1D, bendRestLength, kbend); // bottom-bottom
-                springIndex(sid*2) = pid; springIndex(sid*2+1) = pid+2*particleNum1D;
-                springCoef(sid*2) = bendRestLength; springCoef(sid*2+1) = kbend;
-                sid++;
-            }
+        if(selfBase > 0) {
+            if(!debugSelfCollisions.vertexPtr) debugSelfCollisions = DebugLineGL<CPU>(selfBase/3, debugSelfCollisionNormals.ptr);
+            else debugSelfCollisions.updateBuffer(debugSelfCollisionNormals.ptr, selfBase/3);
+        }
+        if(objBase > 0) {
+            if(!debugObjCollisions.vertexPtr) debugObjCollisions = DebugLineGL<CPU>(objBase/3, debugObjCollisionNormals.ptr);
+            else debugObjCollisions.updateBuffer(debugObjCollisionNormals.ptr, objBase/3);
         }
     }
-
-    Index springCounter() { return springNum; }
-};
-
-
-//template <typename BE, typename PR>
-//struct DeformableMesh {
-//    using Vector = VectorBase<BE, PR>;
-//    using Vectorui = VectorBase<BE, Index>;
-//
-//    MeshInitializer<PR>* initializer;
-//
-//    Vector x, v, f, m;
-//    Vector n;
-//    Vectorui facet;
-//    Vector fixedParticle;
-//
-//    Index vertexNum, facetNum;
-//
-//    Vectorui springIndex;
-//    Vector springCoef;
-//    //std::vector<Spring<PR>> springs;
-//    PR kstretch = 1e5, kshear = 1e5, kbend = 2e5;
-//
-//    MeshGL<CPU> mesh;
-//
-//    DeformableMesh(MeshInitializer<PR>* initializer, Index vertexNum, Index facetNum) 
-//        : initializer(initializer), vertexNum(vertexNum), facetNum(facetNum) {}
-//    ~DeformableMesh() { delete initializer; }
-//
-//    void memoryAllocation(PR mass=0.1) {
-//        if(x.ptr) return;
-//        Index vertexDataNum = vertexNum*3;
-//        Index facetDataNum = facetNum*3;
-//        Index springDataNum = initializer->springCounter()*2;
-//        x = Vector(vertexDataNum);
-//        v = Vector(vertexDataNum, 0);
-//        f = Vector(vertexDataNum, 0);
-//        m = Vector(vertexDataNum, mass);
-//        n = Vector(vertexDataNum);
-//        facet = Vectorui(facetDataNum);
-//        fixedParticle = Vector(vertexNum, 1);
-//        springIndex = Vectorui(springDataNum);
-//        springCoef = Vector(springDataNum);
-//    }
-//    void initialize() {
-//        memoryAllocation();
-//        initializer->initializeGeometry(x.ptr, facet.ptr);
-//        initializer->initializeSpring(springIndex.ptr, springCoef.ptr);
-//        mesh = MeshGL<CPU>(vertexNum, x.ptr, facetNum, facet.ptr, n.ptr);
-//
-//        
-//    }
-//};
-
-template <typename BE, typename PR>
-struct SquareCloth {
-    using Vector = VectorBase<BE, PR>;
-    using Vectorui = VectorBase<BE, Index>;
-
-    MeshInitializer<PR>* initializer;
-
-    Vector x, v, f, m;
-    Vector n;
-    Vectorui facet;
-    Vector fixedParticle;
-
-    Index particleNum1D;
-    Index vertexNum, facetNum;
-
-    PR kstretch, kshear, kbend;
-    PR stretchRestLength, shearRestLength, bendRestLength;
-
-    MeshGL<CPU> mesh;
-
-    SquareCloth(MeshInitializer<PR>* initializer, Index particleNum1D, PR size1D, Index facetNum, PR kstretch, PR kshear, PR kbend) 
-        : initializer(initializer), particleNum1D(particleNum1D), vertexNum(particleNum1D*particleNum1D), facetNum(facetNum),
-        kstretch(kstretch), kshear(kshear), kbend(kbend),
-        stretchRestLength(size1D/PR(particleNum1D-1)), shearRestLength(stretchRestLength*std::sqrt(2)), bendRestLength(stretchRestLength*2)
-    {}
-    ~SquareCloth() { delete initializer; }
-
-    void memoryAllocation(PR mass=0.1) {
-        if(x.ptr) return;
-        Index vertexDataNum = vertexNum*3;
-        Index facetDataNum = facetNum*3;
-        x = Vector(vertexDataNum);
-        v = Vector(vertexDataNum, 0);
-        f = Vector(vertexDataNum, 0);
-        m = Vector(vertexDataNum, mass);
-        n = Vector(vertexDataNum);
-        facet = Vectorui(facetDataNum);
-        fixedParticle = Vector(vertexNum, 1);
-        std::cout << "[Square Cloth memoryAllocation] allocated" << std::endl;
+    void showSelfCollisions() {
+        if(debugSelfCollisions.vertexNum > 0)
+            debugSelfCollisions.draw();
     }
-    void initialize() {
-        memoryAllocation();
-        initializer->initializeGeometry(x.ptr, facet.ptr);
-        mesh = MeshGL<CPU>(vertexNum, x.ptr, facetNum, facet.ptr, n.ptr);
+    void showObjCollisions() {
+        if(debugObjCollisions.vertexNum > 0)
+            debugObjCollisions.draw();
     }
 };
+
 
 
 
@@ -1711,16 +1627,14 @@ struct Box {};
 
 template <typename BE, typename PR>
 struct SceneObject {
-    inline static int numObjects = 0;
+    inline static int numMeshes = 0;
 
-    std::vector<SquareCloth<BE, PR>> squareClothes;
-    //std::vector<DeformableMesh<BE, PR>> deformableMeshes;
     std::vector<Plane> planes;
     inline static std::vector<GeneralMesh<BE, PR>> meshes;
 
     void addGeneralMesh(GeneralMeshInitializer<BE, PR>* initializer, BehaviorType behaviorType, BehaviorParams<PR> behaviorParams) {
         meshes.emplace_back(initializer, behaviorType, behaviorParams);
-        meshes.back().id = numObjects++;
+        meshes.back().id = numMeshes++;
         std::cout << "id " << meshes.back().id << " object is created\n";
     }
 
@@ -1744,35 +1658,37 @@ struct SpatialHashing {
 template <Index MODE, Index PRIMITIVE, typename PR>
 struct BVH {};
 enum BVHMODE {
+    SCENE,
     LINEAR,
     SAH,
 };
 enum BVHPRIMITIVE {
+    OBJECT = 0,
     POINT = 1,
     EDGE = 2,
     TRIANGLE = 3,
 };
 
-struct AABB {
-    tinym::vec3 min, max;
-    AABB() : min(0), max(0) {}
-    AABB(tinym::vec3_view e1, tinym::vec3_view e2) : min(tinym::min(e1, e2)), max(tinym::max(e1, e2)) {}
-    AABB(tinym::vec3_view t1, tinym::vec3_view t2, tinym::vec3_view t3) : min(tinym::min(t1, t2, t3)), max(tinym::max(t1, t2, t3)) {}
-    void combine(const tinym::vec3_view& a) {
-        min = tinym::min(a, min);
-        max = tinym::max(a, max);
-    }
-    void combine(const AABB& aabb) {
-        min = tinym::min(min, aabb.min);
-        max = tinym::max(max, aabb.max);
-    }
-    bool intersect(const AABB& aabb) const {
-        if (max.x < aabb.min.x || min.x > aabb.max.x) return false;
-        if (max.y < aabb.min.y || min.y > aabb.max.y) return false;
-        if (max.z < aabb.min.z || min.z > aabb.max.z) return false;
-        return true;
-    }
-};
+//struct AABB {
+//    tinym::vec3 min, max;
+//    AABB() : min(0), max(0) {}
+//    AABB(tinym::vec3_view e1, tinym::vec3_view e2) : min(tinym::min(e1, e2)), max(tinym::max(e1, e2)) {}
+//    AABB(tinym::vec3_view t1, tinym::vec3_view t2, tinym::vec3_view t3) : min(tinym::min(t1, t2, t3)), max(tinym::max(t1, t2, t3)) {}
+//    void combine(const tinym::vec3_view& a) {
+//        min = tinym::min(a, min);
+//        max = tinym::max(a, max);
+//    }
+//    void combine(const AABB& aabb) {
+//        min = tinym::min(min, aabb.min);
+//        max = tinym::max(max, aabb.max);
+//    }
+//    bool intersect(const AABB& aabb) const {
+//        if (max.x < aabb.min.x || min.x > aabb.max.x) return false;
+//        if (max.y < aabb.min.y || min.y > aabb.max.y) return false;
+//        if (max.z < aabb.min.z || min.z > aabb.max.z) return false;
+//        return true;
+//    }
+//};
 
 struct alignas(32) AABB4 {
     union {
@@ -1847,12 +1763,9 @@ struct BVH<BVHMODE::LINEAR, PRIMITIVE, PR> {
         BVHNode(int childA, int childB) : childA(childA), childB(childB) {}
     };
     static_assert(sizeof(BVHNode) == 32);
-    struct QueryFlag {
-        uint32_t stackOverflow;
-        uint32_t collisionOverflow;
-    };
 
     VectorBase<METAL, PR> positions; // Length 3*N, N is the number of points
+    VectorBase<METAL, PR> velocities;
     VectorBase<METAL, Index> primitives; // Length PRIMITIVE*M, M is the number of primitives.
     VectorBase<METAL, MortonNode> mortons; // Length M, turn the each centers of the primitives into MortonNodes
     VectorBase<METAL, MortonNode> mortonsTemp; // Length M, turn the each centers of the primitives into MortonNodes
@@ -1861,20 +1774,39 @@ struct BVH<BVHMODE::LINEAR, PRIMITIVE, PR> {
     //VectorBase<METAL, BroadCollision> collisions;
     //Index numCollisions = 0, maxNumCollisions;
 
-    DebugLineGL<CPU> debugBox;
-    VectorBase<METAL, PR> debugBoxLines;
     int objid; // who made this tree
-    VectorBase<METAL, QueryFlag> qFlag;
+    VectorBase<METAL, int> objIds;
+    BehaviorType objBehavior;
+    VectorBase<METAL, BehaviorType> objBehaviors;
+    ShapeType objShape;
+    VectorBase<METAL, ShapeType> objShapes;
 
-    MTL::ComputePipelineState* fillMortonPSO;
-    MTL::ComputePipelineState* buildTriTreePSO;
+    MTL::ComputePipelineState* fillMortonsPSO;
+    MTL::ComputePipelineState* buildTreePSO;
     MTL::ComputePipelineState* bottomUpBoxesPSO;
     MTL::ComputePipelineState* queryPointsPSO;
 
+
+    // Debuggings...
+    DebugLineGL<CPU> debugBox;
+    VectorBase<METAL, PR> debugBoxLines;
+
+    struct QueryFlag {
+        uint32_t stackOverflow;
+        uint32_t collisionOverflow;
+    };
+    VectorBase<METAL, QueryFlag> qFlag;
+
+
     BVH() {
         // recieve all points, facets and edges;
-        fillMortonPSO = MetalBVHContext::getPSO("fillMortons");
-        buildTriTreePSO = MetalBVHContext::getPSO("buildTriTree");
+        if constexpr (PRIMITIVE == BVHPRIMITIVE::TRIANGLE) {
+            fillMortonsPSO = MetalBVHContext::getPSO("fillMortons_Tri");
+            buildTreePSO = MetalBVHContext::getPSO("buildTree_Tri");
+        } else if constexpr (PRIMITIVE == BVHPRIMITIVE::EDGE) {
+            fillMortonsPSO = MetalBVHContext::getPSO("fillMortons_Edge");
+            buildTreePSO = MetalBVHContext::getPSO("buildTree_Edge");
+        }
         bottomUpBoxesPSO = MetalBVHContext::getPSO("bottomUpBoxes");
         queryPointsPSO = MetalBVHContext::getPSO("queryPoints");
     }
@@ -1888,11 +1820,20 @@ struct BVH<BVHMODE::LINEAR, PRIMITIVE, PR> {
         qFlag = VectorBase<METAL, QueryFlag>(1);
     }
 
+    void build(GeneralMesh<METAL, PR>& mesh) {
+        build(mesh.id, mesh.state.x, mesh.adjacency.facets);
+    }
+
     void build(int oid, VectorBase<METAL, PR>& pos, VectorBase<METAL, Index>& prim) {
         //std::cout << "[BVH Build] Memory allocated, BVH build start" << std::endl;
         objid = oid;
+
+        auto* mesh = SceneObject<METAL, PR>::findById(objid);
         positions = pos;
+        velocities = mesh->state.v;
         primitives = prim;
+        objBehavior = mesh->behaviorType;
+        objShape = ShapeType::Mesh;
         //std::cout << "[BVH Build] positions and primitives are assigned" << std::endl;
         Index numPrimitives = primitives.size/PRIMITIVE;
         if(!tree.ptr) memoryAllocation();
@@ -1915,7 +1856,7 @@ struct BVH<BVHMODE::LINEAR, PRIMITIVE, PR> {
         MetalGlobalContext::setBytes(sceneBox, 2);
         MetalGlobalContext::setBuffer(mortons, 3);
 
-        MetalGlobalContext::dispatchThreads(fillMortonPSO, numPrimitives);
+        MetalGlobalContext::dispatchThreads(fillMortonsPSO, numPrimitives);
         MetalGlobalContext::commitAndWait();
         
         
@@ -1978,7 +1919,7 @@ struct BVH<BVHMODE::LINEAR, PRIMITIVE, PR> {
         MetalGlobalContext::setBuffer(tree, 4);
         MetalGlobalContext::setBuffer(treeParent, 5);
 
-        MetalGlobalContext::dispatchThreads(buildTriTreePSO, numPrimitives);
+        MetalGlobalContext::dispatchThreads(buildTreePSO, numPrimitives);
         MetalGlobalContext::commitAndWait();
 
         // set intermediate node's aabb
@@ -2000,14 +1941,14 @@ struct BVH<BVHMODE::LINEAR, PRIMITIVE, PR> {
         //MetalGlobalContext::dispatchThreads(bottomUpBoxesPSO, numPrimitives);
         //MetalGlobalContext::commitAndWait();
 
-        int l = 0;
-        std::cout << "Tree test: " << std::endl;
-        for(Index i = 0; i < 5; i++) {
-            std::cout << "node " << l << ": " <<  tree[l].aabb.min << ", " << tree[l].aabb.max << " and ";
-            l = tree[l].childA;
-            std::cout << " next is " << l << std::endl;
-            if(l < 0) break;
-        }
+        //int l = 0;
+        //std::cout << "Tree test: " << std::endl;
+        //for(Index i = 0; i < 5; i++) {
+        //    std::cout << "node " << l << ": " <<  tree[l].aabb.min << ", " << tree[l].aabb.max << " and ";
+        //    l = tree[l].childA;
+        //    std::cout << " next is " << l << std::endl;
+        //    if(l < 0) break;
+        //}
     }
 
     void buildCPU(int oid, VectorBase<METAL, PR>& pos, VectorBase<METAL, Index>& prim) {
@@ -2232,6 +2173,43 @@ struct BVH<BVHMODE::LINEAR, PRIMITIVE, PR> {
             if(l < 0) break;
         }
     }
+
+    void bottomUpCombine() {
+        auto combineAABB = [&](auto&& self, BVHNode& node) -> void {
+            if(node.childA < 0) return;
+            self(self, tree[node.childA]);
+            self(self, tree[node.childB]);
+            node.aabb.min = tree[node.childA].aabb.min;
+            node.aabb.max = tree[node.childA].aabb.max;
+            node.aabb.combine(tree[node.childB].aabb);
+        };
+        combineAABB(combineAABB, tree[0]);
+    }
+
+    void refit() {
+        Index numPrimitives = primitives.size/PRIMITIVE;
+        for(Index i = 0; i < numPrimitives; ++i) {
+            tree[numPrimitives+i-1] = BVHNode(mortons[i], positions, primitives);
+        }
+        bottomUpCombine();
+    }
+
+    void enlargeTrajectory(PR dt) {
+        Index numPrimitives = primitives.size/PRIMITIVE;
+        for(Index i = 0; i < numPrimitives; ++i) {
+            BVHNode& t = tree[numPrimitives+i-1];
+            Index pid = t.childB;
+            Index pbase = pid*PRIMITIVE;
+            for(Index p = 0; p < PRIMITIVE; ++p) {
+                Index posid = primitives[pbase+p];
+                tinym::vec3_view pos (positions.ptr + posid*3);
+                tinym::vec3_view v (velocities.ptr + posid*3);
+                t.min = tinym::min(t.min, pos+v*dt);
+                t.max = tinym::max(t.max, pos+v*dt);
+            }
+        }
+        bottomUpCombine();
+    }
     
     void queryAABB(const AABB4& queryBox, const BVHNode& node) {
         if(! node.aabb.intersect(queryBox)) return;
@@ -2295,8 +2273,8 @@ struct BVH<BVHMODE::LINEAR, PRIMITIVE, PR> {
     }
 
     void checkSelfCollisionsCPU(PR queryMargin) {
-        Index numPoints = positions.size/3;
         auto* qmesh = SceneObject<METAL, PR>::findById(objid); // self query.
+        Index numPoints = qmesh->state.x.size/3;
         qmesh->constraints.numBroadCollisions[0] = 0; // clear the previous collisions.
 
         for(Index vid = 0; vid < numPoints; ++vid) {
@@ -2312,13 +2290,25 @@ struct BVH<BVHMODE::LINEAR, PRIMITIVE, PR> {
         uint32_t qObjId;
         uint32_t tObjId;
         uint32_t maxNumCollisions;
+        uint32_t qBehavior;
+        uint32_t tBehavior;
+        uint32_t qShape;
+        uint32_t tShape;
     };
+
+    void queryBegin() {
+        qFlag[0].stackOverflow = 0;
+        qFlag[0].collisionOverflow = 0;
+    }
     void queryPoints(Index qObjId, PR queryMargin) {
         auto* qmesh = SceneObject<METAL, PR>::findById(qObjId);
         auto& pos = qmesh->state.x;
         Index numPoints = pos.size/3;
         auto& constraints = qmesh->constraints;
-        QueryPointsParams qParams = {queryMargin, numPoints, qObjId, (Index)objid, constraints.maxNumCollisions};
+        QueryPointsParams qParams = {
+            queryMargin, numPoints, qObjId, (Index)objid, constraints.maxNumCollisions,
+            (Index)qmesh->behaviorType, (Index)objBehavior, (Index)qmesh->shapeType, (Index)objShape
+        };
         auto& broadCols = constraints.broadCollisions;
         auto& numBroadCols = constraints.numBroadCollisions;
 
@@ -2330,21 +2320,21 @@ struct BVH<BVHMODE::LINEAR, PRIMITIVE, PR> {
         MetalGlobalContext::setBuffer(numBroadCols, 5);
         MetalGlobalContext::setBuffer(qFlag, 6);
 
-        std::cout << "Dispatched\n";
         MetalGlobalContext::dispatchThreads(queryPointsPSO, numPoints);
+    }
+    void checkSelfCollisions(PR queryMargin) {
+        auto* qmesh = SceneObject<METAL, PR>::findById(objid); // self query.
+        qmesh->constraints.numBroadCollisions[0] = 0; // clear the previous collisions.
+
+        queryPoints(objid, queryMargin);
+    }
+    void queryEnd() {
         MetalGlobalContext::commitAndWait();
         std::cout << "found\n";
         if(qFlag[0].stackOverflow) std::cout << "[QueryPoints] query stack overflowed\n";
         if(qFlag[0].collisionOverflow) std::cout << "[QueryPoints] collision buffer overflowed\n";
     }
-    void checkSelfCollisions(PR queryMargin) {
-        auto* qmesh = SceneObject<METAL, PR>::findById(objid); // self query.
-        qmesh->constraints.numBroadCollisions[0] = 0; // clear the previous collisions.
-        qFlag[0].stackOverflow = 0;
-        qFlag[0].collisionOverflow = 0;
 
-        queryPoints(objid, queryMargin);
-    }
 
 
 
@@ -2390,6 +2380,147 @@ struct BVH<BVHMODE::LINEAR, PRIMITIVE, PR> {
     }
 };
 
+
+template <typename PR>
+struct BVH<BVHMODE::SCENE, BVHPRIMITIVE::OBJECT, PR> {
+    using TRI_LBVH = BVH<BVHMODE::LINEAR, BVHPRIMITIVE::TRIANGLE, PR>;
+    using EDGE_LBVH = BVH<BVHMODE::LINEAR, BVHPRIMITIVE::EDGE, PR>;
+    std::vector<TRI_LBVH> objTrees;
+
+    // BVH for each object's BV
+    VectorBase<METAL, PR> positions;
+    VectorBase<METAL, Index> indices;
+    EDGE_LBVH tree;
+
+    //BVH(SceneObject<METAL, PR>& scene) 
+    //    : objTrees(scene.numMeshes), positions(scene.numMeshes*3), indices(scene.numMeshes*2) {}
+
+    void build(SceneObject<METAL, PR>& scene) {
+        // allocations
+        if(objTrees.size() != scene.numMeshes) {
+            objTrees = std::vector<TRI_LBVH>(scene.numMeshes);
+            positions = VectorBase<METAL, PR>(scene.numMeshes*6);
+            indices = VectorBase<METAL, Index>(scene.numMeshes*2);
+        }
+
+        for(Index i = 0; i < scene.numMeshes; ++i) {
+            objTrees[i].build(scene.meshes[i]);
+            Index pbase = i*6;
+            positions[pbase  ] = objTrees[i].tree[0].min.x;
+            positions[pbase+1] = objTrees[i].tree[0].min.y;
+            positions[pbase+2] = objTrees[i].tree[0].min.z;
+            positions[pbase+3] = objTrees[i].tree[0].max.x;
+            positions[pbase+4] = objTrees[i].tree[0].max.y;
+            positions[pbase+5] = objTrees[i].tree[0].max.z;
+            Index ibase = i*2;
+            indices[ibase  ] = ibase;
+            indices[ibase+1] = ibase+1;
+        }
+
+        tree.build(-1, positions, indices);
+        print(tree.tree[0]);
+    }
+
+    void print(typename EDGE_LBVH::BVHNode node, Index l = 0) {
+        for(Index i = 0; i < l; ++i) std::cout << "  ";
+        std::cout << "- ";
+        if(node.childA < 0) std::cout << "(leaf) box id " << node.childB << "'s ";
+        std::cout << "Min: (" << node.min.x << ", " << node.min.y << ", " << node.min.z << ") and ";
+        std::cout << "Max: (" << node.max.x << ", " << node.max.y << ", " << node.max.z << ")" << std::endl;
+        if(node.childA < 0) return;
+        print(tree.tree[node.childA], l+1);
+        print(tree.tree[node.childB], l+1);
+    }
+
+    void refit() {
+        for(Index i = 0; i < objTrees.size(); ++i) {
+            objTrees[i].refit();
+            Index pbase = i*6;
+            positions[pbase  ] = objTrees[i].tree[0].min.x;
+            positions[pbase+1] = objTrees[i].tree[0].min.y;
+            positions[pbase+2] = objTrees[i].tree[0].min.z;
+            positions[pbase+3] = objTrees[i].tree[0].max.x;
+            positions[pbase+4] = objTrees[i].tree[0].max.y;
+            positions[pbase+5] = objTrees[i].tree[0].max.z;
+            Index ibase = i*2;
+            indices[ibase  ] = ibase;
+            indices[ibase+1] = ibase+1;
+        }
+
+        tree.build(-1, positions, indices);
+    }
+
+    void enlargeTrajectory(PR dt) {
+        for(Index i = 0; i < objTrees.size(); ++i) {
+            objTrees[i].enlargeTrajectory(dt);
+            Index pbase = i*6;
+            positions[pbase  ] = objTrees[i].tree[0].min.x;
+            positions[pbase+1] = objTrees[i].tree[0].min.y;
+            positions[pbase+2] = objTrees[i].tree[0].min.z;
+            positions[pbase+3] = objTrees[i].tree[0].max.x;
+            positions[pbase+4] = objTrees[i].tree[0].max.y;
+            positions[pbase+5] = objTrees[i].tree[0].max.z;
+            Index ibase = i*2;
+            indices[ibase  ] = ibase;
+            indices[ibase+1] = ibase+1;
+        }
+
+        tree.build(-1, positions, indices);
+    }
+
+    void checkSelfCollisions(PR margin) { 
+        for(auto& tree : objTrees) {
+            if(tree.objBehavior == BehaviorType::Float) continue;
+            tree.checkSelfCollisions(margin);
+        }
+    }
+
+    void queryBegin() {
+        for(auto& tree : objTrees) {
+            tree.qFlag[0].stackOverflow = 0;
+            tree.qFlag[0].collisionOverflow = 0;
+            SceneObject<METAL, PR>::findById(tree.objid)->constraints.numBroadCollisions[0] = 0;
+        }
+    }
+    void detectCollisions(PR margin) {
+        queryBegin();
+
+        std::set<IndexPair> checked;
+        for(Index q = 0; q < objTrees.size(); ++q) {
+            auto& queryTree = objTrees[q];
+            if(queryTree.objBehavior == BehaviorType::Float) continue;
+
+            for(Index t = 0; t < objTrees.size(); ++t) {
+                if(q == t) {
+                    queryTree.checkSelfCollisions(margin);
+                    checked.insert({q, t});
+                    continue;
+                }
+                if(checked.find({q, t}) != checked.end()) continue; // already checked
+                objTrees[t].queryPoints(queryTree.objid, margin);
+                checked.insert({q, t});
+            }
+        }
+        queryEnd();
+    }
+    void queryEnd() {
+        MetalGlobalContext::commitAndWait();
+        for(auto& tree : objTrees) {
+            if(tree.qFlag[0].stackOverflow) std::cout << "[Scene BVH detect collisions] " << tree.objid << "'s tree got query stack overflowed\n";
+            if(tree.qFlag[0].collisionOverflow) std::cout << "[Scene BVH detect collisions] " << tree.objid << "'s tree got buffer overflowed\n";
+        }
+    }
+
+    void showBox() { for(auto& tree : objTrees) tree.showBox(); }
+
+    void showSceneBox() { tree.showBox(); }
+};
+
+
+
+
+
+
 // TODO: BroadPhase, NarrowPhase, BruteForce
 template <typename BE, typename PR>
 struct BruteForce {};
@@ -2430,6 +2561,8 @@ struct BruteForce<METAL, PR> {
             auto& triangle = ptCollisions[cid].indexPair.triangle;
             auto& queryObjId = ptCollisions[cid].objPair.query;
             auto& targetObjId = ptCollisions[cid].objPair.target;
+            auto& behaviorPair = ptCollisions[cid].behaviorPair;
+            auto& shapePair = ptCollisions[cid].shapePair;
             //collisions[cid].type;
 
             auto* qmesh = SceneObject<METAL, PR>::findById(queryObjId);
@@ -2468,9 +2601,15 @@ struct BruteForce<METAL, PR> {
             tinym::vec3 p = qpos-t0pos;
 
             PR l = n.dot(p);
-            
-            if(l < 0) continue; // TODO: already-penetrated case, not handled,
-            if(l > radius) continue; // too far.
+
+            // query point 기준으로 normal 방향 정렬
+            if (l < 0) {
+                n = -n;
+                l = -l;
+            }
+            //if(l < 0) continue; // TODO: already-penetrated case, not handled,
+            // TODO: 1.0 is THICK parameter. fix later
+            if(l > radius + 0.5) continue; // too far.
 
             // barycentric coordinate to check in-plane
             tinym::vec3 inplane = p - n*l;
@@ -2487,7 +2626,7 @@ struct BruteForce<METAL, PR> {
             PR a = 1-b-c;
 
             if(a >= 0 && b >= 0 && c >= 0) { // inside plane
-                constraints.narrowCollisions[constraints.numNarrowCollisions] = {{point, triangle}, {queryObjId, targetObjId}, {n, l}};
+                constraints.narrowCollisions[constraints.numNarrowCollisions] = {{point, triangle}, {queryObjId, targetObjId}, {n, l}, behaviorPair, shapePair};
                 constraints.numNarrowCollisions++;
             }
         }
@@ -2535,17 +2674,24 @@ template <typename BE, typename PR, typename System>
 struct Simulator {
     System& system;
 
-    //ByteMemoryPool<BE> pool;
-    //DynamicMemoryAllocator<BE> pool;
     SceneObject<BE, PR> sceneObjects;
 
-    using BroadPhase = BVH<BVHMODE::LINEAR, BVHPRIMITIVE::TRIANGLE, PR>;
+    //using BroadPhase = BVH<BVHMODE::LINEAR, BVHPRIMITIVE::TRIANGLE, PR>;
+    using BroadPhase = BVH<BVHMODE::SCENE, BVHPRIMITIVE::OBJECT, PR>;
     using NarrowPhase = BruteForce<METAL, PR>;
     CollisionPipeline<BroadPhase, NarrowPhase> collisionPipeline;
 
 
     // sim viewer?
     bool pause = true;
+    bool checkCollision = true;
+    Index frame = 0;
+
+
+    PR margin = 1;
+    PR radius = 0.5;
+
+
 
     Simulator(System& system) : system(system) {}
 
@@ -2557,26 +2703,9 @@ struct Simulator {
                 );
     };
 
-    void addClothGrid(size_t particleNum1D = 200, PR size1D = 100, PR kstretch=1e5, PR kshear=1e5, PR kbend=3e5) {
-        //particleNum1D(particleNum1D), particleNum2D(particleNum1D*particleNum1D), particleDataNum(particleNum2D*3),{
-        //size1D(size1D), stretchRestLength(size1D/PR(particleNum1D-1)), shearRestLength(stretchRestLength*std::sqrt(2)), bendRestLength(stretchRestLength*2) 
-        sceneObjects.deformableMeshes.emplace_back(
-                new DeformableMeshGridInitializer<PR>(particleNum1D, size1D, kstretch, kshear, kbend),
-                particleNum1D*particleNum1D, // vertexNum
-                (particleNum1D-1)*(particleNum1D-1)*2 // facetNum
-        );
-    }
-
     void addClothGridFast(Index particleNum1D = 200, PR size1D = 100, PR kstretch=1e5, PR kshear=1e5, PR kbend=3e5, PR mass=0.1) {
         //particleNum1D(particleNum1D), particleNum2D(particleNum1D*particleNum1D), particleDataNum(particleNum2D*3),{
         //size1D(size1D), stretchRestLength(size1D/PR(particleNum1D-1)), shearRestLength(stretchRestLength*std::sqrt(2)), bendRestLength(stretchRestLength*2) 
-        //sceneObjects.squareClothes.emplace_back(
-        //        new DeformableMeshGridInitializer<PR>(particleNum1D, size1D, kstretch, kshear, kbend),
-        //        particleNum1D, // particleNum1D
-        //        size1D, // size1D
-        //        (particleNum1D-1)*(particleNum1D-1)*2, // facetNum
-        //        kstretch, kshear, kbend
-        //);
         sceneObjects.addGeneralMesh(
             new MeshGridInitializer<BE, PR>({
                 PlaneDirection::XYPlane,
@@ -2629,8 +2758,6 @@ struct Simulator {
     };
 
     void memoryAllocation() {
-        for(auto& squareCloth : sceneObjects.squareClothes) squareCloth.memoryAllocation();
-        for(auto& deformableMesh : sceneObjects.deformableMeshes) deformableMesh.memoryAllocation();
         //for(auto& plane : sceneObjects.planes) plane.memoryAllocation(pool);
         for(auto& mesh : sceneObjects.meshes) mesh.memoryAllocation();
     }
@@ -2640,88 +2767,116 @@ struct Simulator {
         GlobalAutoAllocator<BE>::globalInitialize(1<<20);
         std::cout << "[Simulator Init] Memory pool allocated" << std::endl;
 
-        for(auto& squareCloth : sceneObjects.squareClothes) squareCloth.initialize();
-        if(sceneObjects.squareClothes.size() > 0) std::cout << "[Simulator Init] square clothes(fast grid cloth) objects are initialized" << std::endl;
-        //for(auto& deformableMesh : sceneObjects.deformableMeshes) deformableMesh.initialize();
-        //if(sceneObjects.deformableMeshes.size() > 0) std::cout << "[Simulator Init] deformableMesh objects are initialized" << std::endl;
         for(auto& plane : sceneObjects.planes) {}
         for(auto& mesh : sceneObjects.meshes) {
             std::cout << "  - try to initialize mesh " << mesh.id << "\n";
             mesh.initialize();
+            mesh.state.v.map().setZero();
             std::cout << "  - mesh " << mesh.id << " is initialized\n";
         }
         if(sceneObjects.meshes.size() > 0) std::cout << "[Simulator Init] general mesh objects are initialized" << std::endl;
+
+        frame = 0;
 
         std::cout << "[Simulator Init] All scene objects are initialized" << std::endl;
             
     }
 
+
     void update() {
         if(pause) return;
         //std::cout << "[Simulator Update] Start update" << std::endl;
-        if(SceneObject<BE, PR>::numObjects > 0) {
-            auto* mesh = SceneObject<BE, PR>::findById(0);
+        
+        
+        if(frame % 10 == 0) collisionPipeline.broadPhase.build(sceneObjects);
 
-            collisionPipeline.broadPhase.build(mesh->id, mesh->state.x, mesh->adjacency.facets);
-            collisionPipeline.broadPhase.checkSelfCollisions(0.005);
+        
+        for(int i = 0; i < system.subSteps; i++) {
 
-            auto& c = mesh->constraints;
-            std::cout << "Self collision detected: (" << c.numBroadCollisions[0] << "/" << c.maxNumCollisions << ")\n";
-            for(Index i = 0; i < 5; ++i) {
-                std::cout << "  - Collision " << i << ": point " 
-                    << c.broadCollisions[i].indexPair.point
-                    << " and triangle "
-                    << c.broadCollisions[i].indexPair.triangle << std::endl;
-            }
+            //if(i % 10 == 0) checkCollision = true;
+            //else checkCollision = false;
+            checkCollision = true;
 
-            collisionPipeline.narrowPhase.narrowAndSortByVertices(
-                    c.broadCollisions,
-                    c.numBroadCollisions[0],
-                    mesh->adjacency,
-                    c,
-                    0.002);
+            if(SceneObject<BE, PR>::numMeshes > 0 && checkCollision) {
+                //MetalGlobalContext::commitAndWait();
 
-            std::cout << "Narrowed self collision detected: (" << c.numNarrowCollisions << "/" << c.maxNumCollisions << ")\n";
-            Index min = 5 < c.numNarrowCollisions ? 5 : c.numNarrowCollisions;
-            for(Index i = 0; i < min; ++i) {
-                std::cout << "  - Collision " << i << ": point " 
-                    << c.narrowCollisions[i].indexPair.point
-                    << " and triangle "
-                    << c.narrowCollisions[i].indexPair.triangle 
-                    << " and normal " 
-                    << '(' << c.narrowCollisions[i].collisionNormalAndDistance.x 
-                    << ", " << c.narrowCollisions[i].collisionNormalAndDistance.y 
-                    << ", " << c.narrowCollisions[i].collisionNormalAndDistance.z << ')'
-                    << " and distance " 
-                    << c.narrowCollisions[i].collisionNormalAndDistance.w
-                    << std::endl;
-            }
-            std::cout << "Narrowed self collision sorted: (" << c.numNarrowCollisions << "/" << c.maxNumCollisions << ")\n";
-            Index count = 0;
-            for(Index i = 0; i < c.vertexColPrimsOffsets.size-1; ++i) {
-                if(count >= min) break;
-                if(c.vertexColPrimsOffsets[i] == c.vertexColPrimsOffsets[i+1]) continue;
-                for(Index j = c.vertexColPrimsOffsets[i]; j < c.vertexColPrimsOffsets[i+1]; ++j) {
-                    if(count >= min) break;
-                    std::cout << "  - Collision " << j << ": point " 
-                        << c.vertexColPrims[j].indexPair.point
-                        << " and triangle "
-                        << c.vertexColPrims[j].indexPair.triangle 
-                        << " and normal " 
-                        << '(' << c.vertexColPrims[j].collisionNormalAndDistance.x 
-                        << ", " << c.vertexColPrims[j].collisionNormalAndDistance.y 
-                        << ", " << c.vertexColPrims[j].collisionNormalAndDistance.z << ')'
-                        << " and distance " 
-                        << c.vertexColPrims[j].collisionNormalAndDistance.w
-                        << std::endl;
-                    count++;
+                auto* mesh = SceneObject<BE, PR>::findById(0);
+
+
+                //collisionPipeline.broadPhase.enlargeTrajectory(system.h);
+                collisionPipeline.broadPhase.refit();
+                collisionPipeline.broadPhase.detectCollisions(margin);
+
+                auto& c = mesh->constraints;
+                if(c.numBroadCollisions[0] > 0) {
+                    std::cout << "Collision detected: (frame,substep)=" << frame << "," << i << " (" << c.numBroadCollisions[0] << "/" << c.maxNumCollisions << ")\n";
+                    //for(Index i = 0; i < 5; ++i) {
+                    //    std::cout << "  - Collision " << i << ": point " 
+                    //        << c.broadCollisions[i].indexPair.point
+                    //        << " and triangle "
+                    //        << c.broadCollisions[i].indexPair.triangle << std::endl;
+                    //}
+                collisionPipeline.narrowPhase.narrowAndSortByVertices(
+                        c.broadCollisions,
+                        c.numBroadCollisions[0],
+                        mesh->adjacency,
+                        c,
+                        radius);
+                }
+
+
+                if(c.numNarrowCollisions > 0) {
+                    std::cout << "Narrowed collision detected: (frame,substep)=" << frame << "," << i << " (" << c.numNarrowCollisions << "/" << c.maxNumCollisions << ")\n";
+                    //Index min = 5 < c.numNarrowCollisions ? 5 : c.numNarrowCollisions;
+                    //for(Index i = 0; i < min; ++i) {
+                    //    std::cout << "  - Collision " << i << ": point " 
+                    //        << c.narrowCollisions[i].indexPair.point
+                    //        << " and triangle "
+                    //        << c.narrowCollisions[i].indexPair.triangle 
+                    //        << " and normal " 
+                    //        << '(' << c.narrowCollisions[i].collisionNormalAndDistance.x 
+                    //        << ", " << c.narrowCollisions[i].collisionNormalAndDistance.y 
+                    //        << ", " << c.narrowCollisions[i].collisionNormalAndDistance.z << ')'
+                    //        << " and distance " 
+                    //        << c.narrowCollisions[i].collisionNormalAndDistance.w
+                    //        << std::endl;
+                    //}
+                    //std::cout << "Narrowed self collision sorted: (" << c.numNarrowCollisions << "/" << c.maxNumCollisions << ")\n";
+                    //Index count = 0;
+                    //for(Index i = 0; i < c.vertexColPrimsOffsets.size-1; ++i) {
+                    //    if(count >= min) break;
+                    //    if(c.vertexColPrimsOffsets[i] == c.vertexColPrimsOffsets[i+1]) continue;
+                    //    for(Index j = c.vertexColPrimsOffsets[i]; j < c.vertexColPrimsOffsets[i+1]; ++j) {
+                    //        if(count >= min) break;
+                    //        std::cout << "  - Collision " << j << ": point " 
+                    //            << c.vertexColPrims[j].indexPair.point
+                    //            << " and triangle "
+                    //            << c.vertexColPrims[j].indexPair.triangle 
+                    //            << " and normal " 
+                    //            << '(' << c.vertexColPrims[j].collisionNormalAndDistance.x 
+                    //            << ", " << c.vertexColPrims[j].collisionNormalAndDistance.y 
+                    //            << ", " << c.vertexColPrims[j].collisionNormalAndDistance.z << ')'
+                    //            << " and distance " 
+                    //            << c.vertexColPrims[j].collisionNormalAndDistㅅance.w
+                    //            << std::endl;
+                    //        count++;
+                    //    }
+                    //}
                 }
             }
+
+
+
+            system.update(sceneObjects);
         }
 
+        MetalGlobalContext::commitAndWait();
+        
+        system.acctime += system.h;
+        frame++;
 
-
-        system.update(sceneObjects);
+        for(auto& mesh : sceneObjects.meshes)
+            mesh.meshGL.updateBuffer(mesh.state.x.ptr);
 
         //collisionPipeline.broadPhase.build(sceneObjects.squareClothes[0].x, sceneObjects.squareClothes[0].facet);
         //std::cout << "[Simulator Update] Finished update" << std::endl;
@@ -2730,13 +2885,23 @@ struct Simulator {
     void draw() {
         //system.draw();
 
-        for(auto& squareCloth : sceneObjects.squareClothes) squareCloth.mesh.draw();
-        //for(auto& deformableMesh : sceneObjects.deformableMeshes) deformableMesh.mesh.draw();
         for(auto& mesh : sceneObjects.meshes) mesh.meshGL.draw();
     }
 
-    void debugLines() {
+    void debugEachBoxes() {
         collisionPipeline.broadPhase.showBox();
+    }
+    void debugSceneBox() {
+        collisionPipeline.broadPhase.showSceneBox();
+    }
+
+
+    void debugCollisions() {
+        for(GeneralMesh<BE, PR>& mesh : sceneObjects.meshes) {
+            if(mesh.behaviorType == BehaviorType::Float) continue;
+            mesh.prepareDebugCollisions();
+            mesh.showObjCollisions();
+        }
     }
 };
 
@@ -2762,7 +2927,7 @@ struct ExplicitSystem<CPU, PR> {
     //}
 
     void clearForce(SceneObject<CPU, PR>& sceneObjects) { 
-        for(SquareCloth<CPU, PR>& squareCloth : sceneObjects.squareClothes) squareCloth.f.map().setZero(); 
+        //for(SquareCloth<CPU, PR>& squareCloth : sceneObjects.squareClothes) squareCloth.f.map().setZero(); 
         //for(DeformableMesh<CPU, PR>& deformableMesh : sceneObjects.deformableMeshes) deformableMesh.f.map().setZero(); 
     }
     
@@ -2807,81 +2972,81 @@ struct ExplicitSystem<CPU, PR> {
         //        );
         //    }
         //} // deformableMeshes
-        for(SquareCloth<CPU, PR>& squareCloth : sceneObjects.squareClothes) {
-            Eigen::Map<Eigen::Matrix<PR, 3, Eigen::Dynamic>> X(squareCloth.x.ptr, 3, squareCloth.vertexNum);
-            Eigen::Map<Eigen::Matrix<PR, 3, Eigen::Dynamic>> V(squareCloth.v.ptr, 3, squareCloth.vertexNum);
-            Eigen::Map<Eigen::Matrix<PR, 3, Eigen::Dynamic>> F(squareCloth.f.ptr, 3, squareCloth.vertexNum);
-            Eigen::Map<Eigen::Matrix<PR, 3, Eigen::Dynamic>> M(squareCloth.m.ptr, 3, squareCloth.vertexNum);
-            
-            // add gravity
-            F.row(1) += G * M.row(1);
+        //for(SquareCloth<CPU, PR>& squareCloth : sceneObjects.squareClothes) {
+        //    Eigen::Map<Eigen::Matrix<PR, 3, Eigen::Dynamic>> X(squareCloth.x.ptr, 3, squareCloth.vertexNum);
+        //    Eigen::Map<Eigen::Matrix<PR, 3, Eigen::Dynamic>> V(squareCloth.v.ptr, 3, squareCloth.vertexNum);
+        //    Eigen::Map<Eigen::Matrix<PR, 3, Eigen::Dynamic>> F(squareCloth.f.ptr, 3, squareCloth.vertexNum);
+        //    Eigen::Map<Eigen::Matrix<PR, 3, Eigen::Dynamic>> M(squareCloth.m.ptr, 3, squareCloth.vertexNum);
+        //    
+        //    // add gravity
+        //    F.row(1) += G * M.row(1);
 
-            // add air drag
-            F += V * kair;
+        //    // add air drag
+        //    F += V * kair;
 
-            // add spring
-            // 스프링 포스 계산용 람다 함수 (인자로 ID를 받습니다)
-            auto addSpringForce = [&](size_t idA, size_t idB, PR restLength, PR kspring) {
-                // .col()을 쓰면 Eigen::Vector3f 처럼 다룰 수 있습니다!
-                auto dx = X.col(idB) - X.col(idA); 
-                
-                PR len = dx.norm();
-                if (len < 1E-9) return; // 0 나누기 방지
+        //    // add spring
+        //    // 스프링 포스 계산용 람다 함수 (인자로 ID를 받습니다)
+        //    auto addSpringForce = [&](size_t idA, size_t idB, PR restLength, PR kspring) {
+        //        // .col()을 쓰면 Eigen::Vector3f 처럼 다룰 수 있습니다!
+        //        auto dx = X.col(idB) - X.col(idA); 
+        //        
+        //        PR len = dx.norm();
+        //        if (len < 1E-9) return; // 0 나누기 방지
 
-                auto dv = V.col(idB) - V.col(idA);
-                auto ndx = dx / len;
-                auto sf = (kspring * (len - restLength) + kd * dv.dot(ndx)) * ndx;
+        //        auto dv = V.col(idB) - V.col(idA);
+        //        auto ndx = dx / len;
+        //        auto sf = (kspring * (len - restLength) + kd * dv.dot(ndx)) * ndx;
 
-                // 작용-반작용 법칙: A에는 더하고 B에는 뺍니다 (제자리 갱신)
-                F.col(idA) += sf;
-                F.col(idB) -= sf;
-            };
-            for(size_t pid = 0; pid < squareCloth.vertexNum; pid++) {
-                auto col = pid % squareCloth.particleNum1D;
-                auto row = pid / squareCloth.particleNum1D;
-                
-                // stretch
-                if(col < squareCloth.particleNum1D-1) addSpringForce(pid, pid+1, squareCloth.stretchRestLength, squareCloth.kstretch); // right
-                if(row < squareCloth.particleNum1D-1) addSpringForce(pid, pid+squareCloth.particleNum1D, squareCloth.stretchRestLength, squareCloth.kstretch); // bottom
-                // shear
-                if(col < squareCloth.particleNum1D-1 && row < squareCloth.particleNum1D-1) addSpringForce(pid, pid+squareCloth.particleNum1D+1, squareCloth.shearRestLength, squareCloth.kshear); // right-bottom
-                if(col > 0 && row < squareCloth.particleNum1D-1) addSpringForce(pid, pid+squareCloth.particleNum1D-1, squareCloth.shearRestLength, squareCloth.kshear); // left-bottom
-                // bend
-                if(col < squareCloth.particleNum1D-2) addSpringForce(pid, pid+2, squareCloth.bendRestLength, squareCloth.kbend); // right-riht
-                if(row < squareCloth.particleNum1D-2) addSpringForce(pid, pid+2*squareCloth.particleNum1D, squareCloth.bendRestLength, squareCloth.kbend); // bottom-bottom
-            }
-        } // SquareCloth
+        //        // 작용-반작용 법칙: A에는 더하고 B에는 뺍니다 (제자리 갱신)
+        //        F.col(idA) += sf;
+        //        F.col(idB) -= sf;
+        //    };
+        //    for(size_t pid = 0; pid < squareCloth.vertexNum; pid++) {
+        //        auto col = pid % squareCloth.particleNum1D;
+        //        auto row = pid / squareCloth.particleNum1D;
+        //        
+        //        // stretch
+        //        if(col < squareCloth.particleNum1D-1) addSpringForce(pid, pid+1, squareCloth.stretchRestLength, squareCloth.kstretch); // right
+        //        if(row < squareCloth.particleNum1D-1) addSpringForce(pid, pid+squareCloth.particleNum1D, squareCloth.stretchRestLength, squareCloth.kstretch); // bottom
+        //        // shear
+        //        if(col < squareCloth.particleNum1D-1 && row < squareCloth.particleNum1D-1) addSpringForce(pid, pid+squareCloth.particleNum1D+1, squareCloth.shearRestLength, squareCloth.kshear); // right-bottom
+        //        if(col > 0 && row < squareCloth.particleNum1D-1) addSpringForce(pid, pid+squareCloth.particleNum1D-1, squareCloth.shearRestLength, squareCloth.kshear); // left-bottom
+        //        // bend
+        //        if(col < squareCloth.particleNum1D-2) addSpringForce(pid, pid+2, squareCloth.bendRestLength, squareCloth.kbend); // right-riht
+        //        if(row < squareCloth.particleNum1D-2) addSpringForce(pid, pid+2*squareCloth.particleNum1D, squareCloth.bendRestLength, squareCloth.kbend); // bottom-bottom
+        //    }
+        //} // SquareCloth
     }
     
     void update(SceneObject<CPU, PR>& sceneObjects) {
-        for(size_t i = 0; i < subSteps; i++) {
-            clearForce(sceneObjects);
-            addForce(sceneObjects);
-            for(SquareCloth<CPU, PR>& squareCloth : sceneObjects.squareClothes) {
-                Eigen::Map<Eigen::Matrix<PR, 3, Eigen::Dynamic>> X(squareCloth.x.ptr, 3, squareCloth.vertexNum);
-                Eigen::Map<Eigen::Matrix<PR, 3, Eigen::Dynamic>> V(squareCloth.v.ptr, 3, squareCloth.vertexNum);
-                Eigen::Map<Eigen::Matrix<PR, 3, Eigen::Dynamic>> F(squareCloth.f.ptr, 3, squareCloth.vertexNum);
-                Eigen::Map<Eigen::Matrix<PR, 3, Eigen::Dynamic>> M(squareCloth.m.ptr, 3, squareCloth.vertexNum);
+        //for(size_t i = 0; i < subSteps; i++) {
+        //    clearForce(sceneObjects);
+        //    addForce(sceneObjects);
+        //    for(SquareCloth<CPU, PR>& squareCloth : sceneObjects.squareClothes) {
+        //        Eigen::Map<Eigen::Matrix<PR, 3, Eigen::Dynamic>> X(squareCloth.x.ptr, 3, squareCloth.vertexNum);
+        //        Eigen::Map<Eigen::Matrix<PR, 3, Eigen::Dynamic>> V(squareCloth.v.ptr, 3, squareCloth.vertexNum);
+        //        Eigen::Map<Eigen::Matrix<PR, 3, Eigen::Dynamic>> F(squareCloth.f.ptr, 3, squareCloth.vertexNum);
+        //        Eigen::Map<Eigen::Matrix<PR, 3, Eigen::Dynamic>> M(squareCloth.m.ptr, 3, squareCloth.vertexNum);
 
-                Eigen::Map<Eigen::Matrix<PR, 1, Eigen::Dynamic>> Mask(squareCloth.fixedParticle.ptr, 1, squareCloth.vertexNum);
+        //        Eigen::Map<Eigen::Matrix<PR, 1, Eigen::Dynamic>> Mask(squareCloth.fixedParticle.ptr, 1, squareCloth.vertexNum);
 
-                V.array() += (F.array() / M.array()).rowwise() * Mask.array() * subh;
-                X.array() += V.array().rowwise() * Mask.array() * subh;
-            }
-            //for(DeformableMesh<CPU, PR>& deformableMesh : sceneObjects.deformableMeshes) {
-            //    Eigen::Map<Eigen::Matrix<PR, 3, Eigen::Dynamic>> X(deformableMesh.x.ptr, 3, deformableMesh.vertexNum);
-            //    Eigen::Map<Eigen::Matrix<PR, 3, Eigen::Dynamic>> V(deformableMesh.v.ptr, 3, deformableMesh.vertexNum);
-            //    Eigen::Map<Eigen::Matrix<PR, 3, Eigen::Dynamic>> F(deformableMesh.f.ptr, 3, deformableMesh.vertexNum);
-            //    Eigen::Map<Eigen::Matrix<PR, 3, Eigen::Dynamic>> M(deformableMesh.m.ptr, 3, deformableMesh.vertexNum);
+        //        V.array() += (F.array() / M.array()).rowwise() * Mask.array() * subh;
+        //        X.array() += V.array().rowwise() * Mask.array() * subh;
+        //    }
+        //    //for(DeformableMesh<CPU, PR>& deformableMesh : sceneObjects.deformableMeshes) {
+        //    //    Eigen::Map<Eigen::Matrix<PR, 3, Eigen::Dynamic>> X(deformableMesh.x.ptr, 3, deformableMesh.vertexNum);
+        //    //    Eigen::Map<Eigen::Matrix<PR, 3, Eigen::Dynamic>> V(deformableMesh.v.ptr, 3, deformableMesh.vertexNum);
+        //    //    Eigen::Map<Eigen::Matrix<PR, 3, Eigen::Dynamic>> F(deformableMesh.f.ptr, 3, deformableMesh.vertexNum);
+        //    //    Eigen::Map<Eigen::Matrix<PR, 3, Eigen::Dynamic>> M(deformableMesh.m.ptr, 3, deformableMesh.vertexNum);
 
-            //    Eigen::Map<Eigen::Matrix<PR, 1, Eigen::Dynamic>> Mask(deformableMesh.fixedParticle.ptr, 1, deformableMesh.vertexNum);
+        //    //    Eigen::Map<Eigen::Matrix<PR, 1, Eigen::Dynamic>> Mask(deformableMesh.fixedParticle.ptr, 1, deformableMesh.vertexNum);
 
-            //    V.array() += (F.array() / M.array()).rowwise() * Mask.array() * subh;
-            //    X.array() += V.array().rowwise() * Mask.array() * subh;
-            //}
-        }
-        for(SquareCloth<CPU, PR>& squareCloth : sceneObjects.squareClothes) 
-            squareCloth.mesh.updateBuffer(squareCloth.x.ptr);
+        //    //    V.array() += (F.array() / M.array()).rowwise() * Mask.array() * subh;
+        //    //    X.array() += V.array().rowwise() * Mask.array() * subh;
+        //    //}
+        //}
+        //for(SquareCloth<CPU, PR>& squareCloth : sceneObjects.squareClothes) 
+        //    squareCloth.mesh.updateBuffer(squareCloth.x.ptr);
         //for(DeformableMesh<CPU, PR>& deformableMesh : sceneObjects.deformableMeshes) 
         //    deformableMesh.mesh.updateBuffer(deformableMesh.x.ptr);
         for(auto& mesh : sceneObjects.meshes)
@@ -2947,96 +3112,40 @@ struct ExplicitSystem<METAL, PR> {
     // 2. update() 함수 수정
     void update(SceneObject<METAL, PR>& sceneObjects) {
 
-        //for(auto& deformableMesh : sceneObjects.deformableMeshes) {
-        //    // 변수들을 패킹합니다.
-        //    SimParams params = { subh, G, kair, kd, (uint)deformableMesh.vertexNum, acctime };
-
-        //    // [버퍼는 루프 밖에서 딱 한 번만 바인딩합니다!]
-        //    computeEncoder->setBuffer(deformableMesh.x.pool, deformableMesh.x.offset, 0);
-        //    computeEncoder->setBuffer(deformableMesh.v.pool, deformableMesh.v.offset, 1);
-        //    computeEncoder->setBuffer(deformableMesh.f.pool, deformableMesh.f.offset, 2);
-        //    computeEncoder->setBuffer(deformableMesh.m.pool, deformableMesh.m.offset, 3);
-        //    computeEncoder->setBuffer(deformableMesh.fixedParticle.pool, deformableMesh.fixedParticle.offset, 4);
-        //    
-        //    // 4KB 이하의 작은 데이터는 버퍼를 안 만들고 setBytes로 즉시 꽂을 수 있습니다.
-        //    computeEncoder->setBytes(&params, sizeof(SimParams), 6);
-
-        //    computeEncoder->setBuffer(deformableMesh.springIndex.pool, deformableMesh.springIndex.offset, 10);
-        //    computeEncoder->setBuffer(deformableMesh.springCoef.pool, deformableMesh.springCoef.offset, 11);
-
-
-        //    // 💡 서브스텝 만큼 GPU 파이프라인을 교차 실행합니다!
-        //    for(size_t i = 0; i < subSteps; i++) {
-        //        { // force overwrite with gravity + air drag
-        //            MTL::Size gridSize = MTL::Size(deformableMesh.vertexNum, 1, 1);
-        //            MTL::Size threadGroupSize = MTL::Size(std::min((size_t)forcePSO->maxTotalThreadsPerThreadgroup(), (size_t)deformableMesh.vertexNum), 1, 1);
-        //            computeEncoder->setComputePipelineState(forcePSO);
-        //            computeEncoder->dispatchThreads(gridSize, threadGroupSize);
-        //        }
-        //        { // spring force add
-        //            MTL::Size gridSize = MTL::Size(deformableMesh.springIndex.size/2, 1, 1);
-        //            MTL::Size threadGroupSize = MTL::Size(std::min((size_t)springForcePSO->maxTotalThreadsPerThreadgroup(), deformableMesh.springIndex.size/2), 1, 1);
-        //            computeEncoder->setComputePipelineState(springForcePSO);
-        //            computeEncoder->dispatchThreads(gridSize, threadGroupSize);
-        //        }
-        //        { // integration
-        //            MTL::Size gridSize = MTL::Size(deformableMesh.vertexNum, 1, 1);
-        //            MTL::Size threadGroupSize = MTL::Size(std::min((size_t)integratePSO->maxTotalThreadsPerThreadgroup(), (size_t)deformableMesh.vertexNum), 1, 1);
-        //            computeEncoder->setComputePipelineState(integratePSO);
-        //            computeEncoder->dispatchThreads(gridSize, threadGroupSize);
-        //        }
-        //    }
-        //} // deformableMeshes
-        for(auto& squareCloth : sceneObjects.squareClothes) {
-            SimParams params = { subh, G, kair, kd, (uint)squareCloth.vertexNum, acctime };
-            ClothGridParams clothParams = { 
-                squareCloth.particleNum1D, 
-                squareCloth.stretchRestLength, squareCloth.shearRestLength, squareCloth.bendRestLength,
-                squareCloth.kstretch, squareCloth.kshear, squareCloth.kbend
-            };
-
-            // [버퍼는 루프 밖에서 딱 한 번만 바인딩합니다!]
-            MetalGlobalContext::setBuffer(squareCloth.x, 0);
-            MetalGlobalContext::setBuffer(squareCloth.v, 1);
-            MetalGlobalContext::setBuffer(squareCloth.f, 2);
-            MetalGlobalContext::setBuffer(squareCloth.m, 3);
-            MetalGlobalContext::setBuffer(squareCloth.fixedParticle, 4);
-            
-            // 4KB 이하의 작은 데이터는 버퍼를 안 만들고 setBytes로 즉시 꽂을 수 있습니다.
-            MetalGlobalContext::setBytes(params, 8);
-            MetalGlobalContext::setBytes(clothParams, 9);
-
-            for(size_t i = 0; i < subSteps; i++) {
-                MetalGlobalContext::dispatchThreads(clothGridFastForcePSO, squareCloth.vertexNum);
-                MetalGlobalContext::dispatchThreads(integratePSO, squareCloth.vertexNum);
-            }
-        } // squareClothes
         for(auto& mesh : sceneObjects.meshes) {
 
             SimParams params = { subh, G, kair, kd, (uint)mesh.state.x.size/3, acctime };
 
             //BehaviorParams<PR> clothParams = mesh.behaviorParams;
 
+            //switch(mesh.behaviorType) {
+            //    case BehaviorType::TriangularCloth:
+            //        TriangularClothBehavior<METAL, PR>::setBuffer(mesh, params);
+            //        break;
+            //    case BehaviorType::FastGridCloth:
+            //        FastGridClothBehavior<METAL, PR>::setBuffer(mesh, params);
+            //        break;
+            //    case BehaviorType::Float:
+            //        break;
+            //    case BehaviorType::Elastic:
+            //    case BehaviorType::Rigid:
+            //    case BehaviorType::Fluid:
+            //    case BehaviorType::Generator:
+            //    default: break;
+            //}
+            //for(size_t i = 0; i < subSteps; i++) {
             switch(mesh.behaviorType) {
                 case BehaviorType::TriangularCloth:
                     TriangularClothBehavior<METAL, PR>::setBuffer(mesh, params);
+                    TriangularClothBehavior<METAL, PR>::update(mesh.state);
+                    MetalGlobalContext::dispatchThreads(integratePSO, mesh.state.x.size/3);
                     break;
                 case BehaviorType::FastGridCloth:
                     FastGridClothBehavior<METAL, PR>::setBuffer(mesh, params);
-                    break;
-                case BehaviorType::Elastic:
-                case BehaviorType::Rigid:
-                case BehaviorType::Fluid:
-                case BehaviorType::Generator:
-                default: break;
-            }
-            for(size_t i = 0; i < subSteps; i++) {
-            switch(mesh.behaviorType) {
-                case BehaviorType::TriangularCloth:
-                TriangularClothBehavior<METAL, PR>::update(mesh.state);
-                    break;
-                case BehaviorType::FastGridCloth:
                     FastGridClothBehavior<METAL, PR>::update(mesh.state);
+                    MetalGlobalContext::dispatchThreads(integratePSO, mesh.state.x.size/3);
+                    break;
+                case BehaviorType::Float:
                     break;
                 case BehaviorType::Elastic:
                 case BehaviorType::Rigid:
@@ -3045,18 +3154,8 @@ struct ExplicitSystem<METAL, PR> {
                 default: break;
             }
 
-                MetalGlobalContext::dispatchThreads(integratePSO, mesh.state.x.size/3);
-            }
+            //}
         }
-        MetalGlobalContext::commitAndWait();
-        
-        acctime += h;
-        for(auto& squareCloth : sceneObjects.squareClothes) 
-            squareCloth.mesh.updateBuffer(squareCloth.x.ptr);
-        //for(auto& deformableMesh : sceneObjects.deformableMeshes) 
-        //    deformableMesh.mesh.updateBuffer(deformableMesh.x.ptr);
-        for(auto& mesh : sceneObjects.meshes)
-            mesh.meshGL.updateBuffer(mesh.state.x.ptr);
     }
 };
 
@@ -3113,27 +3212,19 @@ int main() {
     Precision kshear = 1e5;
     Precision kbend = 4e5;
     Precision mass = 0.1;
-    //simulator.addClothGrid(particleNum1D, size1D, kstretch, kshear, kbend, mass);
-    simulator.addClothGridFast(particleNum1D, size1D, kstretch, kshear, kbend, mass);
+    //simulator.addClothGridFast(particleNum1D, size1D, kstretch, kshear, kbend, mass);
+    simulator.addClothGridFast(20, 50, 1e5, 1e5, 2e5, 0.1);
     //simulator.addGeneralMesh(particleNum1D, size1D, kstretch/2, kshear, kbend/2, mass);
     //simulator.addClothFile("src/assets", "teapot.obj", 15, 1e4, 0, 2e4, mass);
     //simulator.addClothFile("src/assets", "horse-gallop-01.obj", 80, 1e4, 0, 2e4, mass);
-    //simulator.addGround(PlaneDirection::XZPlane, tinym::vec3(0, -100, 0), 500);
+    simulator.addGround(PlaneDirection::XZPlane, tinym::vec3(0, -100, 0), 500);
     
     std::cout << "[Main] mesh added to scene" << std::endl;
 
     simulator.initialize();
     std::cout << "[Main] simulator is initialized" << std::endl;
 
-    if(simulator.sceneObjects.squareClothes.size() > 0) {
-        simulator.sceneObjects.squareClothes[0].fixedParticle.map()[0] = 0.f;
-        simulator.sceneObjects.squareClothes[0].fixedParticle.map()[particleNum1D-1] = 0.f;
-    }
-    //if(simulator.sceneObjects.deformableMeshes.size() > 0) {
-    //    simulator.sceneObjects.deformableMeshes[0].fixedParticle.map()[0] = 0.f;
-    //    simulator.sceneObjects.deformableMeshes[0].fixedParticle.map()[particleNum1D-1] = 0.f;
-    //}
-    if(SceneObject<Backend, Precision>::numObjects > 0) {
+    if(SceneObject<Backend, Precision>::numMeshes > 0) {
         std::cout << "Try to pin general meshes\n";
         for(auto& mesh: SceneObject<Backend, Precision>::meshes) {
             std::cout << mesh.id << std::endl;
@@ -3141,7 +3232,7 @@ int main() {
         auto* mesh = SceneObject<Backend, Precision>::findById(0);
         std::cout << mesh << std::endl;
         mesh->constraints.fixParticle(0);
-        mesh->constraints.fixParticle(particleNum1D-1);
+        //mesh->constraints.fixParticle(particleNum1D-1);
     }
 
     std::cout << "[Main] particles are pinned" << std::endl;
@@ -3155,7 +3246,9 @@ int main() {
     Program debugLineShader;
     debugLineShader.loadShader("line.vert", "line.frag");
 
-    bool debugBoxes = true;
+    bool debugEachBoxes = false;
+    bool debugSceneBox = false;
+    bool debugCollisions = true;
 
     std::cout << "[Main] programs are loaded" << std::endl;
 
@@ -3166,9 +3259,10 @@ int main() {
 
     struct CallbacksDataPack {
         Simulator<Backend, Precision, ExplicitSystem<Backend, Precision>>* simulator;
-        bool* debugBoxes;
+        bool* debugEachBoxes;
+        bool* debugSceneBox;
     };
-    CallbacksDataPack pack = {&simulator, &debugBoxes};
+    CallbacksDataPack pack = {&simulator, &debugEachBoxes, &debugSceneBox};
 
     //glfwSetWindowUserPointer(window->getGLFWWindow(), &system);
     glfwSetWindowUserPointer(window->getGLFWWindow(), &(pack));
@@ -3176,33 +3270,26 @@ int main() {
 
         auto* pack = static_cast<CallbacksDataPack*>(glfwGetWindowUserPointer(window));
         auto* simulator = pack->simulator;
-        auto* debugBoxes = pack->debugBoxes;
+        auto* debugEachBoxes = pack->debugEachBoxes;
+        auto* debugSceneBox = pack->debugSceneBox;
 
         if(key == GLFW_KEY_0 && action == GLFW_PRESS) {
-            //sys->initCloth();
             simulator->initialize();
         } else if(key == GLFW_KEY_9 && action == GLFW_PRESS) {
-            //sys->initClothHorz();
         } else if(key == GLFW_KEY_1 && action == GLFW_PRESS) {
-            //sys->fixedParticle.map()[0] = !((bool)sys->fixedParticle.map()[0]);
-            if(simulator->sceneObjects.squareClothes.size() > 0) 
-                simulator->sceneObjects.squareClothes[0].fixedParticle.map()[0] = !((bool)simulator->sceneObjects.squareClothes[0].fixedParticle.map()[0]);
             if(simulator->sceneObjects.meshes.size() > 0)
                 simulator->sceneObjects.meshes[0].constraints.fixedParticles[0] = !((bool)simulator->sceneObjects.meshes[0].constraints.fixedParticles[0]);
-            //if(simulator->sceneObjects.deformableMeshes.size() > 0) 
-            //    simulator->sceneObjects.deformableMeshes[0].fixedParticle.map()[0] = !((bool)simulator->sceneObjects.deformableMeshes[0].fixedParticle.map()[0]);
         } else if(key == GLFW_KEY_2 && action == GLFW_PRESS) {
-            //sys->fixedParticle.map()[sys->particleNum1D-1] = !((bool)sys->fixedParticle.map()[sys->particleNum1D-1]);
-            if(simulator->sceneObjects.squareClothes.size() > 0) 
-                simulator->sceneObjects.squareClothes[0].fixedParticle.map()[200-1] = !((bool)simulator->sceneObjects.squareClothes[0].fixedParticle.map()[200-1]);
             if(simulator->sceneObjects.meshes.size() > 0)
                 simulator->sceneObjects.meshes[0].constraints.fixedParticles[200-1] = !((bool)simulator->sceneObjects.meshes[0].constraints.fixedParticles[200-1]);
-            //if(simulator->sceneObjects.deformableMeshes.size() > 0) 
-            //    simulator->sceneObjects.deformableMeshes[0].fixedParticle.map()[200-1] = !((bool)simulator->sceneObjects.deformableMeshes[0].fixedParticle.map()[200-1]);
         } else if(key == GLFW_KEY_SPACE && action == GLFW_PRESS) {
             simulator->pause = !(simulator->pause);
-        } else if(key == GLFW_KEY_D && action == GLFW_PRESS) {
-            *debugBoxes = !(*debugBoxes);
+        } else if(key == GLFW_KEY_B && action == GLFW_PRESS) {
+            *debugEachBoxes = !(*debugEachBoxes);
+        } else if(key == GLFW_KEY_S && action == GLFW_PRESS) {
+            *debugSceneBox = !(*debugSceneBox);
+        } else if(key == GLFW_KEY_C && action == GLFW_PRESS) {
+            simulator->checkCollision = !(simulator->checkCollision);
         }
 
     };
@@ -3248,12 +3335,27 @@ int main() {
         //system.draw();
         simulator.draw();
 
-        if(debugBoxes) {
+        if(debugEachBoxes) {
             debugLineShader.use();
             debugLineShader.setUniform("V", V);
             debugLineShader.setUniform("P", P);
             glLineWidth(2.5f);
-            simulator.debugLines();
+            simulator.debugEachBoxes();
+        }
+        if(debugSceneBox) {
+            debugLineShader.use();
+            debugLineShader.setUniform("V", V);
+            debugLineShader.setUniform("P", P);
+            glLineWidth(2.5f);
+            simulator.debugSceneBox();
+        }
+
+        if(debugCollisions) {
+            debugLineShader.use();
+            debugLineShader.setUniform("V", V);
+            debugLineShader.setUniform("P", P);
+            glLineWidth(2.5f);
+            simulator.debugCollisions();
         }
 
         auto renderingEnd = std::chrono::high_resolution_clock::now();
