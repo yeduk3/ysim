@@ -1243,10 +1243,11 @@ struct MeshFileInitializerParams {
 
     // Specifics
     std::string prefix, fileName;
+    tinym::vec3 offset;
     PR scale;
 
-    MeshFileInitializerParams(std::string prefix, std::string fileName, PR scale, PR mass) 
-        : prefix(prefix), fileName(fileName), scale(scale), mass(mass) {}
+    MeshFileInitializerParams(std::string prefix, std::string fileName, tinym::vec3 offset, PR scale, PR mass) 
+        : prefix(prefix), fileName(fileName), offset(offset), scale(scale), mass(mass) {}
 };
 
 template <typename BE, typename PR>
@@ -1281,9 +1282,9 @@ struct MeshFileInitializer : GeneralMeshInitializer<BE, PR> {
 
         for(Index vid = 0; vid < params.numPoints; vid++) {
             Index vbase = vid*3;
-            state.x[vbase  ] = data.vertices[vid].x*params.scale;
-            state.x[vbase+1] = data.vertices[vid].y*params.scale;
-            state.x[vbase+2] = data.vertices[vid].z*params.scale;
+            state.x[vbase  ] = data.vertices[vid].x*params.scale + params.offset.x;
+            state.x[vbase+1] = data.vertices[vid].y*params.scale + params.offset.y;
+            state.x[vbase+2] = data.vertices[vid].z*params.scale + params.offset.z;
         }
 
         if(adjacency.vertexAdjFacets.ptr) return;
@@ -1372,6 +1373,7 @@ struct Constraints {
 template <typename PR>
 struct ClothBehaviorParams {
     PR stretch, shear, bend;
+    PR thickness;
 };
 
 template <typename PR>
@@ -1379,6 +1381,7 @@ struct FastGridClothBehaviorParams {
     uint particleNum1D;
     PR stretchRest, shearRest, bendRest;
     PR kstretch, kshear, kbend;
+    PR thickness;
 };
 
 template <typename PR>
@@ -1572,7 +1575,7 @@ struct GeneralMesh {
 
             tinym::vec3_view v(state.x.ptr + nc.indexPair.point*3);
             tinym::vec3_view n(nc.collisionNormalAndDistance.v);
-            tinym::vec3 t = v+n*20.f;
+            tinym::vec3 t = v+n*.2f;
 
             if(nc.objPair.query == nc.objPair.target) {
                 debugSelfCollisionNormals[selfBase  ] = v[0];
@@ -2324,7 +2327,7 @@ struct BVH<BVHMODE::LINEAR, PRIMITIVE, PR> {
     }
     void checkSelfCollisions(PR queryMargin) {
         auto* qmesh = SceneObject<METAL, PR>::findById(objid); // self query.
-        qmesh->constraints.numBroadCollisions[0] = 0; // clear the previous collisions.
+        //qmesh->constraints.numBroadCollisions[0] = 0; // clear the previous collisions.
 
         queryPoints(objid, queryMargin);
     }
@@ -2404,6 +2407,7 @@ struct BVH<BVHMODE::SCENE, BVHPRIMITIVE::OBJECT, PR> {
         }
 
         for(Index i = 0; i < scene.numMeshes; ++i) {
+            if(objTrees[i].tree.ptr && objTrees[i].objBehavior == BehaviorType::Float) continue;
             objTrees[i].build(scene.meshes[i]);
             Index pbase = i*6;
             positions[pbase  ] = objTrees[i].tree[0].min.x;
@@ -2482,7 +2486,7 @@ struct BVH<BVHMODE::SCENE, BVHPRIMITIVE::OBJECT, PR> {
             SceneObject<METAL, PR>::findById(tree.objid)->constraints.numBroadCollisions[0] = 0;
         }
     }
-    void detectCollisions(PR margin) {
+    void detectCollisions(PR margin, bool enableSelfCollisions=true) {
         queryBegin();
 
         std::set<IndexPair> checked;
@@ -2492,6 +2496,8 @@ struct BVH<BVHMODE::SCENE, BVHPRIMITIVE::OBJECT, PR> {
 
             for(Index t = 0; t < objTrees.size(); ++t) {
                 if(q == t) {
+                    if(!enableSelfCollisions) continue;
+
                     queryTree.checkSelfCollisions(margin);
                     checked.insert({q, t});
                     continue;
@@ -2609,7 +2615,7 @@ struct BruteForce<METAL, PR> {
             }
             //if(l < 0) continue; // TODO: already-penetrated case, not handled,
             // TODO: 1.0 is THICK parameter. fix later
-            if(l > radius + 0.5) continue; // too far.
+            if(l > radius + 0.01f) continue; // too far.
 
             // barycentric coordinate to check in-plane
             tinym::vec3 inplane = p - n*l;
@@ -2685,25 +2691,33 @@ struct Simulator {
     // sim viewer?
     bool pause = true;
     bool checkCollision = true;
+    bool enableSelfCollisions = false;
     Index frame = 0;
 
 
-    PR margin = 1;
-    PR radius = 0.5;
+    PR margin = 0.015;
+    PR radius = 0.012;
 
 
 
     Simulator(System& system) : system(system) {}
 
-    void addClothFile(std::string prefix, std::string fileName, PR scale, PR kstretch=1e5, PR kshear=1e5, PR kbend=3e5, PR mass=0.1) {
+    void addClothFile(std::string prefix, std::string fileName, tinym::vec3 offset, PR scale, PR kstretch=1e5, PR kshear=1e5, PR kbend=3e5, PR thickness=0.001, PR mass=0.1) {
         sceneObjects.addGeneralMesh(
-                new MeshFileInitializer<BE, PR>({prefix, fileName, scale, mass}),
+                new MeshFileInitializer<BE, PR>({prefix, fileName, offset, scale, mass}),
                 BehaviorType::TriangularCloth,
-                ClothBehaviorParams<PR>{kstretch, kshear, kbend}
+                ClothBehaviorParams<PR>{kstretch, kshear, kbend, thickness}
                 );
     };
 
-    void addClothGridFast(Index particleNum1D = 200, PR size1D = 100, PR kstretch=1e5, PR kshear=1e5, PR kbend=3e5, PR mass=0.1) {
+    void addFloatMesh(std::string prefix, std::string fileName, tinym::vec3 offset, PR scale, PR mass=0.1) {
+        sceneObjects.addGeneralMesh(
+                new MeshFileInitializer<BE, PR>({prefix, fileName, offset, scale, mass}),
+                BehaviorType::Float,
+                FloatBehaviorParams<PR>{}
+                );
+    }
+    void addClothGridFast(Index particleNum1D = 200, PR size1D = 100, PR kstretch=1e5, PR kshear=1e5, PR kbend=3e5, PR thickness=0.001, PR mass=0.1) {
         //particleNum1D(particleNum1D), particleNum2D(particleNum1D*particleNum1D), particleDataNum(particleNum2D*3),{
         //size1D(size1D), stretchRestLength(size1D/PR(particleNum1D-1)), shearRestLength(stretchRestLength*std::sqrt(2)), bendRestLength(stretchRestLength*2) 
         sceneObjects.addGeneralMesh(
@@ -2723,12 +2737,13 @@ struct Simulator {
                 size1D/particleNum1D*2,
                 kstretch, 
                 kshear, 
-                kbend
+                kbend,
+                thickness
             }
         );
     }
 
-    void addGeneralMesh(Index particleNum1D = 200, PR size1D = 100, PR kstretch=1e5, PR kshear=1e5, PR kbend=3e5, PR mass=0.1) {
+    void addCloth(Index particleNum1D = 200, PR size1D = 100, PR kstretch=1e5, PR kshear=1e5, PR kbend=3e5, PR thickness=0.01, PR mass=0.1) {
         sceneObjects.addGeneralMesh(
             new MeshGridInitializer<BE, PR>({
                 PlaneDirection::XYPlane, 
@@ -2739,7 +2754,7 @@ struct Simulator {
                 true // jiggle
             }),
             BehaviorType::TriangularCloth,
-            ClothBehaviorParams<PR>{kstretch, kshear, kbend}
+            ClothBehaviorParams<PR>{kstretch, kshear, kbend, thickness}
         );
     };
     void addGround(PlaneDirection dir, tinym::vec3 center, PR size1D, PR mass=0.1) {
@@ -2778,8 +2793,8 @@ struct Simulator {
 
         frame = 0;
 
+
         std::cout << "[Simulator Init] All scene objects are initialized" << std::endl;
-            
     }
 
 
@@ -2805,7 +2820,7 @@ struct Simulator {
 
                 //collisionPipeline.broadPhase.enlargeTrajectory(system.h);
                 collisionPipeline.broadPhase.refit();
-                collisionPipeline.broadPhase.detectCollisions(margin);
+                collisionPipeline.broadPhase.detectCollisions(margin, enableSelfCollisions);
 
                 auto& c = mesh->constraints;
                 if(c.numBroadCollisions[0] > 0) {
@@ -2816,13 +2831,13 @@ struct Simulator {
                     //        << " and triangle "
                     //        << c.broadCollisions[i].indexPair.triangle << std::endl;
                     //}
+                }
                 collisionPipeline.narrowPhase.narrowAndSortByVertices(
                         c.broadCollisions,
                         c.numBroadCollisions[0],
                         mesh->adjacency,
                         c,
                         radius);
-                }
 
 
                 if(c.numNarrowCollisions > 0) {
@@ -3070,9 +3085,9 @@ struct ExplicitSystem<METAL, PR> {
     PR h = 1/PR(60);
     size_t subSteps = 50;
     PR subh = h/subSteps;
-    PR G = -980; // in cm/s^2
-    PR kair = -0.1;
-    PR kd = 0.1;
+    PR G = -9.8; // in m/s^2
+    PR kair = -0.001;
+    PR kd = .5;
     PR acctime = 0;
     // TODO: bending은 더 강하게 줘야할 듯. - 교수님
 
@@ -3206,18 +3221,20 @@ int main() {
     //Precision kstretch = 2e3;
     //Precision kshear = 2e3;
     //Precision kbend = 4e3;
-    Index particleNum1D = 200;
-    Precision size1D = 100;
+    Index particleNum1D = 100;
+    Precision size1D = 0.5;
     Precision kstretch = 2e5;
     Precision kshear = 1e5;
     Precision kbend = 4e5;
     Precision mass = 0.1;
-    //simulator.addClothGridFast(particleNum1D, size1D, kstretch, kshear, kbend, mass);
-    simulator.addClothGridFast(20, 50, 1e5, 1e5, 2e5, 0.1);
-    //simulator.addGeneralMesh(particleNum1D, size1D, kstretch/2, kshear, kbend/2, mass);
-    //simulator.addClothFile("src/assets", "teapot.obj", 15, 1e4, 0, 2e4, mass);
-    //simulator.addClothFile("src/assets", "horse-gallop-01.obj", 80, 1e4, 0, 2e4, mass);
-    simulator.addGround(PlaneDirection::XZPlane, tinym::vec3(0, -100, 0), 500);
+    Precision thickness = 0.001;
+    //simulator.addClothGridFast(particleNum1D, size1D, kstretch, kshear, kbend, thickness, mass);
+    //simulator.addClothGridFast(20, 0.5, 1e4, 1e4, 2e4, thickness, 0.1);
+    simulator.addCloth(particleNum1D, size1D, kstretch/2, kshear, kbend/2, thickness, mass);
+    //simulator.addClothFile("src/assets", "teapot.obj", {0,0,0} 15, 1e4, 0, 2e4, thickness mass);
+    //simulator.addClothFile("src/assets", "horse-gallop-01.obj", {0,0,0}, 80, 1e4, 0, 2e4, thickness mass);
+    simulator.addFloatMesh("src/assets", "horse-gallop-01.obj", {0, -1, 0}, 1.2);
+    simulator.addGround(PlaneDirection::XZPlane, tinym::vec3(0, -1, 0), 5);
     
     std::cout << "[Main] mesh added to scene" << std::endl;
 
@@ -3253,7 +3270,7 @@ int main() {
     std::cout << "[Main] programs are loaded" << std::endl;
 
 
-    camera.setPosition(tinym::vec3(0, 0, 500));
+    camera.setPosition(tinym::vec3(0, 0, 5));
 
     camera.glfwSetCallbacks(window->getGLFWWindow());
 
@@ -3261,8 +3278,9 @@ int main() {
         Simulator<Backend, Precision, ExplicitSystem<Backend, Precision>>* simulator;
         bool* debugEachBoxes;
         bool* debugSceneBox;
+        bool* debugCollisions;
     };
-    CallbacksDataPack pack = {&simulator, &debugEachBoxes, &debugSceneBox};
+    CallbacksDataPack pack = {&simulator, &debugEachBoxes, &debugSceneBox, &debugCollisions};
 
     //glfwSetWindowUserPointer(window->getGLFWWindow(), &system);
     glfwSetWindowUserPointer(window->getGLFWWindow(), &(pack));
@@ -3272,6 +3290,7 @@ int main() {
         auto* simulator = pack->simulator;
         auto* debugEachBoxes = pack->debugEachBoxes;
         auto* debugSceneBox = pack->debugSceneBox;
+        auto* debugCollisions = pack->debugCollisions;
 
         if(key == GLFW_KEY_0 && action == GLFW_PRESS) {
             simulator->initialize();
@@ -3289,7 +3308,7 @@ int main() {
         } else if(key == GLFW_KEY_S && action == GLFW_PRESS) {
             *debugSceneBox = !(*debugSceneBox);
         } else if(key == GLFW_KEY_C && action == GLFW_PRESS) {
-            simulator->checkCollision = !(simulator->checkCollision);
+            *debugCollisions = !(*debugCollisions);
         }
 
     };

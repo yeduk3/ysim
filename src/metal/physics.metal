@@ -124,7 +124,7 @@ kernel void integrate(
         }
 
         float distance = vertColPrims[i].collisionNormalAndDistance.w;
-        float thickness = 0.5f;
+        float thickness = 0.01f;
 
         if (distance < thickness) {
             pos += (thickness - distance) * n;
