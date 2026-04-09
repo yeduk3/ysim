@@ -117,11 +117,38 @@ struct MetalGlobalContext {
     static void setBytes(const PR& data, Index index) {
         getComputeCommandEncoder()->setBytes(&data, sizeof(PR), index);
     }
-    static void dispatchThreads(MTL::ComputePipelineState* pso, Index numThreads) {
-        MTL::Size gridSize = MTL::Size(numThreads, 1, 1);
-        MTL::Size threadGroupSize = MTL::Size(std::min((Index)pso->maxTotalThreadsPerThreadgroup(), numThreads), 1, 1);
+    //static void dispatchThreads(MTL::ComputePipelineState* pso, Index numThreads) {
+    //    MTL::Size gridSize = MTL::Size(numThreads, 1, 1);
+    //    MTL::Size threadGroupSize = MTL::Size(std::min((Index)pso->maxTotalThreadsPerThreadgroup(), numThreads), 1, 1);
+    //    getComputeCommandEncoder()->setComputePipelineState(pso);
+    //    getComputeCommandEncoder()->dispatchThreads(gridSize, threadGroupSize);
+    //}
+    static void dispatchThreads(
+        MTL::ComputePipelineState* pso,
+        Index numThreads
+    ) {
+        Index tg = std::min<Index>(pso->maxTotalThreadsPerThreadgroup(), numThreads);
+        dispatchThreads(pso, numThreads, tg);
+    }
+
+    static void dispatchThreads(
+        MTL::ComputePipelineState* pso,
+        Index numThreads,
+        Index threadsPerThreadgroup
+    ) {
+        Index maxTG = (Index)pso->maxTotalThreadsPerThreadgroup();
+        if (threadsPerThreadgroup == 0 || threadsPerThreadgroup > maxTG) {
+            std::cerr << "[MetalGlobalContext] invalid threadsPerThreadgroup: "
+                      << threadsPerThreadgroup
+                      << ", max = " << maxTG << std::endl;
+            return;
+        }
+
+        MTL::Size gridSize(numThreads, 1, 1);
+        MTL::Size groupSize(threadsPerThreadgroup, 1, 1);
+
         getComputeCommandEncoder()->setComputePipelineState(pso);
-        getComputeCommandEncoder()->dispatchThreads(gridSize, threadGroupSize);
+        getComputeCommandEncoder()->dispatchThreads(gridSize, groupSize);
     }
     static void commitAndWait() {
         computeCommandEncoder->endEncoding();
@@ -1842,6 +1869,14 @@ struct BVH<BVHMODE::LINEAR, PRIMITIVE, PR> {
     //VectorBase<METAL, BroadCollision> collisions;
     //Index numCollisions = 0, maxNumCollisions;
 
+    VectorBase<METAL, uint32_t> radixBlockHistograms; // numBlocks * 256
+    VectorBase<METAL, uint32_t> radixBlockOffsets;    // numBlocks * 256
+    VectorBase<METAL, uint32_t> radixBucketBase;      // 256
+
+    VectorBase<METAL, uint32_t> bottomUpReadyA;       // numNodes
+    VectorBase<METAL, uint32_t> bottomUpReadyB;       // numNodes
+    VectorBase<METAL, uint32_t> bottomUpProgress;     // 1
+
     int objid; // who made this tree
     VectorBase<METAL, int> objIds;
     BehaviorType objBehavior;
@@ -1851,9 +1886,18 @@ struct BVH<BVHMODE::LINEAR, PRIMITIVE, PR> {
 
     MTL::ComputePipelineState* fillMortonsPSO;
     MTL::ComputePipelineState* buildTreePSO;
+    MTL::ComputePipelineState* buildLeafPSO;
     MTL::ComputePipelineState* bottomUpBoxesPSO;
     MTL::ComputePipelineState* queryPointsPSO;
 
+    MTL::ComputePipelineState* radixCountBlocksPSO;
+    MTL::ComputePipelineState* radixComputeOffsetsPSO;
+    MTL::ComputePipelineState* radixScatterBlocksPSO;
+
+    MTL::ComputePipelineState* initBottomUpReadyPSO;
+    MTL::ComputePipelineState* clearBottomUpProgressPSO;
+    MTL::ComputePipelineState* bottomUpCombineStepPSO;
+    MTL::ComputePipelineState* copyReadyBufferPSO; // optional
 
     // Debuggings...
     DebugLineGL<CPU> debugBox;
@@ -1871,25 +1915,135 @@ struct BVH<BVHMODE::LINEAR, PRIMITIVE, PR> {
         if constexpr (PRIMITIVE == BVHPRIMITIVE::TRIANGLE) {
             fillMortonsPSO = MetalKernelContext::getPSO("fillMortons_Tri");
             buildTreePSO = MetalKernelContext::getPSO("buildTree_Tri");
+            buildLeafPSO = MetalKernelContext::getPSO("buildLeaf_Tri");
         } else if constexpr (PRIMITIVE == BVHPRIMITIVE::EDGE) {
             fillMortonsPSO = MetalKernelContext::getPSO("fillMortons_Edge");
             buildTreePSO = MetalKernelContext::getPSO("buildTree_Edge");
         }
         bottomUpBoxesPSO = MetalKernelContext::getPSO("bottomUpBoxes");
         queryPointsPSO = MetalKernelContext::getPSO("queryPoints");
+
+        radixCountBlocksPSO     = MetalKernelContext::getPSO("radixCountMortonBlocks");
+        radixComputeOffsetsPSO  = MetalKernelContext::getPSO("radixComputeOffsets");
+        radixScatterBlocksPSO   = MetalKernelContext::getPSO("radixScatterMortonBlocks");
+
+        initBottomUpReadyPSO    = MetalKernelContext::getPSO("initBottomUpReady");
+        clearBottomUpProgressPSO= MetalKernelContext::getPSO("clearBottomUpProgress");
+        bottomUpCombineStepPSO  = MetalKernelContext::getPSO("bottomUpCombineStep");
+        copyReadyBufferPSO      = MetalKernelContext::getPSO("copyReadyBuffer");
     }
 
     void memoryAllocation() {
-        Index numPrimitives = primitives.size/PRIMITIVE;
+        Index numPrimitives = primitives.size / PRIMITIVE;
+        Index numNodes = 2 * numPrimitives - 1;
+        Index numBlocks = (numPrimitives + 255) / 256;
+
         mortons = VectorBase<METAL, MortonNode>(numPrimitives);
         mortonsTemp = VectorBase<METAL, MortonNode>(numPrimitives);
-        tree = VectorBase<METAL, BVHNode>(2*numPrimitives-1);
-        treeParent = VectorBase<METAL, int>(2*numPrimitives-1);
+        tree = VectorBase<METAL, BVHNode>(numNodes);
+        treeParent = VectorBase<METAL, int>(numNodes);
         qFlag = VectorBase<METAL, QueryFlag>(1);
+
+        radixBlockHistograms = VectorBase<METAL, uint32_t>(numBlocks * 256);
+        radixBlockOffsets    = VectorBase<METAL, uint32_t>(numBlocks * 256);
+        radixBucketBase      = VectorBase<METAL, uint32_t>(256);
+
+        bottomUpReadyA       = VectorBase<METAL, uint32_t>(numNodes);
+        bottomUpReadyB       = VectorBase<METAL, uint32_t>(numNodes);
+        bottomUpProgress     = VectorBase<METAL, uint32_t>(1);
     }
 
     void build(GeneralMesh<METAL, PR>& mesh) {
         build(mesh.id, mesh.state.x, mesh.adjacency.facets);
+    }
+
+    struct RadixSortParamsCPU {
+        uint32_t numElements;
+        uint32_t shift;
+        uint32_t numBlocks;
+    };
+    struct BottomUpParamsCPU {
+        uint32_t numPrimitives;
+        uint32_t numNodes;
+    };
+    
+
+    void bottomUpCombineGPU() {
+        Index numPrimitives = primitives.size / PRIMITIVE;
+        if (numPrimitives == 0) return;
+
+        Index numNodes = 2 * numPrimitives - 1;
+        BottomUpParamsCPU params = {
+            (uint32_t)numPrimitives,
+            (uint32_t)numNodes
+        };
+
+        // init ready buffers
+        MetalGlobalContext::setBytes(params, 0);
+        MetalGlobalContext::setBuffer(bottomUpReadyA, 1);
+        MetalGlobalContext::setBuffer(bottomUpReadyB, 2);
+        MetalGlobalContext::dispatchThreads(initBottomUpReadyPSO, numNodes);
+        //MetalGlobalContext::commitAndWait();
+
+        auto* readyCur = &bottomUpReadyA;
+        auto* readyNext = &bottomUpReadyB;
+
+        // worst case: skewed tree면 internal node 수만큼 반복 가능
+        for (Index iter = 0; iter < numPrimitives; ++iter) {
+            // progress = 0
+            MetalGlobalContext::setBuffer(bottomUpProgress, 0);
+            MetalGlobalContext::dispatchThreads(clearBottomUpProgressPSO, 1);
+            //MetalGlobalContext::commitAndWait();
+
+            // one combine step
+            MetalGlobalContext::setBytes(params, 0);
+            MetalGlobalContext::setBuffer(tree, 1);
+            MetalGlobalContext::setBuffer(*readyCur, 2);
+            MetalGlobalContext::setBuffer(*readyNext, 3);
+            MetalGlobalContext::setBuffer(bottomUpProgress, 4);
+            MetalGlobalContext::dispatchThreads(bottomUpCombineStepPSO, numNodes);
+            //MetalGlobalContext::commitAndWait();
+
+            // root ready?
+            if ((*readyNext)[0]) {
+                break;
+            }
+
+            // no progress -> something is wrong
+            if (bottomUpProgress[0] == 0) {
+                std::cout << "[bottomUpCombineGPU] no progress; tree may be invalid\n";
+                break;
+            }
+
+            std::swap(readyCur, readyNext);
+        }
+    }
+
+
+    void buildLeafGPU() {
+        int numPrimitives = primitives.size / PRIMITIVE;
+        if (numPrimitives == 0) return;
+
+        MetalGlobalContext::setBuffer(positions, 0);
+        MetalGlobalContext::setBuffer(primitives, 1);
+        MetalGlobalContext::setBytes(numPrimitives, 2);
+        MetalGlobalContext::setBuffer(mortons, 3);
+        MetalGlobalContext::setBuffer(tree, 4);
+
+        MetalGlobalContext::dispatchThreads(buildLeafPSO, numPrimitives);
+    }
+    void buildTreeGPU() {
+        int numPrimitives = primitives.size / PRIMITIVE;
+        if (numPrimitives == 0) return;
+
+        MetalGlobalContext::setBuffer(positions, 0);
+        MetalGlobalContext::setBuffer(primitives, 1);
+        MetalGlobalContext::setBytes(numPrimitives, 2);
+        MetalGlobalContext::setBuffer(mortons, 3);
+        MetalGlobalContext::setBuffer(tree, 4);
+        MetalGlobalContext::setBuffer(treeParent, 5);
+
+        MetalGlobalContext::dispatchThreads(buildTreePSO, numPrimitives);
     }
 
     void build(int oid, VectorBase<METAL, PR>& pos, VectorBase<METAL, Index>& prim) {
@@ -1919,14 +2073,41 @@ struct BVH<BVHMODE::LINEAR, PRIMITIVE, PR> {
         // input: each elements' center. elements can be either triangles or edges
         // output: each elements' morton code
         //std::cout << "  - [Stage 2] Transform each center into morton code" << std::endl;
-        MetalGlobalContext::setBuffer(positions, 0);
-        MetalGlobalContext::setBuffer(primitives, 1);
-        MetalGlobalContext::setBytes(sceneBox, 2);
-        MetalGlobalContext::setBuffer(mortons, 3);
+        //MetalGlobalContext::setBuffer(positions, 0);
+        //MetalGlobalContext::setBuffer(primitives, 1);
+        //MetalGlobalContext::setBytes(sceneBox, 2);
+        //MetalGlobalContext::setBuffer(mortons, 3);
 
-        MetalGlobalContext::dispatchThreads(fillMortonsPSO, numPrimitives);
-        MetalGlobalContext::commitAndWait();
+        //MetalGlobalContext::dispatchThreads(fillMortonsPSO, numPrimitives);
+        //MetalGlobalContext::commitAndWait();
         
+        tinym::vec3 width = sceneBox.max - sceneBox.min;
+        auto expandBits = [](uint v) {
+            v = (v * 0x00010001u) & 0xFF0000FFu;
+            v = (v * 0x00000101u) & 0x0F00F00Fu;
+            v = (v * 0x00000011u) & 0xC30C30C3u;
+            v = (v * 0x00000005u) & 0x49249249u;
+            return v;
+        };
+        auto mortonCode = [&](const tinym::vec3& point) {
+            tinym::vec3 p = tinym::min(tinym::max(point*1024.f, tinym::vec3(0.f)), tinym::vec3(1023.f));
+            unsigned int xx = expandBits((unsigned int)p.x);
+            unsigned int yy = expandBits((unsigned int)p.y);
+            unsigned int zz = expandBits((unsigned int)p.z);
+            return xx * 4 + yy * 2 + zz;
+        };
+        for(Index pid = 0; pid < numPrimitives; ++pid) {
+            Index base = pid*PRIMITIVE;
+            tinym::vec3 center(0);
+            for(Index k = 0; k < PRIMITIVE; ++k) {
+                Index vid = primitives[base + k];
+                center += tinym::vec3_view(positions.ptr + vid*3);
+            }
+            center = center/PRIMITIVE; // real center
+            center = (center - sceneBox.min)/width; // normalized center [0, 1]
+            mortons[pid].code = mortonCode(center);
+            mortons[pid].index = pid;
+        }
         
         // [stage 3] radix sort
         // input: array of each elements' morton code
@@ -1972,7 +2153,46 @@ struct BVH<BVHMODE::LINEAR, PRIMITIVE, PR> {
             }
         };
         radixSortByMortonCode(mortons.ptr, mortonsTemp.ptr, numPrimitives);
+        // Very slow radix sort
+        //constexpr uint32_t BLOCK_SIZE = 256;
+        //uint32_t numBlocks = (numPrimitives + BLOCK_SIZE - 1) / BLOCK_SIZE;
 
+        //VectorBase<METAL, MortonNode>* src = &mortons;
+        //VectorBase<METAL, MortonNode>* dst = &mortonsTemp;
+
+        //for (uint32_t shift = 0; shift < 32; shift += 8) {
+        //    RadixSortParamsCPU params = {
+        //        (uint32_t)numPrimitives,
+        //        shift,
+        //        numBlocks
+        //    };
+
+        //    // 1) block histograms
+        //    MetalGlobalContext::setBuffer(*src, 0);
+        //    MetalGlobalContext::setBytes(params, 1);
+        //    MetalGlobalContext::setBuffer(radixBlockHistograms, 2);
+        //    MetalGlobalContext::dispatchThreads(radixCountBlocksPSO, numBlocks * 256, 256);
+        //    //MetalGlobalContext::commitAndWait();
+
+        //    // 2) offsets and bucket bases
+        //    MetalGlobalContext::setBytes(params, 0);
+        //    MetalGlobalContext::setBuffer(radixBlockHistograms, 1);
+        //    MetalGlobalContext::setBuffer(radixBlockOffsets, 2);
+        //    MetalGlobalContext::setBuffer(radixBucketBase, 3);
+        //    MetalGlobalContext::dispatchThreads(radixComputeOffsetsPSO, 1);
+        //    //MetalGlobalContext::commitAndWait();
+
+        //    // 3) stable scatter
+        //    MetalGlobalContext::setBuffer(*src, 0);
+        //    MetalGlobalContext::setBuffer(*dst, 1);
+        //    MetalGlobalContext::setBytes(params, 2);
+        //    MetalGlobalContext::setBuffer(radixBlockOffsets, 3);
+        //    MetalGlobalContext::setBuffer(radixBucketBase, 4);
+        //    MetalGlobalContext::dispatchThreads(radixScatterBlocksPSO, numBlocks * 256, 256);
+        //    //MetalGlobalContext::commitAndWait();
+
+        //    std::swap(src, dst);
+        //}
         //encoder->setThreadgroupMemoryLength(?, NS::UInteger index)
         
 
@@ -1980,14 +2200,7 @@ struct BVH<BVHMODE::LINEAR, PRIMITIVE, PR> {
         // input: sorted array of elements' morton code
         // output: linear bvh tree
         //std::cout << "  - [Stage 4] Build tree" << std::endl;
-        MetalGlobalContext::setBuffer(positions, 0);
-        MetalGlobalContext::setBuffer(primitives, 1);
-        MetalGlobalContext::setBytes(sceneBox, 2);
-        MetalGlobalContext::setBuffer(mortons, 3);
-        MetalGlobalContext::setBuffer(tree, 4);
-        MetalGlobalContext::setBuffer(treeParent, 5);
-
-        MetalGlobalContext::dispatchThreads(buildTreePSO, numPrimitives);
+        buildTreeGPU();
         MetalGlobalContext::commitAndWait();
 
         // set intermediate node's aabb
@@ -2001,7 +2214,9 @@ struct BVH<BVHMODE::LINEAR, PRIMITIVE, PR> {
             node.aabb.combine(tree[node.childB].aabb);
         };
         combineAABB(combineAABB, tree[0]);
-
+        //bottomUpCombineGPU();
+        //MetalGlobalContext::commitAndWait();
+    
         //DynamicMemoryAllocator<METAL> tempPool;
         //VectorBase<METAL, uint> treeVisitCounts(tempPool.template zeros<uint>(numPrimitives - 1));
         //MetalGlobalContext::setBuffer(treeVisitCounts, 6);
@@ -2260,6 +2475,10 @@ struct BVH<BVHMODE::LINEAR, PRIMITIVE, PR> {
             tree[numPrimitives+i-1] = BVHNode(mortons[i], positions, primitives);
         }
         bottomUpCombine();
+
+        //buildLeafGPU();
+        //bottomUpCombineGPU();
+        //MetalGlobalContext::commitAndWait();
     }
 
     void enlargeTrajectory(PR dt) {

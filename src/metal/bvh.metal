@@ -111,6 +111,114 @@ kernel void fillMortons_Edge(
 //
 //}
 
+#define RADIX_BITS 8u
+#define RADIX (1u << RADIX_BITS)
+#define RADIX_MASK (RADIX - 1u)
+#define RADIX_BLOCK_SIZE 256u
+
+struct RadixSortParams {
+    uint numElements;
+    uint shift;
+    uint numBlocks;
+};
+
+inline uint radixBucket(uint code, uint shift) {
+    return (code >> shift) & RADIX_MASK;
+}
+
+kernel void radixCountMortonBlocks(
+    device const MortonNode* src [[buffer(0)]],
+    constant RadixSortParams& params [[buffer(1)]],
+    device uint* blockHistograms [[buffer(2)]], // size = numBlocks * 256
+    uint tid [[thread_position_in_grid]],
+    uint lid [[thread_index_in_threadgroup]], // per threads in a block(tg)
+    uint gid [[threadgroup_position_in_grid]] // per blocks(tg) in a grid
+) {
+    if (gid >= params.numBlocks) return;
+
+    threadgroup atomic_uint localHist[RADIX];
+
+    // init local histogram
+    if (lid < RADIX) {
+        atomic_store_explicit(&localHist[lid], 0u, memory_order_relaxed);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint blockStart = gid * RADIX_BLOCK_SIZE;
+    uint idx = blockStart + lid;
+
+    // one block = one threadgroup
+    if (idx < params.numElements) {
+        uint b = radixBucket(src[idx].code, params.shift);
+        atomic_fetch_add_explicit(&localHist[b], 1u, memory_order_relaxed);
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // flush to global
+    if (lid < RADIX) {
+        blockHistograms[gid * RADIX + lid] =
+            atomic_load_explicit(&localHist[lid], memory_order_relaxed);
+    }
+}
+
+kernel void radixComputeOffsets(
+    constant RadixSortParams& params [[buffer(0)]],
+    device const uint* blockHistograms [[buffer(1)]], // numBlocks * 256
+    device uint* blockOffsets [[buffer(2)]],          // numBlocks * 256
+    device uint* bucketBase [[buffer(3)]],            // 256
+    uint tid [[thread_position_in_grid]]
+) {
+    if (tid != 0) return;
+
+    uint runningGlobal = 0;
+
+    for (uint b = 0; b < RADIX; ++b) {
+        bucketBase[b] = runningGlobal;
+
+        uint runningBucket = 0;
+        for (uint g = 0; g < params.numBlocks; ++g) {
+            uint idx = g * RADIX + b;
+            blockOffsets[idx] = runningBucket;
+            runningBucket += blockHistograms[idx];
+        }
+
+        runningGlobal += runningBucket;
+    }
+}
+
+kernel void radixScatterMortonBlocks(
+    device const MortonNode* src [[buffer(0)]],
+    device MortonNode* dst [[buffer(1)]],
+    constant RadixSortParams& params [[buffer(2)]],
+    device const uint* blockOffsets [[buffer(3)]], // numBlocks * 256
+    device const uint* bucketBase [[buffer(4)]],   // 256
+    uint lid [[thread_index_in_threadgroup]],
+    uint gid [[threadgroup_position_in_grid]]
+) {
+    if (gid >= params.numBlocks) return;
+
+    if (lid != 0) return; // correctness-first stable scatter
+
+    uint localCount[RADIX];
+    for (uint b = 0; b < RADIX; ++b) localCount[b] = 0;
+
+    uint blockStart = gid * RADIX_BLOCK_SIZE;
+    uint blockEnd   = min(blockStart + RADIX_BLOCK_SIZE, params.numElements);
+
+    for (uint i = blockStart; i < blockEnd; ++i) {
+        MortonNode m = src[i];
+        uint b = radixBucket(m.code, params.shift);
+
+        uint dstIndex = bucketBase[b]
+                      + blockOffsets[gid * RADIX + b]
+                      + localCount[b];
+
+        dst[dstIndex] = m;
+        localCount[b]++;
+    }
+}
+
 
 inline uint findSplit(
     device const MortonNode* mortons,
@@ -175,16 +283,39 @@ inline int2 determineRange(
     else      return int2(index, j);
 }
 
+kernel void buildLeaf_Tri(
+    device const packed_float3* x [[buffer(0)]],
+    device const packed_uint3* facets [[buffer(1)]],
+    constant int& numPrimitives [[buffer(2)]],
+    device const MortonNode* mortons [[buffer(3)]],
+    device BVHNode* tree [[buffer(4)]],
+    uint id [[thread_position_in_grid]]
+) {
+    int idx = (int)id;
+
+    // leaf nodes
+    if (idx >= numPrimitives) return;
+
+    int fid = mortons[id].index;
+    uint3 facet = facets[fid];
+    float3 v0 = x[facet.x];
+    float3 v1 = x[facet.y];
+    float3 v2 = x[facet.z];
+    int leafid = numPrimitives+idx-1;
+    tree[leafid].min = min3(v0, v1, v2);
+    tree[leafid].childA = -1;
+    tree[leafid].max = max3(v0, v1, v2);
+    tree[leafid].childB = fid;
+}
 kernel void buildTree_Tri(
     device const packed_float3* x [[buffer(0)]],
     device const packed_uint3* facets [[buffer(1)]],
-    constant AABB4& sceneBox [[buffer(2)]],
+    constant int& numPrimitives [[buffer(2)]],
     device const MortonNode* mortons [[buffer(3)]],
     device BVHNode* tree [[buffer(4)]],
     device int* treeParent [[buffer(5)]],
     uint id [[thread_position_in_grid]]
 ) {
-    int numPrimitives = sceneBox._pad0;
     int idx = (int)id;
 
     // leaf nodes
@@ -223,13 +354,12 @@ kernel void buildTree_Tri(
 kernel void buildTree_Edge(
     device const packed_float3* x [[buffer(0)]],
     device const packed_uint2* edges [[buffer(1)]],
-    constant AABB4& sceneBox [[buffer(2)]],
+    constant int& numPrimitives [[buffer(2)]],
     device const MortonNode* mortons [[buffer(3)]],
     device BVHNode* tree [[buffer(4)]],
     device int* treeParent [[buffer(5)]],
     uint id [[thread_position_in_grid]]
 ) {
-    int numPrimitives = sceneBox._pad0;
     int idx = (int)id;
 
     // leaf nodes
@@ -310,6 +440,90 @@ kernel void bottomUpBoxes(
 }
 
 
+struct BottomUpParams {
+    uint numPrimitives;  // leaf count
+    uint numNodes;       // 2*numPrimitives - 1
+};
+
+kernel void initBottomUpReady(
+    constant BottomUpParams& params [[buffer(0)]],
+    device uint* readyCur [[buffer(1)]],
+    device uint* readyNext [[buffer(2)]],
+    uint id [[thread_position_in_grid]]
+) {
+    if (id >= params.numNodes) return;
+
+    uint leafBegin = params.numPrimitives - 1;
+    uint r = (id >= leafBegin) ? 1u : 0u;
+
+    readyCur[id] = r;
+    readyNext[id] = r;
+}
+
+kernel void clearBottomUpProgress(
+    device uint* progress [[buffer(0)]],
+    uint tid [[thread_position_in_grid]]
+) {
+    if (tid == 0) progress[0] = 0u;
+}
+
+kernel void bottomUpCombineStep(
+    constant BottomUpParams& params [[buffer(0)]],
+    device BVHNode* tree [[buffer(1)]],
+    device const uint* readyCur [[buffer(2)]],
+    device uint* readyNext [[buffer(3)]],
+    device uint* progress [[buffer(4)]],
+    uint id [[thread_position_in_grid]]
+) {
+    if (id >= params.numNodes) return;
+
+    uint leafBegin = params.numPrimitives - 1;
+
+    // leaf stays ready
+    if (id >= leafBegin) {
+        readyNext[id] = 1u;
+        return;
+    }
+
+    // already ready -> keep ready
+    if (readyCur[id]) {
+        readyNext[id] = 1u;
+        return;
+    }
+
+    int childA = tree[id].childA;
+    int childB = tree[id].childB;
+
+    if (childA < 0 || childB < 0) {
+        readyNext[id] = 0u;
+        return;
+    }
+
+    if (readyCur[childA] && readyCur[childB]) {
+        float3 minA = float3(tree[childA].min);
+        float3 maxA = float3(tree[childA].max);
+        float3 minB = float3(tree[childB].min);
+        float3 maxB = float3(tree[childB].max);
+
+        tree[id].min = packed_float3(min(minA, minB));
+        tree[id].max = packed_float3(max(maxA, maxB));
+
+        readyNext[id] = 1u;
+        progress[0] = 1u;
+    } else {
+        readyNext[id] = 0u;
+    }
+}
+
+kernel void copyReadyBuffer(
+    constant BottomUpParams& params [[buffer(0)]],
+    device const uint* src [[buffer(1)]],
+    device uint* dst [[buffer(2)]],
+    uint id [[thread_position_in_grid]]
+) {
+    if (id >= params.numNodes) return;
+    dst[id] = src[id];
+}
 
 
 
@@ -342,61 +556,6 @@ struct QueryFlag {
     uint collisionOverflow;
 };
 
-//kernel void queryPoints(
-//    device const packed_float3* x [[buffer(0)]],
-//    device const packed_uint3* facets [[buffer(1)]],
-//    device const BVHNode* tree [[buffer(2)]],
-//    constant QueryPointsParams& qParams [[buffer(3)]],
-//    device BroadCollision* broadCollisions [[buffer(4)]],
-//    device atomic_uint* numBroadCollisions [[buffer(5)]],
-//    device QueryFlag* qFlag [[buffer(6)]],
-//    uint id [[thread_position_in_grid]]
-//) {
-//    if(id >= qParams.numPoints) return;
-//
-//    float3 pos = x[id];
-//    float3 margin = float3(qParams.queryMargin);
-//    float3 qmin = pos-margin;
-//    float3 qmax = pos+margin;
-//
-//    const int stackDepth = 64;
-//
-//    int stack[stackDepth];
-//    int sp = 0;
-//    stack[sp++] = 0;
-//
-//    while(sp > 0) {
-//        int nodeid = stack[--sp];
-//        BVHNode node = tree[nodeid];
-//
-//        if (!intersectAABB(qmin, qmax, node))
-//            continue;
-//
-//        if (node.childA < 0) { // leaf
-//            uint fid = (uint)node.childB;
-//            uint3 facet = facets[fid];
-//            if(id == facet.x || id == facet.y || id == facet.z) continue;
-//
-//            uint idx = atomic_fetch_add_explicit(numBroadCollisions, 1u, memory_order_relaxed);
-//            if(idx >= qParams.maxNumCollisions) {
-//                qFlag[0].collisionOverflow = 1u;
-//                continue;
-//            }
-//            broadCollisions[idx].indexPair = {id, fid};
-//            broadCollisions[idx].objPair = {qParams.qObjId, qParams.tObjId};
-//            broadCollisions[idx].behaviorPair = {qParams.qBehavior, qParams.tBehavior};
-//            broadCollisions[idx].shapePair = {qParams.qShape, qParams.tShape};
-//            continue;
-//        }
-//        if (sp + 2 > stackDepth) {
-//            qFlag[0].stackOverflow = 1u;
-//            continue;
-//        }
-//
-//        stack[sp++] = node.childA;
-//        stack[sp++] = node.childB;
-//    }
-//}
 
 
 void queryAABB(
