@@ -81,63 +81,6 @@ struct NarrowCollision {
 // ========================================================
 // [커널 2] 위치와 속도만 업데이트하는 파이프라인
 // ========================================================
-kernel void integrate(
-    device packed_float3* x [[buffer(0)]],
-    device packed_float3* v [[buffer(1)]],
-    device const packed_float3* f [[buffer(2)]],
-    device const float* m [[buffer(3)]],
-    device const float* fixedParticle [[buffer(4)]],
-    device const NarrowCollision* vertColPrims [[buffer(5)]],
-    device const uint* vertColPrimsOffsets [[buffer(6)]],
-    constant SimParams& params [[buffer(8)]],
-    uint id [[thread_position_in_grid]]
-) {
-    if (id >= params.vertexNum) return; 
-
-    float mask = fixedParticle[id];
-    
-    // float3로 연산 후 packed_float3로 다시 저장
-    float3 vel = v[id];
-    float3 pos = x[id];
-    float3 force = f[id];
-
-    vel += (params.subh * force / m[id]) * mask;
-
-    // apply collision constraints
-    uint begin = vertColPrimsOffsets[id];
-    uint end   = vertColPrimsOffsets[id + 1];
-
-    for (uint i = begin; i < end; ++i) {
-        float3 n = vertColPrims[i].collisionNormalAndDistance.xyz;
-
-        float nlen2 = dot(n, n);
-        if (nlen2 < 1e-12f) continue;
-
-        // 안전하게 normalize
-        n *= rsqrt(nlen2);
-
-        float vn = dot(vel, n);
-
-        // normal 방향으로 파고드는 속도만 제거
-        if (vn < 0.0f) {
-            vel -= vn * n;
-        }
-
-        float distance = vertColPrims[i].collisionNormalAndDistance.w;
-        float thickness = 0.01f;
-
-        if (distance < thickness) {
-            pos += (thickness - distance) * n;
-        }
-    }
-
-
-
-    pos += (params.subh * vel) * mask;
-
-    v[id] = vel;
-    x[id] = pos;
-}
 
 inline float3 calc_spring(float3 p0, float3 v0, float3 p1, float3 v1, float rest_len, float ks, float kd) {
     float3 dx = p1 - p0;
@@ -154,6 +97,7 @@ struct ClothGridParams {
     uint particleNum1D;
     float stretchRest, shearRest, bendRest;
     float kstretch, kshear, kbend;
+    float thickness;
 };
 
 kernel void compute_cloth_grid_forces_fast(
@@ -207,8 +151,66 @@ kernel void compute_cloth_grid_forces_fast(
     f[id] = force;
 }
 
+kernel void integrate_cloth_grid(
+    device packed_float3* x [[buffer(0)]],
+    device packed_float3* v [[buffer(1)]],
+    device const packed_float3* f [[buffer(2)]],
+    device const float* m [[buffer(3)]],
+    device const float* fixedParticle [[buffer(4)]],
+    device const NarrowCollision* vertColPrims [[buffer(5)]],
+    device const uint* vertColPrimsOffsets [[buffer(6)]],
+    constant SimParams& params [[buffer(8)]],
+    constant ClothGridParams& clothParams [[buffer(9)]],
+    uint id [[thread_position_in_grid]]
+) {
+    if (id >= params.vertexNum) return; 
+
+    float mask = fixedParticle[id];
+    
+    // float3로 연산 후 packed_float3로 다시 저장
+    float3 vel = v[id];
+    float3 pos = x[id];
+    float3 force = f[id];
+
+    vel += (params.subh * force / m[id]) * mask;
+
+    // apply collision constraints
+    uint begin = vertColPrimsOffsets[id];
+    uint end   = vertColPrimsOffsets[id + 1];
+
+    for (uint i = begin; i < end; ++i) {
+        float3 n = vertColPrims[i].collisionNormalAndDistance.xyz;
+
+        float nlen2 = dot(n, n);
+        if (nlen2 < 1e-12f) continue;
+
+        // 안전하게 normalize
+        n *= rsqrt(nlen2);
+
+        float vn = dot(vel, n);
+
+        // normal 방향으로 파고드는 속도만 제거
+        if (vn < 0.0f) {
+            vel -= vn * n;
+        }
+
+        float distance = vertColPrims[i].collisionNormalAndDistance.w;
+        float thickness = clothParams.thickness;
+
+        if (distance < thickness) {
+            pos += (thickness - distance) * n;
+        }
+    }
+
+    pos += (params.subh * vel) * mask;
+
+    v[id] = vel;
+    x[id] = pos;
+}
+
 struct ClothParams {
     float kstretch, kshear, kbend;
+    float thickness;
 };
 
 kernel void compute_tri_spring_forces(
@@ -268,4 +270,61 @@ kernel void compute_tri_spring_forces(
     }
 
     f[id] = force;
+}
+
+kernel void integrate_cloth(
+    device packed_float3* x [[buffer(0)]],
+    device packed_float3* v [[buffer(1)]],
+    device const packed_float3* f [[buffer(2)]],
+    device const float* m [[buffer(3)]],
+    device const float* fixedParticle [[buffer(4)]],
+    device const NarrowCollision* vertColPrims [[buffer(5)]],
+    device const uint* vertColPrimsOffsets [[buffer(6)]],
+    constant SimParams& params [[buffer(8)]],
+    constant ClothParams& clothParams [[buffer(9)]],
+    uint id [[thread_position_in_grid]]
+) {
+    if (id >= params.vertexNum) return; 
+
+    float mask = fixedParticle[id];
+    
+    // float3로 연산 후 packed_float3로 다시 저장
+    float3 vel = v[id];
+    float3 pos = x[id];
+    float3 force = f[id];
+
+    vel += (params.subh * force / m[id]) * mask;
+
+    // apply collision constraints
+    uint begin = vertColPrimsOffsets[id];
+    uint end   = vertColPrimsOffsets[id + 1];
+
+    for (uint i = begin; i < end; ++i) {
+        float3 n = vertColPrims[i].collisionNormalAndDistance.xyz;
+
+        float nlen2 = dot(n, n);
+        if (nlen2 < 1e-12f) continue;
+
+        // 안전하게 normalize
+        n *= rsqrt(nlen2);
+
+        float vn = dot(vel, n);
+
+        // normal 방향으로 파고드는 속도만 제거
+        if (vn < 0.0f) {
+            vel -= vn * n;
+        }
+
+        float distance = vertColPrims[i].collisionNormalAndDistance.w;
+        float thickness = clothParams.thickness;
+
+        if (distance < thickness) {
+            pos += (thickness - distance) * n;
+        }
+    }
+
+    pos += (params.subh * vel) * mask;
+
+    v[id] = vel;
+    x[id] = pos;
 }

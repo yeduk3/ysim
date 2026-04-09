@@ -1,0 +1,11 @@
+#ifndef COMMON_TYPES_METALH
+#define COMMON_TYPES_METALH
+
+struct BroadCollision {
+    uint2 indexPair;
+    uint2 objPair;
+    uint2 behaviorPair;
+    uint2 shapePair;
+};
+
+#endif

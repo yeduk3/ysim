@@ -2,6 +2,8 @@
 #include <metal_atomic>
 using namespace metal;
 
+#include "common_types.metalh"
+
 struct AABB4 {
     packed_float3 min;
     int _pad0;
@@ -311,12 +313,6 @@ kernel void bottomUpBoxes(
 
 
 
-struct BroadCollision {
-    uint2 indexPair;
-    uint2 objPair;
-    uint2 behaviorPair;
-    uint2 shapePair;
-};
 
 
 

@@ -133,71 +133,7 @@ struct MetalGlobalContext {
     }
 
 };
-struct MetalPhysicsContext {
-    static MTL::Library* getLibrary() {
-        static MTL::Library* library = nullptr;
-
-        if (!library) {
-            NS::Error* error = nullptr;
-
-            auto path = NS::String::string("default.metallib", NS::UTF8StringEncoding);
-
-            library = MetalGlobalContext::getDevice()->newLibrary(path, &error);
-
-            if (!library) {
-                std::cout << "[Metal Error] Failed to load " << path->utf8String() << "!\n";
-                if (error) {
-                    std::cout << error->localizedDescription()->utf8String() << std::endl;
-                }
-                exit(1);
-            }
-
-            path->release();
-        }
-
-        return library;
-    }
-    static MTL::Function* getFunction(const char* name) {
-        static std::unordered_map<std::string, MTL::Function*> cache;
-
-        auto it = cache.find(name);
-        if (it != cache.end()) return it->second;
-
-        auto nsName = NS::String::string(name, NS::UTF8StringEncoding);
-        auto func = getLibrary()->newFunction(nsName);
-
-        if (!func) {
-            std::cout << "[Metal Error] Failed to load function: " << name << "\n";
-            exit(1);
-        }
-
-        cache[name] = func;
-        nsName->release();
-
-        return func;
-    }
-    static MTL::ComputePipelineState* getPSO(const char* name) {
-        static std::unordered_map<std::string, MTL::ComputePipelineState*> cache;
-
-        auto it = cache.find(name);
-        if (it != cache.end()) return it->second;
-
-        NS::Error* error = nullptr;
-        auto func = getFunction(name);
-
-        auto pso = MetalGlobalContext::getDevice()->newComputePipelineState(func, &error);
-
-        if (!pso) {
-            std::cout << "[Metal Error] PSO creation failed: " << name << "\n";
-            exit(1);
-        }
-
-        cache[name] = pso;
-        return pso;
-    }
-};
-
-struct MetalBVHContext {
+struct MetalKernelContext {
     static MTL::Library* getLibrary() {
         static MTL::Library* library = nullptr;
 
@@ -552,6 +488,12 @@ struct VectorBase<METAL, PR> {
         this->size = block.size;
     }
     VectorBase(const MemoryBlock<METAL, PR>& block) : pool(block.pool), offset(block.offset), ptr(block.ptr), size(block.size) {}
+    VectorBase(const VectorBase<METAL, PR>& v, size_t start, size_t size) {
+        this->pool = v.pool;
+        this->offset = v.offset + start*sizeof(PR);
+        this->ptr = v.ptr + start;
+        this->size = size;
+    }
     auto map() { return Eigen::Map<Eigen::VectorX<PR>>(ptr, size); }
     PR& operator[](Index index) { return ptr[index]; }
 };
@@ -837,13 +779,12 @@ struct MeshState {
     Vector x, v, f, m, n;
     template <typename InitializerParams>
     void memoryAllocation(InitializerParams& params) {
-        if(x.ptr) return;
         Index numData = params.numPoints*3;
-        x = Vector(numData);
-        v = Vector(numData, 0);
-        f = Vector(numData, 0);
-        m = Vector(numData, params.mass);
-        n = Vector(numData);
+        if(!x.ptr) x = Vector(numData);
+        if(!v.ptr) v = Vector(numData, 0);
+        if(!f.ptr) f = Vector(numData, 0);
+        if(!m.ptr) m = Vector(numData, params.mass);
+        if(!n.ptr) n = Vector(numData);
     }
 };
 
@@ -863,7 +804,6 @@ struct MeshAdjacency {
     Vectorui vertexOppVertices, vertexOppVerticesOffsets; // for spring
     template <typename InitializerParams>
     void memoryAllocation(InitializerParams& params) {
-        if(facets.ptr) return;
         if(params.numFacets > 0) {
             if(!facets.ptr) 
                 facets = Vectorui(params.numFacets*3);
@@ -893,10 +833,18 @@ struct EdgeInfo {
     int o0=-1, o1=-1; // o0 in f0, o1 in f1
 };
 
+template <typename PR>
+struct InitializerParams {
+    // Commons
+    Index numPoints, numFacets, numEdges;
+    PR mass;
+    InitializerParams(Index numPoints, Index numFacets, Index numEdges, PR mass) : numPoints(numPoints), numFacets(numFacets), numEdges(numEdges), mass(mass) {}
+};
 template <typename BE, typename PR>
 struct GeneralMeshInitializer {
     virtual ~GeneralMeshInitializer() = default;
     virtual void initialize(MeshState<BE, PR>& state, MeshAdjacency<BE, PR>& adjacency) = 0;
+    virtual InitializerParams<PR>* getParams() = 0;
 };
 //! Suppose that the positions and facets are given
 template <typename BE, typename PR>
@@ -1130,10 +1078,7 @@ enum struct PlaneDirection : Index {
 
 //! Special class for grid cloth
 template <typename PR>
-struct MeshGridInitializerParams {
-    // Commons
-    Index numPoints, numFacets, numEdges;
-    PR mass;
+struct MeshGridInitializerParams : InitializerParams<PR> {
 
     // Specifics
     Index particleNum1D;
@@ -1145,10 +1090,12 @@ struct MeshGridInitializerParams {
     MeshGridInitializerParams(PlaneDirection dir, tinym::vec3 center, Index particleNum1D, PR size1D, PR mass, bool jiggle)
         : dir(dir), center(center),
         particleNum1D(particleNum1D), 
-        numPoints(particleNum1D*particleNum1D),
-        numFacets(2*(particleNum1D-1)*(particleNum1D-1)), 
-        numEdges(2*(particleNum1D-1)*particleNum1D+numFacets),
-        size1D(size1D), mass(mass), jiggle(jiggle) {}
+        InitializerParams<PR>(
+                particleNum1D*particleNum1D, // numPoints
+                2*(particleNum1D-1)*(particleNum1D-1), // numFacets
+                2*(particleNum1D-1)*particleNum1D+2*(particleNum1D-1)*(particleNum1D-1), // numEdges
+                mass),
+        size1D(size1D), jiggle(jiggle) {}
 };
 
 template <typename BE, typename PR>
@@ -1158,7 +1105,7 @@ struct MeshGridInitializer : GeneralMeshInitializer<BE, PR> {
 
     MeshGridInitializer(ParamsType params) : params(params) {}
 
-    void initialize(MeshState<BE, PR>& state, MeshAdjacency<BE, PR>& adjacency) {
+    void initialize(MeshState<BE, PR>& state, MeshAdjacency<BE, PR>& adjacency) override {
         std::cout << "[MeshGridSpringInitializer initialize] start" << std::endl;
         
         state.memoryAllocation(params); // numPoints
@@ -1232,22 +1179,19 @@ struct MeshGridInitializer : GeneralMeshInitializer<BE, PR> {
 
         MeshAdjacencyInitializer<BE, PR>::initialize(state, adjacency);
     }
+
+    InitializerParams<PR>* getParams() override { return &params; }
 };
 
 template <typename PR>
-struct MeshFileInitializerParams {
-    // Commons
-    Index numPoints, numFacets, numEdges;
-    PR mass;
-
-
+struct MeshFileInitializerParams : InitializerParams<PR> {
     // Specifics
     std::string prefix, fileName;
     tinym::vec3 offset;
     PR scale;
 
     MeshFileInitializerParams(std::string prefix, std::string fileName, tinym::vec3 offset, PR scale, PR mass) 
-        : prefix(prefix), fileName(fileName), offset(offset), scale(scale), mass(mass) {}
+        : prefix(prefix), fileName(fileName), offset(offset), scale(scale), InitializerParams<PR>(0,0,0,mass) {}
 };
 
 template <typename BE, typename PR>
@@ -1297,6 +1241,8 @@ struct MeshFileInitializer : GeneralMeshInitializer<BE, PR> {
 
         MeshAdjacencyInitializer<BE, PR>::initialize(state, adjacency);
     }
+
+    InitializerParams<PR>* getParams() override { return &params; }
 };
 
 
@@ -1340,7 +1286,7 @@ struct Constraints {
     Index maxNumCollisions = 0;
     //Index numBroadCollisions = 0;
     VectorBase<BE, Index> numBroadCollisions;
-    Index numNarrowCollisions = 0;
+    VectorBase<BE, Index> numNarrowCollisions;
     Index approxColPerVertex = 15;
     VectorBase<BE, BroadCollision> broadCollisions;
     VectorBase<BE, NarrowCollision> narrowCollisions;
@@ -1357,6 +1303,7 @@ struct Constraints {
 
         maxNumCollisions = numPoints * approxColPerVertex;
         numBroadCollisions = VectorBase<BE, Index>(1);
+        numNarrowCollisions = VectorBase<BE, Index>(1);
 
         broadCollisions = VectorBase<BE, BroadCollision>(maxNumCollisions);
         narrowCollisions = VectorBase<BE, NarrowCollision>(maxNumCollisions);
@@ -1404,7 +1351,7 @@ struct TriangularClothBehavior<METAL, PR> {
     static MTL::ComputePipelineState* getPSO() {
         static MTL::ComputePipelineState* pso = nullptr;
         if (!pso) {
-            pso = MetalPhysicsContext::getPSO("compute_tri_spring_forces");
+            pso = MetalKernelContext::getPSO("compute_tri_spring_forces");
         }
         return pso;
     }
@@ -1456,7 +1403,7 @@ struct FastGridClothBehavior<METAL, PR> {
     static MTL::ComputePipelineState* getPSO() {
         static MTL::ComputePipelineState* pso = nullptr;
         if (!pso) {
-            pso = MetalPhysicsContext::getPSO("compute_cloth_grid_forces_fast");
+            pso = MetalKernelContext::getPSO("compute_cloth_grid_forces_fast");
         }
         return pso;
     }
@@ -1561,7 +1508,7 @@ struct GeneralMesh {
 
 
     void prepareDebugCollisions() {
-        if(constraints.numNarrowCollisions <= 0) return;
+        if(constraints.numNarrowCollisions[0] <= 0) return;
 
         if(!debugSelfCollisionNormals.ptr) {
             debugSelfCollisionNormals = VectorBase<BE, PR>(constraints.maxNumCollisions*6);
@@ -1570,7 +1517,7 @@ struct GeneralMesh {
 
         Index selfBase = 0;
         Index objBase = 0;
-        for(Index cid = 0; cid < constraints.numNarrowCollisions; ++cid) {
+        for(Index cid = 0; cid < constraints.numNarrowCollisions[0]; ++cid) {
             NarrowCollision& nc = constraints.narrowCollisions[cid];
 
             tinym::vec3_view v(state.x.ptr + nc.indexPair.point*3);
@@ -1628,18 +1575,136 @@ struct Plane {
 // TODO: Box Collier
 struct Box {};
 
+
 template <typename BE, typename PR>
-struct SceneObject {
+struct Scene {
     inline static int numMeshes = 0;
 
     std::vector<Plane> planes;
     inline static std::vector<GeneralMesh<BE, PR>> meshes;
 
+    struct RequestGeneralMesh {
+        int id;
+        GeneralMeshInitializer<BE, PR>* initializer;
+        BehaviorType behaviorType;
+        BehaviorParams<PR> behaviorParams;
+
+        RequestGeneralMesh(int id, GeneralMeshInitializer<BE, PR> *initializer,
+                           BehaviorType behaviorType,
+                           BehaviorParams<PR> behaviorParams)
+            : id(id), initializer(initializer), behaviorType(behaviorType),
+              behaviorParams(std::move(behaviorParams)) {}
+    };
+
+    inline static std::vector<RequestGeneralMesh> requestsGeneralMeshes;
+    inline static bool dirty = true;
+
     void addGeneralMesh(GeneralMeshInitializer<BE, PR>* initializer, BehaviorType behaviorType, BehaviorParams<PR> behaviorParams) {
-        meshes.emplace_back(initializer, behaviorType, behaviorParams);
-        meshes.back().id = numMeshes++;
-        std::cout << "id " << meshes.back().id << " object is created\n";
+        //meshes.emplace_back(initializer, behaviorType, behaviorParams);
+        //meshes.back().id = numMeshes++;
+
+        requestsGeneralMeshes.emplace_back(numMeshes++, initializer, behaviorType, behaviorParams);
+
+        dirty = true;
+
+        //std::cout << "id " << meshes.back().id << " object is created\n";
     }
+
+
+    struct PackedMeshData {
+        // MeshState
+        VectorBase<BE, PR> x;
+        VectorBase<BE, PR> v;
+        VectorBase<BE, PR> f;
+        VectorBase<BE, PR> m;
+        VectorBase<BE, PR> n;
+        // MeshAdjacency
+        VectorBase<BE, Index> facets;
+        VectorBase<BE, Index> edges;
+
+        // offset data by id
+        VectorBase<BE, Index> statesOffsets;
+        VectorBase<BE, Index> facetsOffsets;
+        VectorBase<BE, Index> edgesOffsets;
+    };
+    inline static PackedMeshData packedMeshData;
+
+    struct PackedCollisionData {
+        VectorBase<BE, BroadCollision> broadCollisions;
+        VectorBase<BE, Index> numBroadCollisions;
+        VectorBase<BE, NarrowCollision> narrowCollisions;
+        VectorBase<BE, Index> numNarrowCollisions;
+        Index approxColsPerPoints = 15;
+
+        PackedCollisionData() {}
+        void allocate(Index numPoints) {
+            broadCollisions = VectorBase<BE, BroadCollision>(numPoints*approxColsPerPoints);
+            numBroadCollisions = VectorBase<BE, Index>(1, 0);
+            narrowCollisions = VectorBase<BE, NarrowCollision>(numPoints*approxColsPerPoints);
+            numNarrowCollisions = VectorBase<BE, Index>(1, 0);
+        }
+    };
+    inline static PackedCollisionData packedCollisionData;
+
+    static void pack() {
+        if(!dirty) return;
+        meshes.clear();
+
+        // count sizes
+        packedMeshData.statesOffsets = VectorBase<BE, Index>(numMeshes+1, 0);
+        packedMeshData.facetsOffsets = VectorBase<BE, Index>(numMeshes+1, 0);
+        packedMeshData.edgesOffsets  = VectorBase<BE, Index>(numMeshes+1, 0);
+        std::vector<PR> masses(numMeshes);
+
+        for(Index i = 0; i < requestsGeneralMeshes.size(); ++i) {
+            RequestGeneralMesh& req = requestsGeneralMeshes[i];
+
+            packedMeshData.statesOffsets[i+1] = packedMeshData.statesOffsets[i] + req.initializer->getParams()->numPoints;
+            packedMeshData.facetsOffsets[i+1] = packedMeshData.facetsOffsets[i] + req.initializer->getParams()->numFacets;
+            packedMeshData.edgesOffsets [i+1] = packedMeshData.edgesOffsets [i] + req.initializer->getParams()->numEdges;
+            masses[i] = req.initializer->getParams()->mass;
+        }
+
+        // allocate MeshState
+        Index numStatesData = packedMeshData.statesOffsets[numMeshes]*3;
+        packedMeshData.x = VectorBase<BE, PR>(numStatesData);
+        packedMeshData.v = VectorBase<BE, PR>(numStatesData, 0);
+        packedMeshData.f = VectorBase<BE, PR>(numStatesData, 0);
+        packedMeshData.m = VectorBase<BE, PR>(numStatesData);
+        for(Index i = 0; i < requestsGeneralMeshes.size(); ++i) 
+            std::fill(packedMeshData.m.ptr + packedMeshData.statesOffsets[i]*3,
+                    packedMeshData.m.ptr + packedMeshData.statesOffsets[i+1]*3,
+                    masses[i]);
+        packedMeshData.n = VectorBase<BE, PR>(numStatesData);
+        
+        // allocate MeshAdjacency
+        packedMeshData.facets = VectorBase<BE, Index>(packedMeshData.facetsOffsets[numMeshes]*3);
+        packedMeshData.edges  = VectorBase<BE, Index>(packedMeshData.edgesOffsets [numMeshes]*2);
+
+        // initialize meshes
+        //meshes.resize(numMeshes);
+        for(Index i = 0; i < numMeshes; ++i) {
+            RequestGeneralMesh& req = requestsGeneralMeshes[i];
+            meshes.emplace_back(req.initializer, req.behaviorType, req.behaviorParams);
+            meshes[i].id = req.id;
+            meshes[i].state.x = VectorBase<BE, PR>(packedMeshData.x, packedMeshData.statesOffsets[i]*3, (packedMeshData.statesOffsets[i+1]-packedMeshData.statesOffsets[i])*3);
+            meshes[i].state.v = VectorBase<BE, PR>(packedMeshData.v, packedMeshData.statesOffsets[i]*3, (packedMeshData.statesOffsets[i+1]-packedMeshData.statesOffsets[i])*3);
+            meshes[i].state.f = VectorBase<BE, PR>(packedMeshData.f, packedMeshData.statesOffsets[i]*3, (packedMeshData.statesOffsets[i+1]-packedMeshData.statesOffsets[i])*3);
+            meshes[i].state.m = VectorBase<BE, PR>(packedMeshData.m, packedMeshData.statesOffsets[i]*3, (packedMeshData.statesOffsets[i+1]-packedMeshData.statesOffsets[i])*3);
+            meshes[i].state.n = VectorBase<BE, PR>(packedMeshData.n, packedMeshData.statesOffsets[i]*3, (packedMeshData.statesOffsets[i+1]-packedMeshData.statesOffsets[i])*3);
+
+            meshes[i].adjacency.facets = VectorBase<BE, Index>(packedMeshData.facets, packedMeshData.facetsOffsets[i]*3, (packedMeshData.facetsOffsets[i+1]-packedMeshData.facetsOffsets[i])*3);
+            meshes[i].adjacency.edges = VectorBase<BE, Index>(packedMeshData.edges, packedMeshData.edgesOffsets[i]*2, (packedMeshData.edgesOffsets[i+1]-packedMeshData.edgesOffsets[i])*2);
+        }
+
+        // allocate collisions
+        packedCollisionData.allocate(packedMeshData.statesOffsets[numMeshes]);
+
+
+        dirty = false;
+    }
+
+
 
     static GeneralMesh<BE, PR>* findById(int id) {
         for(auto& mesh : meshes) {
@@ -1804,14 +1869,14 @@ struct BVH<BVHMODE::LINEAR, PRIMITIVE, PR> {
     BVH() {
         // recieve all points, facets and edges;
         if constexpr (PRIMITIVE == BVHPRIMITIVE::TRIANGLE) {
-            fillMortonsPSO = MetalBVHContext::getPSO("fillMortons_Tri");
-            buildTreePSO = MetalBVHContext::getPSO("buildTree_Tri");
+            fillMortonsPSO = MetalKernelContext::getPSO("fillMortons_Tri");
+            buildTreePSO = MetalKernelContext::getPSO("buildTree_Tri");
         } else if constexpr (PRIMITIVE == BVHPRIMITIVE::EDGE) {
-            fillMortonsPSO = MetalBVHContext::getPSO("fillMortons_Edge");
-            buildTreePSO = MetalBVHContext::getPSO("buildTree_Edge");
+            fillMortonsPSO = MetalKernelContext::getPSO("fillMortons_Edge");
+            buildTreePSO = MetalKernelContext::getPSO("buildTree_Edge");
         }
-        bottomUpBoxesPSO = MetalBVHContext::getPSO("bottomUpBoxes");
-        queryPointsPSO = MetalBVHContext::getPSO("queryPoints");
+        bottomUpBoxesPSO = MetalKernelContext::getPSO("bottomUpBoxes");
+        queryPointsPSO = MetalKernelContext::getPSO("queryPoints");
     }
 
     void memoryAllocation() {
@@ -1831,7 +1896,7 @@ struct BVH<BVHMODE::LINEAR, PRIMITIVE, PR> {
         //std::cout << "[BVH Build] Memory allocated, BVH build start" << std::endl;
         objid = oid;
 
-        auto* mesh = SceneObject<METAL, PR>::findById(objid);
+        auto* mesh = Scene<METAL, PR>::findById(objid);
         positions = pos;
         velocities = mesh->state.v;
         primitives = prim;
@@ -2217,7 +2282,7 @@ struct BVH<BVHMODE::LINEAR, PRIMITIVE, PR> {
     void queryAABB(const AABB4& queryBox, const BVHNode& node) {
         if(! node.aabb.intersect(queryBox)) return;
 
-        auto* qmesh = SceneObject<METAL, PR>::findById(queryBox.i1);
+        auto* qmesh = Scene<METAL, PR>::findById(queryBox.i1);
         auto& c = qmesh->constraints;
         if(c.numBroadCollisions[0] >= c.maxNumCollisions) return;
         
@@ -2276,7 +2341,7 @@ struct BVH<BVHMODE::LINEAR, PRIMITIVE, PR> {
     }
 
     void checkSelfCollisionsCPU(PR queryMargin) {
-        auto* qmesh = SceneObject<METAL, PR>::findById(objid); // self query.
+        auto* qmesh = Scene<METAL, PR>::findById(objid); // self query.
         Index numPoints = qmesh->state.x.size/3;
         qmesh->constraints.numBroadCollisions[0] = 0; // clear the previous collisions.
 
@@ -2304,7 +2369,7 @@ struct BVH<BVHMODE::LINEAR, PRIMITIVE, PR> {
         qFlag[0].collisionOverflow = 0;
     }
     void queryPoints(Index qObjId, PR queryMargin) {
-        auto* qmesh = SceneObject<METAL, PR>::findById(qObjId);
+        auto* qmesh = Scene<METAL, PR>::findById(qObjId);
         auto& pos = qmesh->state.x;
         Index numPoints = pos.size/3;
         auto& constraints = qmesh->constraints;
@@ -2326,7 +2391,7 @@ struct BVH<BVHMODE::LINEAR, PRIMITIVE, PR> {
         MetalGlobalContext::dispatchThreads(queryPointsPSO, numPoints);
     }
     void checkSelfCollisions(PR queryMargin) {
-        auto* qmesh = SceneObject<METAL, PR>::findById(objid); // self query.
+        auto* qmesh = Scene<METAL, PR>::findById(objid); // self query.
         //qmesh->constraints.numBroadCollisions[0] = 0; // clear the previous collisions.
 
         queryPoints(objid, queryMargin);
@@ -2398,7 +2463,7 @@ struct BVH<BVHMODE::SCENE, BVHPRIMITIVE::OBJECT, PR> {
     //BVH(SceneObject<METAL, PR>& scene) 
     //    : objTrees(scene.numMeshes), positions(scene.numMeshes*3), indices(scene.numMeshes*2) {}
 
-    void build(SceneObject<METAL, PR>& scene) {
+    void build(Scene<METAL, PR>& scene) {
         // allocations
         if(objTrees.size() != scene.numMeshes) {
             objTrees = std::vector<TRI_LBVH>(scene.numMeshes);
@@ -2483,7 +2548,7 @@ struct BVH<BVHMODE::SCENE, BVHPRIMITIVE::OBJECT, PR> {
         for(auto& tree : objTrees) {
             tree.qFlag[0].stackOverflow = 0;
             tree.qFlag[0].collisionOverflow = 0;
-            SceneObject<METAL, PR>::findById(tree.objid)->constraints.numBroadCollisions[0] = 0;
+            Scene<METAL, PR>::findById(tree.objid)->constraints.numBroadCollisions[0] = 0;
         }
     }
     void detectCollisions(PR margin, bool enableSelfCollisions=true) {
@@ -2551,15 +2616,63 @@ struct BruteForce<CPU, PR> {
 
 template <typename PR>
 struct BruteForce<METAL, PR> {
+    MTL::ComputePipelineState* bruteForcePSO;
+    BruteForce() {
+        bruteForcePSO = MetalKernelContext::getPSO("narrow_pt_tri");
+    }
+    struct NarrowParams {
+        uint32_t numBroadCollisions;
+        uint32_t maxNumCollisions;
+        float radius;
+        float thickness;
+    };
+    void narrow(Index oid, PR radius) {
+        GeneralMesh<METAL, PR>* qmesh = Scene<METAL, PR>::findById(oid);
+        auto& constraints = qmesh->constraints;
+        NarrowParams nparams{};
+        nparams.numBroadCollisions = std::min(
+            constraints.numBroadCollisions[0],
+            constraints.maxNumCollisions
+        );
+        nparams.maxNumCollisions = constraints.maxNumCollisions;
+        nparams.radius = radius;
 
-    void narrow(
+        BehaviorType qBehaviorType = (BehaviorType)qmesh->behaviorPair.query; // 혹은 qmesh->behaviorType
+        switch (qBehaviorType) {
+            case BehaviorType::FastGridCloth:
+                nparams.thickness =
+                    std::get<FastGridClothBehaviorParams<PR>>(qmesh->behaviorParams).thickness;
+                break;
+            case BehaviorType::TriangularCloth:
+                nparams.thickness =
+                    std::get<ClothBehaviorParams<PR>>(qmesh->behaviorParams).thickness;
+                break;
+            default:
+                nparams.thickness = 0.0f;
+                break;
+        }
+
+        MetalGlobalContext::setBuffer(constraints.broadCollisions, 0);
+        MetalGlobalContext::setBuffer(constraints.narrowCollisions, 1);
+        MetalGlobalContext::setBuffer(constraints.numNarrowCollisions, 2);
+
+        MetalGlobalContext::setBuffer(Scene<METAL, PR>::packedMeshData.x, 3);
+        MetalGlobalContext::setBuffer(Scene<METAL, PR>::packedMeshData.statesOffsets, 4);
+        MetalGlobalContext::setBuffer(Scene<METAL, PR>::packedMeshData.facets, 5);
+        MetalGlobalContext::setBuffer(Scene<METAL, PR>::packedMeshData.facetsOffsets, 6);
+        MetalGlobalContext::setBytes(nparams, 7);
+
+        MetalGlobalContext::dispatchThreads(bruteForcePSO, nparams.numBroadCollisions);
+    }
+
+    void narrowCPU(
             VectorBase<METAL, BroadCollision>& ptCollisions, 
             Index numCollisions,
             MeshAdjacency<METAL, PR>& adjacency,
             Constraints<METAL, PR>& constraints,
             PR radius) {
         if(!constraints.narrowCollisions.ptr) constraints.narrowCollisions = VectorBase<METAL, NarrowCollision>(ptCollisions.size);
-        else constraints.numNarrowCollisions = 0;
+        else constraints.numNarrowCollisions[0] = 0;
         numCollisions = std::min(constraints.numBroadCollisions[0], constraints.maxNumCollisions);
         for(Index cid = 0; cid < numCollisions; ++cid) {
             // check if the pairs are really close than the radius.
@@ -2571,8 +2684,8 @@ struct BruteForce<METAL, PR> {
             auto& shapePair = ptCollisions[cid].shapePair;
             //collisions[cid].type;
 
-            auto* qmesh = SceneObject<METAL, PR>::findById(queryObjId);
-            auto* tmesh = SceneObject<METAL, PR>::findById(targetObjId);
+            auto* qmesh = Scene<METAL, PR>::findById(queryObjId);
+            auto* tmesh = Scene<METAL, PR>::findById(targetObjId);
 
             auto& qpositions = qmesh->state.x;
             auto& tpositions = tmesh->state.x;
@@ -2615,7 +2728,20 @@ struct BruteForce<METAL, PR> {
             }
             //if(l < 0) continue; // TODO: already-penetrated case, not handled,
             // TODO: 1.0 is THICK parameter. fix later
-            if(l > radius + 0.01f) continue; // too far.
+            BehaviorType qBehaviorType = (BehaviorType)behaviorPair.query;
+            PR thickness = 0.0;
+            switch (qBehaviorType) {
+                case BehaviorType::FastGridCloth:
+                    thickness = std::get<FastGridClothBehaviorParams<PR>>(qmesh->behaviorParams).thickness;
+                    break;
+                case BehaviorType::TriangularCloth:
+                    thickness = std::get<ClothBehaviorParams<PR>>(qmesh->behaviorParams).thickness;
+                    break;
+                default:
+                    break;
+
+            }
+            if(l > radius + thickness) continue; // too far.
 
             // barycentric coordinate to check in-plane
             tinym::vec3 inplane = p - n*l;
@@ -2632,8 +2758,8 @@ struct BruteForce<METAL, PR> {
             PR a = 1-b-c;
 
             if(a >= 0 && b >= 0 && c >= 0) { // inside plane
-                constraints.narrowCollisions[constraints.numNarrowCollisions] = {{point, triangle}, {queryObjId, targetObjId}, {n, l}, behaviorPair, shapePair};
-                constraints.numNarrowCollisions++;
+                constraints.narrowCollisions[constraints.numNarrowCollisions[0]] = {{point, triangle}, {queryObjId, targetObjId}, {n, l}, behaviorPair, shapePair};
+                constraints.numNarrowCollisions[0]++;
             }
         }
     }
@@ -2644,12 +2770,15 @@ struct BruteForce<METAL, PR> {
             MeshAdjacency<METAL, PR>& adjacency,
             Constraints<METAL, PR>& constraints,
             PR radius) {
-        narrow(ptCollisions, numCollisions, adjacency, constraints, radius);
+        narrowCPU(ptCollisions, numCollisions, adjacency, constraints, radius);
+        //narrow(ptCollisions, numCollisions, adjacency, constraints, radius);
 
         constraints.vertexColPrimsOffsets.map().setZero();
         constraints.vertexColPrims.map().setZero();
 
-        for(Index i = 0; i < constraints.numNarrowCollisions; ++i) {
+        if(constraints.numNarrowCollisions[0] == 0) return;
+
+        for(Index i = 0; i < constraints.numNarrowCollisions[0]; ++i) {
             Index pid = constraints.narrowCollisions[i].indexPair.point;
             constraints.vertexColPrimsOffsets[pid+1]++;
         }
@@ -2660,7 +2789,7 @@ struct BruteForce<METAL, PR> {
         DynamicMemoryAllocator<METAL> tempPool;
         VectorBase<METAL, Index> offsets(tempPool.template zeros<Index>(constraints.vertexColPrimsOffsets.size-1));
         
-        for(Index i = 0; i < constraints.numNarrowCollisions; ++i) {
+        for(Index i = 0; i < constraints.numNarrowCollisions[0]; ++i) {
             Index pid = constraints.narrowCollisions[i].indexPair.point;
             Index base = offsets[pid]+constraints.vertexColPrimsOffsets[pid];
             constraints.vertexColPrims[base] = constraints.narrowCollisions[i];
@@ -2680,7 +2809,7 @@ template <typename BE, typename PR, typename System>
 struct Simulator {
     System& system;
 
-    SceneObject<BE, PR> sceneObjects;
+    Scene<BE, PR> sceneObjects;
 
     //using BroadPhase = BVH<BVHMODE::LINEAR, BVHPRIMITIVE::TRIANGLE, PR>;
     using BroadPhase = BVH<BVHMODE::SCENE, BVHPRIMITIVE::OBJECT, PR>;
@@ -2743,11 +2872,11 @@ struct Simulator {
         );
     }
 
-    void addCloth(Index particleNum1D = 200, PR size1D = 100, PR kstretch=1e5, PR kshear=1e5, PR kbend=3e5, PR thickness=0.01, PR mass=0.1) {
+    void addCloth(Index particleNum1D, PR size1D, tinym::vec3 center, PR kstretch=1e5, PR kshear=1e5, PR kbend=3e5, PR thickness=0.01, PR mass=0.1) {
         sceneObjects.addGeneralMesh(
             new MeshGridInitializer<BE, PR>({
-                PlaneDirection::XYPlane, 
-                tinym::vec3(0),
+                PlaneDirection::XZPlane, 
+                center,
                 particleNum1D, 
                 size1D, 
                 mass, 
@@ -2782,6 +2911,8 @@ struct Simulator {
         GlobalAutoAllocator<BE>::globalInitialize(1<<20);
         std::cout << "[Simulator Init] Memory pool allocated" << std::endl;
 
+        Scene<BE, PR>::pack();
+
         for(auto& plane : sceneObjects.planes) {}
         for(auto& mesh : sceneObjects.meshes) {
             std::cout << "  - try to initialize mesh " << mesh.id << "\n";
@@ -2812,16 +2943,29 @@ struct Simulator {
             //else checkCollision = false;
             checkCollision = true;
 
-            if(SceneObject<BE, PR>::numMeshes > 0 && checkCollision) {
+            if(Scene<BE, PR>::numMeshes > 0 && checkCollision) {
                 //MetalGlobalContext::commitAndWait();
 
-                auto* mesh = SceneObject<BE, PR>::findById(0);
 
 
                 //collisionPipeline.broadPhase.enlargeTrajectory(system.h);
                 collisionPipeline.broadPhase.refit();
                 collisionPipeline.broadPhase.detectCollisions(margin, enableSelfCollisions);
 
+                for(auto& mesh : Scene<BE, PR>::meshes) {
+                    if(mesh.behaviorType == BehaviorType::Float) continue;
+                    auto& c = mesh.constraints;
+
+                    collisionPipeline.narrowPhase.narrowAndSortByVertices(
+                            c.broadCollisions,
+                            c.numBroadCollisions[0],
+                            mesh.adjacency,
+                            c,
+                            radius);
+                }
+
+
+                auto* mesh = Scene<BE, PR>::findById(0);
                 auto& c = mesh->constraints;
                 if(c.numBroadCollisions[0] > 0) {
                     std::cout << "Collision detected: (frame,substep)=" << frame << "," << i << " (" << c.numBroadCollisions[0] << "/" << c.maxNumCollisions << ")\n";
@@ -2831,17 +2975,13 @@ struct Simulator {
                     //        << " and triangle "
                     //        << c.broadCollisions[i].indexPair.triangle << std::endl;
                     //}
-                }
-                collisionPipeline.narrowPhase.narrowAndSortByVertices(
-                        c.broadCollisions,
-                        c.numBroadCollisions[0],
-                        mesh->adjacency,
-                        c,
-                        radius);
+                } 
+                else std::cout << "No broad collisions\n";
 
 
-                if(c.numNarrowCollisions > 0) {
-                    std::cout << "Narrowed collision detected: (frame,substep)=" << frame << "," << i << " (" << c.numNarrowCollisions << "/" << c.maxNumCollisions << ")\n";
+
+                if(c.numNarrowCollisions[0] > 0) {
+                    std::cout << "Narrowed collision detected: (frame,substep)=" << frame << "," << i << " (" << c.numNarrowCollisions[0] << "/" << c.maxNumCollisions << ")\n";
                     //Index min = 5 < c.numNarrowCollisions ? 5 : c.numNarrowCollisions;
                     //for(Index i = 0; i < min; ++i) {
                     //    std::cout << "  - Collision " << i << ": point " 
@@ -2878,6 +3018,7 @@ struct Simulator {
                     //    }
                     //}
                 }
+                else std::cout << "No narrow collision\n";
             }
 
 
@@ -2941,12 +3082,12 @@ struct ExplicitSystem<CPU, PR> {
     //    std::cout << "[System Creation] Try to create Explicit System..." << std::endl;
     //}
 
-    void clearForce(SceneObject<CPU, PR>& sceneObjects) { 
+    void clearForce(Scene<CPU, PR>& sceneObjects) { 
         //for(SquareCloth<CPU, PR>& squareCloth : sceneObjects.squareClothes) squareCloth.f.map().setZero(); 
         //for(DeformableMesh<CPU, PR>& deformableMesh : sceneObjects.deformableMeshes) deformableMesh.f.map().setZero(); 
     }
     
-    void addForce(SceneObject<CPU, PR>& sceneObjects) {
+    void addForce(Scene<CPU, PR>& sceneObjects) {
         // View change: (3Nx1) to (3xN)
         //for(DeformableMesh<CPU, PR>& deformableMesh : sceneObjects.deformableMeshes) {
         //    Eigen::Map<Eigen::Matrix<PR, 3, Eigen::Dynamic>> X(deformableMesh.x.ptr, 3, deformableMesh.vertexNum);
@@ -3033,7 +3174,7 @@ struct ExplicitSystem<CPU, PR> {
         //} // SquareCloth
     }
     
-    void update(SceneObject<CPU, PR>& sceneObjects) {
+    void update(Scene<CPU, PR>& sceneObjects) {
         //for(size_t i = 0; i < subSteps; i++) {
         //    clearForce(sceneObjects);
         //    addForce(sceneObjects);
@@ -3078,8 +3219,9 @@ struct ExplicitSystem<METAL, PR> {
     // Metal vars
     MTL::ComputePipelineState* forcePSO;
     MTL::ComputePipelineState* springForcePSO;
-    MTL::ComputePipelineState* integratePSO;
+    MTL::ComputePipelineState* integrateClothPSO;
     MTL::ComputePipelineState* clothGridFastForcePSO;
+    MTL::ComputePipelineState* integrateClothGridPSO;
 
     // Sim vars
     PR h = 1/PR(60);
@@ -3103,10 +3245,11 @@ struct ExplicitSystem<METAL, PR> {
         // find own metal kernel library
 
         // find desired kernel
-        forcePSO = MetalPhysicsContext::getPSO("compute_forces");
-        springForcePSO = MetalPhysicsContext::getPSO("compute_spring_forces");
-        integratePSO = MetalPhysicsContext::getPSO("integrate");
-        clothGridFastForcePSO = MetalPhysicsContext::getPSO("compute_cloth_grid_forces_fast");
+        forcePSO = MetalKernelContext::getPSO("compute_forces");
+        springForcePSO = MetalKernelContext::getPSO("compute_spring_forces");
+        integrateClothPSO = MetalKernelContext::getPSO("integrate_cloth");
+        clothGridFastForcePSO = MetalKernelContext::getPSO("compute_cloth_grid_forces_fast");
+        integrateClothGridPSO = MetalKernelContext::getPSO("integrate_cloth_grid");
     }
     
     struct SimParams {
@@ -3119,13 +3262,15 @@ struct ExplicitSystem<METAL, PR> {
         uint particleNum1D;
         float stretchRest, shearRest, bendRest;
         float kstretch, kshear, kbend;
+        float thickness;
     };
     struct ClothParams {
         float kstretch, kshear, kbend;
+        float thickness;
     };
 
     // 2. update() 함수 수정
-    void update(SceneObject<METAL, PR>& sceneObjects) {
+    void update(Scene<METAL, PR>& sceneObjects) {
 
         for(auto& mesh : sceneObjects.meshes) {
 
@@ -3153,12 +3298,12 @@ struct ExplicitSystem<METAL, PR> {
                 case BehaviorType::TriangularCloth:
                     TriangularClothBehavior<METAL, PR>::setBuffer(mesh, params);
                     TriangularClothBehavior<METAL, PR>::update(mesh.state);
-                    MetalGlobalContext::dispatchThreads(integratePSO, mesh.state.x.size/3);
+                    MetalGlobalContext::dispatchThreads(integrateClothPSO, mesh.state.x.size/3);
                     break;
                 case BehaviorType::FastGridCloth:
                     FastGridClothBehavior<METAL, PR>::setBuffer(mesh, params);
                     FastGridClothBehavior<METAL, PR>::update(mesh.state);
-                    MetalGlobalContext::dispatchThreads(integratePSO, mesh.state.x.size/3);
+                    MetalGlobalContext::dispatchThreads(integrateClothGridPSO, mesh.state.x.size/3);
                     break;
                 case BehaviorType::Float:
                     break;
@@ -3181,8 +3326,6 @@ struct ExplicitSystem<METAL, PR> {
 
 
 // simulation mamage
-constexpr int particleN = 20;
-constexpr int groundN = 1;
 
 
 
@@ -3191,7 +3334,7 @@ constexpr int groundN = 1;
 
 int main() {
     
-    std::cout << "Render" << std::endl;
+    std::cout << "Run simulator" << std::endl;
 
     //window = new YGLWindow(640, 480, "ysim");
     window = new YGLWindow(1600, 900, "ysim");
@@ -3221,19 +3364,21 @@ int main() {
     //Precision kstretch = 2e3;
     //Precision kshear = 2e3;
     //Precision kbend = 4e3;
-    Index particleNum1D = 100;
+    Index particleNum1D = 20;
     Precision size1D = 0.5;
-    Precision kstretch = 2e5;
+    Precision kstretch = 1e5;
     Precision kshear = 1e5;
-    Precision kbend = 4e5;
+    Precision kbend = 2e5;
     Precision mass = 0.1;
-    Precision thickness = 0.001;
+    Precision thickness = 0.01;
     //simulator.addClothGridFast(particleNum1D, size1D, kstretch, kshear, kbend, thickness, mass);
     //simulator.addClothGridFast(20, 0.5, 1e4, 1e4, 2e4, thickness, 0.1);
-    simulator.addCloth(particleNum1D, size1D, kstretch/2, kshear, kbend/2, thickness, mass);
+    simulator.addCloth(particleNum1D, size1D, tinym::vec3(0, 0.15, 0), kstretch, kshear, kbend, thickness, mass);
+    //simulator.addCloth(particleNum1D, size1D, tinym::vec3(0, 0.25, 0), kstretch, kshear, kbend, thickness, mass);
     //simulator.addClothFile("src/assets", "teapot.obj", {0,0,0} 15, 1e4, 0, 2e4, thickness mass);
     //simulator.addClothFile("src/assets", "horse-gallop-01.obj", {0,0,0}, 80, 1e4, 0, 2e4, thickness mass);
-    simulator.addFloatMesh("src/assets", "horse-gallop-01.obj", {0, -1, 0}, 1.2);
+    //simulator.addFloatMesh("src/assets", "horse-gallop-01.obj", {0, -1, 0}, 1.2);
+    simulator.addFloatMesh("src/assets", "camel-gallop-reference.obj", {0, -1, 0}, 1.2);
     simulator.addGround(PlaneDirection::XZPlane, tinym::vec3(0, -1, 0), 5);
     
     std::cout << "[Main] mesh added to scene" << std::endl;
@@ -3241,12 +3386,12 @@ int main() {
     simulator.initialize();
     std::cout << "[Main] simulator is initialized" << std::endl;
 
-    if(SceneObject<Backend, Precision>::numMeshes > 0) {
+    if(Scene<Backend, Precision>::numMeshes > 0) {
         std::cout << "Try to pin general meshes\n";
-        for(auto& mesh: SceneObject<Backend, Precision>::meshes) {
+        for(auto& mesh: Scene<Backend, Precision>::meshes) {
             std::cout << mesh.id << std::endl;
         }
-        auto* mesh = SceneObject<Backend, Precision>::findById(0);
+        auto* mesh = Scene<Backend, Precision>::findById(0);
         std::cout << mesh << std::endl;
         mesh->constraints.fixParticle(0);
         //mesh->constraints.fixParticle(particleNum1D-1);
