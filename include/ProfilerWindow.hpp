@@ -1,0 +1,50 @@
+#pragma once
+
+#include "FrameProfiler.hpp"
+
+#include <chrono>
+#include <cstdio>
+#include <ctime>
+#include <string>
+
+namespace profiler {
+
+inline std::string makeDefaultProfileExportPath() {
+    auto now = std::chrono::system_clock::now();
+    std::time_t now_time = std::chrono::system_clock::to_time_t(now);
+
+    std::tm local_time{};
+#if defined(_WIN32)
+    localtime_s(&local_time, &now_time);
+#else
+    localtime_r(&now_time, &local_time);
+#endif
+
+    char timestamp[64];
+    std::strftime(timestamp, sizeof(timestamp), "%Y%m%d_%H%M%S", &local_time);
+
+#ifdef YSIM_PROJECT_ROOT
+    return std::string(YSIM_PROJECT_ROOT) + "/profiles/profile_" + timestamp + ".csv";
+#else
+    return std::string("profiles/profile_") + timestamp + ".csv";
+#endif
+}
+
+struct ProfilerWindowState {
+    bool open = true;
+    float history_seconds = 3.0f;
+    int selected_section = 0;
+    std::string export_path = makeDefaultProfileExportPath();
+    std::string status_message;
+};
+
+void drawProfilerWindow(
+    ProfilerWindowState& state,
+    FrameProfiler& profiler,
+    bool* pause,
+    bool* debug_each_boxes,
+    bool* debug_scene_box,
+    bool* debug_collisions
+);
+
+} // namespace profiler

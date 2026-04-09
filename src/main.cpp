@@ -4,8 +4,14 @@
 #include "Metal/MTLComputePipeline.hpp"
 #include "YGLWindow.hpp"
 #include "camera.hpp"
+#include "FrameProfiler.hpp"
+#include "ProfilerWindow.hpp"
 #include "program.hpp"
 #include "objreader.hpp"
+
+#include "imgui.h"
+#include "imgui_impl_glfw.h"
+#include "imgui_impl_opengl3.h"
 
 #include <cstddef>
 #include <iostream>
@@ -30,6 +36,9 @@ struct CUDA : Backend {};
 struct METAL : Backend {};
 
 #include <algorithm>
+#include <chrono>
+#include <cstring>
+#include <unordered_map>
 #include <vector>
 #include <iostream>
 /// Static Memory Pool ///
@@ -2706,7 +2715,7 @@ struct BVH<BVHMODE::SCENE, BVHPRIMITIVE::OBJECT, PR> {
         }
 
         tree.build(-1, positions, indices);
-        print(tree.tree[0]);
+        //print(tree.tree[0]);
     }
 
     void print(typename EDGE_LBVH::BVHNode node, Index l = 0) {
@@ -3041,6 +3050,7 @@ struct Simulator {
     bool checkCollision = true;
     bool enableSelfCollisions = false;
     Index frame = 0;
+    profiler::FrameProfiler* profiler = nullptr;
 
 
     PR margin = 0.015;
@@ -3153,7 +3163,14 @@ struct Simulator {
         //std::cout << "[Simulator Update] Start update" << std::endl;
         
         
-        if(frame % 10 == 0) collisionPipeline.broadPhase.build(sceneObjects);
+        if(frame % 10 == 0) {
+            if (profiler) {
+                auto scope = profiler->scoped("bvh_build");
+                collisionPipeline.broadPhase.build(sceneObjects);
+            } else {
+                collisionPipeline.broadPhase.build(sceneObjects);
+            }
+        }
 
         
         for(int i = 0; i < system.subSteps; i++) {
@@ -3168,90 +3185,124 @@ struct Simulator {
 
 
                 //collisionPipeline.broadPhase.enlargeTrajectory(system.h);
-                collisionPipeline.broadPhase.refit();
-                collisionPipeline.broadPhase.detectCollisions(margin, enableSelfCollisions);
+                if (profiler) {
+                    auto scope = profiler->scoped("broad_refit");
+                    collisionPipeline.broadPhase.refit();
+                } else {
+                    collisionPipeline.broadPhase.refit();
+                }
+                if (profiler) {
+                    auto scope = profiler->scoped("broad_detect");
+                    collisionPipeline.broadPhase.detectCollisions(margin, enableSelfCollisions);
+                } else {
+                    collisionPipeline.broadPhase.detectCollisions(margin, enableSelfCollisions);
+                }
 
                 for(auto& mesh : Scene<BE, PR>::meshes) {
                     if(mesh.behaviorType == BehaviorType::Float) continue;
                     auto& c = mesh.constraints;
 
-                    collisionPipeline.narrowPhase.narrowAndSortByVertices(
-                            c.broadCollisions,
-                            c.numBroadCollisions[0],
-                            mesh.adjacency,
-                            c,
-                            radius);
+                    if (profiler) {
+                        auto scope = profiler->scoped("narrow_phase");
+                        collisionPipeline.narrowPhase.narrowAndSortByVertices(
+                                c.broadCollisions,
+                                c.numBroadCollisions[0],
+                                mesh.adjacency,
+                                c,
+                                radius);
+                    } else {
+                        collisionPipeline.narrowPhase.narrowAndSortByVertices(
+                                c.broadCollisions,
+                                c.numBroadCollisions[0],
+                                mesh.adjacency,
+                                c,
+                                radius);
+                    }
                 }
 
 
                 auto* mesh = Scene<BE, PR>::findById(0);
                 auto& c = mesh->constraints;
-                if(c.numBroadCollisions[0] > 0) {
-                    std::cout << "Collision detected: (frame,substep)=" << frame << "," << i << " (" << c.numBroadCollisions[0] << "/" << c.maxNumCollisions << ")\n";
-                    //for(Index i = 0; i < 5; ++i) {
-                    //    std::cout << "  - Collision " << i << ": point " 
-                    //        << c.broadCollisions[i].indexPair.point
-                    //        << " and triangle "
-                    //        << c.broadCollisions[i].indexPair.triangle << std::endl;
-                    //}
-                } 
-                else std::cout << "No broad collisions\n";
+                //if(c.numBroadCollisions[0] > 0) {
+                //    std::cout << "Collision detected: (frame,substep)=" << frame << "," << i << " (" << c.numBroadCollisions[0] << "/" << c.maxNumCollisions << ")\n";
+                //    //for(Index i = 0; i < 5; ++i) {
+                //    //    std::cout << "  - Collision " << i << ": point " 
+                //    //        << c.broadCollisions[i].indexPair.point
+                //    //        << " and triangle "
+                //    //        << c.broadCollisions[i].indexPair.triangle << std::endl;
+                //    //}
+                //} 
+                //else std::cout << "No broad collisions\n";
 
 
 
-                if(c.numNarrowCollisions[0] > 0) {
-                    std::cout << "Narrowed collision detected: (frame,substep)=" << frame << "," << i << " (" << c.numNarrowCollisions[0] << "/" << c.maxNumCollisions << ")\n";
-                    //Index min = 5 < c.numNarrowCollisions ? 5 : c.numNarrowCollisions;
-                    //for(Index i = 0; i < min; ++i) {
-                    //    std::cout << "  - Collision " << i << ": point " 
-                    //        << c.narrowCollisions[i].indexPair.point
-                    //        << " and triangle "
-                    //        << c.narrowCollisions[i].indexPair.triangle 
-                    //        << " and normal " 
-                    //        << '(' << c.narrowCollisions[i].collisionNormalAndDistance.x 
-                    //        << ", " << c.narrowCollisions[i].collisionNormalAndDistance.y 
-                    //        << ", " << c.narrowCollisions[i].collisionNormalAndDistance.z << ')'
-                    //        << " and distance " 
-                    //        << c.narrowCollisions[i].collisionNormalAndDistance.w
-                    //        << std::endl;
-                    //}
-                    //std::cout << "Narrowed self collision sorted: (" << c.numNarrowCollisions << "/" << c.maxNumCollisions << ")\n";
-                    //Index count = 0;
-                    //for(Index i = 0; i < c.vertexColPrimsOffsets.size-1; ++i) {
-                    //    if(count >= min) break;
-                    //    if(c.vertexColPrimsOffsets[i] == c.vertexColPrimsOffsets[i+1]) continue;
-                    //    for(Index j = c.vertexColPrimsOffsets[i]; j < c.vertexColPrimsOffsets[i+1]; ++j) {
-                    //        if(count >= min) break;
-                    //        std::cout << "  - Collision " << j << ": point " 
-                    //            << c.vertexColPrims[j].indexPair.point
-                    //            << " and triangle "
-                    //            << c.vertexColPrims[j].indexPair.triangle 
-                    //            << " and normal " 
-                    //            << '(' << c.vertexColPrims[j].collisionNormalAndDistance.x 
-                    //            << ", " << c.vertexColPrims[j].collisionNormalAndDistance.y 
-                    //            << ", " << c.vertexColPrims[j].collisionNormalAndDistance.z << ')'
-                    //            << " and distance " 
-                    //            << c.vertexColPrims[j].collisionNormalAndDistㅅance.w
-                    //            << std::endl;
-                    //        count++;
-                    //    }
-                    //}
-                }
-                else std::cout << "No narrow collision\n";
+                //if(c.numNarrowCollisions[0] > 0) {
+                //    std::cout << "Narrowed collision detected: (frame,substep)=" << frame << "," << i << " (" << c.numNarrowCollisions[0] << "/" << c.maxNumCollisions << ")\n";
+                //    //Index min = 5 < c.numNarrowCollisions ? 5 : c.numNarrowCollisions;
+                //    //for(Index i = 0; i < min; ++i) {
+                //    //    std::cout << "  - Collision " << i << ": point " 
+                //    //        << c.narrowCollisions[i].indexPair.point
+                //    //        << " and triangle "
+                //    //        << c.narrowCollisions[i].indexPair.triangle 
+                //    //        << " and normal " 
+                //    //        << '(' << c.narrowCollisions[i].collisionNormalAndDistance.x 
+                //    //        << ", " << c.narrowCollisions[i].collisionNormalAndDistance.y 
+                //    //        << ", " << c.narrowCollisions[i].collisionNormalAndDistance.z << ')'
+                //    //        << " and distance " 
+                //    //        << c.narrowCollisions[i].collisionNormalAndDistance.w
+                //    //        << std::endl;
+                //    //}
+                //    //std::cout << "Narrowed self collision sorted: (" << c.numNarrowCollisions << "/" << c.maxNumCollisions << ")\n";
+                //    //Index count = 0;
+                //    //for(Index i = 0; i < c.vertexColPrimsOffsets.size-1; ++i) {
+                //    //    if(count >= min) break;
+                //    //    if(c.vertexColPrimsOffsets[i] == c.vertexColPrimsOffsets[i+1]) continue;
+                //    //    for(Index j = c.vertexColPrimsOffsets[i]; j < c.vertexColPrimsOffsets[i+1]; ++j) {
+                //    //        if(count >= min) break;
+                //    //        std::cout << "  - Collision " << j << ": point " 
+                //    //            << c.vertexColPrims[j].indexPair.point
+                //    //            << " and triangle "
+                //    //            << c.vertexColPrims[j].indexPair.triangle 
+                //    //            << " and normal " 
+                //    //            << '(' << c.vertexColPrims[j].collisionNormalAndDistance.x 
+                //    //            << ", " << c.vertexColPrims[j].collisionNormalAndDistance.y 
+                //    //            << ", " << c.vertexColPrims[j].collisionNormalAndDistance.z << ')'
+                //    //            << " and distance " 
+                //    //            << c.vertexColPrims[j].collisionNormalAndDistㅅance.w
+                //    //            << std::endl;
+                //    //        count++;
+                //    //    }
+                //    //}
+                //}
+                //else std::cout << "No narrow collision\n";
             }
 
-
-
-            system.update(sceneObjects);
+            if (profiler) {
+                auto scope = profiler->scoped("system_update");
+                system.update(sceneObjects);
+            } else {
+                system.update(sceneObjects);
+            }
         }
 
-        MetalGlobalContext::commitAndWait();
+        if (profiler) {
+            auto scope = profiler->scoped("metal_commit");
+            MetalGlobalContext::commitAndWait();
+        } else {
+            MetalGlobalContext::commitAndWait();
+        }
         
         system.acctime += system.h;
         frame++;
 
-        for(auto& mesh : sceneObjects.meshes)
-            mesh.meshGL.updateBuffer(mesh.state.x.ptr);
+        if (profiler) {
+            auto scope = profiler->scoped("mesh_upload");
+            for(auto& mesh : sceneObjects.meshes)
+                mesh.meshGL.updateBuffer(mesh.state.x.ptr);
+        } else {
+            for(auto& mesh : sceneObjects.meshes)
+                mesh.meshGL.updateBuffer(mesh.state.x.ptr);
+        }
 
         //collisionPipeline.broadPhase.build(sceneObjects.squareClothes[0].x, sceneObjects.squareClothes[0].facet);
         //std::cout << "[Simulator Update] Finished update" << std::endl;
@@ -3548,9 +3599,6 @@ struct ExplicitSystem<METAL, PR> {
 
 
 
-#include <chrono> // 시간 관련 라이브러리
-
-
 int main() {
     
     std::cout << "Run simulator" << std::endl;
@@ -3630,25 +3678,57 @@ int main() {
     bool debugEachBoxes = false;
     bool debugSceneBox = false;
     bool debugCollisions = true;
+    profiler::FrameProfiler frameProfiler(360);
+    profiler::ProfilerWindowState profilerWindowState;
 
     std::cout << "[Main] programs are loaded" << std::endl;
 
 
     camera.setPosition(tinym::vec3(0, 0, 5));
 
-    camera.glfwSetCallbacks(window->getGLFWWindow());
+    IMGUI_CHECKVERSION();
+    ImGui::CreateContext();
+    ImGui::StyleColorsDark();
+    ImGuiIO& io = ImGui::GetIO();
+    io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+    ImGui_ImplGlfw_InitForOpenGL(window->getGLFWWindow(), false);
+#ifdef __APPLE__
+    ImGui_ImplOpenGL3_Init("#version 410");
+#else
+    ImGui_ImplOpenGL3_Init("#version 330");
+#endif
 
     struct CallbacksDataPack {
         Simulator<Backend, Precision, ExplicitSystem<Backend, Precision>>* simulator;
         bool* debugEachBoxes;
         bool* debugSceneBox;
         bool* debugCollisions;
+        profiler::FrameProfiler* frameProfiler;
     };
-    CallbacksDataPack pack = {&simulator, &debugEachBoxes, &debugSceneBox, &debugCollisions};
+    CallbacksDataPack pack = {&simulator, &debugEachBoxes, &debugSceneBox, &debugCollisions, &frameProfiler};
 
     //glfwSetWindowUserPointer(window->getGLFWWindow(), &system);
     glfwSetWindowUserPointer(window->getGLFWWindow(), &(pack));
+
+    auto cursorCallback = [](GLFWwindow* window, double xpos, double ypos) {
+        ImGui_ImplGlfw_CursorPosCallback(window, xpos, ypos);
+        if (ImGui::GetIO().WantCaptureMouse) return;
+        cursorPosCallback(window, xpos, ypos);
+    };
+    auto scrollCallbackWrapped = [](GLFWwindow* window, double xoffset, double yoffset) {
+        ImGui_ImplGlfw_ScrollCallback(window, xoffset, yoffset);
+        if (ImGui::GetIO().WantCaptureMouse) return;
+        scrollCallback(window, xoffset, yoffset);
+    };
+    auto mouseButtonCallback = [](GLFWwindow* window, int button, int action, int mods) {
+        ImGui_ImplGlfw_MouseButtonCallback(window, button, action, mods);
+    };
+    auto charCallback = [](GLFWwindow* window, unsigned int c) {
+        ImGui_ImplGlfw_CharCallback(window, c);
+    };
     auto keyCallback = [](GLFWwindow* window, int key, int scancode, int action, int mods) {
+        ImGui_ImplGlfw_KeyCallback(window, key, scancode, action, mods);
+        if (ImGui::GetIO().WantCaptureKeyboard) return;
 
         auto* pack = static_cast<CallbacksDataPack*>(glfwGetWindowUserPointer(window));
         auto* simulator = pack->simulator;
@@ -3676,93 +3756,123 @@ int main() {
         }
 
     };
+    glfwSetCursorPosCallback(window->getGLFWWindow(), cursorCallback);
+    glfwSetScrollCallback(window->getGLFWWindow(), scrollCallbackWrapped);
+    glfwSetMouseButtonCallback(window->getGLFWWindow(), mouseButtonCallback);
+    glfwSetCharCallback(window->getGLFWWindow(), charCallback);
     glfwSetKeyCallback(window->getGLFWWindow(), keyCallback);
 
     std::cout << "[Main] callbacks are set" << std::endl;
 
-    int frameCounter = 0;
-    double lastTime = glfwGetTime();
+    simulator.profiler = &frameProfiler;
 
-    auto init = []() {};
-    auto render = [&]() {
-        auto physicsStart = std::chrono::high_resolution_clock::now();
-        //system.update();
-        simulator.update();
-        auto physicsEnd = std::chrono::high_resolution_clock::now();
-        double physicsTime = std::chrono::duration<double, std::milli>(physicsEnd - physicsStart).count();
-        
-        auto renderingStart = std::chrono::high_resolution_clock::now();
-        shader.use();
-        glViewport(0, 0, window->width(), window->height());
-        glClearColor(0, 0, 0, 0);
-        glEnable(GL_DEPTH_TEST);
-        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
-        //float M[16] = {1, 0, 0, 0,   0, 1, 0, 0,   0, 0, 1, 0,   0, -0.5, 0, 1};
-        tinym::mat4 M(1);
-        //M[3][1] = -0.5; // translation
-        tinym::mat4 V = camera.lookAt();
-        shader.setUniform("M", M);
-        shader.setUniform("V", V);
-        tinym::mat4 P = camera.perspective(window->aspect(), 0.1f, 1000.f);
-        shader.setUniform("P", P);
-        auto w = window->width()/2;
-        auto h = window->height()/2;
-        tinym::mat4 viewport = tinym::mat4(
-                tinym::vec4(w,0.0f,0.0f,0.0f),
-                tinym::vec4(0.0f,h,0.0f,0.0f),
-                tinym::vec4(0.0f,0.0f,1.0f,0.0f),
-                tinym::vec4(w+0, h+0, 0.0f, 1.0f));
-        shader.setUniform("ViewportMatrix", viewport);
+    auto init = []() {
         glfwSwapInterval(1);
-
-        //system.draw();
-        simulator.draw();
-
-        if(debugEachBoxes) {
-            debugLineShader.use();
-            debugLineShader.setUniform("V", V);
-            debugLineShader.setUniform("P", P);
-            glLineWidth(2.5f);
-            simulator.debugEachBoxes();
-        }
-        if(debugSceneBox) {
-            debugLineShader.use();
-            debugLineShader.setUniform("V", V);
-            debugLineShader.setUniform("P", P);
-            glLineWidth(2.5f);
-            simulator.debugSceneBox();
-        }
-
-        if(debugCollisions) {
-            debugLineShader.use();
-            debugLineShader.setUniform("V", V);
-            debugLineShader.setUniform("P", P);
-            glLineWidth(2.5f);
-            simulator.debugCollisions();
-        }
-
-        auto renderingEnd = std::chrono::high_resolution_clock::now();
-        double renderingTime = std::chrono::duration<double, std::milli>(renderingEnd - renderingStart).count();
-
-        frameCounter++;
+    };
+    auto render = [&]() {
         double currentTime = glfwGetTime();
-        if (currentTime - lastTime >= 1.0) { // 1초마다 업데이트
-            char title[256];
-            snprintf(title, sizeof(title), 
-                     "ysim | FPS: %d | Physics: %.2f ms | Rendering: %.2f ms", 
-                     frameCounter, physicsTime, renderingTime);
-            glfwSetWindowTitle(window->getGLFWWindow(), title); // GLFWwindow 포인터 전달
-            
-            frameCounter = 0;
-            lastTime += 1.0;
+        frameProfiler.beginFrame(simulator.frame, currentTime);
+
+        ImGui_ImplOpenGL3_NewFrame();
+        ImGui_ImplGlfw_NewFrame();
+        ImGui::NewFrame();
+
+        {
+            auto scope = frameProfiler.scoped("physics_total");
+            simulator.update();
         }
 
+        {
+            auto scope = frameProfiler.scoped("render_total");
+
+            shader.use();
+            glViewport(0, 0, window->width(), window->height());
+            glClearColor(0, 0, 0, 0);
+            glEnable(GL_DEPTH_TEST);
+            glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+            tinym::mat4 M(1);
+            tinym::mat4 V = camera.lookAt();
+            shader.setUniform("M", M);
+            shader.setUniform("V", V);
+            tinym::mat4 P = camera.perspective(window->aspect(), 0.1f, 1000.f);
+            shader.setUniform("P", P);
+            auto w = window->width()/2;
+            auto h = window->height()/2;
+            tinym::mat4 viewport = tinym::mat4(
+                    tinym::vec4(w,0.0f,0.0f,0.0f),
+                    tinym::vec4(0.0f,h,0.0f,0.0f),
+                    tinym::vec4(0.0f,0.0f,1.0f,0.0f),
+                    tinym::vec4(w+0, h+0, 0.0f, 1.0f));
+            shader.setUniform("ViewportMatrix", viewport);
+
+            {
+                auto drawScope = frameProfiler.scoped("scene_draw");
+                simulator.draw();
+            }
+
+            {
+                auto debugScope = frameProfiler.scoped("debug_draw");
+                if(debugEachBoxes) {
+                    debugLineShader.use();
+                    debugLineShader.setUniform("V", V);
+                    debugLineShader.setUniform("P", P);
+                    glLineWidth(2.5f);
+                    simulator.debugEachBoxes();
+                }
+                if(debugSceneBox) {
+                    debugLineShader.use();
+                    debugLineShader.setUniform("V", V);
+                    debugLineShader.setUniform("P", P);
+                    glLineWidth(2.5f);
+                    simulator.debugSceneBox();
+                }
+
+                if(debugCollisions) {
+                    debugLineShader.use();
+                    debugLineShader.setUniform("V", V);
+                    debugLineShader.setUniform("P", P);
+                    glLineWidth(2.5f);
+                    simulator.debugCollisions();
+                }
+            }
+        }
+
+        {
+            auto imguiScope = frameProfiler.scoped("imgui_draw");
+            profiler::drawProfilerWindow(
+                profilerWindowState,
+                frameProfiler,
+                &simulator.pause,
+                &debugEachBoxes,
+                &debugSceneBox,
+                &debugCollisions
+            );
+            ImGui::Render();
+            ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+        }
+
+        frameProfiler.endFrame();
+
+        if (const auto* latest = frameProfiler.history().latestFrame()) {
+            char title[256];
+            std::snprintf(
+                title,
+                sizeof(title),
+                "ysim | FPS: %.1f | Frame: %.2f ms",
+                latest->fps,
+                latest->frame_ms
+            );
+            glfwSetWindowTitle(window->getGLFWWindow(), title);
+        }
     };
 
 
     window->mainLoop(init, render);
 
+    ImGui_ImplOpenGL3_Shutdown();
+    ImGui_ImplGlfw_Shutdown();
+    ImGui::DestroyContext();
+
     return 0;
 }
-
-
