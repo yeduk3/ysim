@@ -1,8 +1,24 @@
 # 1. 실행 파일 타겟 생성
-add_executable(ysim main.cpp metal_impl.cpp)
+add_executable(ysim
+    main.cpp
+    metal_impl.cpp
+    profiler_gui.cpp
+    ${CMAKE_SOURCE_DIR}/third_party/imgui/imgui.cpp
+    ${CMAKE_SOURCE_DIR}/third_party/imgui/imgui_draw.cpp
+    ${CMAKE_SOURCE_DIR}/third_party/imgui/imgui_tables.cpp
+    ${CMAKE_SOURCE_DIR}/third_party/imgui/imgui_widgets.cpp
+    ${CMAKE_SOURCE_DIR}/third_party/imgui/backends/imgui_impl_glfw.cpp
+    ${CMAKE_SOURCE_DIR}/third_party/imgui/backends/imgui_impl_opengl3.cpp
+)
 
 # 2. OpenGL 찾기
 find_package(OpenGL REQUIRED)
+find_path(GLFW_NATIVE_INCLUDE_DIR GLFW/glfw3native.h
+    PATHS
+        /opt/homebrew/include
+        /opt/homebrew/Cellar/glfw/3.4/include
+        /usr/local/include
+)
 
 # 3. 로컬 lib 폴더 경로 지정 (glfw, glew가 최상단 lib 폴더에 있는 경우)
 # CMAKE_SOURCE_DIR은 최상단 폴더(ysim)의 절대 경로를 의미합니다.
@@ -15,6 +31,23 @@ target_link_libraries(ysim PRIVATE
     glfw          # lib 폴더 안에 있는 glfw
     glew          # lib 폴더 안에 있는 glew
     OpenGL::GL    # 시스템 OpenGL
+)
+
+target_include_directories(ysim PRIVATE
+    ${CMAKE_SOURCE_DIR}/third_party/imgui
+    ${CMAKE_SOURCE_DIR}/third_party/imgui/backends
+)
+
+if (GLFW_NATIVE_INCLUDE_DIR)
+    target_include_directories(ysim PRIVATE ${GLFW_NATIVE_INCLUDE_DIR})
+endif()
+
+target_compile_definitions(ysim PRIVATE
+    IMGUI_IMPL_OPENGL_LOADER_GLEW
+)
+
+target_compile_definitions(ysim PRIVATE
+    YSIM_PROJECT_ROOT="${YSIM_PROJECT_ROOT_DIR}"
 )
 
 
@@ -49,3 +82,5 @@ add_custom_command(TARGET ysim POST_BUILD
             ${CMAKE_SOURCE_DIR}/assets
             $<TARGET_FILE_DIR:ysim>/assets
 )
+
+

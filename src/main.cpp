@@ -4,8 +4,14 @@
 #include "Metal/MTLComputePipeline.hpp"
 #include "YGLWindow.hpp"
 #include "camera.hpp"
+#include "FrameProfiler.hpp"
+#include "ProfilerWindow.hpp"
 #include "program.hpp"
 #include "objreader.hpp"
+
+#include "imgui.h"
+#include "imgui_impl_glfw.h"
+#include "imgui_impl_opengl3.h"
 
 #include <cstddef>
 #include <iostream>
@@ -30,6 +36,9 @@ struct CUDA : Backend {};
 struct METAL : Backend {};
 
 #include <algorithm>
+#include <chrono>
+#include <cstring>
+#include <unordered_map>
 #include <vector>
 #include <iostream>
 /// Static Memory Pool ///
@@ -1744,8 +1753,20 @@ struct Scene {
 
 
 // TODO: BroadPhase, SpatialHashing
-struct SpatialHashing {
+template <typename BE, typename PR>
+struct SpatialHashing {};
+
+template<typename PR>
+struct SpatialHashing<METAL, PR> {
     
+
+    void build() {
+        
+    }
+
+    void detect() {
+
+    }
 };
 
 
@@ -1897,7 +1918,6 @@ struct BVH<BVHMODE::LINEAR, PRIMITIVE, PR> {
     MTL::ComputePipelineState* initBottomUpReadyPSO;
     MTL::ComputePipelineState* clearBottomUpProgressPSO;
     MTL::ComputePipelineState* bottomUpCombineStepPSO;
-    MTL::ComputePipelineState* copyReadyBufferPSO; // optional
 
     // Debuggings...
     DebugLineGL<CPU> debugBox;
@@ -1919,6 +1939,7 @@ struct BVH<BVHMODE::LINEAR, PRIMITIVE, PR> {
         } else if constexpr (PRIMITIVE == BVHPRIMITIVE::EDGE) {
             fillMortonsPSO = MetalKernelContext::getPSO("fillMortons_Edge");
             buildTreePSO = MetalKernelContext::getPSO("buildTree_Edge");
+            buildLeafPSO = MetalKernelContext::getPSO("buildLeaf_Edge");
         }
         bottomUpBoxesPSO = MetalKernelContext::getPSO("bottomUpBoxes");
         queryPointsPSO = MetalKernelContext::getPSO("queryPoints");
@@ -1930,7 +1951,6 @@ struct BVH<BVHMODE::LINEAR, PRIMITIVE, PR> {
         initBottomUpReadyPSO    = MetalKernelContext::getPSO("initBottomUpReady");
         clearBottomUpProgressPSO= MetalKernelContext::getPSO("clearBottomUpProgress");
         bottomUpCombineStepPSO  = MetalKernelContext::getPSO("bottomUpCombineStep");
-        copyReadyBufferPSO      = MetalKernelContext::getPSO("copyReadyBuffer");
     }
 
     void memoryAllocation() {
@@ -1989,7 +2009,8 @@ struct BVH<BVHMODE::LINEAR, PRIMITIVE, PR> {
         auto* readyNext = &bottomUpReadyB;
 
         // worst case: skewed tree면 internal node 수만큼 반복 가능
-        for (Index iter = 0; iter < numPrimitives; ++iter) {
+        int depth = std::log2(numPrimitives)+1;
+        for (Index iter = 0; iter < depth; ++iter) {
             // progress = 0
             MetalGlobalContext::setBuffer(bottomUpProgress, 0);
             MetalGlobalContext::dispatchThreads(clearBottomUpProgressPSO, 1);
@@ -2005,15 +2026,15 @@ struct BVH<BVHMODE::LINEAR, PRIMITIVE, PR> {
             //MetalGlobalContext::commitAndWait();
 
             // root ready?
-            if ((*readyNext)[0]) {
-                break;
-            }
+            //if ((*readyNext)[0]) {
+            //    break;
+            //}
 
             // no progress -> something is wrong
-            if (bottomUpProgress[0] == 0) {
-                std::cout << "[bottomUpCombineGPU] no progress; tree may be invalid\n";
-                break;
-            }
+            //if (bottomUpProgress[0] == 0) {
+            //    std::cout << "[bottomUpCombineGPU] no progress; tree may be invalid\n";
+            //    break;
+            //}
 
             std::swap(readyCur, readyNext);
         }
@@ -2046,73 +2067,8 @@ struct BVH<BVHMODE::LINEAR, PRIMITIVE, PR> {
         MetalGlobalContext::dispatchThreads(buildTreePSO, numPrimitives);
     }
 
-    void build(int oid, VectorBase<METAL, PR>& pos, VectorBase<METAL, Index>& prim) {
-        //std::cout << "[BVH Build] Memory allocated, BVH build start" << std::endl;
-        objid = oid;
-
-        auto* mesh = Scene<METAL, PR>::findById(objid);
-        positions = pos;
-        velocities = mesh->state.v;
-        primitives = prim;
-        objBehavior = mesh->behaviorType;
-        objShape = ShapeType::Mesh;
-        //std::cout << "[BVH Build] positions and primitives are assigned" << std::endl;
+    void radixSortCPU() {
         Index numPrimitives = primitives.size/PRIMITIVE;
-        if(!tree.ptr) memoryAllocation();
-
-        // [stage 1] compute biggest aabb
-        // input: each points
-        // output: biggest aabbs
-        //std::cout << "  - [Stage 1] Compute biggest AABB" << std::endl;
-        AABB4 sceneBox(positions.ptr, positions.ptr+3);
-        for(Index i = 6; i < positions.size; i+=3) sceneBox.combine(positions.ptr+i);
-        sceneBox.i0 = numPrimitives;
-        //std::cout << "  - [Stage 1] Scene Box Range: " << sceneBox.min << " to " << sceneBox.max << std::endl;
-        
-        // [stage 2] transform each center into morton code
-        // input: each elements' center. elements can be either triangles or edges
-        // output: each elements' morton code
-        //std::cout << "  - [Stage 2] Transform each center into morton code" << std::endl;
-        //MetalGlobalContext::setBuffer(positions, 0);
-        //MetalGlobalContext::setBuffer(primitives, 1);
-        //MetalGlobalContext::setBytes(sceneBox, 2);
-        //MetalGlobalContext::setBuffer(mortons, 3);
-
-        //MetalGlobalContext::dispatchThreads(fillMortonsPSO, numPrimitives);
-        //MetalGlobalContext::commitAndWait();
-        
-        tinym::vec3 width = sceneBox.max - sceneBox.min;
-        auto expandBits = [](uint v) {
-            v = (v * 0x00010001u) & 0xFF0000FFu;
-            v = (v * 0x00000101u) & 0x0F00F00Fu;
-            v = (v * 0x00000011u) & 0xC30C30C3u;
-            v = (v * 0x00000005u) & 0x49249249u;
-            return v;
-        };
-        auto mortonCode = [&](const tinym::vec3& point) {
-            tinym::vec3 p = tinym::min(tinym::max(point*1024.f, tinym::vec3(0.f)), tinym::vec3(1023.f));
-            unsigned int xx = expandBits((unsigned int)p.x);
-            unsigned int yy = expandBits((unsigned int)p.y);
-            unsigned int zz = expandBits((unsigned int)p.z);
-            return xx * 4 + yy * 2 + zz;
-        };
-        for(Index pid = 0; pid < numPrimitives; ++pid) {
-            Index base = pid*PRIMITIVE;
-            tinym::vec3 center(0);
-            for(Index k = 0; k < PRIMITIVE; ++k) {
-                Index vid = primitives[base + k];
-                center += tinym::vec3_view(positions.ptr + vid*3);
-            }
-            center = center/PRIMITIVE; // real center
-            center = (center - sceneBox.min)/width; // normalized center [0, 1]
-            mortons[pid].code = mortonCode(center);
-            mortons[pid].index = pid;
-        }
-        
-        // [stage 3] radix sort
-        // input: array of each elements' morton code
-        // output: sorted array of input
-        //std::cout << "  - [Stage 3] Radix sort" << std::endl;
         auto radixSortByMortonCode = [](MortonNode* in, MortonNode* tmp, size_t n) {
             constexpr int BITS_PER_PASS = 8;
             constexpr int RADIX = 1 << BITS_PER_PASS; // 256
@@ -2153,69 +2109,150 @@ struct BVH<BVHMODE::LINEAR, PRIMITIVE, PR> {
             }
         };
         radixSortByMortonCode(mortons.ptr, mortonsTemp.ptr, numPrimitives);
-        // Very slow radix sort
-        //constexpr uint32_t BLOCK_SIZE = 256;
-        //uint32_t numBlocks = (numPrimitives + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    }
+    void radixSortGPU() {
+        Index numPrimitives = primitives.size/PRIMITIVE;
 
-        //VectorBase<METAL, MortonNode>* src = &mortons;
-        //VectorBase<METAL, MortonNode>* dst = &mortonsTemp;
+        constexpr uint32_t BLOCK_SIZE = 256;
+        uint32_t numBlocks = (numPrimitives + BLOCK_SIZE - 1) / BLOCK_SIZE;
 
-        //for (uint32_t shift = 0; shift < 32; shift += 8) {
-        //    RadixSortParamsCPU params = {
-        //        (uint32_t)numPrimitives,
-        //        shift,
-        //        numBlocks
-        //    };
+        VectorBase<METAL, MortonNode>* src = &mortons;
+        VectorBase<METAL, MortonNode>* dst = &mortonsTemp;
 
-        //    // 1) block histograms
-        //    MetalGlobalContext::setBuffer(*src, 0);
-        //    MetalGlobalContext::setBytes(params, 1);
-        //    MetalGlobalContext::setBuffer(radixBlockHistograms, 2);
-        //    MetalGlobalContext::dispatchThreads(radixCountBlocksPSO, numBlocks * 256, 256);
-        //    //MetalGlobalContext::commitAndWait();
+        for (uint32_t shift = 0; shift < 32; shift += 8) {
+            RadixSortParamsCPU params = {
+                (uint32_t)numPrimitives,
+                shift,
+                numBlocks
+            };
 
-        //    // 2) offsets and bucket bases
-        //    MetalGlobalContext::setBytes(params, 0);
-        //    MetalGlobalContext::setBuffer(radixBlockHistograms, 1);
-        //    MetalGlobalContext::setBuffer(radixBlockOffsets, 2);
-        //    MetalGlobalContext::setBuffer(radixBucketBase, 3);
-        //    MetalGlobalContext::dispatchThreads(radixComputeOffsetsPSO, 1);
-        //    //MetalGlobalContext::commitAndWait();
+            // 1) block histograms
+            MetalGlobalContext::setBuffer(*src, 0);
+            MetalGlobalContext::setBytes(params, 1);
+            MetalGlobalContext::setBuffer(radixBlockHistograms, 2);
+            MetalGlobalContext::dispatchThreads(radixCountBlocksPSO, numBlocks * 256, 256);
+            //MetalGlobalContext::commitAndWait();
 
-        //    // 3) stable scatter
-        //    MetalGlobalContext::setBuffer(*src, 0);
-        //    MetalGlobalContext::setBuffer(*dst, 1);
-        //    MetalGlobalContext::setBytes(params, 2);
-        //    MetalGlobalContext::setBuffer(radixBlockOffsets, 3);
-        //    MetalGlobalContext::setBuffer(radixBucketBase, 4);
-        //    MetalGlobalContext::dispatchThreads(radixScatterBlocksPSO, numBlocks * 256, 256);
-        //    //MetalGlobalContext::commitAndWait();
+            // 2) offsets and bucket bases
+            MetalGlobalContext::setBytes(params, 0);
+            MetalGlobalContext::setBuffer(radixBlockHistograms, 1);
+            MetalGlobalContext::setBuffer(radixBlockOffsets, 2);
+            MetalGlobalContext::setBuffer(radixBucketBase, 3);
+            MetalGlobalContext::dispatchThreads(radixComputeOffsetsPSO, 1);
+            //MetalGlobalContext::commitAndWait();
 
-        //    std::swap(src, dst);
-        //}
-        //encoder->setThreadgroupMemoryLength(?, NS::UInteger index)
+            // 3) stable scatter
+            MetalGlobalContext::setBuffer(*src, 0);
+            MetalGlobalContext::setBuffer(*dst, 1);
+            MetalGlobalContext::setBytes(params, 2);
+            MetalGlobalContext::setBuffer(radixBlockOffsets, 3);
+            MetalGlobalContext::setBuffer(radixBucketBase, 4);
+            MetalGlobalContext::dispatchThreads(radixScatterBlocksPSO, numBlocks * 256, 256);
+            //MetalGlobalContext::commitAndWait();
+
+            std::swap(src, dst);
+        }
+    }
+    void fillMortonsCPU(AABB4& sceneBox) {
+        Index numPrimitives = primitives.size/PRIMITIVE;
+        tinym::vec3 width = sceneBox.max - sceneBox.min;
+        auto expandBits = [](uint v) {
+            v = (v * 0x00010001u) & 0xFF0000FFu;
+            v = (v * 0x00000101u) & 0x0F00F00Fu;
+            v = (v * 0x00000011u) & 0xC30C30C3u;
+            v = (v * 0x00000005u) & 0x49249249u;
+            return v;
+        };
+        auto mortonCode = [&](const tinym::vec3& point) {
+            tinym::vec3 p = tinym::min(tinym::max(point*1024.f, tinym::vec3(0.f)), tinym::vec3(1023.f));
+            unsigned int xx = expandBits((unsigned int)p.x);
+            unsigned int yy = expandBits((unsigned int)p.y);
+            unsigned int zz = expandBits((unsigned int)p.z);
+            return xx * 4 + yy * 2 + zz;
+        };
+        for(Index pid = 0; pid < numPrimitives; ++pid) {
+            Index base = pid*PRIMITIVE;
+            tinym::vec3 center(0);
+            for(Index k = 0; k < PRIMITIVE; ++k) {
+                Index vid = primitives[base + k];
+                center += tinym::vec3_view(positions.ptr + vid*3);
+            }
+            center = center/PRIMITIVE; // real center
+            center = (center - sceneBox.min)/width; // normalized center [0, 1]
+            mortons[pid].code = mortonCode(center);
+            mortons[pid].index = pid;
+        }
+    }
+    void fillMortonsGPU(AABB4& sceneBox) {
+        Index numPrimitives = primitives.size/PRIMITIVE;
+        MetalGlobalContext::setBuffer(positions, 0);
+        MetalGlobalContext::setBuffer(primitives, 1);
+        MetalGlobalContext::setBytes(sceneBox, 2);
+        MetalGlobalContext::setBuffer(mortons, 3);
+
+        MetalGlobalContext::dispatchThreads(fillMortonsPSO, numPrimitives);
+        MetalGlobalContext::commitAndWait();
+    }
+    void build(int oid, VectorBase<METAL, PR>& pos, VectorBase<METAL, Index>& prim) {
+        //std::cout << "[BVH Build] Memory allocated, BVH build start" << std::endl;
+        objid = oid;
+
+        auto* mesh = Scene<METAL, PR>::findById(objid);
+        positions = pos;
+        velocities = mesh->state.v;
+        primitives = prim;
+        objBehavior = mesh->behaviorType;
+        objShape = ShapeType::Mesh;
+        //std::cout << "[BVH Build] positions and primitives are assigned" << std::endl;
+        Index numPrimitives = primitives.size/PRIMITIVE;
+        if(!tree.ptr) memoryAllocation();
+
+        // [stage 1] compute biggest aabb
+        // input: each points
+        // output: biggest aabbs
+        //std::cout << "  - [Stage 1] Compute biggest AABB" << std::endl;
+        AABB4 sceneBox(positions.ptr, positions.ptr+3);
+        for(Index i = 6; i < positions.size; i+=3) sceneBox.combine(positions.ptr+i);
+        sceneBox.i0 = numPrimitives;
+        //std::cout << "  - [Stage 1] Scene Box Range: " << sceneBox.min << " to " << sceneBox.max << std::endl;
         
+        // [stage 2] transform each center into morton code
+        // input: each elements' center. elements can be either triangles or edges
+        // output: each elements' morton code
+        //std::cout << "  - [Stage 2] Transform each center into morton code" << std::endl;
+        //fillMortonsCPU(sceneBox);
+        fillMortonsGPU(sceneBox);
+        //MetalGlobalContext::commitAndWait();
+        
+        // [stage 3] radix sort
+        // input: array of each elements' morton code
+        // output: sorted array of input
+        //std::cout << "  - [Stage 3] Radix sort" << std::endl;
+        //radixSortCPU();
+        // Very slow radix sort
+        radixSortGPU();
+        //MetalGlobalContext::commitAndWait();
 
         // [stage 4] build tree
         // input: sorted array of elements' morton code
         // output: linear bvh tree
         //std::cout << "  - [Stage 4] Build tree" << std::endl;
         buildTreeGPU();
-        MetalGlobalContext::commitAndWait();
+        //MetalGlobalContext::commitAndWait();
 
         // set intermediate node's aabb
         //std::cout << "  - AABB combining for intermediate" << std::endl;
-        auto combineAABB = [&](auto&& self, BVHNode& node) -> void {
-            if(node.childA < 0) return;
-            self(self, tree[node.childA]);
-            self(self, tree[node.childB]);
-            node.aabb.min = tree[node.childA].aabb.min;
-            node.aabb.max = tree[node.childA].aabb.max;
-            node.aabb.combine(tree[node.childB].aabb);
-        };
-        combineAABB(combineAABB, tree[0]);
-        //bottomUpCombineGPU();
-        //MetalGlobalContext::commitAndWait();
+        //auto combineAABB = [&](auto&& self, BVHNode& node) -> void {
+        //    if(node.childA < 0) return;
+        //    self(self, tree[node.childA]);
+        //    self(self, tree[node.childB]);
+        //    node.aabb.min = tree[node.childA].aabb.min;
+        //    node.aabb.max = tree[node.childA].aabb.max;
+        //    node.aabb.combine(tree[node.childB].aabb);
+        //};
+        //combineAABB(combineAABB, tree[0]);
+        bottomUpCombineGPU();
+        MetalGlobalContext::commitAndWait();
     
         //DynamicMemoryAllocator<METAL> tempPool;
         //VectorBase<METAL, uint> treeVisitCounts(tempPool.template zeros<uint>(numPrimitives - 1));
@@ -2706,7 +2743,7 @@ struct BVH<BVHMODE::SCENE, BVHPRIMITIVE::OBJECT, PR> {
         }
 
         tree.build(-1, positions, indices);
-        print(tree.tree[0]);
+        //print(tree.tree[0]);
     }
 
     void print(typename EDGE_LBVH::BVHNode node, Index l = 0) {
@@ -3041,6 +3078,7 @@ struct Simulator {
     bool checkCollision = true;
     bool enableSelfCollisions = false;
     Index frame = 0;
+    profiler::FrameProfiler* profiler = nullptr;
 
 
     PR margin = 0.015;
@@ -3153,7 +3191,14 @@ struct Simulator {
         //std::cout << "[Simulator Update] Start update" << std::endl;
         
         
-        if(frame % 10 == 0) collisionPipeline.broadPhase.build(sceneObjects);
+        if(frame % 10 == 0) {
+            if (profiler) {
+                auto scope = profiler->scoped("bvh_build");
+                collisionPipeline.broadPhase.build(sceneObjects);
+            } else {
+                collisionPipeline.broadPhase.build(sceneObjects);
+            }
+        }
 
         
         for(int i = 0; i < system.subSteps; i++) {
@@ -3168,90 +3213,124 @@ struct Simulator {
 
 
                 //collisionPipeline.broadPhase.enlargeTrajectory(system.h);
-                collisionPipeline.broadPhase.refit();
-                collisionPipeline.broadPhase.detectCollisions(margin, enableSelfCollisions);
+                if (profiler) {
+                    auto scope = profiler->scoped("broad_refit");
+                    collisionPipeline.broadPhase.refit();
+                } else {
+                    collisionPipeline.broadPhase.refit();
+                }
+                if (profiler) {
+                    auto scope = profiler->scoped("broad_detect");
+                    collisionPipeline.broadPhase.detectCollisions(margin, enableSelfCollisions);
+                } else {
+                    collisionPipeline.broadPhase.detectCollisions(margin, enableSelfCollisions);
+                }
 
                 for(auto& mesh : Scene<BE, PR>::meshes) {
                     if(mesh.behaviorType == BehaviorType::Float) continue;
                     auto& c = mesh.constraints;
 
-                    collisionPipeline.narrowPhase.narrowAndSortByVertices(
-                            c.broadCollisions,
-                            c.numBroadCollisions[0],
-                            mesh.adjacency,
-                            c,
-                            radius);
+                    if (profiler) {
+                        auto scope = profiler->scoped("narrow_phase");
+                        collisionPipeline.narrowPhase.narrowAndSortByVertices(
+                                c.broadCollisions,
+                                c.numBroadCollisions[0],
+                                mesh.adjacency,
+                                c,
+                                radius);
+                    } else {
+                        collisionPipeline.narrowPhase.narrowAndSortByVertices(
+                                c.broadCollisions,
+                                c.numBroadCollisions[0],
+                                mesh.adjacency,
+                                c,
+                                radius);
+                    }
                 }
 
 
                 auto* mesh = Scene<BE, PR>::findById(0);
                 auto& c = mesh->constraints;
-                if(c.numBroadCollisions[0] > 0) {
-                    std::cout << "Collision detected: (frame,substep)=" << frame << "," << i << " (" << c.numBroadCollisions[0] << "/" << c.maxNumCollisions << ")\n";
-                    //for(Index i = 0; i < 5; ++i) {
-                    //    std::cout << "  - Collision " << i << ": point " 
-                    //        << c.broadCollisions[i].indexPair.point
-                    //        << " and triangle "
-                    //        << c.broadCollisions[i].indexPair.triangle << std::endl;
-                    //}
-                } 
-                else std::cout << "No broad collisions\n";
+                //if(c.numBroadCollisions[0] > 0) {
+                //    std::cout << "Collision detected: (frame,substep)=" << frame << "," << i << " (" << c.numBroadCollisions[0] << "/" << c.maxNumCollisions << ")\n";
+                //    //for(Index i = 0; i < 5; ++i) {
+                //    //    std::cout << "  - Collision " << i << ": point " 
+                //    //        << c.broadCollisions[i].indexPair.point
+                //    //        << " and triangle "
+                //    //        << c.broadCollisions[i].indexPair.triangle << std::endl;
+                //    //}
+                //} 
+                //else std::cout << "No broad collisions\n";
 
 
 
-                if(c.numNarrowCollisions[0] > 0) {
-                    std::cout << "Narrowed collision detected: (frame,substep)=" << frame << "," << i << " (" << c.numNarrowCollisions[0] << "/" << c.maxNumCollisions << ")\n";
-                    //Index min = 5 < c.numNarrowCollisions ? 5 : c.numNarrowCollisions;
-                    //for(Index i = 0; i < min; ++i) {
-                    //    std::cout << "  - Collision " << i << ": point " 
-                    //        << c.narrowCollisions[i].indexPair.point
-                    //        << " and triangle "
-                    //        << c.narrowCollisions[i].indexPair.triangle 
-                    //        << " and normal " 
-                    //        << '(' << c.narrowCollisions[i].collisionNormalAndDistance.x 
-                    //        << ", " << c.narrowCollisions[i].collisionNormalAndDistance.y 
-                    //        << ", " << c.narrowCollisions[i].collisionNormalAndDistance.z << ')'
-                    //        << " and distance " 
-                    //        << c.narrowCollisions[i].collisionNormalAndDistance.w
-                    //        << std::endl;
-                    //}
-                    //std::cout << "Narrowed self collision sorted: (" << c.numNarrowCollisions << "/" << c.maxNumCollisions << ")\n";
-                    //Index count = 0;
-                    //for(Index i = 0; i < c.vertexColPrimsOffsets.size-1; ++i) {
-                    //    if(count >= min) break;
-                    //    if(c.vertexColPrimsOffsets[i] == c.vertexColPrimsOffsets[i+1]) continue;
-                    //    for(Index j = c.vertexColPrimsOffsets[i]; j < c.vertexColPrimsOffsets[i+1]; ++j) {
-                    //        if(count >= min) break;
-                    //        std::cout << "  - Collision " << j << ": point " 
-                    //            << c.vertexColPrims[j].indexPair.point
-                    //            << " and triangle "
-                    //            << c.vertexColPrims[j].indexPair.triangle 
-                    //            << " and normal " 
-                    //            << '(' << c.vertexColPrims[j].collisionNormalAndDistance.x 
-                    //            << ", " << c.vertexColPrims[j].collisionNormalAndDistance.y 
-                    //            << ", " << c.vertexColPrims[j].collisionNormalAndDistance.z << ')'
-                    //            << " and distance " 
-                    //            << c.vertexColPrims[j].collisionNormalAndDistㅅance.w
-                    //            << std::endl;
-                    //        count++;
-                    //    }
-                    //}
-                }
-                else std::cout << "No narrow collision\n";
+                //if(c.numNarrowCollisions[0] > 0) {
+                //    std::cout << "Narrowed collision detected: (frame,substep)=" << frame << "," << i << " (" << c.numNarrowCollisions[0] << "/" << c.maxNumCollisions << ")\n";
+                //    //Index min = 5 < c.numNarrowCollisions ? 5 : c.numNarrowCollisions;
+                //    //for(Index i = 0; i < min; ++i) {
+                //    //    std::cout << "  - Collision " << i << ": point " 
+                //    //        << c.narrowCollisions[i].indexPair.point
+                //    //        << " and triangle "
+                //    //        << c.narrowCollisions[i].indexPair.triangle 
+                //    //        << " and normal " 
+                //    //        << '(' << c.narrowCollisions[i].collisionNormalAndDistance.x 
+                //    //        << ", " << c.narrowCollisions[i].collisionNormalAndDistance.y 
+                //    //        << ", " << c.narrowCollisions[i].collisionNormalAndDistance.z << ')'
+                //    //        << " and distance " 
+                //    //        << c.narrowCollisions[i].collisionNormalAndDistance.w
+                //    //        << std::endl;
+                //    //}
+                //    //std::cout << "Narrowed self collision sorted: (" << c.numNarrowCollisions << "/" << c.maxNumCollisions << ")\n";
+                //    //Index count = 0;
+                //    //for(Index i = 0; i < c.vertexColPrimsOffsets.size-1; ++i) {
+                //    //    if(count >= min) break;
+                //    //    if(c.vertexColPrimsOffsets[i] == c.vertexColPrimsOffsets[i+1]) continue;
+                //    //    for(Index j = c.vertexColPrimsOffsets[i]; j < c.vertexColPrimsOffsets[i+1]; ++j) {
+                //    //        if(count >= min) break;
+                //    //        std::cout << "  - Collision " << j << ": point " 
+                //    //            << c.vertexColPrims[j].indexPair.point
+                //    //            << " and triangle "
+                //    //            << c.vertexColPrims[j].indexPair.triangle 
+                //    //            << " and normal " 
+                //    //            << '(' << c.vertexColPrims[j].collisionNormalAndDistance.x 
+                //    //            << ", " << c.vertexColPrims[j].collisionNormalAndDistance.y 
+                //    //            << ", " << c.vertexColPrims[j].collisionNormalAndDistance.z << ')'
+                //    //            << " and distance " 
+                //    //            << c.vertexColPrims[j].collisionNormalAndDistㅅance.w
+                //    //            << std::endl;
+                //    //        count++;
+                //    //    }
+                //    //}
+                //}
+                //else std::cout << "No narrow collision\n";
             }
 
-
-
-            system.update(sceneObjects);
+            if (profiler) {
+                auto scope = profiler->scoped("system_update");
+                system.update(sceneObjects);
+            } else {
+                system.update(sceneObjects);
+            }
         }
 
-        MetalGlobalContext::commitAndWait();
+        if (profiler) {
+            auto scope = profiler->scoped("metal_commit");
+            MetalGlobalContext::commitAndWait();
+        } else {
+            MetalGlobalContext::commitAndWait();
+        }
         
         system.acctime += system.h;
         frame++;
 
-        for(auto& mesh : sceneObjects.meshes)
-            mesh.meshGL.updateBuffer(mesh.state.x.ptr);
+        if (profiler) {
+            auto scope = profiler->scoped("mesh_upload");
+            for(auto& mesh : sceneObjects.meshes)
+                mesh.meshGL.updateBuffer(mesh.state.x.ptr);
+        } else {
+            for(auto& mesh : sceneObjects.meshes)
+                mesh.meshGL.updateBuffer(mesh.state.x.ptr);
+        }
 
         //collisionPipeline.broadPhase.build(sceneObjects.squareClothes[0].x, sceneObjects.squareClothes[0].facet);
         //std::cout << "[Simulator Update] Finished update" << std::endl;
@@ -3548,9 +3627,6 @@ struct ExplicitSystem<METAL, PR> {
 
 
 
-#include <chrono> // 시간 관련 라이브러리
-
-
 int main() {
     
     std::cout << "Run simulator" << std::endl;
@@ -3592,7 +3668,8 @@ int main() {
     Precision thickness = 0.01;
     //simulator.addClothGridFast(particleNum1D, size1D, kstretch, kshear, kbend, thickness, mass);
     //simulator.addClothGridFast(20, 0.5, 1e4, 1e4, 2e4, thickness, 0.1);
-    simulator.addCloth(particleNum1D, size1D, tinym::vec3(0, 0.15, 0), kstretch, kshear, kbend, thickness, mass);
+    for(int i = 0; i < 1; i++) 
+        simulator.addCloth(particleNum1D, size1D, tinym::vec3(0, 0.15+(float)i*0.05f, 0), kstretch, kshear, kbend, thickness, mass);
     //simulator.addCloth(particleNum1D, size1D, tinym::vec3(0, 0.25, 0), kstretch, kshear, kbend, thickness, mass);
     //simulator.addClothFile("src/assets", "teapot.obj", {0,0,0} 15, 1e4, 0, 2e4, thickness mass);
     //simulator.addClothFile("src/assets", "horse-gallop-01.obj", {0,0,0}, 80, 1e4, 0, 2e4, thickness mass);
@@ -3630,25 +3707,57 @@ int main() {
     bool debugEachBoxes = false;
     bool debugSceneBox = false;
     bool debugCollisions = true;
+    profiler::FrameProfiler frameProfiler(360);
+    profiler::ProfilerWindowState profilerWindowState;
 
     std::cout << "[Main] programs are loaded" << std::endl;
 
 
     camera.setPosition(tinym::vec3(0, 0, 5));
 
-    camera.glfwSetCallbacks(window->getGLFWWindow());
+    IMGUI_CHECKVERSION();
+    ImGui::CreateContext();
+    ImGui::StyleColorsDark();
+    ImGuiIO& io = ImGui::GetIO();
+    io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+    ImGui_ImplGlfw_InitForOpenGL(window->getGLFWWindow(), false);
+#ifdef __APPLE__
+    ImGui_ImplOpenGL3_Init("#version 410");
+#else
+    ImGui_ImplOpenGL3_Init("#version 330");
+#endif
 
     struct CallbacksDataPack {
         Simulator<Backend, Precision, ExplicitSystem<Backend, Precision>>* simulator;
         bool* debugEachBoxes;
         bool* debugSceneBox;
         bool* debugCollisions;
+        profiler::FrameProfiler* frameProfiler;
     };
-    CallbacksDataPack pack = {&simulator, &debugEachBoxes, &debugSceneBox, &debugCollisions};
+    CallbacksDataPack pack = {&simulator, &debugEachBoxes, &debugSceneBox, &debugCollisions, &frameProfiler};
 
     //glfwSetWindowUserPointer(window->getGLFWWindow(), &system);
     glfwSetWindowUserPointer(window->getGLFWWindow(), &(pack));
+
+    auto cursorCallback = [](GLFWwindow* window, double xpos, double ypos) {
+        ImGui_ImplGlfw_CursorPosCallback(window, xpos, ypos);
+        if (ImGui::GetIO().WantCaptureMouse) return;
+        cursorPosCallback(window, xpos, ypos);
+    };
+    auto scrollCallbackWrapped = [](GLFWwindow* window, double xoffset, double yoffset) {
+        ImGui_ImplGlfw_ScrollCallback(window, xoffset, yoffset);
+        if (ImGui::GetIO().WantCaptureMouse) return;
+        scrollCallback(window, xoffset, yoffset);
+    };
+    auto mouseButtonCallback = [](GLFWwindow* window, int button, int action, int mods) {
+        ImGui_ImplGlfw_MouseButtonCallback(window, button, action, mods);
+    };
+    auto charCallback = [](GLFWwindow* window, unsigned int c) {
+        ImGui_ImplGlfw_CharCallback(window, c);
+    };
     auto keyCallback = [](GLFWwindow* window, int key, int scancode, int action, int mods) {
+        ImGui_ImplGlfw_KeyCallback(window, key, scancode, action, mods);
+        if (ImGui::GetIO().WantCaptureKeyboard) return;
 
         auto* pack = static_cast<CallbacksDataPack*>(glfwGetWindowUserPointer(window));
         auto* simulator = pack->simulator;
@@ -3676,93 +3785,187 @@ int main() {
         }
 
     };
+    glfwSetCursorPosCallback(window->getGLFWWindow(), cursorCallback);
+    glfwSetScrollCallback(window->getGLFWWindow(), scrollCallbackWrapped);
+    glfwSetMouseButtonCallback(window->getGLFWWindow(), mouseButtonCallback);
+    glfwSetCharCallback(window->getGLFWWindow(), charCallback);
     glfwSetKeyCallback(window->getGLFWWindow(), keyCallback);
 
     std::cout << "[Main] callbacks are set" << std::endl;
 
-    int frameCounter = 0;
-    double lastTime = glfwGetTime();
+    simulator.profiler = &frameProfiler;
 
-    auto init = []() {};
-    auto render = [&]() {
-        auto physicsStart = std::chrono::high_resolution_clock::now();
-        //system.update();
-        simulator.update();
-        auto physicsEnd = std::chrono::high_resolution_clock::now();
-        double physicsTime = std::chrono::duration<double, std::milli>(physicsEnd - physicsStart).count();
-        
-        auto renderingStart = std::chrono::high_resolution_clock::now();
-        shader.use();
-        glViewport(0, 0, window->width(), window->height());
-        glClearColor(0, 0, 0, 0);
-        glEnable(GL_DEPTH_TEST);
-        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
-        //float M[16] = {1, 0, 0, 0,   0, 1, 0, 0,   0, 0, 1, 0,   0, -0.5, 0, 1};
-        tinym::mat4 M(1);
-        //M[3][1] = -0.5; // translation
-        tinym::mat4 V = camera.lookAt();
-        shader.setUniform("M", M);
-        shader.setUniform("V", V);
-        tinym::mat4 P = camera.perspective(window->aspect(), 0.1f, 1000.f);
-        shader.setUniform("P", P);
-        auto w = window->width()/2;
-        auto h = window->height()/2;
-        tinym::mat4 viewport = tinym::mat4(
-                tinym::vec4(w,0.0f,0.0f,0.0f),
-                tinym::vec4(0.0f,h,0.0f,0.0f),
-                tinym::vec4(0.0f,0.0f,1.0f,0.0f),
-                tinym::vec4(w+0, h+0, 0.0f, 1.0f));
-        shader.setUniform("ViewportMatrix", viewport);
+    auto init = []() {
         glfwSwapInterval(1);
-
-        //system.draw();
-        simulator.draw();
-
-        if(debugEachBoxes) {
-            debugLineShader.use();
-            debugLineShader.setUniform("V", V);
-            debugLineShader.setUniform("P", P);
-            glLineWidth(2.5f);
-            simulator.debugEachBoxes();
-        }
-        if(debugSceneBox) {
-            debugLineShader.use();
-            debugLineShader.setUniform("V", V);
-            debugLineShader.setUniform("P", P);
-            glLineWidth(2.5f);
-            simulator.debugSceneBox();
-        }
-
-        if(debugCollisions) {
-            debugLineShader.use();
-            debugLineShader.setUniform("V", V);
-            debugLineShader.setUniform("P", P);
-            glLineWidth(2.5f);
-            simulator.debugCollisions();
-        }
-
-        auto renderingEnd = std::chrono::high_resolution_clock::now();
-        double renderingTime = std::chrono::duration<double, std::milli>(renderingEnd - renderingStart).count();
-
-        frameCounter++;
+    };
+    auto render = [&]() {
         double currentTime = glfwGetTime();
-        if (currentTime - lastTime >= 1.0) { // 1초마다 업데이트
-            char title[256];
-            snprintf(title, sizeof(title), 
-                     "ysim | FPS: %d | Physics: %.2f ms | Rendering: %.2f ms", 
-                     frameCounter, physicsTime, renderingTime);
-            glfwSetWindowTitle(window->getGLFWWindow(), title); // GLFWwindow 포인터 전달
-            
-            frameCounter = 0;
-            lastTime += 1.0;
+        bool collectProfileFrame = !simulator.pause;
+        if (collectProfileFrame) {
+            frameProfiler.beginFrame(simulator.frame, currentTime);
         }
 
+        ImGui_ImplOpenGL3_NewFrame();
+        ImGui_ImplGlfw_NewFrame();
+        ImGui::NewFrame();
+
+        if (collectProfileFrame) {
+            auto scope = frameProfiler.scoped("physics_total");
+            simulator.update();
+        } else {
+            simulator.update();
+        }
+
+        if (collectProfileFrame) {
+            auto scope = frameProfiler.scoped("render_total");
+
+            shader.use();
+            glViewport(0, 0, window->width(), window->height());
+            glClearColor(0, 0, 0, 0);
+            glEnable(GL_DEPTH_TEST);
+            glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+            tinym::mat4 M(1);
+            tinym::mat4 V = camera.lookAt();
+            shader.setUniform("M", M);
+            shader.setUniform("V", V);
+            tinym::mat4 P = camera.perspective(window->aspect(), 0.1f, 1000.f);
+            shader.setUniform("P", P);
+            auto w = window->width()/2;
+            auto h = window->height()/2;
+            tinym::mat4 viewport = tinym::mat4(
+                    tinym::vec4(w,0.0f,0.0f,0.0f),
+                    tinym::vec4(0.0f,h,0.0f,0.0f),
+                    tinym::vec4(0.0f,0.0f,1.0f,0.0f),
+                    tinym::vec4(w+0, h+0, 0.0f, 1.0f));
+            shader.setUniform("ViewportMatrix", viewport);
+
+            {
+                auto drawScope = frameProfiler.scoped("scene_draw");
+                simulator.draw();
+            }
+
+            {
+                auto debugScope = frameProfiler.scoped("debug_draw");
+                if(debugEachBoxes) {
+                    debugLineShader.use();
+                    debugLineShader.setUniform("V", V);
+                    debugLineShader.setUniform("P", P);
+                    glLineWidth(2.5f);
+                    simulator.debugEachBoxes();
+                }
+                if(debugSceneBox) {
+                    debugLineShader.use();
+                    debugLineShader.setUniform("V", V);
+                    debugLineShader.setUniform("P", P);
+                    glLineWidth(2.5f);
+                    simulator.debugSceneBox();
+                }
+
+                if(debugCollisions) {
+                    debugLineShader.use();
+                    debugLineShader.setUniform("V", V);
+                    debugLineShader.setUniform("P", P);
+                    glLineWidth(2.5f);
+                    simulator.debugCollisions();
+                }
+            }
+        } else {
+            shader.use();
+            glViewport(0, 0, window->width(), window->height());
+            glClearColor(0, 0, 0, 0);
+            glEnable(GL_DEPTH_TEST);
+            glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+            tinym::mat4 M(1);
+            tinym::mat4 V = camera.lookAt();
+            shader.setUniform("M", M);
+            shader.setUniform("V", V);
+            tinym::mat4 P = camera.perspective(window->aspect(), 0.1f, 1000.f);
+            shader.setUniform("P", P);
+            auto w = window->width()/2;
+            auto h = window->height()/2;
+            tinym::mat4 viewport = tinym::mat4(
+                    tinym::vec4(w,0.0f,0.0f,0.0f),
+                    tinym::vec4(0.0f,h,0.0f,0.0f),
+                    tinym::vec4(0.0f,0.0f,1.0f,0.0f),
+                    tinym::vec4(w+0, h+0, 0.0f, 1.0f));
+            shader.setUniform("ViewportMatrix", viewport);
+
+            simulator.draw();
+
+            if(debugEachBoxes) {
+                debugLineShader.use();
+                debugLineShader.setUniform("V", V);
+                debugLineShader.setUniform("P", P);
+                glLineWidth(2.5f);
+                simulator.debugEachBoxes();
+            }
+            if(debugSceneBox) {
+                debugLineShader.use();
+                debugLineShader.setUniform("V", V);
+                debugLineShader.setUniform("P", P);
+                glLineWidth(2.5f);
+                simulator.debugSceneBox();
+            }
+
+            if(debugCollisions) {
+                debugLineShader.use();
+                debugLineShader.setUniform("V", V);
+                debugLineShader.setUniform("P", P);
+                glLineWidth(2.5f);
+                simulator.debugCollisions();
+            }
+        }
+
+        if (collectProfileFrame) {
+            auto imguiScope = frameProfiler.scoped("imgui_draw");
+            profiler::drawProfilerWindow(
+                profilerWindowState,
+                frameProfiler,
+                &simulator.pause,
+                &debugEachBoxes,
+                &debugSceneBox,
+                &debugCollisions
+            );
+            ImGui::Render();
+            ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+        } else {
+            profiler::drawProfilerWindow(
+                profilerWindowState,
+                frameProfiler,
+                &simulator.pause,
+                &debugEachBoxes,
+                &debugSceneBox,
+                &debugCollisions
+            );
+            ImGui::Render();
+            ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+        }
+
+        if (collectProfileFrame) {
+            frameProfiler.endFrame();
+        }
+
+        if (const auto* latest = frameProfiler.history().latestFrame()) {
+            char title[256];
+            std::snprintf(
+                title,
+                sizeof(title),
+                "ysim | FPS: %.1f | Frame: %.2f ms",
+                latest->fps,
+                latest->frame_ms
+            );
+            glfwSetWindowTitle(window->getGLFWWindow(), title);
+        }
     };
 
 
     window->mainLoop(init, render);
 
+    ImGui_ImplOpenGL3_Shutdown();
+    ImGui_ImplGlfw_Shutdown();
+    ImGui::DestroyContext();
+
     return 0;
 }
-
-

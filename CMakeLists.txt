@@ -62,6 +62,9 @@ add_custom_command(
 
 add_custom_target(MetalKernels ALL DEPENDS ${METAL_LIBRARY})
 
+# root set
+set(YSIM_PROJECT_ROOT_DIR "${PROJECT_SOURCE_DIR}")
+
 # 4. src 폴더의 CMakeLists.txt 실행
 add_subdirectory(src)
 
