@@ -351,6 +351,30 @@ kernel void buildTree_Tri(
 }
 
 
+kernel void buildLeaf_Edge(
+    device const packed_float3* x [[buffer(0)]],
+    device const packed_uint2* edges [[buffer(1)]],
+    constant int& numPrimitives [[buffer(2)]],
+    device const MortonNode* mortons [[buffer(3)]],
+    device BVHNode* tree [[buffer(4)]],
+    device int* treeParent [[buffer(5)]],
+    uint id [[thread_position_in_grid]]
+) {
+    int idx = (int)id;
+
+    // leaf nodes
+    if (idx >= numPrimitives) return;
+
+    int eid = mortons[id].index;
+    uint2 edge = edges[eid];
+    float3 v0 = x[edge.x];
+    float3 v1 = x[edge.y];
+    int leafid = numPrimitives+idx-1;
+    tree[leafid].min = min(v0, v1);
+    tree[leafid].childA = -1;
+    tree[leafid].max = max(v0, v1);
+    tree[leafid].childB = eid;
+}
 kernel void buildTree_Edge(
     device const packed_float3* x [[buffer(0)]],
     device const packed_uint2* edges [[buffer(1)]],
@@ -515,15 +539,6 @@ kernel void bottomUpCombineStep(
     }
 }
 
-kernel void copyReadyBuffer(
-    constant BottomUpParams& params [[buffer(0)]],
-    device const uint* src [[buffer(1)]],
-    device uint* dst [[buffer(2)]],
-    uint id [[thread_position_in_grid]]
-) {
-    if (id >= params.numNodes) return;
-    dst[id] = src[id];
-}
 
 
 
