@@ -2843,7 +2843,7 @@ struct BVH<BVHMODE::SCENE, BVHPRIMITIVE::OBJECT, PR> {
     void showSceneBox() { tree.showBox(); }
 };
 
-
+struct BVH
 
 
 
@@ -3667,10 +3667,10 @@ int main() {
     Precision mass = 0.1;
     Precision thickness = 0.01;
     //simulator.addClothGridFast(particleNum1D, size1D, kstretch, kshear, kbend, thickness, mass);
-    //simulator.addClothGridFast(20, 0.5, 1e4, 1e4, 2e4, thickness, 0.1);
-    for(int i = 0; i < 1; i++) 
-        simulator.addCloth(particleNum1D, size1D, tinym::vec3(0, 0.15+(float)i*0.05f, 0), kstretch, kshear, kbend, thickness, mass);
-    //simulator.addCloth(particleNum1D, size1D, tinym::vec3(0, 0.25, 0), kstretch, kshear, kbend, thickness, mass);
+    //simulator.addClothGridFast(100, 1, kstretch, kshear, kbend, thickness, mass);
+    //for(int i = 0; i < 10; i++) 
+    //    simulator.addCloth(particleNum1D, size1D, tinym::vec3(0, 0.15+(float)i*0.05f, 0), kstretch, kshear, kbend, thickness, mass);
+    simulator.addCloth(100, 1, tinym::vec3(0, 0.25, 0), kstretch, kshear, kbend, thickness, mass);
     //simulator.addClothFile("src/assets", "teapot.obj", {0,0,0} 15, 1e4, 0, 2e4, thickness mass);
     //simulator.addClothFile("src/assets", "horse-gallop-01.obj", {0,0,0}, 80, 1e4, 0, 2e4, thickness mass);
     //simulator.addFloatMesh("src/assets", "horse-gallop-01.obj", {0, -1, 0}, 1.2);
