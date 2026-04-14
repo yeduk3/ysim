@@ -4,21 +4,7 @@ using namespace metal;
 
 #include "common_types.metalh"
 
-struct NarrowCollision {
-    uint2 indexPair;      // point, triangle
-    uint2 objPair;        // queryObjId, targetObjId
-    float4 collisionNormalAndDistance; // xyz: normal, w: distance
-    uint2 behaviorPair;
-    uint2 shapePair;
-};
 
-struct NarrowParams {
-    uint numBroadCollisions;
-    uint maxNumCollisions;
-    float radius;
-    float thickness;
-    uint selfCollision;   // 1 if queryObjId == targetObjId
-};
 
 inline bool pointInTriangleBary(
     float3 p,   // point projected into triangle plane, expressed from t0

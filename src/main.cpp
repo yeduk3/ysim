@@ -780,6 +780,9 @@ struct DebugPointGL<CPU> {
 };
 
 
+template <typename BE, typename PR>
+struct Scene;
+
 // General Mesh Deinfe!
 
 template <typename BE, typename PR>
@@ -1319,16 +1322,16 @@ template <typename BE, typename PR>
 struct Constraints {
     VectorBase<BE, PR> fixedParticles;
 
-    Index maxNumCollisions = 0;
-    //Index numBroadCollisions = 0;
-    VectorBase<BE, Index> numBroadCollisions;
-    VectorBase<BE, Index> numNarrowCollisions;
-    Index approxColPerVertex = 15;
-    VectorBase<BE, BroadCollision> broadCollisions;
-    VectorBase<BE, NarrowCollision> narrowCollisions;
+    //Index maxNumCollisions = 0;
+    ////Index numBroadCollisions = 0;
+    //VectorBase<BE, Index> numBroadCollisions;
+    //VectorBase<BE, Index> numNarrowCollisions;
+    //Index approxColPerVertex = 15;
+    //VectorBase<BE, BroadCollision> broadCollisions;
+    //VectorBase<BE, NarrowCollision> narrowCollisions;
 
-    VectorBase<BE, NarrowCollision> vertexColPrims;
-    VectorBase<BE, Index> vertexColPrimsOffsets;
+    //VectorBase<BE, NarrowCollision> vertexColPrims;
+    //VectorBase<BE, Index> vertexColPrimsOffsets;
 
     private:
 
@@ -1337,15 +1340,15 @@ struct Constraints {
         if(fixedParticles.ptr) return;
         fixedParticles = VectorBase<BE, PR>(numPoints, 1);
 
-        maxNumCollisions = numPoints * approxColPerVertex;
-        numBroadCollisions = VectorBase<BE, Index>(1);
-        numNarrowCollisions = VectorBase<BE, Index>(1);
+        //maxNumCollisions = numPoints * approxColPerVertex;
+        //numBroadCollisions = VectorBase<BE, Index>(1);
+        //numNarrowCollisions = VectorBase<BE, Index>(1);
 
-        broadCollisions = VectorBase<BE, BroadCollision>(maxNumCollisions);
-        narrowCollisions = VectorBase<BE, NarrowCollision>(maxNumCollisions);
+        //broadCollisions = VectorBase<BE, BroadCollision>(maxNumCollisions);
+        //narrowCollisions = VectorBase<BE, NarrowCollision>(maxNumCollisions);
 
-        vertexColPrims = VectorBase<BE, NarrowCollision>(maxNumCollisions);
-        vertexColPrimsOffsets = VectorBase<BE, Index>(numPoints+1, 0);
+        //vertexColPrims = VectorBase<BE, NarrowCollision>(maxNumCollisions);
+        //vertexColPrimsOffsets = VectorBase<BE, Index>(numPoints+1, 0);
     }
 
     void fixParticle(Index id) { fixedParticles[id] = PR(0); }
@@ -1404,8 +1407,10 @@ struct TriangularClothBehavior<METAL, PR> {
         MetalGlobalContext::setBuffer(mesh.state.m, offset++);
         // constraints 4-6
         MetalGlobalContext::setBuffer(mesh.constraints.fixedParticles, offset++);
-        MetalGlobalContext::setBuffer(mesh.constraints.vertexColPrims, offset++);
-        MetalGlobalContext::setBuffer(mesh.constraints.vertexColPrimsOffsets, offset++);
+        //MetalGlobalContext::setBuffer(mesh.constraints.vertexColPrims, offset++);
+        //MetalGlobalContext::setBuffer(mesh.constraints.vertexColPrimsOffsets, offset++);
+        MetalGlobalContext::setBuffer(Scene<METAL,PR>::packedCollisionData.vertColFacets, offset++);
+        MetalGlobalContext::setBuffer(Scene<METAL,PR>::packedCollisionData.vertColFacetsOffsets, offset++);
         // external forces 7
         MetalGlobalContext::setBuffer(mesh.externalForces.externalForces, offset++);
         //simulation parameters 8-9
@@ -1422,6 +1427,9 @@ struct TriangularClothBehavior<METAL, PR> {
         MetalGlobalContext::setBuffer(mesh.adjacency.vertexOppVertices, offset++);
         MetalGlobalContext::setBuffer(mesh.adjacency.vertexOppVerticesOffsets, offset++);
         MetalGlobalContext::setBuffer(mesh.adjacency.restOppLengths, offset++);
+        // packed data
+        MetalGlobalContext::setBuffer(Scene<METAL, PR>::packedMeshData.statesOffsets, offset++);
+        MetalGlobalContext::setBytes(mesh.id, offset++);
     }
 
     static void update(MeshState<METAL, PR>& state) {
@@ -1456,8 +1464,10 @@ struct FastGridClothBehavior<METAL, PR> {
         MetalGlobalContext::setBuffer(mesh.state.m, offset++);
         // constraints 4-6
         MetalGlobalContext::setBuffer(mesh.constraints.fixedParticles, offset++);
-        MetalGlobalContext::setBuffer(mesh.constraints.vertexColPrims, offset++);
-        MetalGlobalContext::setBuffer(mesh.constraints.vertexColPrimsOffsets, offset++);
+        //MetalGlobalContext::setBuffer(mesh.constraints.vertexColPrims, offset++);
+        //MetalGlobalContext::setBuffer(mesh.constraints.vertexColPrimsOffsets, offset++);
+        MetalGlobalContext::setBuffer(Scene<METAL, PR>::packedCollisionData.vertColFacets, offset++);
+        MetalGlobalContext::setBuffer(Scene<METAL, PR>::packedCollisionData.vertColFacetsOffsets, offset++);
         // external forces 7
         MetalGlobalContext::setBuffer(mesh.externalForces.externalForces, offset++);
         //simulation parameters 8-9
@@ -1474,6 +1484,9 @@ struct FastGridClothBehavior<METAL, PR> {
         //MetalGlobalContext::setBuffer(mesh.adjacency.vertexOppVertices, offset++);
         //MetalGlobalContext::setBuffer(mesh.adjacency.vertexOppVerticesOffsets, offset++);
         //MetalGlobalContext::setBuffer(mesh.adjacency.restOppLengths, offset++);
+
+        MetalGlobalContext::setBuffer(Scene<METAL, PR>::packedMeshData.statesOffsets, offset++);
+        MetalGlobalContext::setBytes(mesh.id, offset++);
     }
 
     static void update(MeshState<METAL, PR>& state) {
@@ -1506,11 +1519,6 @@ struct GeneralMesh {
     MeshGL<CPU> meshGL;
 
 
-    // debug
-    DebugLineGL<CPU> debugSelfCollisions;
-    DebugLineGL<CPU> debugObjCollisions;
-    VectorBase<BE, PR> debugSelfCollisionNormals;
-    VectorBase<BE, PR> debugObjCollisionNormals;
 
 
     GeneralMesh(GeneralMeshInitializer<BE, PR>* initializer, BehaviorType behaviorType, BehaviorParams<PR> behaviorParams) 
@@ -1543,59 +1551,6 @@ struct GeneralMesh {
     }
 
 
-    void prepareDebugCollisions() {
-        if(constraints.numNarrowCollisions[0] <= 0) return;
-
-        if(!debugSelfCollisionNormals.ptr) {
-            debugSelfCollisionNormals = VectorBase<BE, PR>(constraints.maxNumCollisions*6);
-            debugObjCollisionNormals = VectorBase<BE, PR>(constraints.maxNumCollisions*6);
-        }
-
-        Index selfBase = 0;
-        Index objBase = 0;
-        for(Index cid = 0; cid < constraints.numNarrowCollisions[0]; ++cid) {
-            NarrowCollision& nc = constraints.narrowCollisions[cid];
-
-            tinym::vec3_view v(state.x.ptr + nc.indexPair.point*3);
-            tinym::vec3_view n(nc.collisionNormalAndDistance.v);
-            tinym::vec3 t = v+n*.2f;
-
-            if(nc.objPair.query == nc.objPair.target) {
-                debugSelfCollisionNormals[selfBase  ] = v[0];
-                debugSelfCollisionNormals[selfBase+1] = v[1];
-                debugSelfCollisionNormals[selfBase+2] = v[2];
-                debugSelfCollisionNormals[selfBase+3] = t[0];
-                debugSelfCollisionNormals[selfBase+4] = t[1];
-                debugSelfCollisionNormals[selfBase+5] = t[2];
-                selfBase += 6;
-            }
-            else {
-                debugObjCollisionNormals[objBase  ] = v[0];
-                debugObjCollisionNormals[objBase+1] = v[1];
-                debugObjCollisionNormals[objBase+2] = v[2];
-                debugObjCollisionNormals[objBase+3] = t[0];
-                debugObjCollisionNormals[objBase+4] = t[1];
-                debugObjCollisionNormals[objBase+5] = t[2];
-                objBase += 6;
-            }
-        }
-        if(selfBase > 0) {
-            if(!debugSelfCollisions.vertexPtr) debugSelfCollisions = DebugLineGL<CPU>(selfBase/3, debugSelfCollisionNormals.ptr);
-            else debugSelfCollisions.updateBuffer(debugSelfCollisionNormals.ptr, selfBase/3);
-        }
-        if(objBase > 0) {
-            if(!debugObjCollisions.vertexPtr) debugObjCollisions = DebugLineGL<CPU>(objBase/3, debugObjCollisionNormals.ptr);
-            else debugObjCollisions.updateBuffer(debugObjCollisionNormals.ptr, objBase/3);
-        }
-    }
-    void showSelfCollisions() {
-        if(debugSelfCollisions.vertexNum > 0)
-            debugSelfCollisions.draw();
-    }
-    void showObjCollisions() {
-        if(debugObjCollisions.vertexNum > 0)
-            debugObjCollisions.draw();
-    }
 };
 
 
@@ -1671,13 +1626,19 @@ struct Scene {
         VectorBase<BE, NarrowCollision> narrowCollisions;
         VectorBase<BE, Index> numNarrowCollisions;
         Index approxColsPerPoints = 15;
+        Index maxNumCollisions;
+        VectorBase<BE, NarrowCollision> vertColFacets;
+        VectorBase<BE, Index> vertColFacetsOffsets;
 
         PackedCollisionData() {}
         void allocate(Index numPoints) {
-            broadCollisions = VectorBase<BE, BroadCollision>(numPoints*approxColsPerPoints);
+            maxNumCollisions = numPoints*approxColsPerPoints;
+            broadCollisions = VectorBase<BE, BroadCollision>(maxNumCollisions);
             numBroadCollisions = VectorBase<BE, Index>(1, 0);
-            narrowCollisions = VectorBase<BE, NarrowCollision>(numPoints*approxColsPerPoints);
+            narrowCollisions = VectorBase<BE, NarrowCollision>(maxNumCollisions);
             numNarrowCollisions = VectorBase<BE, Index>(1, 0);
+            vertColFacets = VectorBase<BE, NarrowCollision>(maxNumCollisions);
+            vertColFacetsOffsets = VectorBase<BE, Index>(numPoints+1, 0);
         }
     };
     inline static PackedCollisionData packedCollisionData;
@@ -1702,7 +1663,8 @@ struct Scene {
         }
 
         // allocate MeshState
-        Index numStatesData = packedMeshData.statesOffsets[numMeshes]*3;
+        Index numPoints = packedMeshData.statesOffsets[numMeshes];
+        Index numStatesData = numPoints*3;
         packedMeshData.x = VectorBase<BE, PR>(numStatesData);
         packedMeshData.v = VectorBase<BE, PR>(numStatesData, 0);
         packedMeshData.f = VectorBase<BE, PR>(numStatesData, 0);
@@ -1734,7 +1696,7 @@ struct Scene {
         }
 
         // allocate collisions
-        packedCollisionData.allocate(packedMeshData.statesOffsets[numMeshes]);
+        packedCollisionData.allocate(numPoints);
 
 
         dirty = false;
@@ -1771,7 +1733,7 @@ struct SpatialHashing<METAL, PR> {
 
 
 // TODO: BroadPhase, BVH
-template <Index MODE, Index PRIMITIVE, typename PR>
+template <typename BE, typename PR, Index MODE, Index PRIMITIVE>
 struct BVH {};
 enum BVHMODE {
     SCENE,
@@ -1842,11 +1804,11 @@ static_assert(sizeof(AABB4) == 32);
 
 
 // TODO: BroadPhase, LBVH
-template <Index PRIMITIVE, typename PR>
-struct BVH<BVHMODE::LINEAR, PRIMITIVE, PR> {
+template <typename BE, typename PR, Index PRIMITIVE>
+struct BVH<BE, PR, BVHMODE::LINEAR, PRIMITIVE> {
     struct alignas(8) MortonNode {
         uint code; // Morton code, 32bit, 10bit per coordinate
-        uint index; // facet index
+        uint index; // obj index ( primitive index
     };
     static_assert(sizeof(MortonNode) == 8);
     struct BVHNode {
@@ -2199,9 +2161,11 @@ struct BVH<BVHMODE::LINEAR, PRIMITIVE, PR> {
 
         auto* mesh = Scene<METAL, PR>::findById(objid);
         positions = pos;
-        velocities = mesh->state.v;
         primitives = prim;
-        objBehavior = mesh->behaviorType;
+        if(mesh) {
+            velocities = mesh->state.v;
+            objBehavior = mesh->behaviorType;
+        }
         objShape = ShapeType::Mesh;
         //std::cout << "[BVH Build] positions and primitives are assigned" << std::endl;
         Index numPrimitives = primitives.size/PRIMITIVE;
@@ -2451,6 +2415,7 @@ struct BVH<BVHMODE::LINEAR, PRIMITIVE, PR> {
         //std::cout << "  - Leaf constructing" << std::endl;
         for(Index i = 0; i < numberOfPrimitives; ++i) {
             tree[numberOfPrimitives+i-1] = BVHNode(mortons[i], positions, primitives);
+            tree[numberOfPrimitives+i-1].childA = -objid;
         }
 
         // construct intermediate
@@ -2542,7 +2507,7 @@ struct BVH<BVHMODE::LINEAR, PRIMITIVE, PR> {
         auto& c = qmesh->constraints;
         if(c.numBroadCollisions[0] >= c.maxNumCollisions) return;
         
-        if(node.childA == -1) { // leaf
+        if(node.childA < 0) { // leaf
         Index fid = (Index)node.childB;
         Index fbase = fid * 3;
         Index f0 = primitives[fbase];
@@ -2626,28 +2591,29 @@ struct BVH<BVHMODE::LINEAR, PRIMITIVE, PR> {
     }
     void queryPoints(Index qObjId, PR queryMargin) {
         auto* qmesh = Scene<METAL, PR>::findById(qObjId);
-        auto& pos = qmesh->state.x;
-        Index numPoints = pos.size/3;
-        auto& constraints = qmesh->constraints;
+        auto& qpos = qmesh->state.x;
+        Index qnumPoints = qpos.size/3;
+        //auto& constraints = qmesh->constraints;
+        typename Scene<METAL, PR>::PackedCollisionData& packedCol = Scene<METAL, PR>::packedCollisionData;
         QueryPointsParams qParams = {
-            queryMargin, numPoints, qObjId, (Index)objid, constraints.maxNumCollisions,
+            queryMargin, qnumPoints, qObjId, (Index)objid, /*constraints.maxNumCollisions*/ packedCol.maxNumCollisions,
             (Index)qmesh->behaviorType, (Index)objBehavior, (Index)qmesh->shapeType, (Index)objShape
         };
-        auto& broadCols = constraints.broadCollisions;
-        auto& numBroadCols = constraints.numBroadCollisions;
+        //auto& broadCols = constraints.broadCollisions;
+        //auto& numBroadCols = constraints.numBroadCollisions;
 
-        MetalGlobalContext::setBuffer(pos, 0);
+        MetalGlobalContext::setBuffer(qpos, 0);
         MetalGlobalContext::setBuffer(primitives, 1);
         MetalGlobalContext::setBuffer(tree, 2);
         MetalGlobalContext::setBytes(qParams, 3);
-        MetalGlobalContext::setBuffer(broadCols, 4);
-        MetalGlobalContext::setBuffer(numBroadCols, 5);
+        MetalGlobalContext::setBuffer(packedCol.broadCollisions, 4);
+        MetalGlobalContext::setBuffer(packedCol.numBroadCollisions, 5);
         MetalGlobalContext::setBuffer(qFlag, 6);
 
-        MetalGlobalContext::dispatchThreads(queryPointsPSO, numPoints);
+        MetalGlobalContext::dispatchThreads(queryPointsPSO, qnumPoints);
     }
     void checkSelfCollisions(PR queryMargin) {
-        auto* qmesh = Scene<METAL, PR>::findById(objid); // self query.
+        //auto* qmesh = Scene<METAL, PR>::findById(objid); // self query.
         //qmesh->constraints.numBroadCollisions[0] = 0; // clear the previous collisions.
 
         queryPoints(objid, queryMargin);
@@ -2705,10 +2671,10 @@ struct BVH<BVHMODE::LINEAR, PRIMITIVE, PR> {
 };
 
 
-template <typename PR>
-struct BVH<BVHMODE::SCENE, BVHPRIMITIVE::OBJECT, PR> {
-    using TRI_LBVH = BVH<BVHMODE::LINEAR, BVHPRIMITIVE::TRIANGLE, PR>;
-    using EDGE_LBVH = BVH<BVHMODE::LINEAR, BVHPRIMITIVE::EDGE, PR>;
+template <typename BE, typename PR>
+struct BVH<BE, PR, BVHMODE::SCENE, BVHPRIMITIVE::OBJECT> {
+    using TRI_LBVH = BVH<BE, PR, BVHMODE::LINEAR, BVHPRIMITIVE::TRIANGLE>;
+    using EDGE_LBVH = BVH<BE, PR, BVHMODE::LINEAR, BVHPRIMITIVE::EDGE>;
     std::vector<TRI_LBVH> objTrees;
 
     // BVH for each object's BV
@@ -2760,6 +2726,9 @@ struct BVH<BVHMODE::SCENE, BVHPRIMITIVE::OBJECT, PR> {
     void refit() {
         for(Index i = 0; i < objTrees.size(); ++i) {
             objTrees[i].refit();
+            //std::cout << "[objTree root before scene build] id " << i
+            //  << " min=" << objTrees[i].tree[0].min
+            //  << " max=" << objTrees[i].tree[0].max << std::endl;
             Index pbase = i*6;
             positions[pbase  ] = objTrees[i].tree[0].min.x;
             positions[pbase+1] = objTrees[i].tree[0].min.y;
@@ -2773,6 +2742,9 @@ struct BVH<BVHMODE::SCENE, BVHPRIMITIVE::OBJECT, PR> {
         }
 
         tree.build(-1, positions, indices);
+        //    std::cout << "[tree root before scene build] scene tree " 
+        //      << " min=" << tree.tree[0].min
+        //      << " max=" << tree.tree[0].max << std::endl;
     }
 
     void enlargeTrajectory(PR dt) {
@@ -2804,8 +2776,9 @@ struct BVH<BVHMODE::SCENE, BVHPRIMITIVE::OBJECT, PR> {
         for(auto& tree : objTrees) {
             tree.qFlag[0].stackOverflow = 0;
             tree.qFlag[0].collisionOverflow = 0;
-            Scene<METAL, PR>::findById(tree.objid)->constraints.numBroadCollisions[0] = 0;
+            //Scene<METAL, PR>::findById(tree.objid)->constraints.numBroadCollisions[0] = 0;
         }
+        Scene<METAL, PR>::packedCollisionData.numBroadCollisions[0] = 0;
     }
     void detectCollisions(PR margin, bool enableSelfCollisions=true) {
         queryBegin();
@@ -2816,16 +2789,23 @@ struct BVH<BVHMODE::SCENE, BVHPRIMITIVE::OBJECT, PR> {
             if(queryTree.objBehavior == BehaviorType::Float) continue;
 
             for(Index t = 0; t < objTrees.size(); ++t) {
+                Index a = std::min(q, t);
+                Index b = std::max(q, t);
                 if(q == t) {
                     if(!enableSelfCollisions) continue;
 
+                    //std::cout << "BVH Query Meshes with " << a << " and " << b << '\n';
                     queryTree.checkSelfCollisions(margin);
-                    checked.insert({q, t});
+                    checked.insert({a, b});
                     continue;
                 }
-                if(checked.find({q, t}) != checked.end()) continue; // already checked
-                objTrees[t].queryPoints(queryTree.objid, margin);
-                checked.insert({q, t});
+                if(checked.find({a, b}) != checked.end()) continue; // already checked
+                // check root insertection
+                if(objTrees[t].tree[0].aabb.intersect(queryTree.tree[0].aabb)) {
+                    //std::cout << "BVH Query Meshes with " << a << " and " << b << '\n';
+                    objTrees[t].queryPoints(queryTree.objid, margin);
+                    checked.insert({a, b});
+                }
             }
         }
         queryEnd();
@@ -2834,7 +2814,11 @@ struct BVH<BVHMODE::SCENE, BVHPRIMITIVE::OBJECT, PR> {
         MetalGlobalContext::commitAndWait();
         for(auto& tree : objTrees) {
             if(tree.qFlag[0].stackOverflow) std::cout << "[Scene BVH detect collisions] " << tree.objid << "'s tree got query stack overflowed\n";
-            if(tree.qFlag[0].collisionOverflow) std::cout << "[Scene BVH detect collisions] " << tree.objid << "'s tree got buffer overflowed\n";
+            if(tree.qFlag[0].collisionOverflow) {
+                std::cout << "[Scene BVH detect collisions] " << tree.objid << "'s tree got buffer overflowed: "
+                          << '(' << Scene<METAL, PR>::packedCollisionData.numBroadCollisions[0] << '/'
+                          << Scene<METAL, PR>::packedCollisionData.maxNumCollisions << ")\n";
+            }
         }
     }
 
@@ -2843,7 +2827,9 @@ struct BVH<BVHMODE::SCENE, BVHPRIMITIVE::OBJECT, PR> {
     void showSceneBox() { tree.showBox(); }
 };
 
-struct BVH
+// TODO: later
+template <typename BE, typename PR, BVHPRIMITIVE PRIMITIVE>
+struct BVH<BE, PR, BVHMODE::SCENE, PRIMITIVE> {};
 
 
 
@@ -2882,43 +2868,71 @@ struct BruteForce<METAL, PR> {
         float radius;
         float thickness;
     };
-    void narrow(Index oid, PR radius) {
-        GeneralMesh<METAL, PR>* qmesh = Scene<METAL, PR>::findById(oid);
-        auto& constraints = qmesh->constraints;
+    bool narrow(PR radius) {
+        typename Scene<METAL, PR>::PackedMeshData& packedMesh = Scene<METAL, PR>::packedMeshData;
+        typename Scene<METAL, PR>::PackedCollisionData& packedCol = Scene<METAL, PR>::packedCollisionData;
+
+        packedCol.numNarrowCollisions[0] = 0;
+        if(packedCol.numBroadCollisions[0] == 0) return false;
+
         NarrowParams nparams{};
         nparams.numBroadCollisions = std::min(
-            constraints.numBroadCollisions[0],
-            constraints.maxNumCollisions
+            packedCol.numBroadCollisions[0],
+            packedCol.maxNumCollisions
         );
-        nparams.maxNumCollisions = constraints.maxNumCollisions;
+        nparams.maxNumCollisions = packedCol.maxNumCollisions;
         nparams.radius = radius;
 
-        BehaviorType qBehaviorType = (BehaviorType)qmesh->behaviorPair.query; // 혹은 qmesh->behaviorType
-        switch (qBehaviorType) {
-            case BehaviorType::FastGridCloth:
-                nparams.thickness =
-                    std::get<FastGridClothBehaviorParams<PR>>(qmesh->behaviorParams).thickness;
-                break;
-            case BehaviorType::TriangularCloth:
-                nparams.thickness =
-                    std::get<ClothBehaviorParams<PR>>(qmesh->behaviorParams).thickness;
-                break;
-            default:
-                nparams.thickness = 0.0f;
-                break;
-        }
+        nparams.thickness = 0; // temp.
 
-        MetalGlobalContext::setBuffer(constraints.broadCollisions, 0);
-        MetalGlobalContext::setBuffer(constraints.narrowCollisions, 1);
-        MetalGlobalContext::setBuffer(constraints.numNarrowCollisions, 2);
+        MetalGlobalContext::setBuffer(packedCol.broadCollisions, 0);
+        MetalGlobalContext::setBuffer(packedCol.numNarrowCollisions, 1);
+        MetalGlobalContext::setBuffer(packedCol.narrowCollisions, 2);
 
-        MetalGlobalContext::setBuffer(Scene<METAL, PR>::packedMeshData.x, 3);
-        MetalGlobalContext::setBuffer(Scene<METAL, PR>::packedMeshData.statesOffsets, 4);
-        MetalGlobalContext::setBuffer(Scene<METAL, PR>::packedMeshData.facets, 5);
-        MetalGlobalContext::setBuffer(Scene<METAL, PR>::packedMeshData.facetsOffsets, 6);
+        MetalGlobalContext::setBuffer(packedMesh.x, 3);
+        MetalGlobalContext::setBuffer(packedMesh.statesOffsets, 4);
+        MetalGlobalContext::setBuffer(packedMesh.facets, 5);
+        MetalGlobalContext::setBuffer(packedMesh.facetsOffsets, 6);
         MetalGlobalContext::setBytes(nparams, 7);
 
         MetalGlobalContext::dispatchThreads(bruteForcePSO, nparams.numBroadCollisions);
+        return true;
+    }
+    void narrowAndSortByVertices(PR radius) {
+
+        if(narrow(radius))
+            MetalGlobalContext::commitAndWait();
+        else return;
+
+        typename Scene<METAL, PR>::PackedMeshData& packedMesh = Scene<METAL, PR>::packedMeshData;
+        typename Scene<METAL, PR>::PackedCollisionData& packedCol = Scene<METAL, PR>::packedCollisionData;
+
+        packedCol.vertColFacets.map().setZero();
+        packedCol.vertColFacetsOffsets.map().setZero();
+
+        for(Index i = 0; i < packedCol.numNarrowCollisions[0]; ++i) {
+            NarrowCollision& nc = packedCol.narrowCollisions[i];
+            Index pid = nc.indexPair.point;
+            Index obase = packedMesh.statesOffsets[nc.objPair.query];
+            Index ppid = obase + pid;
+            packedCol.vertColFacetsOffsets[ppid+1]++;
+        }
+
+        for(Index i = 1; i < packedCol.vertColFacetsOffsets.size; ++i) 
+            packedCol.vertColFacetsOffsets[i] += packedCol.vertColFacetsOffsets[i-1];
+
+        DynamicMemoryAllocator<METAL> tempPool;
+        VectorBase<METAL, Index> offsets(tempPool.template zeros<Index>(packedCol.vertColFacetsOffsets.size-1));
+        
+        for(Index i = 0; i < packedCol.numNarrowCollisions[0]; ++i) {
+            NarrowCollision& nc = packedCol.narrowCollisions[i];
+            Index pid = nc.indexPair.point;
+            Index obase = packedMesh.statesOffsets[nc.objPair.query];
+            Index ppid = obase + pid;
+            Index colid = packedCol.vertColFacetsOffsets[ppid]+offsets[ppid];
+            packedCol.vertColFacets[colid] = packedCol.narrowCollisions[i];
+            offsets[ppid]++;
+        }
     }
 
     void narrowCPU(
@@ -3020,7 +3034,7 @@ struct BruteForce<METAL, PR> {
         }
     }
 
-    void narrowAndSortByVertices(
+    void narrowAndSortByVerticesCPU(
             VectorBase<METAL, BroadCollision>& ptCollisions, 
             Index numCollisions,
             MeshAdjacency<METAL, PR>& adjacency,
@@ -3059,6 +3073,9 @@ struct CollisionPipeline {
     BroadPhase broadPhase;
     BroadPhase broadPhaseTest;
     NarrowPhase narrowPhase;
+
+
+
 };
 
 template <typename BE, typename PR, typename System>
@@ -3068,7 +3085,7 @@ struct Simulator {
     Scene<BE, PR> sceneObjects;
 
     //using BroadPhase = BVH<BVHMODE::LINEAR, BVHPRIMITIVE::TRIANGLE, PR>;
-    using BroadPhase = BVH<BVHMODE::SCENE, BVHPRIMITIVE::OBJECT, PR>;
+    using BroadPhase = BVH<BE, PR, BVHMODE::SCENE, BVHPRIMITIVE::OBJECT>;
     using NarrowPhase = BruteForce<METAL, PR>;
     CollisionPipeline<BroadPhase, NarrowPhase> collisionPipeline;
 
@@ -3226,31 +3243,36 @@ struct Simulator {
                     collisionPipeline.broadPhase.detectCollisions(margin, enableSelfCollisions);
                 }
 
-                for(auto& mesh : Scene<BE, PR>::meshes) {
-                    if(mesh.behaviorType == BehaviorType::Float) continue;
-                    auto& c = mesh.constraints;
+                //for(auto& mesh : Scene<BE, PR>::meshes) {
+                //    if(mesh.behaviorType == BehaviorType::Float) continue;
+                //    auto& c = mesh.constraints;
 
-                    if (profiler) {
-                        auto scope = profiler->scoped("narrow_phase");
-                        collisionPipeline.narrowPhase.narrowAndSortByVertices(
-                                c.broadCollisions,
-                                c.numBroadCollisions[0],
-                                mesh.adjacency,
-                                c,
-                                radius);
-                    } else {
-                        collisionPipeline.narrowPhase.narrowAndSortByVertices(
-                                c.broadCollisions,
-                                c.numBroadCollisions[0],
-                                mesh.adjacency,
-                                c,
-                                radius);
-                    }
+                //    if (profiler) {
+                //        auto scope = profiler->scoped("narrow_phase");
+                //        collisionPipeline.narrowPhase.narrowAndSortByVerticesCPU(
+                //                c.broadCollisions,
+                //                c.numBroadCollisions[0],
+                //                mesh.adjacency,
+                //                c,
+                //                radius);
+                //    } else {
+                //        collisionPipeline.narrowPhase.narrowAndSortByVerticesCPU(
+                //                c.broadCollisions,
+                //                c.numBroadCollisions[0],
+                //                mesh.adjacency,
+                //                c,
+                //                radius);
+                //    }
+                //}
+                if (profiler) {
+                    auto scope = profiler->scoped("narrow_phase");
+                    collisionPipeline.narrowPhase.narrowAndSortByVertices(radius);
+                } else {
+                    collisionPipeline.narrowPhase.narrowAndSortByVertices(radius);
                 }
 
-
-                auto* mesh = Scene<BE, PR>::findById(0);
-                auto& c = mesh->constraints;
+                //auto* mesh = Scene<BE, PR>::findById(0);
+                //auto& c = mesh->constraints;
                 //if(c.numBroadCollisions[0] > 0) {
                 //    std::cout << "Collision detected: (frame,substep)=" << frame << "," << i << " (" << c.numBroadCollisions[0] << "/" << c.maxNumCollisions << ")\n";
                 //    //for(Index i = 0; i < 5; ++i) {
@@ -3319,6 +3341,8 @@ struct Simulator {
         } else {
             MetalGlobalContext::commitAndWait();
         }
+        std::cout << Scene<BE, PR>::packedCollisionData.numBroadCollisions[0] << ", "
+            << Scene<BE, PR>::packedCollisionData.numNarrowCollisions[0] << '\n';
         
         system.acctime += system.h;
         frame++;
@@ -3349,13 +3373,72 @@ struct Simulator {
         collisionPipeline.broadPhase.showSceneBox();
     }
 
+    VectorBase<BE, PR> debugSelfCollisionNormals, debugObjCollisionNormals;
+    DebugLineGL<CPU> debugSelfCollisions;
+    DebugLineGL<CPU> debugObjCollisions;
+    void prepareDebugCollisions() {
+        typename Scene<BE, PR>::PackedCollisionData& packedCol = Scene<BE, PR>::packedCollisionData;
+        typename Scene<BE, PR>::PackedMeshData& packedMesh = Scene<BE, PR>::packedMeshData;
+        if(packedCol.numNarrowCollisions[0] <= 0) return;
+
+        if(!debugSelfCollisionNormals.ptr) {
+            debugSelfCollisionNormals = VectorBase<BE, PR>(packedCol.maxNumCollisions*6);
+            debugObjCollisionNormals = VectorBase<BE, PR>(packedCol.maxNumCollisions*6);
+        }
+
+        Index selfBase = 0;
+        Index objBase = 0;
+        for(Index cid = 0; cid < packedCol.numNarrowCollisions[0]; ++cid) {
+            NarrowCollision& nc = packedCol.narrowCollisions[cid];
+
+            auto& packedMesh = Scene<BE, PR>::packedMeshData;
+            Index obase = packedMesh.statesOffsets[nc.objPair.query];
+            Index ppid = nc.indexPair.point + nc.objPair.query;
+            tinym::vec3_view v(packedMesh.x.ptr + ppid*3);
+            tinym::vec3_view n(nc.collisionNormalAndDistance.v);
+            tinym::vec3 t = v+n*.2f;
+
+            if(nc.objPair.query == nc.objPair.target) {
+                debugSelfCollisionNormals[selfBase  ] = v[0];
+                debugSelfCollisionNormals[selfBase+1] = v[1];
+                debugSelfCollisionNormals[selfBase+2] = v[2];
+                debugSelfCollisionNormals[selfBase+3] = t[0];
+                debugSelfCollisionNormals[selfBase+4] = t[1];
+                debugSelfCollisionNormals[selfBase+5] = t[2];
+                selfBase += 6;
+            }
+            else {
+                debugObjCollisionNormals[objBase  ] = v[0];
+                debugObjCollisionNormals[objBase+1] = v[1];
+                debugObjCollisionNormals[objBase+2] = v[2];
+                debugObjCollisionNormals[objBase+3] = t[0];
+                debugObjCollisionNormals[objBase+4] = t[1];
+                debugObjCollisionNormals[objBase+5] = t[2];
+                objBase += 6;
+            }
+        }
+        if(selfBase > 0) {
+            if(!debugSelfCollisions.vertexPtr) debugSelfCollisions = DebugLineGL<CPU>(selfBase/3, debugSelfCollisionNormals.ptr);
+            else debugSelfCollisions.updateBuffer(debugSelfCollisionNormals.ptr, selfBase/3);
+        }
+        if(objBase > 0) {
+            if(!debugObjCollisions.vertexPtr) debugObjCollisions = DebugLineGL<CPU>(objBase/3, debugObjCollisionNormals.ptr);
+            else debugObjCollisions.updateBuffer(debugObjCollisionNormals.ptr, objBase/3);
+        }
+    }
+    void showSelfCollisions() {
+        if(debugSelfCollisions.vertexNum > 0)
+            debugSelfCollisions.draw();
+    }
+    void showObjCollisions() {
+        if(debugObjCollisions.vertexNum > 0)
+            debugObjCollisions.draw();
+    }
 
     void debugCollisions() {
-        for(GeneralMesh<BE, PR>& mesh : sceneObjects.meshes) {
-            if(mesh.behaviorType == BehaviorType::Float) continue;
-            mesh.prepareDebugCollisions();
-            mesh.showObjCollisions();
-        }
+        prepareDebugCollisions();
+        showSelfCollisions();
+        showObjCollisions();
     }
 };
 

@@ -2,6 +2,8 @@
 #include <metal_atomic>
 using namespace metal;
 
+#include "common_types.metalh"
+
 // CPU에서 한 번에 넘겨줄 설정값들 (C++의 구조체와 동일해야 합니다)
 struct SimParams {
     float subh;
@@ -72,11 +74,11 @@ kernel void compute_spring_forces(
 }
 
 
-struct NarrowCollision {
-    uint2 indexPair;     // 혹은 네 구조에 맞는 형태
-    uint2 objPair;
-    float4 collisionNormalAndDistance;
-};
+//struct NarrowCollision {
+//    uint2 indexPair;     // 혹은 네 구조에 맞는 형태
+//    uint2 objPair;
+//    float4 collisionNormalAndDistance;
+//};
 
 // ========================================================
 // [커널 2] 위치와 속도만 업데이트하는 파이프라인
@@ -157,10 +159,12 @@ kernel void integrate_cloth_grid(
     device const packed_float3* f [[buffer(2)]],
     device const float* m [[buffer(3)]],
     device const float* fixedParticle [[buffer(4)]],
-    device const NarrowCollision* vertColPrims [[buffer(5)]],
-    device const uint* vertColPrimsOffsets [[buffer(6)]],
+    device const NarrowCollision* vertColFacets [[buffer(5)]],
+    device const uint* vertColFacetsOffsets [[buffer(6)]],
     constant SimParams& params [[buffer(8)]],
     constant ClothGridParams& clothParams [[buffer(9)]],
+    device const uint* statesOffsets [[buffer(10)]],
+    constant uint& oid [[buffer(11)]],
     uint id [[thread_position_in_grid]]
 ) {
     if (id >= params.vertexNum) return; 
@@ -175,11 +179,12 @@ kernel void integrate_cloth_grid(
     vel += (params.subh * force / m[id]) * mask;
 
     // apply collision constraints
-    uint begin = vertColPrimsOffsets[id];
-    uint end   = vertColPrimsOffsets[id + 1];
+    uint obase = statesOffsets[oid];
+    uint begin = vertColFacetsOffsets[obase+id];
+    uint end   = vertColFacetsOffsets[obase+id+1];
 
     for (uint i = begin; i < end; ++i) {
-        float3 n = vertColPrims[i].collisionNormalAndDistance.xyz;
+        float3 n = vertColFacets[i].collisionNormalAndDistance.xyz;
 
         float nlen2 = dot(n, n);
         if (nlen2 < 1e-12f) continue;
@@ -194,7 +199,7 @@ kernel void integrate_cloth_grid(
             vel -= vn * n;
         }
 
-        float distance = vertColPrims[i].collisionNormalAndDistance.w;
+        float distance = vertColFacets[i].collisionNormalAndDistance.w;
         float thickness = clothParams.thickness;
 
         if (distance < thickness) {
@@ -278,10 +283,12 @@ kernel void integrate_cloth(
     device const packed_float3* f [[buffer(2)]],
     device const float* m [[buffer(3)]],
     device const float* fixedParticle [[buffer(4)]],
-    device const NarrowCollision* vertColPrims [[buffer(5)]],
-    device const uint* vertColPrimsOffsets [[buffer(6)]],
+    device const NarrowCollision* vertColFacets [[buffer(5)]],
+    device const uint* vertColFacetsOffsets [[buffer(6)]],
     constant SimParams& params [[buffer(8)]],
     constant ClothParams& clothParams [[buffer(9)]],
+    device const uint* statesOffsets [[buffer(18)]],
+    constant uint& oid [[buffer(19)]],
     uint id [[thread_position_in_grid]]
 ) {
     if (id >= params.vertexNum) return; 
@@ -296,11 +303,12 @@ kernel void integrate_cloth(
     vel += (params.subh * force / m[id]) * mask;
 
     // apply collision constraints
-    uint begin = vertColPrimsOffsets[id];
-    uint end   = vertColPrimsOffsets[id + 1];
+    uint obase = statesOffsets[oid];
+    uint begin = vertColFacetsOffsets[obase+id];
+    uint end   = vertColFacetsOffsets[obase+id+1];
 
     for (uint i = begin; i < end; ++i) {
-        float3 n = vertColPrims[i].collisionNormalAndDistance.xyz;
+        float3 n = vertColFacets[i].collisionNormalAndDistance.xyz;
 
         float nlen2 = dot(n, n);
         if (nlen2 < 1e-12f) continue;
@@ -315,7 +323,7 @@ kernel void integrate_cloth(
             vel -= vn * n;
         }
 
-        float distance = vertColPrims[i].collisionNormalAndDistance.w;
+        float distance = vertColFacets[i].collisionNormalAndDistance.w;
         float thickness = clothParams.thickness;
 
         if (distance < thickness) {
@@ -328,3 +336,17 @@ kernel void integrate_cloth(
     v[id] = vel;
     x[id] = pos;
 }
+
+//kernel void integrate_all(
+//    device packed_float3* x [[buffer(0)]],
+//    device packed_float3* v [[buffer(1)]],
+//    device const packed_float3* f [[buffer(2)]],
+//    device const float* m [[buffer(3)]],
+//    device const float* fixedParticle [[buffer(4)]],
+//    device const NarrowCollision* vertColPrims [[buffer(5)]],
+//    device const uint* vertColPrimsOffsets [[buffer(6)]],
+//    constant SimParams& params [[buffer(8)]],
+//    uint id [[thread_position_in_grid]]
+//) {
+//
+//}
