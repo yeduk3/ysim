@@ -40,7 +40,10 @@ kernel void narrow_pt_tri(
     device const packed_uint3*  scenePackedFacets          [[buffer(5)]],
     device const uint*  scenePackedFacetsOffsets          [[buffer(6)]],
 
-    constant NarrowParams& params                [[buffer(7)]],
+    device const uint* sceneVertexAdjFacets [[buffer(7)]],
+    device const uint* sceneVertexAdjFacetsOffsets [[buffer(8)]],
+
+    constant NarrowParams& params                [[buffer(9)]],
     uint id [[thread_position_in_grid]]
 ) {
     if (id >= params.numBroadCollisions) return;
@@ -59,12 +62,17 @@ kernel void narrow_pt_tri(
     uint f2 = tri.z;
 
     if (qObjId == tObjId) { // same object
-        if (point == f0 || point == f1 || point == f2) return;
+        //if (point == f0 || point == f1 || point == f2) return;
+        uint gPoint = point+scenePackedPositionsOffsets[tObjId];
+        for(uint i = sceneVertexAdjFacetsOffsets[gPoint]; i < sceneVertexAdjFacetsOffsets[gPoint+1]; ++i) {
+            uint f = sceneVertexAdjFacets[i];
+            if (f == triangle) return;
+        }
     }
 
     
 
-    float3 qpos  = float3(scenePackedPositions[point + scenePackedFacetsOffsets[qObjId]]);
+    float3 qpos  = float3(scenePackedPositions[point + scenePackedPositionsOffsets[qObjId]]);
     float3 t0pos = float3(scenePackedPositions[f0 + scenePackedPositionsOffsets[tObjId]]);
     float3 t1pos = float3(scenePackedPositions[f1 + scenePackedPositionsOffsets[tObjId]]);
     float3 t2pos = float3(scenePackedPositions[f2 + scenePackedPositionsOffsets[tObjId]]);
@@ -109,4 +117,19 @@ kernel void narrow_pt_tri(
     narrowCollisions[outIdx].collisionNormalAndDistance = float4(n, l);
     narrowCollisions[outIdx].behaviorPair = bc.behaviorPair;
     narrowCollisions[outIdx].shapePair = bc.shapePair;
+}
+
+
+kernel void fill_vf_offsets(
+    device uint* numNarrowCollisions [[buffer(1)]],
+    device NarrowCollision* narrowCollisions [[buffer(2)]],
+    device const uint* scenePackedPositionsOffsets [[buffer(4)]],
+    device atomic_uint* vertColFacetsOffsets [[buffer(8)]],
+    uint id [[thread_position_in_grid]]
+) {
+    if(id >= numNarrowCollisions[0]) return;
+
+    NarrowCollision nc = narrowCollisions[id];
+    uint ppid = scenePackedPositionsOffsets[nc.objPair.x] + nc.indexPair.x;
+    atomic_fetch_add_explicit(&vertColFacetsOffsets[ppid+1], 1u, memory_order_relaxed);
 }

@@ -1612,6 +1612,8 @@ struct Scene {
         // MeshAdjacency
         VectorBase<BE, Index> facets;
         VectorBase<BE, Index> edges;
+        VectorBase<BE, Index> vertexAdjFacets, vertexAdjFacetsOffsets;
+        VectorBase<BE, Index> vertexAdjEdges, vertexAdjEdgesOffsets;
 
         // offset data by id
         VectorBase<BE, Index> statesOffsets;
@@ -1630,21 +1632,21 @@ struct Scene {
         VectorBase<BE, NarrowCollision> vertColFacets;
         VectorBase<BE, Index> vertColFacetsOffsets;
 
-        PackedCollisionData() {}
-        void allocate(Index numPoints) {
-            maxNumCollisions = numPoints*approxColsPerPoints;
-            broadCollisions = VectorBase<BE, BroadCollision>(maxNumCollisions);
-            numBroadCollisions = VectorBase<BE, Index>(1, 0);
-            narrowCollisions = VectorBase<BE, NarrowCollision>(maxNumCollisions);
-            numNarrowCollisions = VectorBase<BE, Index>(1, 0);
-            vertColFacets = VectorBase<BE, NarrowCollision>(maxNumCollisions);
-            vertColFacetsOffsets = VectorBase<BE, Index>(numPoints+1, 0);
+        void resetNarrow() {
+            std::memset(narrowCollisions.ptr, 0, sizeof(NarrowCollision)*numNarrowCollisions[0]);
+            std::memset(vertColFacets.ptr, 0, sizeof(NarrowCollision)*numNarrowCollisions[0]);
+            std::memset(vertColFacetsOffsets.ptr, 0, sizeof(Index)*numNarrowCollisions[0]);
+            numNarrowCollisions[0] = 0;
         }
     };
     inline static PackedCollisionData packedCollisionData;
 
     static void pack() {
-        if(!dirty) return;
+        if(!dirty) {
+            initialize();
+            return;
+        }
+
         meshes.clear();
 
         // count sizes
@@ -1678,29 +1680,82 @@ struct Scene {
         // allocate MeshAdjacency
         packedMeshData.facets = VectorBase<BE, Index>(packedMeshData.facetsOffsets[numMeshes]*3);
         packedMeshData.edges  = VectorBase<BE, Index>(packedMeshData.edgesOffsets [numMeshes]*2);
+        packedMeshData.vertexAdjFacetsOffsets = VectorBase<BE, Index>(numPoints+1, 0);
+        packedMeshData.vertexAdjEdgesOffsets  = VectorBase<BE, Index>(numPoints+1, 0);
 
         // initialize meshes
         //meshes.resize(numMeshes);
+        Index numVertexAdjFacets = 0, numVertexAdjEdges = 0;
         for(Index i = 0; i < numMeshes; ++i) {
             RequestGeneralMesh& req = requestsGeneralMeshes[i];
             meshes.emplace_back(req.initializer, req.behaviorType, req.behaviorParams);
             meshes[i].id = req.id;
-            meshes[i].state.x = VectorBase<BE, PR>(packedMeshData.x, packedMeshData.statesOffsets[i]*3, (packedMeshData.statesOffsets[i+1]-packedMeshData.statesOffsets[i])*3);
-            meshes[i].state.v = VectorBase<BE, PR>(packedMeshData.v, packedMeshData.statesOffsets[i]*3, (packedMeshData.statesOffsets[i+1]-packedMeshData.statesOffsets[i])*3);
-            meshes[i].state.f = VectorBase<BE, PR>(packedMeshData.f, packedMeshData.statesOffsets[i]*3, (packedMeshData.statesOffsets[i+1]-packedMeshData.statesOffsets[i])*3);
-            meshes[i].state.m = VectorBase<BE, PR>(packedMeshData.m, packedMeshData.statesOffsets[i]*3, (packedMeshData.statesOffsets[i+1]-packedMeshData.statesOffsets[i])*3);
-            meshes[i].state.n = VectorBase<BE, PR>(packedMeshData.n, packedMeshData.statesOffsets[i]*3, (packedMeshData.statesOffsets[i+1]-packedMeshData.statesOffsets[i])*3);
+            Index prevNumPoints = packedMeshData.statesOffsets[i];
+            Index curNumPoints = packedMeshData.statesOffsets[i+1]-prevNumPoints;
+            meshes[i].state.x = VectorBase<BE, PR>(packedMeshData.x, prevNumPoints*3, curNumPoints*3);
+            meshes[i].state.v = VectorBase<BE, PR>(packedMeshData.v, prevNumPoints*3, curNumPoints*3);
+            meshes[i].state.f = VectorBase<BE, PR>(packedMeshData.f, prevNumPoints*3, curNumPoints*3);
+            meshes[i].state.m = VectorBase<BE, PR>(packedMeshData.m, prevNumPoints*3, curNumPoints*3);
+            meshes[i].state.n = VectorBase<BE, PR>(packedMeshData.n, prevNumPoints*3, curNumPoints*3);
 
             meshes[i].adjacency.facets = VectorBase<BE, Index>(packedMeshData.facets, packedMeshData.facetsOffsets[i]*3, (packedMeshData.facetsOffsets[i+1]-packedMeshData.facetsOffsets[i])*3);
-            meshes[i].adjacency.edges = VectorBase<BE, Index>(packedMeshData.edges, packedMeshData.edgesOffsets[i]*2, (packedMeshData.edgesOffsets[i+1]-packedMeshData.edgesOffsets[i])*2);
+            meshes[i].adjacency.edges  = VectorBase<BE, Index>(packedMeshData.edges, packedMeshData.edgesOffsets[i]*2, (packedMeshData.edgesOffsets[i+1]-packedMeshData.edgesOffsets[i])*2);
+
+            meshes[i].initialize();
+
+            for(int j = 0; j < curNumPoints; ++j) {
+                packedMeshData.vertexAdjFacetsOffsets[prevNumPoints+j+1] = meshes[i].adjacency.vertexAdjFacetsOffsets[j+1]+numVertexAdjFacets;
+                packedMeshData.vertexAdjEdgesOffsets [prevNumPoints+j+1] = meshes[i].adjacency.vertexAdjEdgesOffsets [j+1]+numVertexAdjEdges;
+            }
+            numVertexAdjFacets += meshes[i].adjacency.vertexAdjFacets.size;
+            numVertexAdjEdges  += meshes[i].adjacency.vertexAdjEdges.size;
+        }
+
+        packedMeshData.vertexAdjFacets = VectorBase<BE, Index>(numVertexAdjFacets);
+        packedMeshData.vertexAdjEdges  = VectorBase<BE, Index>(numVertexAdjEdges);
+        numVertexAdjFacets = numVertexAdjEdges = 0;
+        Index numFacets = 0, numEdges = 0;
+        for(Index i = 0; i < numMeshes; ++i) {
+            auto& vaf = meshes[i].adjacency.vertexAdjFacets;
+            auto& vae = meshes[i].adjacency.vertexAdjEdges;
+            std::copy(vaf.ptr, vaf.ptr+vaf.size, packedMeshData.vertexAdjFacets.ptr+numVertexAdjFacets);
+            std::copy(vae.ptr, vae.ptr+vae.size, packedMeshData.vertexAdjEdges.ptr+numVertexAdjEdges);
+            for(Index j = 0; j < vaf.size; ++j)
+                if(packedMeshData.vertexAdjFacets[numVertexAdjFacets+j] != vaf[j]) exit(1);
+            for(Index j = 0; j < vae.size; ++j)
+                if(packedMeshData.vertexAdjEdges[numVertexAdjEdges+j]  != vae[j]) exit(1);
+            vaf = VectorBase<BE, Index>(packedMeshData.vertexAdjFacets, numVertexAdjFacets, vaf.size);
+            vae = VectorBase<BE, Index>(packedMeshData.vertexAdjEdges,  numVertexAdjEdges,  vae.size);
+            numVertexAdjFacets += vaf.size;
+            numVertexAdjEdges  += vae.size;
         }
 
         // allocate collisions
-        packedCollisionData.allocate(numPoints);
+        packedCollisionData.maxNumCollisions = numPoints*packedCollisionData.approxColsPerPoints;
+        packedCollisionData.broadCollisions = VectorBase<BE, BroadCollision>(packedCollisionData.maxNumCollisions);
+        packedCollisionData.numBroadCollisions = VectorBase<BE, Index>(1, 0);
+        packedCollisionData.narrowCollisions = VectorBase<BE, NarrowCollision>(packedCollisionData.maxNumCollisions);
+        packedCollisionData.numNarrowCollisions = VectorBase<BE, Index>(1, 0);
+        packedCollisionData.vertColFacets = VectorBase<BE, NarrowCollision>(packedCollisionData.maxNumCollisions);
+        packedCollisionData.vertColFacetsOffsets = VectorBase<BE, Index>(numPoints+1, 0);
 
+
+        // adjacency data
 
         dirty = false;
     }
+
+    static void initialize() {
+        for(auto& mesh : meshes) {
+            std::cout << "  - try to initialize mesh " << mesh.id << "\n";
+            mesh.initialize();
+            mesh.state.v.map().setZero();
+            std::cout << "  - mesh " << mesh.id << " is initialized\n";
+        }
+        if(meshes.size() > 0) std::cout << "[Simulator Init] general mesh objects are initialized" << std::endl;
+    }
+
+    /// postpack() is for data which is able to allocate after the mesh initialization.
 
 
 
@@ -2872,7 +2927,7 @@ struct BruteForce<METAL, PR> {
         typename Scene<METAL, PR>::PackedMeshData& packedMesh = Scene<METAL, PR>::packedMeshData;
         typename Scene<METAL, PR>::PackedCollisionData& packedCol = Scene<METAL, PR>::packedCollisionData;
 
-        packedCol.numNarrowCollisions[0] = 0;
+        packedCol.resetNarrow();
         if(packedCol.numBroadCollisions[0] == 0) return false;
 
         NarrowParams nparams{};
@@ -2893,7 +2948,9 @@ struct BruteForce<METAL, PR> {
         MetalGlobalContext::setBuffer(packedMesh.statesOffsets, 4);
         MetalGlobalContext::setBuffer(packedMesh.facets, 5);
         MetalGlobalContext::setBuffer(packedMesh.facetsOffsets, 6);
-        MetalGlobalContext::setBytes(nparams, 7);
+        MetalGlobalContext::setBuffer(packedMesh.vertexAdjFacets, 7);
+        MetalGlobalContext::setBuffer(packedMesh.vertexAdjFacetsOffsets, 8);
+        MetalGlobalContext::setBytes(nparams, 9);
 
         MetalGlobalContext::dispatchThreads(bruteForcePSO, nparams.numBroadCollisions);
         return true;
@@ -3187,14 +3244,7 @@ struct Simulator {
 
         Scene<BE, PR>::pack();
 
-        for(auto& plane : sceneObjects.planes) {}
-        for(auto& mesh : sceneObjects.meshes) {
-            std::cout << "  - try to initialize mesh " << mesh.id << "\n";
-            mesh.initialize();
-            mesh.state.v.map().setZero();
-            std::cout << "  - mesh " << mesh.id << " is initialized\n";
-        }
-        if(sceneObjects.meshes.size() > 0) std::cout << "[Simulator Init] general mesh objects are initialized" << std::endl;
+        //Scene<BE, PR>::initialize();
 
         frame = 0;
 
@@ -3751,7 +3801,7 @@ int main() {
     Precision thickness = 0.01;
     //simulator.addClothGridFast(particleNum1D, size1D, kstretch, kshear, kbend, thickness, mass);
     //simulator.addClothGridFast(100, 1, kstretch, kshear, kbend, thickness, mass);
-    //for(int i = 0; i < 10; i++) 
+    //for(int i = 0; i < 1; i++) 
     //    simulator.addCloth(particleNum1D, size1D, tinym::vec3(0, 0.15+(float)i*0.05f, 0), kstretch, kshear, kbend, thickness, mass);
     simulator.addCloth(100, 1, tinym::vec3(0, 0.25, 0), kstretch, kshear, kbend, thickness, mass);
     //simulator.addClothFile("src/assets", "teapot.obj", {0,0,0} 15, 1e4, 0, 2e4, thickness mass);
