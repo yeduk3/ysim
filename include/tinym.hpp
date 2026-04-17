@@ -75,6 +75,7 @@ struct vec3_base {
 using vec3 = vec3_base<float>;
 using vec3ui = vec3_base<uint>;
 using vec3_view = vec3_view_base<float>;
+using vec3ui_view = vec3_view_base<uint>;
 
 inline vec3 operator-(const vec3_view& a, const vec3_view& b) {
     return vec3(a[0]-b[0], a[1]-b[1], a[2]-b[2]);
@@ -111,6 +112,11 @@ struct vec4_base {
         return *this;
     }
     vec4_base operator*(float s) const { return vec4_base(x*s, y*s, z*s, w*s); }
+
+    friend std::ostream& operator<<(std::ostream& os, const vec4_base& v) {
+        os << '(' << v.x << ", " << v.y << ", " << v.z << ", " << v.w << ')';
+        return os;
+    }
 };
 
 using vec4 = vec4_base<float>;
@@ -170,69 +176,164 @@ struct mat4_base {
             c[0].w*v.x + c[1].w*v.y + c[2].w*v.z + c[3].w*v.w
         );
     }
+
+    mat4_base<T> transpose() const {
+        return mat4_base<T>(
+            c[0][0], c[1][0], c[2][0], c[3][0],
+            c[0][1], c[1][1], c[2][1], c[3][1],
+            c[0][2], c[1][2], c[2][2], c[3][2],
+            c[0][3], c[1][3], c[2][3], c[3][3]
+        );
+    }
+
+    mat4_base<T> inverse() const {
+        mat4_base<T> inv;
+
+        inv.v[0] =
+            v[5]  * v[10] * v[15] -
+            v[5]  * v[11] * v[14] -
+            v[9]  * v[6]  * v[15] +
+            v[9]  * v[7]  * v[14] +
+            v[13] * v[6]  * v[11] -
+            v[13] * v[7]  * v[10];
+
+        inv.v[4] =
+           -v[4]  * v[10] * v[15] +
+            v[4]  * v[11] * v[14] +
+            v[8]  * v[6]  * v[15] -
+            v[8]  * v[7]  * v[14] -
+            v[12] * v[6]  * v[11] +
+            v[12] * v[7]  * v[10];
+
+        inv.v[8] =
+            v[4]  * v[9]  * v[15] -
+            v[4]  * v[11] * v[13] -
+            v[8]  * v[5]  * v[15] +
+            v[8]  * v[7]  * v[13] +
+            v[12] * v[5]  * v[11] -
+            v[12] * v[7]  * v[9];
+
+        inv.v[12] =
+           -v[4]  * v[9]  * v[14] +
+            v[4]  * v[10] * v[13] +
+            v[8]  * v[5]  * v[14] -
+            v[8]  * v[6]  * v[13] -
+            v[12] * v[5]  * v[10] +
+            v[12] * v[6]  * v[9];
+
+        inv.v[1] =
+           -v[1]  * v[10] * v[15] +
+            v[1]  * v[11] * v[14] +
+            v[9]  * v[2]  * v[15] -
+            v[9]  * v[3]  * v[14] -
+            v[13] * v[2]  * v[11] +
+            v[13] * v[3]  * v[10];
+
+        inv.v[5] =
+            v[0]  * v[10] * v[15] -
+            v[0]  * v[11] * v[14] -
+            v[8]  * v[2]  * v[15] +
+            v[8]  * v[3]  * v[14] +
+            v[12] * v[2]  * v[11] -
+            v[12] * v[3]  * v[10];
+
+        inv.v[9] =
+           -v[0]  * v[9]  * v[15] +
+            v[0]  * v[11] * v[13] +
+            v[8]  * v[1]  * v[15] -
+            v[8]  * v[3]  * v[13] -
+            v[12] * v[1]  * v[11] +
+            v[12] * v[3]  * v[9];
+
+        inv.v[13] =
+            v[0]  * v[9]  * v[14] -
+            v[0]  * v[10] * v[13] -
+            v[8]  * v[1]  * v[14] +
+            v[8]  * v[2]  * v[13] +
+            v[12] * v[1]  * v[10] -
+            v[12] * v[2]  * v[9];
+
+        inv.v[2] =
+            v[1]  * v[6]  * v[15] -
+            v[1]  * v[7]  * v[14] -
+            v[5]  * v[2]  * v[15] +
+            v[5]  * v[3]  * v[14] +
+            v[13] * v[2]  * v[7]  -
+            v[13] * v[3]  * v[6];
+
+        inv.v[6] =
+           -v[0]  * v[6]  * v[15] +
+            v[0]  * v[7]  * v[14] +
+            v[4]  * v[2]  * v[15] -
+            v[4]  * v[3]  * v[14] -
+            v[12] * v[2]  * v[7]  +
+            v[12] * v[3]  * v[6];
+
+        inv.v[10] =
+            v[0]  * v[5]  * v[15] -
+            v[0]  * v[7]  * v[13] -
+            v[4]  * v[1]  * v[15] +
+            v[4]  * v[3]  * v[13] +
+            v[12] * v[1]  * v[7]  -
+            v[12] * v[3]  * v[5];
+
+        inv.v[14] =
+           -v[0]  * v[5]  * v[14] +
+            v[0]  * v[6]  * v[13] +
+            v[4]  * v[1]  * v[14] -
+            v[4]  * v[2]  * v[13] -
+            v[12] * v[1]  * v[6]  +
+            v[12] * v[2]  * v[5];
+
+        inv.v[3] =
+           -v[1]  * v[6]  * v[11] +
+            v[1]  * v[7]  * v[10] +
+            v[5]  * v[2]  * v[11] -
+            v[5]  * v[3]  * v[10] -
+            v[9]  * v[2]  * v[7]  +
+            v[9]  * v[3]  * v[6];
+
+        inv.v[7] =
+            v[0]  * v[6]  * v[11] -
+            v[0]  * v[7]  * v[10] -
+            v[4]  * v[2]  * v[11] +
+            v[4]  * v[3]  * v[10] +
+            v[8]  * v[2]  * v[7]  -
+            v[8]  * v[3]  * v[6];
+
+        inv.v[11] =
+           -v[0]  * v[5]  * v[11] +
+            v[0]  * v[7]  * v[9]  +
+            v[4]  * v[1]  * v[11] -
+            v[4]  * v[3]  * v[9]  -
+            v[8]  * v[1]  * v[7]  +
+            v[8]  * v[3]  * v[5];
+
+        inv.v[15] =
+            v[0]  * v[5]  * v[10] -
+            v[0]  * v[6]  * v[9]  -
+            v[4]  * v[1]  * v[10] +
+            v[4]  * v[2]  * v[9]  +
+            v[8]  * v[1]  * v[6]  -
+            v[8]  * v[2]  * v[5];
+
+        T det =
+            v[0] * inv.v[0] +
+            v[1] * inv.v[4] +
+            v[2] * inv.v[8] +
+            v[3] * inv.v[12];
+
+        T invDet = T(1) / det;
+        for (int i = 0; i < 16; ++i) inv.v[i] *= invDet;
+
+        return inv;
+    }
 };
 
 using mat4 = mat4_base<float>;
 
 
-// 3. 카메라 View 행렬 생성 (LookAt)
-inline mat4 lookAt(const vec3& eye, const vec3& center, const vec3& up) {
-    vec3 f = (center - eye).normalize();
-    vec3 s = f.cross(up).normalize();
-    vec3 u = s.cross(f);
 
-    mat4 res;
-    res.v[0] = s.x;  res.v[4] = s.y;  res.v[8]  = s.z;  res.v[12] = -s.dot(eye);
-    res.v[1] = u.x;  res.v[5] = u.y;  res.v[9]  = u.z;  res.v[13] = -u.dot(eye);
-    res.v[2] = -f.x; res.v[6] = -f.y; res.v[10] = -f.z; res.v[14] = f.dot(eye);
-    res.v[3] = 0.0f; res.v[7] = 0.0f; res.v[11] = 0.0f; res.v[15] = 1.0f;
-    return res;
-}
-
-// 4. 카메라 Projection 행렬 생성 (Perspective)
-inline mat4 perspective(float fovy_rad, float aspect, float zNear, float zFar) {
-    float tanHalfFovy = std::tan(fovy_rad / 2.0f);
-    
-    mat4 res;
-    res.v[0] = 1.0f / (aspect * tanHalfFovy);
-    res.v[5] = 1.0f / (tanHalfFovy);
-    res.v[10] = -(zFar + zNear) / (zFar - zNear);
-    res.v[11] = -1.0f;
-    res.v[14] = -(2.0f * zFar * zNear) / (zFar - zNear);
-    return res;
-}
-
-// 5. 임의의 축을 기준으로 회전하는 행렬 생성 (Rodrigues' rotation formula)
-inline tinym::mat4 rotate(float angle, const tinym::vec3& axis) {
-    float c = std::cos(angle);
-    float s = std::sin(angle);
-    float C = 1.0f - c;
-
-    // 회전축은 반드시 정규화(Normalize)되어야 합니다.
-    tinym::vec3 ax = axis.normalize();
-    float x = ax.x;
-    float y = ax.y;
-    float z = ax.z;
-
-    // tinym::mat4(T d) 생성자를 이용해 대각선이 1인 단위 행렬(Identity)로 뼈대를 잡습니다.
-    tinym::mat4 res(1.0f);
-
-    // Column-major 배열 (c[열].행) 에 맞춰 회전 공식 적용
-    res.c[0].x = x * x * C + c;
-    res.c[0].y = y * x * C + z * s;
-    res.c[0].z = z * x * C - y * s;
-
-    res.c[1].x = x * y * C - z * s;
-    res.c[1].y = y * y * C + c;
-    res.c[1].z = z * y * C + x * s;
-
-    res.c[2].x = x * z * C + y * s;
-    res.c[2].y = y * z * C - x * s;
-    res.c[2].z = z * z * C + c;
-
-    // 4번째 열과 4번째 행은 단위 행렬 값(0, 0, 0, 1) 그대로 유지됩니다.
-    return res;
-}
 
 template <typename T>
 inline const T* value_ptr(const vec3_base<T>& v3) { return v3.v; }
@@ -370,6 +471,68 @@ struct alignas(16) vec3f1i {
 static_assert(sizeof(vec3f1i) == 16);
 
 
+
+// transforms
+
+
+// 3. 카메라 View 행렬 생성 (LookAt)
+inline mat4 lookAt(const vec3& eye, const vec3& center, const vec3& up) {
+    vec3 f = (center - eye).normalize();
+    vec3 s = f.cross(up).normalize();
+    vec3 u = s.cross(f);
+
+    mat4 res;
+    res.v[0] = s.x;  res.v[4] = s.y;  res.v[8]  = s.z;  res.v[12] = -s.dot(eye);
+    res.v[1] = u.x;  res.v[5] = u.y;  res.v[9]  = u.z;  res.v[13] = -u.dot(eye);
+    res.v[2] = -f.x; res.v[6] = -f.y; res.v[10] = -f.z; res.v[14] = f.dot(eye);
+    res.v[3] = 0.0f; res.v[7] = 0.0f; res.v[11] = 0.0f; res.v[15] = 1.0f;
+    return res;
+}
+
+// 4. 카메라 Projection 행렬 생성 (Perspective)
+inline mat4 perspective(float fovy_rad, float aspect, float zNear, float zFar) {
+    float tanHalfFovy = std::tan(fovy_rad / 2.0f);
+    
+    mat4 res;
+    res.v[0] = 1.0f / (aspect * tanHalfFovy);
+    res.v[5] = 1.0f / (tanHalfFovy);
+    res.v[10] = -(zFar + zNear) / (zFar - zNear);
+    res.v[11] = -1.0f;
+    res.v[14] = -(2.0f * zFar * zNear) / (zFar - zNear);
+    return res;
+}
+
+// 5. 임의의 축을 기준으로 회전하는 행렬 생성 (Rodrigues' rotation formula)
+inline tinym::mat4 rotate(float angle, const tinym::vec3& axis) {
+    float c = std::cos(angle);
+    float s = std::sin(angle);
+    float C = 1.0f - c;
+
+    // 회전축은 반드시 정규화(Normalize)되어야 합니다.
+    tinym::vec3 ax = axis.normalize();
+    float x = ax.x;
+    float y = ax.y;
+    float z = ax.z;
+
+    // tinym::mat4(T d) 생성자를 이용해 대각선이 1인 단위 행렬(Identity)로 뼈대를 잡습니다.
+    tinym::mat4 res(1.0f);
+
+    // Column-major 배열 (c[열].행) 에 맞춰 회전 공식 적용
+    res.c[0].x = x * x * C + c;
+    res.c[0].y = y * x * C + z * s;
+    res.c[0].z = z * x * C - y * s;
+
+    res.c[1].x = x * y * C - z * s;
+    res.c[1].y = y * y * C + c;
+    res.c[1].z = z * y * C + x * s;
+
+    res.c[2].x = x * z * C + y * s;
+    res.c[2].y = y * z * C - x * s;
+    res.c[2].z = z * z * C + c;
+
+    // 4번째 열과 4번째 행은 단위 행렬 값(0, 0, 0, 1) 그대로 유지됩니다.
+    return res;
+}
 
 
 

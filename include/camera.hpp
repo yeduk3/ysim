@@ -34,6 +34,10 @@ using namespace glm;
 using namespace tinym;
 
 #endif
+
+
+inline float toRadian(float angle) { return angle*PI/180.f; }
+
 struct Camera {
     
     void setPosition(const vec3& initPos) {
@@ -52,6 +56,9 @@ struct Camera {
     float phi = 0;
     float fovy = 45.f;
     
+    float zNear=0.1, zFar=1000.0;
+    float aspect = 0;
+
 private:
     vec3 curPosition = vec3(0, 0, 10);
     
@@ -71,8 +78,12 @@ public:
     }
     
     mat4 perspective(float aspect, float zNear, float zFar) {
-        return ::perspective(fovy * PI / 180.f, aspect, zNear, zFar);
+        aspect = aspect;
+        zNear = zNear;
+        zFar = zFar;
+        return ::perspective(toRadian(fovy), aspect, zNear, zFar);
     }
+    mat4 perspective(float aspect) { return perspective(aspect, zNear, zFar); }
     
     void glfwSetCallbacks(GLFWwindow* window) {
         glfwSetCursorPosCallback(window, cursorPosCallback);
@@ -80,6 +91,22 @@ public:
     }
     
     vec3 getCurPosition() { return curPosition; }
+
+
+    /// unproject the screen space (x, y) into world space point.
+    /// nz: normalized z [-1.0, 1.0] in the perspective frustrum.
+    vec3 unProjectPerspective(GLFWwindow* window, double x, double y, double nz) {
+        int w, h;
+        glfwGetWindowSize(window, &w, &h); // size of the screen coordinate
+        double nx =  x/w*2-1;
+        double ny = -y/h*2+1;
+        
+        // z normalized point
+        vec4 np(nx, ny, nz, 1);
+        mat4 invVP = (::perspective(toRadian(fovy), w/(float)h, zNear, zFar) * ::lookAt(curPosition, look, up)).inverse();
+        vec4 p4 = invVP*np;
+        return vec3(p4)/p4.w;
+    }
 };
 
 Camera camera;
@@ -95,6 +122,8 @@ inline float clamp(const float &value, const float &left, const float &right) {
     return max(left, min(value, right));
 }
 }
+
+namespace YGL {
 
 void cursorPosCallback(GLFWwindow *window, double xpos, double ypos)
 {
@@ -134,5 +163,7 @@ void scrollCallback(GLFWwindow *window, double xoffset, double yoffset)
     camera.fovy -= yoffset / 10;
     camera.fovy = comp::clamp(camera.fovy, 0.01f, 180.f-0.01f);
 }
+
+};
 
 #endif

@@ -22,7 +22,7 @@
 #include <typeindex>
 #include <set>
 
-YGLWindow* window;
+YGLWindow* yglwindow;
 
 #include <cstdint>
 
@@ -1556,22 +1556,25 @@ struct GeneralMesh {
 
 
 
-struct Sphere {};
 
-// TODO: Plane Collier
-struct Plane {
-    tinym::vec3 p;
+
+struct Ray {
+    tinym::vec3 origin;
+    tinym::vec3 dir;
 };
 
-// TODO: Box Collier
-struct Box {};
+
+struct RayHit {
+    Index obj;
+    Index primId;
+    float tmin, tmax;
+};
 
 
 template <typename BE, typename PR>
 struct Scene {
     inline static int numMeshes = 0;
 
-    std::vector<Plane> planes;
     inline static std::vector<GeneralMesh<BE, PR>> meshes;
 
     struct RequestGeneralMesh {
@@ -1640,6 +1643,13 @@ struct Scene {
         }
     };
     inline static PackedCollisionData packedCollisionData;
+
+    struct RayTracedData {
+        VectorBase<BE, RayHit> clickRayCollisions;
+        VectorBase<BE, Index> numClickRayCollisions;
+        Index approxColsPerRay = 4096;
+    };
+    inline static RayTracedData rayTracedData;
 
     static void pack() {
         if(!dirty) {
@@ -1740,6 +1750,11 @@ struct Scene {
         packedCollisionData.vertColFacetsOffsets = VectorBase<BE, Index>(numPoints+1, 0);
 
 
+        // allocate ray traced data
+        rayTracedData.clickRayCollisions = VectorBase<BE, RayHit>(rayTracedData.approxColsPerRay);
+        rayTracedData.numClickRayCollisions = VectorBase<BE, Index>(1, 0);
+
+
         // adjacency data
 
         dirty = false;
@@ -1823,6 +1838,7 @@ enum BVHPRIMITIVE {
 //    }
 //};
 
+
 struct alignas(32) AABB4 {
     union {
         struct {
@@ -1853,6 +1869,36 @@ struct alignas(32) AABB4 {
         if (max.y < aabb.min.y || min.y > aabb.max.y) return false;
         if (max.z < aabb.min.z || min.z > aabb.max.z) return false;
         return true;
+    }
+    bool intersect(const Ray& ray, RayHit& hit) const {
+        float tmin = 0.0f;
+        float tmax = std::numeric_limits<float>::infinity();
+        const float eps = 1e-6f;
+
+        for (int axis = 0; axis < 3; ++axis) {
+            float o = ray.origin[axis];
+            float d = ray.dir[axis];
+
+            if (std::abs(d) < eps) {
+                // 이 축에 대해 ray가 평행
+                if (o < min[axis] || o > max[axis]) return false;
+            } else {
+                float t1 = (min[axis] - o) / d;
+                float t2 = (max[axis] - o) / d;
+
+                if (t1 > t2) std::swap(t1, t2);
+
+                tmin = std::max(tmin, t1);
+                tmax = std::min(tmax, t2);
+
+                if (tmin > tmax) return false;
+            }
+        }
+
+        hit.tmin = tmin;
+        hit.tmax = tmax;
+
+        return tmax >= 0.0f;
     }
 };
 static_assert(sizeof(AABB4) == 32);
@@ -2208,7 +2254,7 @@ struct BVH<BE, PR, BVHMODE::LINEAR, PRIMITIVE> {
         MetalGlobalContext::setBuffer(mortons, 3);
 
         MetalGlobalContext::dispatchThreads(fillMortonsPSO, numPrimitives);
-        MetalGlobalContext::commitAndWait();
+        //MetalGlobalContext::commitAndWait();
     }
     void build(int oid, VectorBase<METAL, PR>& pos, VectorBase<METAL, Index>& prim) {
         //std::cout << "[BVH Build] Memory allocated, BVH build start" << std::endl;
@@ -2257,22 +2303,14 @@ struct BVH<BE, PR, BVHMODE::LINEAR, PRIMITIVE> {
         // output: linear bvh tree
         //std::cout << "  - [Stage 4] Build tree" << std::endl;
         buildTreeGPU();
-        //MetalGlobalContext::commitAndWait();
+        MetalGlobalContext::commitAndWait();
 
         // set intermediate node's aabb
         //std::cout << "  - AABB combining for intermediate" << std::endl;
-        //auto combineAABB = [&](auto&& self, BVHNode& node) -> void {
-        //    if(node.childA < 0) return;
-        //    self(self, tree[node.childA]);
-        //    self(self, tree[node.childB]);
-        //    node.aabb.min = tree[node.childA].aabb.min;
-        //    node.aabb.max = tree[node.childA].aabb.max;
-        //    node.aabb.combine(tree[node.childB].aabb);
-        //};
-        //combineAABB(combineAABB, tree[0]);
-        bottomUpCombineGPU();
-        MetalGlobalContext::commitAndWait();
-    
+        bottomUpCombine();
+        //bottomUpCombineGPU();
+        //MetalGlobalContext::commitAndWait();
+
         //DynamicMemoryAllocator<METAL> tempPool;
         //VectorBase<METAL, uint> treeVisitCounts(tempPool.template zeros<uint>(numPrimitives - 1));
         //MetalGlobalContext::setBuffer(treeVisitCounts, 6);
@@ -2470,7 +2508,7 @@ struct BVH<BE, PR, BVHMODE::LINEAR, PRIMITIVE> {
         //std::cout << "  - Leaf constructing" << std::endl;
         for(Index i = 0; i < numberOfPrimitives; ++i) {
             tree[numberOfPrimitives+i-1] = BVHNode(mortons[i], positions, primitives);
-            tree[numberOfPrimitives+i-1].childA = -objid;
+            tree[numberOfPrimitives+i-1].childA = -1;
         }
 
         // construct intermediate
@@ -2563,14 +2601,15 @@ struct BVH<BE, PR, BVHMODE::LINEAR, PRIMITIVE> {
         if(c.numBroadCollisions[0] >= c.maxNumCollisions) return;
         
         if(node.childA < 0) { // leaf
-        Index fid = (Index)node.childB;
-        Index fbase = fid * 3;
-        Index f0 = primitives[fbase];
-        Index f1 = primitives[fbase + 1];
-        Index f2 = primitives[fbase + 2];
-        Index pid = (Index)queryBox.i0;
+            Index fid = (Index)node.childB;
+            Index fbase = fid * 3;
+            Index f0 = primitives[fbase];
+            Index f1 = primitives[fbase + 1];
+            Index f2 = primitives[fbase + 2];
+            Index pid = (Index)queryBox.i0;
 
-        if (pid == f0 || pid == f1 || pid == f2) return;
+            if (pid == f0 || pid == f1 || pid == f2) return;
+
             c.broadCollisions[c.numBroadCollisions[0]].indexPair = {(Index)queryBox.i0, (Index)node.childB}; // conversion is safe since it is leaf
             c.broadCollisions[c.numBroadCollisions[0]].objPair = {(Index)queryBox.i1, (Index)objid};
             c.numBroadCollisions[0]++;
@@ -2678,6 +2717,30 @@ struct BVH<BE, PR, BVHMODE::LINEAR, PRIMITIVE> {
         std::cout << "found\n";
         if(qFlag[0].stackOverflow) std::cout << "[QueryPoints] query stack overflowed\n";
         if(qFlag[0].collisionOverflow) std::cout << "[QueryPoints] collision buffer overflowed\n";
+    }
+
+
+    void queryClickRay(const Ray& ray, const BVHNode& node) {
+        RayHit hit;
+        if(! node.aabb.intersect(ray, hit)) return;
+        
+        if(node.childA < 0) { // found
+            auto& rayTracedData = Scene<BE, PR>::rayTracedData;
+            auto& rayTraced = rayTracedData.clickRayCollisions;
+            auto& numTraced = rayTracedData.numClickRayCollisions;
+            if(numTraced[0] >= rayTracedData.approxColsPerRay) return;
+            rayTraced[numTraced[0]] = {
+                (Index)objid, (Index)node.childB, hit.tmin, hit.tmax};
+            numTraced[0]++;
+        }
+
+        if(node.childA > 0) queryClickRay(ray, tree[node.childA]);
+        if(node.childB > 0) queryClickRay(ray, tree[node.childB]);
+    }
+
+    void queryClickRay(const Ray& ray) {
+        //std::cout << "Ray entered the tree " << objid << std::endl;
+        queryClickRay(ray, tree[0]);
     }
 
 
@@ -2880,6 +2943,15 @@ struct BVH<BE, PR, BVHMODE::SCENE, BVHPRIMITIVE::OBJECT> {
     void showBox() { for(auto& tree : objTrees) tree.showBox(); }
 
     void showSceneBox() { tree.showBox(); }
+
+
+    void queryClickRay(const Ray& ray) {
+        for(auto& objTree : objTrees) {
+            RayHit hit;
+            if(! objTree.tree[0].aabb.intersect(ray, hit)) continue;
+            objTree.queryClickRay(ray);
+        }
+    }
 };
 
 // TODO: later
@@ -3139,7 +3211,7 @@ template <typename BE, typename PR, typename System>
 struct Simulator {
     System& system;
 
-    Scene<BE, PR> sceneObjects;
+    Scene<BE, PR> scene;
 
     //using BroadPhase = BVH<BVHMODE::LINEAR, BVHPRIMITIVE::TRIANGLE, PR>;
     using BroadPhase = BVH<BE, PR, BVHMODE::SCENE, BVHPRIMITIVE::OBJECT>;
@@ -3159,11 +3231,15 @@ struct Simulator {
     PR radius = 0.012;
 
 
+    // object select
+    Index selectedObj = -1;
+
+
 
     Simulator(System& system) : system(system) {}
 
     void addClothFile(std::string prefix, std::string fileName, tinym::vec3 offset, PR scale, PR kstretch=1e5, PR kshear=1e5, PR kbend=3e5, PR thickness=0.001, PR mass=0.1) {
-        sceneObjects.addGeneralMesh(
+        scene.addGeneralMesh(
                 new MeshFileInitializer<BE, PR>({prefix, fileName, offset, scale, mass}),
                 BehaviorType::TriangularCloth,
                 ClothBehaviorParams<PR>{kstretch, kshear, kbend, thickness}
@@ -3171,7 +3247,7 @@ struct Simulator {
     };
 
     void addFloatMesh(std::string prefix, std::string fileName, tinym::vec3 offset, PR scale, PR mass=0.1) {
-        sceneObjects.addGeneralMesh(
+        scene.addGeneralMesh(
                 new MeshFileInitializer<BE, PR>({prefix, fileName, offset, scale, mass}),
                 BehaviorType::Float,
                 FloatBehaviorParams<PR>{}
@@ -3180,7 +3256,7 @@ struct Simulator {
     void addClothGridFast(Index particleNum1D = 200, PR size1D = 100, PR kstretch=1e5, PR kshear=1e5, PR kbend=3e5, PR thickness=0.001, PR mass=0.1) {
         //particleNum1D(particleNum1D), particleNum2D(particleNum1D*particleNum1D), particleDataNum(particleNum2D*3),{
         //size1D(size1D), stretchRestLength(size1D/PR(particleNum1D-1)), shearRestLength(stretchRestLength*std::sqrt(2)), bendRestLength(stretchRestLength*2) 
-        sceneObjects.addGeneralMesh(
+        scene.addGeneralMesh(
             new MeshGridInitializer<BE, PR>({
                 PlaneDirection::XYPlane,
                 tinym::vec3(0),
@@ -3204,7 +3280,7 @@ struct Simulator {
     }
 
     void addCloth(Index particleNum1D, PR size1D, tinym::vec3 center, PR kstretch=1e5, PR kshear=1e5, PR kbend=3e5, PR thickness=0.01, PR mass=0.1) {
-        sceneObjects.addGeneralMesh(
+        scene.addGeneralMesh(
             new MeshGridInitializer<BE, PR>({
                 PlaneDirection::XZPlane, 
                 center,
@@ -3218,7 +3294,7 @@ struct Simulator {
         );
     };
     void addGround(PlaneDirection dir, tinym::vec3 center, PR size1D, PR mass=0.1) {
-        sceneObjects.addGeneralMesh(
+        scene.addGeneralMesh(
             new MeshGridInitializer<BE, PR>({
                 dir, 
                 center, 
@@ -3234,7 +3310,7 @@ struct Simulator {
 
     void memoryAllocation() {
         //for(auto& plane : sceneObjects.planes) plane.memoryAllocation(pool);
-        for(auto& mesh : sceneObjects.meshes) mesh.memoryAllocation();
+        for(auto& mesh : scene.meshes) mesh.memoryAllocation();
     }
 
 
@@ -3243,6 +3319,7 @@ struct Simulator {
         std::cout << "[Simulator Init] Memory pool allocated" << std::endl;
 
         Scene<BE, PR>::pack();
+        collisionPipeline.broadPhase.build(scene);
 
         //Scene<BE, PR>::initialize();
 
@@ -3261,9 +3338,9 @@ struct Simulator {
         if(frame % 10 == 0) {
             if (profiler) {
                 auto scope = profiler->scoped("bvh_build");
-                collisionPipeline.broadPhase.build(sceneObjects);
+                collisionPipeline.broadPhase.build(scene);
             } else {
-                collisionPipeline.broadPhase.build(sceneObjects);
+                collisionPipeline.broadPhase.build(scene);
             }
         }
 
@@ -3293,27 +3370,6 @@ struct Simulator {
                     collisionPipeline.broadPhase.detectCollisions(margin, enableSelfCollisions);
                 }
 
-                //for(auto& mesh : Scene<BE, PR>::meshes) {
-                //    if(mesh.behaviorType == BehaviorType::Float) continue;
-                //    auto& c = mesh.constraints;
-
-                //    if (profiler) {
-                //        auto scope = profiler->scoped("narrow_phase");
-                //        collisionPipeline.narrowPhase.narrowAndSortByVerticesCPU(
-                //                c.broadCollisions,
-                //                c.numBroadCollisions[0],
-                //                mesh.adjacency,
-                //                c,
-                //                radius);
-                //    } else {
-                //        collisionPipeline.narrowPhase.narrowAndSortByVerticesCPU(
-                //                c.broadCollisions,
-                //                c.numBroadCollisions[0],
-                //                mesh.adjacency,
-                //                c,
-                //                radius);
-                //    }
-                //}
                 if (profiler) {
                     auto scope = profiler->scoped("narrow_phase");
                     collisionPipeline.narrowPhase.narrowAndSortByVertices(radius);
@@ -3321,67 +3377,13 @@ struct Simulator {
                     collisionPipeline.narrowPhase.narrowAndSortByVertices(radius);
                 }
 
-                //auto* mesh = Scene<BE, PR>::findById(0);
-                //auto& c = mesh->constraints;
-                //if(c.numBroadCollisions[0] > 0) {
-                //    std::cout << "Collision detected: (frame,substep)=" << frame << "," << i << " (" << c.numBroadCollisions[0] << "/" << c.maxNumCollisions << ")\n";
-                //    //for(Index i = 0; i < 5; ++i) {
-                //    //    std::cout << "  - Collision " << i << ": point " 
-                //    //        << c.broadCollisions[i].indexPair.point
-                //    //        << " and triangle "
-                //    //        << c.broadCollisions[i].indexPair.triangle << std::endl;
-                //    //}
-                //} 
-                //else std::cout << "No broad collisions\n";
-
-
-
-                //if(c.numNarrowCollisions[0] > 0) {
-                //    std::cout << "Narrowed collision detected: (frame,substep)=" << frame << "," << i << " (" << c.numNarrowCollisions[0] << "/" << c.maxNumCollisions << ")\n";
-                //    //Index min = 5 < c.numNarrowCollisions ? 5 : c.numNarrowCollisions;
-                //    //for(Index i = 0; i < min; ++i) {
-                //    //    std::cout << "  - Collision " << i << ": point " 
-                //    //        << c.narrowCollisions[i].indexPair.point
-                //    //        << " and triangle "
-                //    //        << c.narrowCollisions[i].indexPair.triangle 
-                //    //        << " and normal " 
-                //    //        << '(' << c.narrowCollisions[i].collisionNormalAndDistance.x 
-                //    //        << ", " << c.narrowCollisions[i].collisionNormalAndDistance.y 
-                //    //        << ", " << c.narrowCollisions[i].collisionNormalAndDistance.z << ')'
-                //    //        << " and distance " 
-                //    //        << c.narrowCollisions[i].collisionNormalAndDistance.w
-                //    //        << std::endl;
-                //    //}
-                //    //std::cout << "Narrowed self collision sorted: (" << c.numNarrowCollisions << "/" << c.maxNumCollisions << ")\n";
-                //    //Index count = 0;
-                //    //for(Index i = 0; i < c.vertexColPrimsOffsets.size-1; ++i) {
-                //    //    if(count >= min) break;
-                //    //    if(c.vertexColPrimsOffsets[i] == c.vertexColPrimsOffsets[i+1]) continue;
-                //    //    for(Index j = c.vertexColPrimsOffsets[i]; j < c.vertexColPrimsOffsets[i+1]; ++j) {
-                //    //        if(count >= min) break;
-                //    //        std::cout << "  - Collision " << j << ": point " 
-                //    //            << c.vertexColPrims[j].indexPair.point
-                //    //            << " and triangle "
-                //    //            << c.vertexColPrims[j].indexPair.triangle 
-                //    //            << " and normal " 
-                //    //            << '(' << c.vertexColPrims[j].collisionNormalAndDistance.x 
-                //    //            << ", " << c.vertexColPrims[j].collisionNormalAndDistance.y 
-                //    //            << ", " << c.vertexColPrims[j].collisionNormalAndDistance.z << ')'
-                //    //            << " and distance " 
-                //    //            << c.vertexColPrims[j].collisionNormalAndDistㅅance.w
-                //    //            << std::endl;
-                //    //        count++;
-                //    //    }
-                //    //}
-                //}
-                //else std::cout << "No narrow collision\n";
             }
 
             if (profiler) {
                 auto scope = profiler->scoped("system_update");
-                system.update(sceneObjects);
+                system.update(scene);
             } else {
-                system.update(sceneObjects);
+                system.update(scene);
             }
         }
 
@@ -3399,10 +3401,10 @@ struct Simulator {
 
         if (profiler) {
             auto scope = profiler->scoped("mesh_upload");
-            for(auto& mesh : sceneObjects.meshes)
+            for(auto& mesh : scene.meshes)
                 mesh.meshGL.updateBuffer(mesh.state.x.ptr);
         } else {
-            for(auto& mesh : sceneObjects.meshes)
+            for(auto& mesh : scene.meshes)
                 mesh.meshGL.updateBuffer(mesh.state.x.ptr);
         }
 
@@ -3413,13 +3415,27 @@ struct Simulator {
     void draw() {
         //system.draw();
 
-        for(auto& mesh : sceneObjects.meshes) mesh.meshGL.draw();
+        for(auto& mesh : scene.meshes) mesh.meshGL.draw();
+
+        if(selectedObj >= 0) {
+            
+        }
     }
 
-    void debugEachBoxes() {
+    void debugEachBoxes(tinym::mat4& V, tinym::mat4& P) {
+        if(! debugLineShader.programID) debugLineShader.loadShader("line.vert", "line.frag");
+        debugLineShader.use();
+        debugLineShader.setUniform("V", V);
+        debugLineShader.setUniform("P", P);
+        glLineWidth(2.5f);
         collisionPipeline.broadPhase.showBox();
     }
-    void debugSceneBox() {
+    void debugSceneBox(tinym::mat4& V, tinym::mat4& P) {
+        if(! debugLineShader.programID) debugLineShader.loadShader("line.vert", "line.frag");
+        debugLineShader.use();
+        debugLineShader.setUniform("V", V);
+        debugLineShader.setUniform("P", P);
+        glLineWidth(2.5f);
         collisionPipeline.broadPhase.showSceneBox();
     }
 
@@ -3485,10 +3501,36 @@ struct Simulator {
             debugObjCollisions.draw();
     }
 
-    void debugCollisions() {
+    void debugCollisions(tinym::mat4& V, tinym::mat4& P) {
+        if(! debugLineShader.programID) debugLineShader.loadShader("line.vert", "line.frag");
+
+        debugLineShader.use();
+        debugLineShader.setUniform("V", V);
+        debugLineShader.setUniform("P", P);
+        glLineWidth(2.5f);
         prepareDebugCollisions();
         showSelfCollisions();
         showObjCollisions();
+    }
+
+    Program debugLineShader;
+    DebugLineGL<CPU> debugLineGL;
+    std::vector<tinym::vec3> debugLines;
+    void clearDebugLines() { debugLines.clear(); }
+    void addDebugLines(tinym::vec3& a, tinym::vec3& b) {
+        debugLines.push_back(a);
+        debugLines.push_back(b);
+    }
+    void showDebugLines(tinym::mat4& V, tinym::mat4& P) {
+        if(! debugLineShader.programID) debugLineShader.loadShader("line.vert", "line.frag");
+        if(! debugLineGL.vao) debugLineGL = DebugLineGL<CPU>(debugLines.size(), (float*)debugLines.data());
+        else debugLineGL.updateBuffer((float*)debugLines.data(), debugLines.size());
+
+        debugLineShader.use();
+        debugLineShader.setUniform("V", V);
+        debugLineShader.setUniform("P", P);
+        glLineWidth(2.5f);
+        debugLineGL.draw();
     }
 };
 
@@ -3765,7 +3807,7 @@ int main() {
     std::cout << "Run simulator" << std::endl;
 
     //window = new YGLWindow(640, 480, "ysim");
-    window = new YGLWindow(1600, 900, "ysim");
+    yglwindow = new YGLWindow(1600, 900, "ysim");
 
 
     // Add Ground
@@ -3809,7 +3851,7 @@ int main() {
     //simulator.addFloatMesh("src/assets", "horse-gallop-01.obj", {0, -1, 0}, 1.2);
     simulator.addFloatMesh("src/assets", "camel-gallop-reference.obj", {0, -1, 0}, 1.2);
     simulator.addGround(PlaneDirection::XZPlane, tinym::vec3(0, -1, 0), 5);
-    
+
     std::cout << "[Main] mesh added to scene" << std::endl;
 
     simulator.initialize();
@@ -3834,8 +3876,6 @@ int main() {
     Program shader;
     shader.loadShader("shader.vert", "shader.geom", "shader.frag");
 
-    Program debugLineShader;
-    debugLineShader.loadShader("line.vert", "line.frag");
 
     bool debugEachBoxes = false;
     bool debugSceneBox = false;
@@ -3853,7 +3893,7 @@ int main() {
     ImGui::StyleColorsDark();
     ImGuiIO& io = ImGui::GetIO();
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
-    ImGui_ImplGlfw_InitForOpenGL(window->getGLFWWindow(), false);
+    ImGui_ImplGlfw_InitForOpenGL(yglwindow->getGLFWWindow(), false);
 #ifdef __APPLE__
     ImGui_ImplOpenGL3_Init("#version 410");
 #else
@@ -3870,20 +3910,60 @@ int main() {
     CallbacksDataPack pack = {&simulator, &debugEachBoxes, &debugSceneBox, &debugCollisions, &frameProfiler};
 
     //glfwSetWindowUserPointer(window->getGLFWWindow(), &system);
-    glfwSetWindowUserPointer(window->getGLFWWindow(), &(pack));
+    glfwSetWindowUserPointer(yglwindow->getGLFWWindow(), &(pack));
 
     auto cursorCallback = [](GLFWwindow* window, double xpos, double ypos) {
         ImGui_ImplGlfw_CursorPosCallback(window, xpos, ypos);
         if (ImGui::GetIO().WantCaptureMouse) return;
-        cursorPosCallback(window, xpos, ypos);
+        YGL::cursorPosCallback(window, xpos, ypos);
     };
     auto scrollCallbackWrapped = [](GLFWwindow* window, double xoffset, double yoffset) {
         ImGui_ImplGlfw_ScrollCallback(window, xoffset, yoffset);
         if (ImGui::GetIO().WantCaptureMouse) return;
-        scrollCallback(window, xoffset, yoffset);
+        YGL::scrollCallback(window, xoffset, yoffset);
     };
     auto mouseButtonCallback = [](GLFWwindow* window, int button, int action, int mods) {
         ImGui_ImplGlfw_MouseButtonCallback(window, button, action, mods);
+        if (ImGui::GetIO().WantCaptureMouse) return;
+        if(button == GLFW_MOUSE_BUTTON_LEFT && action == GLFW_PRESS) {
+            auto* pack = static_cast<CallbacksDataPack*>(glfwGetWindowUserPointer(window));
+            auto* simulator = pack->simulator;
+
+            // pixel position에서 model space로 변환
+            // ray를 bvh에 태워서 체크 (별도의 ray 객체 생성 후 intersection test)
+            double x, y;
+            glfwGetCursorPos(window, &x, &y);
+            tinym::vec3 npp = camera.unProjectPerspective(window, x, y, -1);
+            tinym::vec3 fpp = camera.unProjectPerspective(window, x, y,  1);
+            //std::cout << npp << " to " << fpp << std::endl;
+
+            Ray ray;
+            ray.origin = npp;
+            ray.dir = (fpp-npp).normalize();
+
+            simulator->clearDebugLines();
+            simulator->addDebugLines(ray.origin, fpp);
+
+            simulator->scene.rayTracedData.numClickRayCollisions[0] = 0;
+            simulator->collisionPipeline.broadPhase.queryClickRay(ray);
+
+            
+            Index numRayCols = simulator->scene.rayTracedData.numClickRayCollisions[0];
+            if(numRayCols == 0) {
+                simulator->selectedObj = -1;
+                return;
+            }
+            auto& rayCols = simulator->scene.rayTracedData.clickRayCollisions;
+
+            Index closestObj = rayCols[0].obj;
+            float tmin = rayCols[0].tmin;
+            for(int i = 1; i < numRayCols; ++i) if(rayCols[i].tmin < tmin) {
+                closestObj = rayCols[i].obj;
+                tmin = rayCols[i].tmin;
+            }
+            simulator->selectedObj = closestObj;
+            std::cout << "ClosestObj: " << closestObj << std::endl;
+        }
     };
     auto charCallback = [](GLFWwindow* window, unsigned int c) {
         ImGui_ImplGlfw_CharCallback(window, c);
@@ -3902,11 +3982,11 @@ int main() {
             simulator->initialize();
         } else if(key == GLFW_KEY_9 && action == GLFW_PRESS) {
         } else if(key == GLFW_KEY_1 && action == GLFW_PRESS) {
-            if(simulator->sceneObjects.meshes.size() > 0)
-                simulator->sceneObjects.meshes[0].constraints.fixedParticles[0] = !((bool)simulator->sceneObjects.meshes[0].constraints.fixedParticles[0]);
+            if(simulator->scene.meshes.size() > 0)
+                simulator->scene.meshes[0].constraints.fixedParticles[0] = !((bool)simulator->scene.meshes[0].constraints.fixedParticles[0]);
         } else if(key == GLFW_KEY_2 && action == GLFW_PRESS) {
-            if(simulator->sceneObjects.meshes.size() > 0)
-                simulator->sceneObjects.meshes[0].constraints.fixedParticles[200-1] = !((bool)simulator->sceneObjects.meshes[0].constraints.fixedParticles[200-1]);
+            if(simulator->scene.meshes.size() > 0)
+                simulator->scene.meshes[0].constraints.fixedParticles[200-1] = !((bool)simulator->scene.meshes[0].constraints.fixedParticles[200-1]);
         } else if(key == GLFW_KEY_SPACE && action == GLFW_PRESS) {
             simulator->pause = !(simulator->pause);
         } else if(key == GLFW_KEY_B && action == GLFW_PRESS) {
@@ -3916,13 +3996,12 @@ int main() {
         } else if(key == GLFW_KEY_C && action == GLFW_PRESS) {
             *debugCollisions = !(*debugCollisions);
         }
-
     };
-    glfwSetCursorPosCallback(window->getGLFWWindow(), cursorCallback);
-    glfwSetScrollCallback(window->getGLFWWindow(), scrollCallbackWrapped);
-    glfwSetMouseButtonCallback(window->getGLFWWindow(), mouseButtonCallback);
-    glfwSetCharCallback(window->getGLFWWindow(), charCallback);
-    glfwSetKeyCallback(window->getGLFWWindow(), keyCallback);
+    glfwSetCursorPosCallback(yglwindow->getGLFWWindow(), cursorCallback);
+    glfwSetScrollCallback(yglwindow->getGLFWWindow(), scrollCallbackWrapped);
+    glfwSetMouseButtonCallback(yglwindow->getGLFWWindow(), mouseButtonCallback);
+    glfwSetCharCallback(yglwindow->getGLFWWindow(), charCallback);
+    glfwSetKeyCallback(yglwindow->getGLFWWindow(), keyCallback);
 
     std::cout << "[Main] callbacks are set" << std::endl;
 
@@ -3953,7 +4032,7 @@ int main() {
             auto scope = frameProfiler.scoped("render_total");
 
             shader.use();
-            glViewport(0, 0, window->width(), window->height());
+            glViewport(0, 0, yglwindow->width(), yglwindow->height());
             glClearColor(0, 0, 0, 0);
             glEnable(GL_DEPTH_TEST);
             glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
@@ -3962,10 +4041,10 @@ int main() {
             tinym::mat4 V = camera.lookAt();
             shader.setUniform("M", M);
             shader.setUniform("V", V);
-            tinym::mat4 P = camera.perspective(window->aspect(), 0.1f, 1000.f);
+            tinym::mat4 P = camera.perspective(yglwindow->aspect(), 0.1f, 1000.f);
             shader.setUniform("P", P);
-            auto w = window->width()/2;
-            auto h = window->height()/2;
+            auto w = yglwindow->width()/2;
+            auto h = yglwindow->height()/2;
             tinym::mat4 viewport = tinym::mat4(
                     tinym::vec4(w,0.0f,0.0f,0.0f),
                     tinym::vec4(0.0f,h,0.0f,0.0f),
@@ -3981,31 +4060,19 @@ int main() {
             {
                 auto debugScope = frameProfiler.scoped("debug_draw");
                 if(debugEachBoxes) {
-                    debugLineShader.use();
-                    debugLineShader.setUniform("V", V);
-                    debugLineShader.setUniform("P", P);
-                    glLineWidth(2.5f);
-                    simulator.debugEachBoxes();
+                    simulator.debugEachBoxes(V, P);
                 }
                 if(debugSceneBox) {
-                    debugLineShader.use();
-                    debugLineShader.setUniform("V", V);
-                    debugLineShader.setUniform("P", P);
-                    glLineWidth(2.5f);
-                    simulator.debugSceneBox();
+                    simulator.debugSceneBox(V, P);
                 }
 
                 if(debugCollisions) {
-                    debugLineShader.use();
-                    debugLineShader.setUniform("V", V);
-                    debugLineShader.setUniform("P", P);
-                    glLineWidth(2.5f);
-                    simulator.debugCollisions();
+                    simulator.debugCollisions(V, P);
                 }
             }
         } else {
             shader.use();
-            glViewport(0, 0, window->width(), window->height());
+            glViewport(0, 0, yglwindow->width(), yglwindow->height());
             glClearColor(0, 0, 0, 0);
             glEnable(GL_DEPTH_TEST);
             glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
@@ -4014,10 +4081,10 @@ int main() {
             tinym::mat4 V = camera.lookAt();
             shader.setUniform("M", M);
             shader.setUniform("V", V);
-            tinym::mat4 P = camera.perspective(window->aspect(), 0.1f, 1000.f);
+            tinym::mat4 P = camera.perspective(yglwindow->aspect(), 0.1f, 1000.f);
             shader.setUniform("P", P);
-            auto w = window->width()/2;
-            auto h = window->height()/2;
+            auto w = yglwindow->width()/2;
+            auto h = yglwindow->height()/2;
             tinym::mat4 viewport = tinym::mat4(
                     tinym::vec4(w,0.0f,0.0f,0.0f),
                     tinym::vec4(0.0f,h,0.0f,0.0f),
@@ -4028,27 +4095,16 @@ int main() {
             simulator.draw();
 
             if(debugEachBoxes) {
-                debugLineShader.use();
-                debugLineShader.setUniform("V", V);
-                debugLineShader.setUniform("P", P);
-                glLineWidth(2.5f);
-                simulator.debugEachBoxes();
+                simulator.debugEachBoxes(V, P);
             }
             if(debugSceneBox) {
-                debugLineShader.use();
-                debugLineShader.setUniform("V", V);
-                debugLineShader.setUniform("P", P);
-                glLineWidth(2.5f);
-                simulator.debugSceneBox();
+                simulator.debugSceneBox(V, P);
             }
 
             if(debugCollisions) {
-                debugLineShader.use();
-                debugLineShader.setUniform("V", V);
-                debugLineShader.setUniform("P", P);
-                glLineWidth(2.5f);
-                simulator.debugCollisions();
+                simulator.debugCollisions(V, P);
             }
+            simulator.showDebugLines(V, P);
         }
 
         if (collectProfileFrame) {
@@ -4089,12 +4145,12 @@ int main() {
                 latest->fps,
                 latest->frame_ms
             );
-            glfwSetWindowTitle(window->getGLFWWindow(), title);
+            glfwSetWindowTitle(yglwindow->getGLFWWindow(), title);
         }
     };
 
 
-    window->mainLoop(init, render);
+    yglwindow->mainLoop(init, render);
 
     ImGui_ImplOpenGL3_Shutdown();
     ImGui_ImplGlfw_Shutdown();
