@@ -44,7 +44,8 @@ void drawProfilerWindow(
     bool* pause,
     bool* debug_each_boxes,
     bool* debug_scene_box,
-    bool* debug_collisions
+    bool* debug_collisions,
+    bool* mesh_inspector_open
 );
 
 } // namespace profiler

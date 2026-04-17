@@ -29,7 +29,8 @@ void drawProfilerWindow(
     bool* pause,
     bool* debug_each_boxes,
     bool* debug_scene_box,
-    bool* debug_collisions
+    bool* debug_collisions,
+    bool* mesh_inspector_open
 ) {
     if (!state.open) return;
 
@@ -61,6 +62,7 @@ void drawProfilerWindow(
     if (debug_each_boxes) ImGui::Checkbox("Debug Each Boxes", debug_each_boxes);
     if (debug_scene_box) ImGui::Checkbox("Debug Scene Box", debug_scene_box);
     if (debug_collisions) ImGui::Checkbox("Debug Collisions", debug_collisions);
+    if (mesh_inspector_open) ImGui::Checkbox("Mesh Inspector", mesh_inspector_open);
 
     ImGui::Separator();
 

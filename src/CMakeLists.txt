@@ -3,6 +3,7 @@ add_executable(ysim
     main.cpp
     metal_impl.cpp
     profiler_gui.cpp
+    mesh_inspector_gui.cpp
     ${CMAKE_SOURCE_DIR}/third_party/imgui/imgui.cpp
     ${CMAKE_SOURCE_DIR}/third_party/imgui/imgui_draw.cpp
     ${CMAKE_SOURCE_DIR}/third_party/imgui/imgui_tables.cpp
@@ -82,5 +83,4 @@ add_custom_command(TARGET ysim POST_BUILD
             ${CMAKE_SOURCE_DIR}/assets
             $<TARGET_FILE_DIR:ysim>/assets
 )
-
 

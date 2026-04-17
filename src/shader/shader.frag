@@ -8,8 +8,8 @@ out vec4 FragColor;
 
 uniform vec3 lightPosition = vec3(50, 50, 30);
 uniform mat4 V;
-uniform vec3 lightColor = vec3(160, 0, 0);
-uniform vec3 diffuseColor = vec3(10, 0, 0);
+uniform vec3 lightColor = vec3(160, 160, 160);
+uniform vec3 diffuseColor = vec3(1.0);
 uniform vec3 specularColor = vec3(0.3);
 uniform float shininess = 2.f;
 
@@ -49,4 +49,3 @@ void main() {
     float mixVal = smoothstep( LineWidth - 1, LineWidth + 1, d);
     FragColor = mix( LineColor, FragColor, mixVal );
 }
-

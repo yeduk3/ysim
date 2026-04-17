@@ -5,6 +5,7 @@
 #include "YGLWindow.hpp"
 #include "camera.hpp"
 #include "FrameProfiler.hpp"
+#include "MeshInspectorWindow.hpp"
 #include "ProfilerWindow.hpp"
 #include "program.hpp"
 #include "objreader.hpp"
@@ -680,7 +681,8 @@ struct MeshGL<CPU> {
         glBufferSubData(GL_ARRAY_BUFFER, 0, vertexNum * sizeof(float) * 3, normalPtr);
     }
 
-    void draw() {
+    void draw(Program& shader, const tinym::vec3& baseColor) {
+        shader.setUniform("diffuseColor", baseColor);
         glBindVertexArray(vao);
         glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, facetBuffer);
 
@@ -1303,6 +1305,27 @@ enum struct ShapeType : Index {
     Plane,
 };
 
+const char* behaviorTypeName(BehaviorType behaviorType) {
+    switch (behaviorType) {
+        case BehaviorType::TriangularCloth: return "TriangularCloth";
+        case BehaviorType::FastGridCloth: return "FastGridCloth";
+        case BehaviorType::Elastic: return "Elastic";
+        case BehaviorType::Rigid: return "Rigid";
+        case BehaviorType::Float: return "Float";
+        case BehaviorType::Fluid: return "Fluid";
+        case BehaviorType::Generator: return "Generator";
+        default: return "Unknown";
+    }
+}
+
+const char* shapeTypeName(ShapeType shapeType) {
+    switch (shapeType) {
+        case ShapeType::Mesh: return "Mesh";
+        case ShapeType::Plane: return "Plane";
+        default: return "Unknown";
+    }
+}
+
 struct alignas(32) BroadCollision {
     IndexPair indexPair;
     IndexPair objPair;
@@ -1496,7 +1519,9 @@ struct FastGridClothBehavior<METAL, PR> {
     }
 };
 
-struct Material {};
+struct Material {
+    tinym::vec3 baseColor = tinym::vec3(1.0f);
+};
 
 
 
@@ -3232,7 +3257,7 @@ struct Simulator {
 
 
     // object select
-    Index selectedObj = -1;
+    int selectedObj = -1;
 
 
 
@@ -3412,13 +3437,13 @@ struct Simulator {
         //std::cout << "[Simulator Update] Finished update" << std::endl;
     }
     
-    void draw() {
+    void draw(Program& shader) {
         //system.draw();
 
-        for(auto& mesh : scene.meshes) mesh.meshGL.draw();
+        for(auto& mesh : scene.meshes) mesh.meshGL.draw(shader, mesh.material.baseColor);
 
         if(selectedObj >= 0) {
-            
+            // Reserved for a future selected-mesh overlay pass.
         }
     }
 
@@ -3882,6 +3907,7 @@ int main() {
     bool debugCollisions = true;
     profiler::FrameProfiler frameProfiler(360);
     profiler::ProfilerWindowState profilerWindowState;
+    mesh_inspector::MeshInspectorWindowState meshInspectorWindowState;
 
     std::cout << "[Main] programs are loaded" << std::endl;
 
@@ -4017,6 +4043,17 @@ int main() {
             frameProfiler.beginFrame(simulator.frame, currentTime);
         }
 
+        auto buildSelectedMeshTarget = [&]() {
+            mesh_inspector::MeshInspectorTarget target;
+            if (auto* selectedMesh = Scene<Backend, Precision>::findById(simulator.selectedObj)) {
+                target.mesh_id = selectedMesh->id;
+                target.behavior_label = behaviorTypeName(selectedMesh->behaviorType);
+                target.shape_label = shapeTypeName(selectedMesh->shapeType);
+                target.base_color = &selectedMesh->material.baseColor;
+            }
+            return target;
+        };
+
         ImGui_ImplOpenGL3_NewFrame();
         ImGui_ImplGlfw_NewFrame();
         ImGui::NewFrame();
@@ -4051,10 +4088,11 @@ int main() {
                     tinym::vec4(0.0f,0.0f,1.0f,0.0f),
                     tinym::vec4(w+0, h+0, 0.0f, 1.0f));
             shader.setUniform("ViewportMatrix", viewport);
+            shader.setUniform("lightColor", tinym::vec3(160.0f));
 
             {
                 auto drawScope = frameProfiler.scoped("scene_draw");
-                simulator.draw();
+                simulator.draw(shader);
             }
 
             {
@@ -4091,8 +4129,9 @@ int main() {
                     tinym::vec4(0.0f,0.0f,1.0f,0.0f),
                     tinym::vec4(w+0, h+0, 0.0f, 1.0f));
             shader.setUniform("ViewportMatrix", viewport);
+            shader.setUniform("lightColor", tinym::vec3(160.0f));
 
-            simulator.draw();
+            simulator.draw(shader);
 
             if(debugEachBoxes) {
                 simulator.debugEachBoxes(V, P);
@@ -4115,8 +4154,10 @@ int main() {
                 &simulator.pause,
                 &debugEachBoxes,
                 &debugSceneBox,
-                &debugCollisions
+                &debugCollisions,
+                &meshInspectorWindowState.open
             );
+            mesh_inspector::drawMeshInspectorWindow(meshInspectorWindowState, buildSelectedMeshTarget());
             ImGui::Render();
             ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
         } else {
@@ -4126,8 +4167,10 @@ int main() {
                 &simulator.pause,
                 &debugEachBoxes,
                 &debugSceneBox,
-                &debugCollisions
+                &debugCollisions,
+                &meshInspectorWindowState.open
             );
+            mesh_inspector::drawMeshInspectorWindow(meshInspectorWindowState, buildSelectedMeshTarget());
             ImGui::Render();
             ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
         }
