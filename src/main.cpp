@@ -15,6 +15,7 @@
 #include "imgui_impl_opengl3.h"
 
 #include <cstddef>
+#include <cmath>
 #include <iostream>
 #include <iterator>
 #include <ratio>
@@ -39,6 +40,7 @@ struct METAL : Backend {};
 #include <algorithm>
 #include <chrono>
 #include <cstring>
+#include <memory>
 #include <unordered_map>
 #include <vector>
 #include <iostream>
@@ -84,13 +86,13 @@ struct ByteMemoryPool<CPU> {
     template <typename PR>
     MemoryBlock<CPU, PR> zeros(size_t count) {
         auto ret = alloc<PR>(count);
-        memset(ret.ptr, 0, count*sizeof(PR));
+        if (ret.ptr) memset(ret.ptr, 0, count*sizeof(PR));
         return ret;
     }
     template <typename PR>
     MemoryBlock<CPU, PR> allocFill(size_t count, PR fill) {
         auto ret = alloc<PR>(count);
-        std::fill(ret.ptr, ret.ptr+count, fill);
+        if (ret.ptr) std::fill(ret.ptr, ret.ptr+count, fill);
         return ret;
     }
 
@@ -296,13 +298,13 @@ struct ByteMemoryPool<METAL> {
     template <typename PR>
     MemoryBlock<METAL, PR> zeros(size_t count) {
         auto ret = alloc<PR>(count);
-        memset(ret.ptr, 0, count*sizeof(PR));
+        if (ret.ptr) memset(ret.ptr, 0, count*sizeof(PR));
         return ret;
     }
     template <typename PR>
     MemoryBlock<METAL, PR> allocFill(size_t count, PR fill) {
         auto ret = alloc<PR>(count);
-        std::fill(ret.ptr, ret.ptr+count, fill);
+        if (ret.ptr) std::fill(ret.ptr, ret.ptr+count, fill);
         return ret;
     }
 
@@ -401,6 +403,9 @@ struct DynamicByteMemoryPool {
 
     ByteMemoryPool<BE> pack() {
         size_t totalBytes = totalUsedBytes();
+        if (totalBytes == 0) {
+            return ByteMemoryPool<BE>();
+        }
         ByteMemoryPool<BE> ret(totalBytes);
 
         char* dst = ret.bytePtr();
@@ -417,7 +422,10 @@ struct DynamicByteMemoryPool {
         ret.marker = totalBytes;
         return ret;
     }
-    void clear() { poolList.clear(); }
+    void clear() {
+        poolList.clear();
+        poolList.shrink_to_fit();
+    }
 };
 
 template <typename BE>
@@ -434,6 +442,8 @@ struct DynamicMemoryAllocator {
     template <typename PR>
     auto allocFill(size_t count, PR fill) { return pool.template allocFill<PR>(count, fill); }
 
+    void clear() { pool.clear(); }
+
     // TODO: Pack complete
     ByteMemoryPool<BE> pack() {
         return pool.pack();
@@ -449,6 +459,11 @@ struct GlobalAutoAllocator {
         if(globalInitialized) return;
         globalPool = DynamicMemoryAllocator<BE>(N); 
         globalInitialized = true;
+    }
+
+    static void reset() {
+        if (!globalInitialized) return;
+        globalPool.clear();
     }
 
     template <typename PR>
@@ -526,6 +541,13 @@ struct VectorBase<METAL, PR> {
     }
     VectorBase(const MemoryBlock<METAL, PR>& block) : pool(block.pool), offset(block.offset), ptr(block.ptr), size(block.size) {}
     VectorBase(const VectorBase<METAL, PR>& v, size_t start, size_t size) {
+        if (!v.ptr || size == 0) {
+            this->pool = nullptr;
+            this->offset = 0;
+            this->ptr = nullptr;
+            this->size = 0;
+            return;
+        }
         this->pool = v.pool;
         this->offset = v.offset + start*sizeof(PR);
         this->ptr = v.ptr + start;
@@ -591,7 +613,77 @@ struct MeshGL<CPU> {
     unsigned int* facetPtr;
     float* normalPtr;
 
-    MeshGL() {}
+    MeshGL()
+        : vao(0),
+          vertexBuffer(0),
+          normalBuffer(0),
+          facetBuffer(0),
+          texCoordBuffer(0),
+          vertexNum(0),
+          facetNum(0),
+          vertexPtr(nullptr),
+          facetPtr(nullptr),
+          normalPtr(nullptr) {}
+
+    MeshGL(const MeshGL&) = delete;
+    MeshGL& operator=(const MeshGL&) = delete;
+
+    MeshGL(MeshGL&& other) noexcept
+        : MeshGL() {
+        *this = std::move(other);
+    }
+
+    MeshGL& operator=(MeshGL&& other) noexcept {
+        if (this == &other) return *this;
+
+        release();
+
+        vao = other.vao;
+        vertexBuffer = other.vertexBuffer;
+        normalBuffer = other.normalBuffer;
+        facetBuffer = other.facetBuffer;
+        texCoordBuffer = other.texCoordBuffer;
+        vertexNum = other.vertexNum;
+        facetNum = other.facetNum;
+        vertexPtr = other.vertexPtr;
+        facetPtr = other.facetPtr;
+        normalPtr = other.normalPtr;
+
+        other.vao = 0;
+        other.vertexBuffer = 0;
+        other.normalBuffer = 0;
+        other.facetBuffer = 0;
+        other.texCoordBuffer = 0;
+        other.vertexNum = 0;
+        other.facetNum = 0;
+        other.vertexPtr = nullptr;
+        other.facetPtr = nullptr;
+        other.normalPtr = nullptr;
+
+        return *this;
+    }
+
+    ~MeshGL() { release(); }
+
+    void release() {
+        if (texCoordBuffer) glDeleteBuffers(1, &texCoordBuffer);
+        if (normalBuffer) glDeleteBuffers(1, &normalBuffer);
+        if (vertexBuffer) glDeleteBuffers(1, &vertexBuffer);
+        if (facetBuffer) glDeleteBuffers(1, &facetBuffer);
+        if (vao) glDeleteVertexArrays(1, &vao);
+
+        vao = 0;
+        vertexBuffer = 0;
+        normalBuffer = 0;
+        facetBuffer = 0;
+        texCoordBuffer = 0;
+        vertexNum = 0;
+        facetNum = 0;
+        vertexPtr = nullptr;
+        facetPtr = nullptr;
+        normalPtr = nullptr;
+    }
+
     MeshGL(size_t vertexNum, float* vertexPtr, size_t facetNum, unsigned int* facetPtr, float* normalPtr, float* texCoordPtr=nullptr) 
         : vertexNum(vertexNum), vertexPtr(vertexPtr), facetNum(facetNum), facetPtr(facetPtr), normalPtr(normalPtr) {
         std::cout << "[MeshGL] Try to create..." << std::endl;
@@ -703,6 +795,34 @@ struct DebugLineGL<CPU> {
 
     DebugLineGL() = default;
 
+    DebugLineGL(const DebugLineGL&) = delete;
+    DebugLineGL& operator=(const DebugLineGL&) = delete;
+
+    DebugLineGL(DebugLineGL&& other) noexcept
+        : DebugLineGL() {
+        *this = std::move(other);
+    }
+
+    DebugLineGL& operator=(DebugLineGL&& other) noexcept {
+        if (this == &other) return *this;
+
+        release();
+
+        vao = other.vao;
+        vertexBuffer = other.vertexBuffer;
+        vertexPtr = other.vertexPtr;
+        vertexNum = other.vertexNum;
+        capacityVertices = other.capacityVertices;
+
+        other.vao = 0;
+        other.vertexBuffer = 0;
+        other.vertexPtr = nullptr;
+        other.vertexNum = 0;
+        other.capacityVertices = 0;
+
+        return *this;
+    }
+
     DebugLineGL(size_t vertexNum, float* vertexPtr)
         : vertexPtr(vertexPtr), vertexNum(vertexNum), capacityVertices(vertexNum) {
         glGenVertexArrays(1, &vao);
@@ -718,9 +838,28 @@ struct DebugLineGL<CPU> {
         glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), 0);
     }
 
-    void updateBuffer(float* newVertexPtr, size_t newVertexNum = 0) {
-        if (newVertexNum > 0) vertexNum = newVertexNum;
+    ~DebugLineGL() { release(); }
+
+    void release() {
+        if (vertexBuffer) glDeleteBuffers(1, &vertexBuffer);
+        if (vao) glDeleteVertexArrays(1, &vao);
+
+        vao = 0;
+        vertexBuffer = 0;
+        vertexPtr = nullptr;
+        vertexNum = 0;
+        capacityVertices = 0;
+    }
+
+    void clear() {
+        vertexNum = 0;
+    }
+
+    void updateBuffer(float* newVertexPtr, size_t newVertexNum) {
         vertexPtr = newVertexPtr;
+        vertexNum = newVertexNum;
+
+        if (!vao || !vertexBuffer || vertexNum == 0) return;
 
         glBindBuffer(GL_ARRAY_BUFFER, vertexBuffer);
 
@@ -739,6 +878,7 @@ struct DebugLineGL<CPU> {
     }
 
     void draw() {
+        if (!vao || vertexNum == 0) return;
         glBindVertexArray(vao);
         glDrawArrays(GL_LINES, 0, vertexNum);
     }
@@ -748,13 +888,40 @@ template <typename BE>
 struct DebugPointGL {};
 template <>
 struct DebugPointGL<CPU> {
-    GLuint vao;
-    GLuint vertexBuffer;
+    GLuint vao = 0;
+    GLuint vertexBuffer = 0;
 
-    float* vertexPtr;
-    size_t vertexNum;
+    float* vertexPtr = nullptr;
+    size_t vertexNum = 0;
 
-    DebugPointGL() : vertexPtr(nullptr), vertexNum(0) {}
+    DebugPointGL() = default;
+
+    DebugPointGL(const DebugPointGL&) = delete;
+    DebugPointGL& operator=(const DebugPointGL&) = delete;
+
+    DebugPointGL(DebugPointGL&& other) noexcept
+        : DebugPointGL() {
+        *this = std::move(other);
+    }
+
+    DebugPointGL& operator=(DebugPointGL&& other) noexcept {
+        if (this == &other) return *this;
+
+        release();
+
+        vao = other.vao;
+        vertexBuffer = other.vertexBuffer;
+        vertexPtr = other.vertexPtr;
+        vertexNum = other.vertexNum;
+
+        other.vao = 0;
+        other.vertexBuffer = 0;
+        other.vertexPtr = nullptr;
+        other.vertexNum = 0;
+
+        return *this;
+    }
+
     DebugPointGL(size_t vertexNum, float* vertexPtr) : vertexNum(vertexNum), vertexPtr(vertexPtr) {
         glGenVertexArrays(1, &vao);
         glBindVertexArray(vao);
@@ -769,12 +936,31 @@ struct DebugPointGL<CPU> {
         glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), 0);
     }
 
+    ~DebugPointGL() { release(); }
+
+    void release() {
+        if (vertexBuffer) glDeleteBuffers(1, &vertexBuffer);
+        if (vao) glDeleteVertexArrays(1, &vao);
+
+        vao = 0;
+        vertexBuffer = 0;
+        vertexPtr = nullptr;
+        vertexNum = 0;
+    }
+
+    void clear() {
+        vertexNum = 0;
+    }
+
     void updateBuffer(float* newVertexPtr) {
+        vertexPtr = newVertexPtr;
+        if (!vao || !vertexBuffer || vertexNum == 0) return;
         glBindBuffer(GL_ARRAY_BUFFER, vertexBuffer);
         glBufferSubData(GL_ARRAY_BUFFER, 0, vertexNum * sizeof(float) * 3, newVertexPtr);
     }
 
     void draw() {
+        if (!vao || vertexNum == 0) return;
         glBindVertexArray(vao);
         
         glDrawArrays(GL_POINTS, 0, vertexNum);
@@ -1318,6 +1504,24 @@ const char* behaviorTypeName(BehaviorType behaviorType) {
     }
 }
 
+int behaviorInspectorIndex(BehaviorType behaviorType) {
+    switch (behaviorType) {
+        case BehaviorType::TriangularCloth: return 0;
+        case BehaviorType::FastGridCloth: return 1;
+        case BehaviorType::Float: return 2;
+        default: return -1;
+    }
+}
+
+BehaviorType behaviorFromInspectorIndex(int index) {
+    switch (index) {
+        case 0: return BehaviorType::TriangularCloth;
+        case 1: return BehaviorType::FastGridCloth;
+        case 2: return BehaviorType::Float;
+        default: return BehaviorType::Float;
+    }
+}
+
 const char* shapeTypeName(ShapeType shapeType) {
     switch (shapeType) {
         case ShapeType::Mesh: return "Mesh";
@@ -1559,10 +1763,10 @@ struct GeneralMesh {
           constraints(std::move(other.constraints)),
           externalForces(std::move(other.externalForces)),
           meshGL(std::move(other.meshGL)) 
-    {
-        other.initializer = nullptr;
-    }
-    ~GeneralMesh() { delete initializer; }
+        {
+            other.initializer = nullptr;
+        }
+    ~GeneralMesh() = default;
 
     void initialize() {
         std::cout << "  - [GeneralMesh initialize] id " << id << " try to initialize\n";
@@ -1604,15 +1808,19 @@ struct Scene {
 
     struct RequestGeneralMesh {
         int id;
-        GeneralMeshInitializer<BE, PR>* initializer;
+        std::unique_ptr<GeneralMeshInitializer<BE, PR>> initializer;
         BehaviorType behaviorType;
         BehaviorParams<PR> behaviorParams;
+        Material material;
 
         RequestGeneralMesh(int id, GeneralMeshInitializer<BE, PR> *initializer,
                            BehaviorType behaviorType,
                            BehaviorParams<PR> behaviorParams)
-            : id(id), initializer(initializer), behaviorType(behaviorType),
-              behaviorParams(std::move(behaviorParams)) {}
+            : id(id),
+              initializer(initializer),
+              behaviorType(behaviorType),
+              behaviorParams(std::move(behaviorParams)),
+              material() {}
     };
 
     inline static std::vector<RequestGeneralMesh> requestsGeneralMeshes;
@@ -1627,6 +1835,100 @@ struct Scene {
         dirty = true;
 
         //std::cout << "id " << meshes.back().id << " object is created\n";
+    }
+
+    static bool supportsBehavior(const RequestGeneralMesh& request, BehaviorType behaviorType) {
+        switch (behaviorType) {
+            case BehaviorType::TriangularCloth:
+            case BehaviorType::Float:
+                return true;
+            case BehaviorType::FastGridCloth:
+                return dynamic_cast<const MeshGridInitializer<BE, PR>*>(request.initializer.get()) != nullptr;
+            default:
+                return false;
+        }
+    }
+
+    static RequestGeneralMesh* findRequestById(int id) {
+        for (auto& request : requestsGeneralMeshes) {
+            if (request.id == id) return &request;
+        }
+        return nullptr;
+    }
+
+    static BehaviorParams<PR> makeBehaviorParamsForBehavior(BehaviorType behaviorType, const RequestGeneralMesh& request) {
+        switch (behaviorType) {
+            case BehaviorType::TriangularCloth: {
+                if (const auto* cloth = std::get_if<ClothBehaviorParams<PR>>(&request.behaviorParams)) {
+                    return *cloth;
+                }
+                if (const auto* fast_grid = std::get_if<FastGridClothBehaviorParams<PR>>(&request.behaviorParams)) {
+                    return ClothBehaviorParams<PR>{fast_grid->kstretch, fast_grid->kshear, fast_grid->kbend, fast_grid->thickness};
+                }
+                return ClothBehaviorParams<PR>{1e5, 1e5, 3e5, 0.001};
+            }
+            case BehaviorType::FastGridCloth: {
+                if (const auto* fast_grid = std::get_if<FastGridClothBehaviorParams<PR>>(&request.behaviorParams)) {
+                    return *fast_grid;
+                }
+
+                FastGridClothBehaviorParams<PR> params{};
+                params.particleNum1D = 2;
+                params.stretchRest = PR(1);
+                params.shearRest = PR(std::sqrt(2.0));
+                params.bendRest = PR(2);
+
+                if (request.initializer) {
+                    if (const auto* grid_initializer = dynamic_cast<const MeshGridInitializer<BE, PR>*>(request.initializer.get())) {
+                        params.particleNum1D = grid_initializer->params.particleNum1D;
+                        PR rest = grid_initializer->params.size1D / PR(grid_initializer->params.particleNum1D);
+                        params.stretchRest = rest;
+                        params.shearRest = rest * PR(std::sqrt(2.0));
+                        params.bendRest = rest * PR(2);
+                    }
+                }
+
+                if (const auto* cloth = std::get_if<ClothBehaviorParams<PR>>(&request.behaviorParams)) {
+                    params.kstretch = cloth->stretch;
+                    params.kshear = cloth->shear;
+                    params.kbend = cloth->bend;
+                    params.thickness = cloth->thickness;
+                } else {
+                    params.kstretch = 1e5;
+                    params.kshear = 1e5;
+                    params.kbend = 3e5;
+                    params.thickness = 0.001;
+                }
+                return params;
+            }
+            case BehaviorType::Float:
+                return FloatBehaviorParams<PR>{};
+            default:
+                return FloatBehaviorParams<PR>{};
+        }
+    }
+
+    static bool syncRequestMaterialFromMesh(int id) {
+        return syncRequestStateFromMesh(id);
+    }
+
+    static bool syncRequestStateFromMesh(int id) {
+        auto* mesh = findById(id);
+        auto* request = findRequestById(id);
+        if (!mesh || !request) return false;
+        request->material = mesh->material;
+        request->behaviorType = mesh->behaviorType;
+        request->behaviorParams = mesh->behaviorParams;
+        return true;
+    }
+
+    static bool setRequestBehavior(int id, BehaviorType behaviorType) {
+        auto* request = findRequestById(id);
+        if (!request || !supportsBehavior(*request, behaviorType)) return false;
+        request->behaviorType = behaviorType;
+        request->behaviorParams = makeBehaviorParamsForBehavior(behaviorType, *request);
+        dirty = true;
+        return true;
     }
 
 
@@ -1647,6 +1949,23 @@ struct Scene {
         VectorBase<BE, Index> statesOffsets;
         VectorBase<BE, Index> facetsOffsets;
         VectorBase<BE, Index> edgesOffsets;
+
+        void reset() {
+            x = {};
+            v = {};
+            f = {};
+            m = {};
+            n = {};
+            facets = {};
+            edges = {};
+            vertexAdjFacets = {};
+            vertexAdjFacetsOffsets = {};
+            vertexAdjEdges = {};
+            vertexAdjEdgesOffsets = {};
+            statesOffsets = {};
+            facetsOffsets = {};
+            edgesOffsets = {};
+        }
     };
     inline static PackedMeshData packedMeshData;
 
@@ -1660,10 +1979,30 @@ struct Scene {
         VectorBase<BE, NarrowCollision> vertColFacets;
         VectorBase<BE, Index> vertColFacetsOffsets;
 
+        void reset() {
+            broadCollisions = {};
+            numBroadCollisions = {};
+            narrowCollisions = {};
+            numNarrowCollisions = {};
+            maxNumCollisions = 0;
+            vertColFacets = {};
+            vertColFacetsOffsets = {};
+        }
+
         void resetNarrow() {
-            std::memset(narrowCollisions.ptr, 0, sizeof(NarrowCollision)*numNarrowCollisions[0]);
-            std::memset(vertColFacets.ptr, 0, sizeof(NarrowCollision)*numNarrowCollisions[0]);
-            std::memset(vertColFacetsOffsets.ptr, 0, sizeof(Index)*numNarrowCollisions[0]);
+            if (!narrowCollisions.ptr || !numNarrowCollisions.ptr) return;
+
+            Index currentCount = numNarrowCollisions[0];
+            if (currentCount > narrowCollisions.size) currentCount = narrowCollisions.size;
+            if (narrowCollisions.ptr && currentCount > 0) {
+                std::memset(narrowCollisions.ptr, 0, sizeof(NarrowCollision) * currentCount);
+            }
+            if (vertColFacets.ptr && currentCount > 0) {
+                std::memset(vertColFacets.ptr, 0, sizeof(NarrowCollision) * currentCount);
+            }
+            if (vertColFacetsOffsets.ptr) {
+                std::memset(vertColFacetsOffsets.ptr, 0, sizeof(Index) * vertColFacetsOffsets.size);
+            }
             numNarrowCollisions[0] = 0;
         }
     };
@@ -1673,8 +2012,21 @@ struct Scene {
         VectorBase<BE, RayHit> clickRayCollisions;
         VectorBase<BE, Index> numClickRayCollisions;
         Index approxColsPerRay = 4096;
+
+        void reset() {
+            clickRayCollisions = {};
+            numClickRayCollisions = {};
+        }
     };
     inline static RayTracedData rayTracedData;
+
+    static void resetRuntimeMemory() {
+        meshes.clear();
+        packedMeshData.reset();
+        packedCollisionData.reset();
+        rayTracedData.reset();
+        GlobalAutoAllocator<BE>::reset();
+    }
 
     static void pack() {
         if(!dirty) {
@@ -1682,7 +2034,8 @@ struct Scene {
             return;
         }
 
-        meshes.clear();
+        resetRuntimeMemory();
+        meshes.reserve(numMeshes);
 
         // count sizes
         packedMeshData.statesOffsets = VectorBase<BE, Index>(numMeshes+1, 0);
@@ -1723,8 +2076,9 @@ struct Scene {
         Index numVertexAdjFacets = 0, numVertexAdjEdges = 0;
         for(Index i = 0; i < numMeshes; ++i) {
             RequestGeneralMesh& req = requestsGeneralMeshes[i];
-            meshes.emplace_back(req.initializer, req.behaviorType, req.behaviorParams);
+            meshes.emplace_back(req.initializer.get(), req.behaviorType, req.behaviorParams);
             meshes[i].id = req.id;
+            meshes[i].material = req.material;
             Index prevNumPoints = packedMeshData.statesOffsets[i];
             Index curNumPoints = packedMeshData.statesOffsets[i+1]-prevNumPoints;
             meshes[i].state.x = VectorBase<BE, PR>(packedMeshData.x, prevNumPoints*3, curNumPoints*3);
@@ -2041,8 +2395,40 @@ struct BVH<BE, PR, BVHMODE::LINEAR, PRIMITIVE> {
         bottomUpCombineStepPSO  = MetalKernelContext::getPSO("bottomUpCombineStep");
     }
 
+    void resetMemory() {
+        debugBox.release();
+        debugBoxLines = {};
+
+        positions = {};
+        velocities = {};
+        primitives = {};
+        mortons = {};
+        mortonsTemp = {};
+        tree = {};
+        treeParent = {};
+
+        radixBlockHistograms = {};
+        radixBlockOffsets = {};
+        radixBucketBase = {};
+
+        bottomUpReadyA = {};
+        bottomUpReadyB = {};
+        bottomUpProgress = {};
+
+        objid = -1;
+        objIds = {};
+        objBehavior = BehaviorType::Float;
+        objBehaviors = {};
+        objShape = ShapeType::Mesh;
+        objShapes = {};
+        qFlag = {};
+    }
+
     void memoryAllocation() {
         Index numPrimitives = primitives.size / PRIMITIVE;
+        if (numPrimitives == 0) {
+            return;
+        }
         Index numNodes = 2 * numPrimitives - 1;
         Index numBlocks = (numPrimitives + 255) / 256;
 
@@ -2059,6 +2445,24 @@ struct BVH<BE, PR, BVHMODE::LINEAR, PRIMITIVE> {
         bottomUpReadyA       = VectorBase<METAL, uint32_t>(numNodes);
         bottomUpReadyB       = VectorBase<METAL, uint32_t>(numNodes);
         bottomUpProgress     = VectorBase<METAL, uint32_t>(1);
+    }
+
+    bool needsMemoryAllocation(Index numPrimitives) const {
+        if (numPrimitives == 0) return false;
+        Index numNodes = 2 * numPrimitives - 1;
+        Index numBlocks = (numPrimitives + 255) / 256;
+        return !tree.ptr ||
+               mortons.size != numPrimitives ||
+               mortonsTemp.size != numPrimitives ||
+               tree.size != numNodes ||
+               treeParent.size != numNodes ||
+               radixBlockHistograms.size != numBlocks * 256 ||
+               radixBlockOffsets.size != numBlocks * 256 ||
+               radixBucketBase.size != 256 ||
+               bottomUpReadyA.size != numNodes ||
+               bottomUpReadyB.size != numNodes ||
+               bottomUpProgress.size != 1 ||
+               qFlag.size != 1;
     }
 
     void build(GeneralMesh<METAL, PR>& mesh) {
@@ -2295,7 +2699,11 @@ struct BVH<BE, PR, BVHMODE::LINEAR, PRIMITIVE> {
         objShape = ShapeType::Mesh;
         //std::cout << "[BVH Build] positions and primitives are assigned" << std::endl;
         Index numPrimitives = primitives.size/PRIMITIVE;
-        if(!tree.ptr) memoryAllocation();
+        if (numPrimitives == 0) {
+            resetMemory();
+            return;
+        }
+        if(needsMemoryAllocation(numPrimitives)) memoryAllocation();
 
         // [stage 1] compute biggest aabb
         // input: each points
@@ -2360,7 +2768,11 @@ struct BVH<BE, PR, BVHMODE::LINEAR, PRIMITIVE> {
         primitives = prim;
         //std::cout << "[BVH Build] positions and primitives are assigned" << std::endl;
         Index numberOfPrimitives = primitives.size/PRIMITIVE;
-        if(!tree.ptr) memoryAllocation();
+        if (numberOfPrimitives == 0) {
+            resetMemory();
+            return;
+        }
+        if(needsMemoryAllocation(numberOfPrimitives)) memoryAllocation();
 
         // [stage 1] compute biggest aabb
         // input: each points
@@ -2774,7 +3186,12 @@ struct BVH<BE, PR, BVHMODE::LINEAR, PRIMITIVE> {
     void showBox() {
         Index numLines = tree.size*12;
         Index numVertices = numLines*2;
-        if(!debugBoxLines.ptr) {
+        if (numVertices == 0) {
+            debugBox.clear();
+            return;
+        }
+
+        if(!debugBoxLines.ptr || debugBoxLines.size < numVertices*3) {
             debugBoxLines = VectorBase<METAL, PR>(numVertices*3);
         }
 
@@ -2806,8 +3223,8 @@ struct BVH<BE, PR, BVHMODE::LINEAR, PRIMITIVE> {
             addLine(tinym::vec3(aabb.max.x, aabb.max.y, aabb.min.z), aabb.max);
         }
 
-        if(!debugBox.vertexPtr) debugBox = DebugLineGL<CPU>(numVertices, debugBoxLines.ptr);
-        else debugBox.updateBuffer(debugBoxLines.ptr);
+        if(!debugBox.vao) debugBox = DebugLineGL<CPU>(numVertices, debugBoxLines.ptr);
+        else debugBox.updateBuffer(debugBoxLines.ptr, numVertices);
 
         debugBox.draw();
     }
@@ -2825,12 +3242,28 @@ struct BVH<BE, PR, BVHMODE::SCENE, BVHPRIMITIVE::OBJECT> {
     VectorBase<METAL, Index> indices;
     EDGE_LBVH tree;
 
+    void resetMemory() {
+        for (auto& objTree : objTrees) {
+            objTree.resetMemory();
+        }
+        objTrees.clear();
+        positions = {};
+        indices = {};
+        tree.resetMemory();
+    }
+
     //BVH(SceneObject<METAL, PR>& scene) 
     //    : objTrees(scene.numMeshes), positions(scene.numMeshes*3), indices(scene.numMeshes*2) {}
 
     void build(Scene<METAL, PR>& scene) {
+        if (scene.numMeshes == 0) {
+            resetMemory();
+            return;
+        }
+
         // allocations
         if(objTrees.size() != scene.numMeshes) {
+            resetMemory();
             objTrees = std::vector<TRI_LBVH>(scene.numMeshes);
             positions = VectorBase<METAL, PR>(scene.numMeshes*6);
             indices = VectorBase<METAL, Index>(scene.numMeshes*2);
@@ -3343,8 +3776,7 @@ struct Simulator {
         GlobalAutoAllocator<BE>::globalInitialize(1<<20);
         std::cout << "[Simulator Init] Memory pool allocated" << std::endl;
 
-        Scene<BE, PR>::pack();
-        collisionPipeline.broadPhase.build(scene);
+        rebuildScene();
 
         //Scene<BE, PR>::initialize();
 
@@ -3352,6 +3784,17 @@ struct Simulator {
 
 
         std::cout << "[Simulator Init] All scene objects are initialized" << std::endl;
+    }
+
+    void rebuildScene() {
+        collisionPipeline.broadPhase.resetMemory();
+        collisionPipeline.broadPhaseTest.resetMemory();
+        debugSelfCollisions.release();
+        debugObjCollisions.release();
+        debugSelfCollisionNormals = {};
+        debugObjCollisionNormals = {};
+        Scene<BE, PR>::pack();
+        collisionPipeline.broadPhase.build(scene);
     }
 
 
@@ -3470,21 +3913,30 @@ struct Simulator {
     void prepareDebugCollisions() {
         typename Scene<BE, PR>::PackedCollisionData& packedCol = Scene<BE, PR>::packedCollisionData;
         typename Scene<BE, PR>::PackedMeshData& packedMesh = Scene<BE, PR>::packedMeshData;
-        if(packedCol.numNarrowCollisions[0] <= 0) return;
-
-        if(!debugSelfCollisionNormals.ptr) {
-            debugSelfCollisionNormals = VectorBase<BE, PR>(packedCol.maxNumCollisions*6);
-            debugObjCollisionNormals = VectorBase<BE, PR>(packedCol.maxNumCollisions*6);
+        if(packedCol.numNarrowCollisions[0] <= 0) {
+            debugSelfCollisions.clear();
+            debugObjCollisions.clear();
+            return;
         }
+
+        const Index neededCollisionLineValues = packedCol.maxNumCollisions * 6;
+        if(!debugSelfCollisionNormals.ptr || debugSelfCollisionNormals.size < neededCollisionLineValues) {
+            debugSelfCollisionNormals = VectorBase<BE, PR>(neededCollisionLineValues);
+        }
+        if(!debugObjCollisionNormals.ptr || debugObjCollisionNormals.size < neededCollisionLineValues) {
+            debugObjCollisionNormals = VectorBase<BE, PR>(neededCollisionLineValues);
+        }
+
+        debugSelfCollisions.clear();
+        debugObjCollisions.clear();
 
         Index selfBase = 0;
         Index objBase = 0;
         for(Index cid = 0; cid < packedCol.numNarrowCollisions[0]; ++cid) {
             NarrowCollision& nc = packedCol.narrowCollisions[cid];
 
-            auto& packedMesh = Scene<BE, PR>::packedMeshData;
             Index obase = packedMesh.statesOffsets[nc.objPair.query];
-            Index ppid = nc.indexPair.point + nc.objPair.query;
+            Index ppid = obase + nc.indexPair.point;
             tinym::vec3_view v(packedMesh.x.ptr + ppid*3);
             tinym::vec3_view n(nc.collisionNormalAndDistance.v);
             tinym::vec3 t = v+n*.2f;
@@ -3509,12 +3961,18 @@ struct Simulator {
             }
         }
         if(selfBase > 0) {
-            if(!debugSelfCollisions.vertexPtr) debugSelfCollisions = DebugLineGL<CPU>(selfBase/3, debugSelfCollisionNormals.ptr);
+            if(!debugSelfCollisions.vao) debugSelfCollisions = DebugLineGL<CPU>(selfBase/3, debugSelfCollisionNormals.ptr);
             else debugSelfCollisions.updateBuffer(debugSelfCollisionNormals.ptr, selfBase/3);
         }
+        else {
+            debugSelfCollisions.clear();
+        }
         if(objBase > 0) {
-            if(!debugObjCollisions.vertexPtr) debugObjCollisions = DebugLineGL<CPU>(objBase/3, debugObjCollisionNormals.ptr);
+            if(!debugObjCollisions.vao) debugObjCollisions = DebugLineGL<CPU>(objBase/3, debugObjCollisionNormals.ptr);
             else debugObjCollisions.updateBuffer(debugObjCollisionNormals.ptr, objBase/3);
+        }
+        else {
+            debugObjCollisions.clear();
         }
     }
     void showSelfCollisions() {
@@ -3548,6 +4006,11 @@ struct Simulator {
     }
     void showDebugLines(tinym::mat4& V, tinym::mat4& P) {
         if(! debugLineShader.programID) debugLineShader.loadShader("line.vert", "line.frag");
+        if (debugLines.empty()) {
+            debugLineGL.clear();
+            return;
+        }
+
         if(! debugLineGL.vao) debugLineGL = DebugLineGL<CPU>(debugLines.size(), (float*)debugLines.data());
         else debugLineGL.updateBuffer((float*)debugLines.data(), debugLines.size());
 
@@ -4047,11 +4510,55 @@ int main() {
             mesh_inspector::MeshInspectorTarget target;
             if (auto* selectedMesh = Scene<Backend, Precision>::findById(simulator.selectedObj)) {
                 target.mesh_id = selectedMesh->id;
+                target.behavior_index = behaviorInspectorIndex(selectedMesh->behaviorType);
+                target.fast_grid_supported =
+                    selectedMesh->initializer != nullptr &&
+                    dynamic_cast<MeshGridInitializer<Backend, Precision>*>(selectedMesh->initializer) != nullptr;
                 target.behavior_label = behaviorTypeName(selectedMesh->behaviorType);
                 target.shape_label = shapeTypeName(selectedMesh->shapeType);
                 target.base_color = &selectedMesh->material.baseColor;
+
+                if (auto* cloth = std::get_if<ClothBehaviorParams<Precision>>(&selectedMesh->behaviorParams)) {
+                    target.cloth_stretch = &cloth->stretch;
+                    target.cloth_shear = &cloth->shear;
+                    target.cloth_bend = &cloth->bend;
+                    target.cloth_thickness = &cloth->thickness;
+                } else if (auto* fast_grid = std::get_if<FastGridClothBehaviorParams<Precision>>(&selectedMesh->behaviorParams)) {
+                    target.fast_stretch_rest = &fast_grid->stretchRest;
+                    target.fast_shear_rest = &fast_grid->shearRest;
+                    target.fast_bend_rest = &fast_grid->bendRest;
+                    target.fast_kstretch = &fast_grid->kstretch;
+                    target.fast_kshear = &fast_grid->kshear;
+                    target.fast_kbend = &fast_grid->kbend;
+                    target.fast_thickness = &fast_grid->thickness;
+                }
             }
             return target;
+        };
+
+        auto applyPendingMeshInspectorChanges = [&](const mesh_inspector::MeshInspectorTarget& target) {
+            if (target.mesh_id >= 0) {
+                Scene<Backend, Precision>::syncRequestStateFromMesh(target.mesh_id);
+            }
+
+            if (!meshInspectorWindowState.behavior_change_requested) return;
+
+            const int requestMeshId = meshInspectorWindowState.pending_behavior_mesh_id;
+            const int requestBehaviorIndex = meshInspectorWindowState.pending_behavior_index;
+            meshInspectorWindowState.behavior_change_requested = false;
+            meshInspectorWindowState.pending_behavior_mesh_id = -1;
+            meshInspectorWindowState.pending_behavior_index = -1;
+
+            if (requestMeshId < 0 || requestBehaviorIndex < 0) return;
+
+            const BehaviorType behaviorType = behaviorFromInspectorIndex(requestBehaviorIndex);
+            if (!Scene<Backend, Precision>::setRequestBehavior(requestMeshId, behaviorType)) {
+                meshInspectorWindowState.status_message = "Failed to change mesh behavior.";
+                return;
+            }
+
+            simulator.rebuildScene();
+            meshInspectorWindowState.status_message = std::string("Behavior changed to ") + behaviorTypeName(behaviorType) + ".";
         };
 
         ImGui_ImplOpenGL3_NewFrame();
@@ -4146,8 +4653,8 @@ int main() {
             simulator.showDebugLines(V, P);
         }
 
-        if (collectProfileFrame) {
-            auto imguiScope = frameProfiler.scoped("imgui_draw");
+        auto selectedMeshTarget = buildSelectedMeshTarget();
+        auto drawInspectorWindows = [&]() {
             profiler::drawProfilerWindow(
                 profilerWindowState,
                 frameProfiler,
@@ -4157,20 +4664,17 @@ int main() {
                 &debugCollisions,
                 &meshInspectorWindowState.open
             );
-            mesh_inspector::drawMeshInspectorWindow(meshInspectorWindowState, buildSelectedMeshTarget());
+            mesh_inspector::drawMeshInspectorWindow(meshInspectorWindowState, selectedMeshTarget);
+            applyPendingMeshInspectorChanges(selectedMeshTarget);
+        };
+
+        if (collectProfileFrame) {
+            auto imguiScope = frameProfiler.scoped("imgui_draw");
+            drawInspectorWindows();
             ImGui::Render();
             ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
         } else {
-            profiler::drawProfilerWindow(
-                profilerWindowState,
-                frameProfiler,
-                &simulator.pause,
-                &debugEachBoxes,
-                &debugSceneBox,
-                &debugCollisions,
-                &meshInspectorWindowState.open
-            );
-            mesh_inspector::drawMeshInspectorWindow(meshInspectorWindowState, buildSelectedMeshTarget());
+            drawInspectorWindows();
             ImGui::Render();
             ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
         }
