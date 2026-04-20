@@ -2,6 +2,8 @@
 
 A GPU-accelerated physics simulation engine for cloth dynamics and rigid bodies on macOS. Rendering uses OpenGL, while simulation compute (physics, collision detection) runs on Metal.
 
+![ysim_wip](https://github.com/yeduk3/ysim/blob/guiexperiment/ysim_wip.gif)
+
 ## Features
 
 - **Cloth simulation** with spring-based constraints (stretch, shear, bending)

@@ -381,13 +381,6 @@ kernel void sh_prefixSumAddBlockSums(
 }
 
 
-// ─── Sort key for lightweight radix sort ────────────────────────────
-
-struct SHSortKey {
-    uint hashValue;
-    uint index;       // index into the original compacted entries array
-};
-
 // ─── Radix sort for SHTriEntry by hashValue ─────────────────────────
 // Reuse the same radix sort pattern as BVH (8-bit passes, 4 passes for 32-bit keys).
 
@@ -490,92 +483,6 @@ kernel void sh_radixScatter(
 
     if (idx < params.numElements) {
         // Position within local block for this bucket
-        uint localPos = atomic_fetch_add_explicit((threadgroup atomic_uint*)&localPrefix[bucket], 1u, memory_order_relaxed);
-        uint globalPos = bucketBase[bucket] + blockOff[gid * 256 + bucket] + localPos;
-        dst[globalPos] = src[idx];
-    }
-}
-
-// ─── Lightweight radix sort (SHSortKey = 8 bytes) ───────────────────
-
-kernel void sh_buildSortKeys(
-    device const SHTriEntry* entries [[buffer(0)]],
-    device SHSortKey*        keys    [[buffer(1)]],
-    constant uint&           n       [[buffer(2)]],
-    uint id [[thread_position_in_grid]]
-) {
-    if (id >= n) return;
-    keys[id].hashValue = entries[id].hashValue;
-    keys[id].index = id;
-}
-
-kernel void sh_gatherEntries(
-    device const SHTriEntry* entriesIn  [[buffer(0)]],
-    device const SHSortKey*  sortedKeys [[buffer(1)]],
-    device SHTriEntry*       entriesOut [[buffer(2)]],
-    constant uint&           n          [[buffer(3)]],
-    uint id [[thread_position_in_grid]]
-) {
-    if (id >= n) return;
-    entriesOut[id] = entriesIn[sortedKeys[id].index];
-}
-
-// Unified buffer layout: buf0=src, buf1=dst, buf2=params, buf3=blockHist, buf4=blockOff, buf5=bucketBase
-
-kernel void sh_radixCountKeys(
-    device const SHSortKey*  src       [[buffer(0)]],
-    constant SHRadixParams&  params    [[buffer(2)]],
-    device uint*             blockHist [[buffer(3)]],
-    uint tid [[thread_position_in_grid]],
-    uint lid [[thread_index_in_threadgroup]],
-    uint gid [[threadgroup_position_in_grid]]
-) {
-    threadgroup uint localHist[256];
-    localHist[lid] = 0;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    uint idx = gid * 256 + lid;
-    if (idx < params.numElements) {
-        uint bucket = (src[idx].hashValue >> params.shift) & 0xFF;
-        atomic_fetch_add_explicit((threadgroup atomic_uint*)&localHist[bucket], 1u, memory_order_relaxed);
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    blockHist[gid * 256 + lid] = localHist[lid];
-}
-
-kernel void sh_radixScatterKeys(
-    device const SHSortKey*  src        [[buffer(0)]],
-    device SHSortKey*        dst        [[buffer(1)]],
-    constant SHRadixParams&  params     [[buffer(2)]],
-    device const uint*       blockOff   [[buffer(4)]],
-    device const uint*       bucketBase [[buffer(5)]],
-    uint lid [[thread_index_in_threadgroup]],
-    uint gid [[threadgroup_position_in_grid]]
-) {
-    threadgroup uint localPrefix[256];
-    threadgroup uint localCount[256];
-
-    localCount[lid] = 0;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    uint idx = gid * 256 + lid;
-    uint bucket = 0;
-    if (idx < params.numElements) {
-        bucket = (src[idx].hashValue >> params.shift) & 0xFF;
-        atomic_fetch_add_explicit((threadgroup atomic_uint*)&localCount[bucket], 1u, memory_order_relaxed);
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    if (lid == 0) {
-        uint sum = 0;
-        for (uint b = 0; b < 256; b++) {
-            localPrefix[b] = sum;
-            sum += localCount[b];
-        }
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    if (idx < params.numElements) {
         uint localPos = atomic_fetch_add_explicit((threadgroup atomic_uint*)&localPrefix[bucket], 1u, memory_order_relaxed);
         uint globalPos = bucketBase[bucket] + blockOff[gid * 256 + bucket] + localPos;
         dst[globalPos] = src[idx];

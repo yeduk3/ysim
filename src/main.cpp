@@ -4345,9 +4345,10 @@ struct Simulator {
     Scene<BE, PR> scene;
 
     //using BroadPhase = BVH<BVHMODE::LINEAR, BVHPRIMITIVE::TRIANGLE, PR>;
-    //using BroadPhase = BVH<BE, PR, BVHMODE::SCENE, BVHPRIMITIVE::OBJECT>;
-    using BroadPhase = SpatialHashing<BE, PR>;
-    using NarrowPhase = NoOpNarrowPhase<BE, PR>;
+    using BroadPhase = BVH<BE, PR, BVHMODE::SCENE, BVHPRIMITIVE::OBJECT>;
+    //using BroadPhase = SpatialHashing<BE, PR>;
+    using NarrowPhase = BruteForce<BE, PR>;
+    //using NarrowPhase = NoOpNarrowPhase<BE, PR>;
     CollisionPipeline<BroadPhase, NarrowPhase> collisionPipeline;
 
 
@@ -5013,7 +5014,7 @@ int main() {
     //simulator.addFloatMesh("src/assets", "horse-gallop-01.obj", {0, -1, 0}, 1.2);
     //simulator.addFloatMesh("src/assets", "camel-gallop-reference.obj", {0, -1, 0}, 1.2);
     simulator.addFloatMesh("src/assets", "Human.obj", {0, -1, 0}, 0.05);
-    //simulator.addGround(PlaneDirection::XZPlane, tinym::vec3(0, -1, 0), 5);
+    simulator.addGround(PlaneDirection::XZPlane, tinym::vec3(0, -1, 0), 5);
 
     std::cout << "[Main] mesh added to scene" << std::endl;
 
