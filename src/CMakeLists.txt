@@ -52,35 +52,40 @@ target_compile_definitions(ysim PRIVATE
 )
 
 
-configure_file(
+# Copy shaders next to the executable (works for both Makefile and Xcode generators)
+set(SHADER_FILES
     ${CMAKE_SOURCE_DIR}/src/shader/shader.vert
-    ${CMAKE_BINARY_DIR}/shader.vert
-    COPYONLY
-)
-configure_file(
     ${CMAKE_SOURCE_DIR}/src/shader/shader.geom
-    ${CMAKE_BINARY_DIR}/shader.geom
-    COPYONLY
-)
-configure_file(
     ${CMAKE_SOURCE_DIR}/src/shader/shader.frag
-    ${CMAKE_BINARY_DIR}/shader.frag
-    COPYONLY
-)
-
-configure_file(
     ${CMAKE_SOURCE_DIR}/src/shader/line.vert
-    ${CMAKE_BINARY_DIR}/line.vert
-    COPYONLY
-)
-configure_file(
     ${CMAKE_SOURCE_DIR}/src/shader/line.frag
-    ${CMAKE_BINARY_DIR}/line.frag
-    COPYONLY
 )
+foreach(SHADER ${SHADER_FILES})
+    get_filename_component(SHADER_NAME ${SHADER} NAME)
+    add_custom_command(TARGET ysim POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                ${SHADER}
+                $<TARGET_FILE_DIR:ysim>/${SHADER_NAME}
+    )
+endforeach()
 add_custom_command(TARGET ysim POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_directory
             ${CMAKE_SOURCE_DIR}/assets
             $<TARGET_FILE_DIR:ysim>/assets
+)
+# Also copy to src/assets/ relative to the executable so hardcoded relative paths work in Xcode
+add_custom_command(TARGET ysim POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E make_directory $<TARGET_FILE_DIR:ysim>/src/assets
+    COMMAND ${CMAKE_COMMAND} -E copy_directory
+            ${CMAKE_SOURCE_DIR}/assets
+            $<TARGET_FILE_DIR:ysim>/src/assets
+)
+
+# Copy default.metallib next to the executable (needed for Xcode generator)
+add_custom_command(TARGET ysim POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            ${CMAKE_BINARY_DIR}/default.metallib
+            $<TARGET_FILE_DIR:ysim>/default.metallib
+    COMMENT "Copying default.metallib to executable directory"
 )
 
