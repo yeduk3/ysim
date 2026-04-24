@@ -985,7 +985,7 @@ struct GeneralMesh;
 
 
 enum struct BehaviorType : Index {
-    TriangularCloth,
+    TriangularCloth = 0,
     FastGridCloth,
     Elastic,
     Rigid,
@@ -1548,6 +1548,7 @@ struct NarrowCollision {
     IndexPair indexPair;
     IndexPair objPair;
     tinym::vec4 collisionNormalAndDistance;
+    tinym::vec4 varycentricCoord;
     IndexPair behaviorPair;
     IndexPair shapePair;
 };
@@ -1959,6 +1960,9 @@ struct Scene {
         VectorBase<BE, Index> facetsOffsets;
         VectorBase<BE, Index> edgesOffsets;
 
+        // per-object thickness (0 for behaviors without thickness)
+        VectorBase<BE, PR> thicknesses;
+
         void reset() {
             x = {};
             v = {};
@@ -1974,9 +1978,18 @@ struct Scene {
             statesOffsets = {};
             facetsOffsets = {};
             edgesOffsets = {};
+            thicknesses = {};
         }
+
     };
     inline static PackedMeshData packedMeshData;
+    inline static void clearForces() {
+        static MTL::ComputePipelineState* pso = MetalKernelContext::getPSO("clearForces");
+
+        MetalGlobalContext::setBuffer(packedMeshData.f, 0);
+        MetalGlobalContext::setBytes(packedMeshData.x.size, 1);
+        MetalGlobalContext::dispatchThreads(pso, packedMeshData.x.size);
+    }
 
     struct PackedCollisionData {
         VectorBase<BE, BroadCollision> broadCollisions;
@@ -2017,6 +2030,28 @@ struct Scene {
     };
     inline static PackedCollisionData packedCollisionData;
 
+    struct RepulsionParams {
+        float krepulsion;   // repulsion spring stiffness
+    };
+    inline static void applyRepulsionForces() {
+        static MTL::ComputePipelineState* pso = MetalKernelContext::getPSO("applyRepulsionForces_noSort");
+        if(packedCollisionData.numNarrowCollisions[0] == 0) return;
+
+        RepulsionParams repParams = {1e6};
+        MetalGlobalContext::setBuffer(packedMeshData.x, 0);
+        MetalGlobalContext::setBuffer(packedMeshData.f, 2);
+        MetalGlobalContext::setBuffer(packedMeshData.m, 3);
+        MetalGlobalContext::setBuffer(packedCollisionData.narrowCollisions, 5);
+        MetalGlobalContext::setBuffer(packedCollisionData.numNarrowCollisions, 6);
+        MetalGlobalContext::setBytes(repParams, 8);
+        MetalGlobalContext::setBuffer(packedMeshData.thicknesses, 9);
+        MetalGlobalContext::setBuffer(packedMeshData.statesOffsets, 18);
+        MetalGlobalContext::setBuffer(packedMeshData.facetsOffsets, 19);
+        MetalGlobalContext::setBuffer(packedMeshData.facets, 20);
+        
+        MetalGlobalContext::dispatchThreads(pso, packedCollisionData.numNarrowCollisions[0]);
+    }
+
     struct RayTracedData {
         VectorBase<BE, RayHit> clickRayCollisions;
         VectorBase<BE, Index> numClickRayCollisions;
@@ -2050,6 +2085,7 @@ struct Scene {
         packedMeshData.statesOffsets = VectorBase<BE, Index>(numMeshes+1, 0);
         packedMeshData.facetsOffsets = VectorBase<BE, Index>(numMeshes+1, 0);
         packedMeshData.edgesOffsets  = VectorBase<BE, Index>(numMeshes+1, 0);
+        packedMeshData.thicknesses  = VectorBase<BE, PR>(numMeshes, 0);
         std::vector<PR> masses(numMeshes);
 
         for(Index i = 0; i < requestsGeneralMeshes.size(); ++i) {
@@ -2059,6 +2095,16 @@ struct Scene {
             packedMeshData.facetsOffsets[i+1] = packedMeshData.facetsOffsets[i] + req.initializer->getParams()->numFacets;
             packedMeshData.edgesOffsets [i+1] = packedMeshData.edgesOffsets [i] + req.initializer->getParams()->numEdges;
             masses[i] = req.initializer->getParams()->mass;
+
+            std::visit([&](auto&& params) {
+                using T = std::decay_t<decltype(params)>;
+                if constexpr (std::is_same_v<T, ClothBehaviorParams<PR>>) {
+                    packedMeshData.thicknesses[i] = params.thickness;
+                } else if constexpr (std::is_same_v<T, FastGridClothBehaviorParams<PR>>) {
+                    packedMeshData.thicknesses[i] = params.thickness;
+                }
+                // FloatBehaviorParams and others: stays 0
+            }, req.behaviorParams);
         }
 
         // allocate MeshState
@@ -2189,6 +2235,8 @@ struct SpatialHashing<METAL, PR> {
         int32_t  resZ;
         uint32_t tableSize;
         uint32_t maxNumCollisions;
+        float    sceneMin[3];
+        float    _pad;
     };
 
     struct SHTriEntry {
@@ -2215,18 +2263,25 @@ struct SpatialHashing<METAL, PR> {
     };
 
     struct SHCollisionPassParams {
-        uint32_t numCells;
+        uint32_t numCells;       // totalPairs for flat dispatch
         uint32_t passIndex;
         uint32_t maxNumCollisions;
-        uint32_t numTriangles;
+        uint32_t numTriangles;   // repurposed as numWorkCells for flat dispatch
         float    radius;
         float    thickness;
+    };
+
+    struct SHCellWork {
+        uint32_t numPairs;
+        uint32_t cellType;
+        uint32_t cellIdx;
     };
 
     struct SHRadixParams {
         uint32_t numElements;
         uint32_t shift;
         uint32_t numBlocks;
+        uint32_t blockSize;
     };
 
     // ─── PSOs ───────────────────────────────────────────────────
@@ -2246,13 +2301,9 @@ struct SpatialHashing<METAL, PR> {
     MTL::ComputePipelineState* collectActiveCellsPSO;
     MTL::ComputePipelineState* handlePhantomPhantomPSO;
     MTL::ComputePipelineState* collisionPassPSO;
+    MTL::ComputePipelineState* countCollisionPairsPSO;
+    MTL::ComputePipelineState* collisionPassFlatPSO;
     MTL::ComputePipelineState* clearCellRangesPSO;
-
-    // Lightweight key sort PSOs
-    MTL::ComputePipelineState* buildSortKeysPSO;
-    MTL::ComputePipelineState* gatherEntriesPSO;
-    MTL::ComputePipelineState* radixCountKeysPSO;
-    MTL::ComputePipelineState* radixScatterKeysPSO;
 
     // ─── GPU buffers ────────────────────────────────────────────
     VectorBase<METAL, PR>       radii;           // per-triangle radius
@@ -2279,6 +2330,10 @@ struct SpatialHashing<METAL, PR> {
     VectorBase<METAL, uint32_t>    activeCells;
     VectorBase<METAL, uint32_t>    numActiveCells; // single uint (atomic)
 
+    // Per-cell collision work
+    VectorBase<METAL, SHCellWork>  cellWorkBuf;
+    VectorBase<METAL, uint32_t>    pairOffsets;   // exclusive prefix sum of numPairs, size nActive+1
+
     // Lightweight sort key buffers
     VectorBase<METAL, SHSortKey> sortKeysA;
     VectorBase<METAL, SHSortKey> sortKeysB;
@@ -2287,6 +2342,7 @@ struct SpatialHashing<METAL, PR> {
     // Prefix-sum block sums
     VectorBase<METAL, uint32_t>  prefixBlockSums;
 
+    static constexpr uint32_t RADIX_BLOCK_SIZE = 1024;
     float scaleFactor = 1.1f;
     Index numTotalTriangles = 0;
     bool useKeySorting = false; // toggle: true = lightweight key sort, false = full entry sort
@@ -2316,12 +2372,9 @@ struct SpatialHashing<METAL, PR> {
         collectActiveCellsPSO     = MetalKernelContext::getPSO("sh_collectActiveCells");
         handlePhantomPhantomPSO   = MetalKernelContext::getPSO("sh_handlePhantomPhantom");
         collisionPassPSO          = MetalKernelContext::getPSO("sh_collisionPass");
+        countCollisionPairsPSO    = MetalKernelContext::getPSO("sh_countCollisionPairs");
+        collisionPassFlatPSO      = MetalKernelContext::getPSO("sh_collisionPassFlat");
         clearCellRangesPSO        = MetalKernelContext::getPSO("sh_clearCellRanges");
-
-        buildSortKeysPSO          = MetalKernelContext::getPSO("sh_buildSortKeys");
-        gatherEntriesPSO          = MetalKernelContext::getPSO("sh_gatherEntries");
-        radixCountKeysPSO         = MetalKernelContext::getPSO("sh_radixCountKeys");
-        radixScatterKeysPSO       = MetalKernelContext::getPSO("sh_radixScatterKeys");
     }
 
     void resetMemory() {
@@ -2344,6 +2397,8 @@ struct SpatialHashing<METAL, PR> {
         cellRanges = {};
         activeCells = {};
         numActiveCells = {};
+        cellWorkBuf = {};
+        pairOffsets = {};
         prefixBlockSums = {};
         sortKeysA = {};
         sortKeysB = {};
@@ -2405,6 +2460,7 @@ struct SpatialHashing<METAL, PR> {
         };
         auto t0 = now();
 
+        std::cout<< "[SH] start detection\n";
         // ── Step 1: Compute bounding spheres ──
         // buf layout: 0=radii, 1=centroids, 2=numTris, 3=pm.x, 4=pm.facets, 5=triObjIds, 6=statesOffsets
         uint32_t numTris = (uint32_t)numTotalTriangles;
@@ -2457,7 +2513,7 @@ struct SpatialHashing<METAL, PR> {
         uint32_t tableSize = (uint32_t)(resX * resY * resZ);
 
         // Reallocate cellRanges if table size changed
-        if (!cellRanges.ptr || cellRanges.size != tableSize) {
+        if (!cellRanges.ptr || cellRanges.size < tableSize) {
             cellRanges = VectorBase<METAL, SHCellRange>(tableSize);
         }
 
@@ -2465,7 +2521,9 @@ struct SpatialHashing<METAL, PR> {
             numTris, cellSize, invCellSize,
             resX, resY, resZ,
             tableSize,
-            pc.maxNumCollisions
+            pc.maxNumCollisions,
+            {xmin, ymin, zmin},
+            0.0f
         };
 
         std::cout << "[SH] cellSize=" << cellSize << " maxR=" << maxR
@@ -2556,11 +2614,7 @@ struct SpatialHashing<METAL, PR> {
         auto t5_compact = now();
 
         // ── Step 7: Radix sort by hashValue ──
-        if (useKeySorting) {
-            radixSortByKeys(numEntries);
-        } else {
-            radixSort(numEntries);
-        }
+        radixSort(numEntries);
 
         MetalGlobalContext::commitAndWait();
         auto t5_sort = now();
@@ -2599,30 +2653,68 @@ struct SpatialHashing<METAL, PR> {
         MetalGlobalContext::commitAndWait();
         auto t6 = now();
 
-        // ── Step 10: 8-pass collision detection (inline narrow phase) ──
-        pc.resetNarrow();
+        // ── Step 10: Count collision pairs per cell ──
+        if (!cellWorkBuf.ptr || cellWorkBuf.size < nActive) {
+            cellWorkBuf = VectorBase<METAL, SHCellWork>(nActive);
+            pairOffsets = VectorBase<METAL, uint32_t>(nActive + 1);
+        }
+
+        // New encoder after commitAndWait — must rebind all buffers
         MetalGlobalContext::setBuffer(entriesCompact, 0);
         MetalGlobalContext::setBuffer(cellRanges, 1);
         MetalGlobalContext::setBuffer(activeCells, 2);
-        MetalGlobalContext::setBuffer(pc.narrowCollisions, 4);
-        MetalGlobalContext::setBuffer(pc.numNarrowCollisions, 5);
-        MetalGlobalContext::setBuffer(pm.x, 6);
-        MetalGlobalContext::setBuffer(pm.facets, 7);
-        MetalGlobalContext::setBuffer(pm.statesOffsets, 8);
-        MetalGlobalContext::setBuffer(pm.facetsOffsets, 9);
-        MetalGlobalContext::setBuffer(pm.vertexAdjFacets, 10);
-        MetalGlobalContext::setBuffer(pm.vertexAdjFacetsOffsets, 11);
-        for (uint32_t pass = 0; pass < 8; pass++) {
-            SHCollisionPassParams passParams = {
-                nActive,
-                pass,
-                pc.maxNumCollisions,
-                numTris,
-                radius,
-                thickness
-            };
-            MetalGlobalContext::setBytes(passParams, 3);
-            MetalGlobalContext::dispatchThreads(collisionPassPSO, nActive);
+        MetalGlobalContext::setBytes(nActive, 3);
+        MetalGlobalContext::setBuffer(cellWorkBuf, 4);
+        MetalGlobalContext::dispatchThreads(countCollisionPairsPSO, nActive);
+
+        MetalGlobalContext::commitAndWait();
+
+        // CPU prefix sum on cellWork to build pairOffsets (per-pass)
+        pairOffsets[0] = 0;
+        for (uint32_t i = 0; i < nActive; i++) {
+            pairOffsets[i + 1] = pairOffsets[i] + cellWorkBuf[i].numPairs;
+        }
+        uint32_t totalPairs = pairOffsets[nActive];
+
+        // Debug: per-cellType pair counts
+        uint32_t pairsPerType[8] = {};
+        for (uint32_t i = 0; i < nActive; i++) {
+            uint32_t ct = cellWorkBuf[i].cellType;
+            if (ct < 8) pairsPerType[ct] += cellWorkBuf[i].numPairs;
+        }
+        std::cout << "[SH] totalPairs=" << totalPairs
+                  << " perType=[";
+        for (int t = 0; t < 8; t++) std::cout << pairsPerType[t] << (t<7?",":"");
+        std::cout << "]\n";
+
+        // ── Step 11: 8-pass flat collision detection (inline narrow phase) ──
+        pc.resetNarrow();
+        if (totalPairs > 0) {
+            MetalGlobalContext::setBuffer(entriesCompact, 0);
+            MetalGlobalContext::setBuffer(cellRanges, 1);
+            MetalGlobalContext::setBuffer(cellWorkBuf, 2);
+            MetalGlobalContext::setBuffer(pc.narrowCollisions, 4);
+            MetalGlobalContext::setBuffer(pc.numNarrowCollisions, 5);
+            MetalGlobalContext::setBuffer(pm.x, 6);
+            MetalGlobalContext::setBuffer(pm.facets, 7);
+            MetalGlobalContext::setBuffer(pm.statesOffsets, 8);
+            MetalGlobalContext::setBuffer(pm.facetsOffsets, 9);
+            MetalGlobalContext::setBuffer(pm.vertexAdjFacets, 10);
+            MetalGlobalContext::setBuffer(pm.vertexAdjFacetsOffsets, 11);
+            MetalGlobalContext::setBuffer(pairOffsets, 12);
+
+            for (uint32_t pass = 0; pass < 8; pass++) {
+                SHCollisionPassParams passParams = {
+                    totalPairs,       // numCells = total pairs to dispatch
+                    pass,
+                    pc.maxNumCollisions,
+                    nActive,          // numTriangles repurposed as numWorkCells for binary search
+                    radius,
+                    thickness
+                };
+                MetalGlobalContext::setBytes(passParams, 3);
+                MetalGlobalContext::dispatchThreads(collisionPassFlatPSO, totalPairs);
+            }
         }
 
         MetalGlobalContext::commitAndWait();
@@ -2666,6 +2758,7 @@ struct SpatialHashing<METAL, PR> {
             acc_8pass = acc_sortByVert = acc_total = 0;
             profileFrame = 0;
         }
+        std::cout<< "[SH] finish detection\n";
     }
 
     void showBox() {
@@ -2735,7 +2828,7 @@ private:
 
         // Radix sort buffers (sized for max possible entries = n*8)
         uint32_t maxEntries = (uint32_t)(n * 8);
-        uint32_t numBlocks = (maxEntries + 255) / 256;
+        uint32_t numBlocks = (maxEntries + RADIX_BLOCK_SIZE - 1) / RADIX_BLOCK_SIZE;
         radixBlockHist  = VectorBase<METAL, uint32_t>(numBlocks * 256);
         radixBlockOff   = VectorBase<METAL, uint32_t>(numBlocks * 256);
         radixBucketBase = VectorBase<METAL, uint32_t>(256);
@@ -2746,8 +2839,7 @@ private:
     }
 
     void radixSort(uint32_t numEntries) {
-        constexpr uint32_t BLOCK_SIZE = 256;
-        uint32_t numBlocks = (numEntries + BLOCK_SIZE - 1) / BLOCK_SIZE;
+        uint32_t numBlocks = (numEntries + RADIX_BLOCK_SIZE - 1) / RADIX_BLOCK_SIZE;
 
         VectorBase<METAL, SHTriEntry>* src = &entriesCompact;
         VectorBase<METAL, SHTriEntry>* dst = &entriesTemp;
@@ -2755,6 +2847,7 @@ private:
         SHRadixParams params;
         params.numElements = numEntries;
         params.numBlocks = numBlocks;
+        params.blockSize = RADIX_BLOCK_SIZE;
 
         // Unified layout: buf0=src, buf1=dst, buf2=params, buf3=blockHist, buf4=blockOff, buf5=bucketBase
         // buf3-5 are constant across all iterations, set once
@@ -2768,14 +2861,14 @@ private:
             // Count: needs buf0=src, buf2=params, buf3=blockHist(kept)
             MetalGlobalContext::setBuffer(*src, 0);
             MetalGlobalContext::setBytes(params, 2);
-            MetalGlobalContext::dispatchThreads(radixCountPSO, numBlocks * 256, 256);
+            MetalGlobalContext::dispatchThreads(radixCountPSO, numBlocks * RADIX_BLOCK_SIZE, RADIX_BLOCK_SIZE);
 
             // Offsets: buf2=params(kept), buf3=blockHist(kept), buf4=blockOff(kept), buf5=bucketBase(kept)
             MetalGlobalContext::dispatchThreads(radixComputeOffsetsPSO, 1);
 
             // Scatter: buf0=src(kept), buf2=params(kept), buf4=blockOff(kept), buf5=bucketBase(kept), set buf1=dst
             MetalGlobalContext::setBuffer(*dst, 1);
-            MetalGlobalContext::dispatchThreads(radixScatterPSO, numBlocks * 256, 256);
+            MetalGlobalContext::dispatchThreads(radixScatterPSO, numBlocks * RADIX_BLOCK_SIZE, RADIX_BLOCK_SIZE);
 
             std::swap(src, dst);
         }
@@ -2786,67 +2879,8 @@ private:
         }
     }
 
-    void radixSortByKeys(uint32_t numEntries) {
-        // Ensure key buffers are allocated
-        if (!sortKeysA.ptr || sortKeysA.size < numEntries) {
-            sortKeysA = VectorBase<METAL, SHSortKey>(numEntries);
-            sortKeysB = VectorBase<METAL, SHSortKey>(numEntries);
-            entriesGathered = VectorBase<METAL, SHTriEntry>(numEntries);
-        }
-
-        // Build sort keys from compact entries
-        MetalGlobalContext::setBuffer(entriesCompact, 0);
-        MetalGlobalContext::setBuffer(sortKeysA, 1);
-        MetalGlobalContext::setBytes(numEntries, 2);
-        MetalGlobalContext::dispatchThreads(buildSortKeysPSO, numEntries);
-
-        // Radix sort the lightweight keys (8 bytes each)
-        constexpr uint32_t BLOCK_SIZE = 256;
-        uint32_t numBlocks = (numEntries + BLOCK_SIZE - 1) / BLOCK_SIZE;
-
-        VectorBase<METAL, SHSortKey>* src = &sortKeysA;
-        VectorBase<METAL, SHSortKey>* dst = &sortKeysB;
-
-        SHRadixParams params;
-        params.numElements = numEntries;
-        params.numBlocks = numBlocks;
-
-        MetalGlobalContext::setBuffer(radixBlockHist, 3);
-        MetalGlobalContext::setBuffer(radixBlockOff, 4);
-        MetalGlobalContext::setBuffer(radixBucketBase, 5);
-
-        for (uint32_t shift = 0; shift < 32; shift += 8) {
-            params.shift = shift;
-
-            MetalGlobalContext::setBuffer(*src, 0);
-            MetalGlobalContext::setBytes(params, 2);
-            MetalGlobalContext::dispatchThreads(radixCountKeysPSO, numBlocks * 256, 256);
-
-            // Reuse same radixComputeOffsets kernel (reads params at buf2, hist at buf3)
-            MetalGlobalContext::dispatchThreads(radixComputeOffsetsPSO, 1);
-
-            MetalGlobalContext::setBuffer(*dst, 1);
-            MetalGlobalContext::dispatchThreads(radixScatterKeysPSO, numBlocks * 256, 256);
-
-            std::swap(src, dst);
-        }
-
-        // After 4 passes, sorted keys are in src (= sortKeysA)
-        if (src != &sortKeysA) {
-            std::swap(sortKeysA, sortKeysB);
-        }
-
-        // Gather: reorder entries based on sorted key indices
-        MetalGlobalContext::setBuffer(entriesCompact, 0);
-        MetalGlobalContext::setBuffer(sortKeysA, 1);
-        MetalGlobalContext::setBuffer(entriesGathered, 2);
-        MetalGlobalContext::setBytes(numEntries, 3);
-        MetalGlobalContext::dispatchThreads(gatherEntriesPSO, numEntries);
-
-        // Swap so entriesCompact points to sorted data
-        std::swap(entriesCompact, entriesGathered);
-    }
 };
+
 
 
 // TODO: BroadPhase, BVH
@@ -4119,7 +4153,6 @@ struct BruteForce<METAL, PR> {
         uint32_t numBroadCollisions;
         uint32_t maxNumCollisions;
         float radius;
-        float thickness;
     };
     bool narrow(PR radius) {
         typename Scene<METAL, PR>::PackedMeshData& packedMesh = Scene<METAL, PR>::packedMeshData;
@@ -4136,7 +4169,6 @@ struct BruteForce<METAL, PR> {
         nparams.maxNumCollisions = packedCol.maxNumCollisions;
         nparams.radius = radius;
 
-        nparams.thickness = 0; // temp.
 
         MetalGlobalContext::setBuffer(packedCol.broadCollisions, 0);
         MetalGlobalContext::setBuffer(packedCol.numNarrowCollisions, 1);
@@ -4149,6 +4181,7 @@ struct BruteForce<METAL, PR> {
         MetalGlobalContext::setBuffer(packedMesh.vertexAdjFacets, 7);
         MetalGlobalContext::setBuffer(packedMesh.vertexAdjFacetsOffsets, 8);
         MetalGlobalContext::setBytes(nparams, 9);
+        MetalGlobalContext::setBuffer(packedMesh.thicknesses,10);
 
         MetalGlobalContext::dispatchThreads(bruteForcePSO, nparams.numBroadCollisions);
         return true;
@@ -4345,10 +4378,10 @@ struct Simulator {
     Scene<BE, PR> scene;
 
     //using BroadPhase = BVH<BVHMODE::LINEAR, BVHPRIMITIVE::TRIANGLE, PR>;
-    using BroadPhase = BVH<BE, PR, BVHMODE::SCENE, BVHPRIMITIVE::OBJECT>;
-    //using BroadPhase = SpatialHashing<BE, PR>;
-    using NarrowPhase = BruteForce<BE, PR>;
-    //using NarrowPhase = NoOpNarrowPhase<BE, PR>;
+    //using BroadPhase = BVH<BE, PR, BVHMODE::SCENE, BVHPRIMITIVE::OBJECT>;
+    using BroadPhase = SpatialHashing<BE, PR>;
+    //using NarrowPhase = BruteForce<BE, PR>;
+    using NarrowPhase = NoOpNarrowPhase<BE, PR>;
     CollisionPipeline<BroadPhase, NarrowPhase> collisionPipeline;
 
 
@@ -4522,6 +4555,21 @@ struct Simulator {
 
             }
 
+            // clear forces
+            if (profiler) {
+                auto scope = profiler->scoped("clear_forces");
+                scene.clearForces();
+            } else {
+                scene.clearForces();
+            }
+
+            if (profiler) {
+                auto scope = profiler->scoped("applyRepulsionForces");
+                scene.applyRepulsionForces();
+            } else {
+                scene.applyRepulsionForces();
+            }
+
             if (profiler) {
                 auto scope = profiler->scoped("system_update");
                 system.update(scene);
@@ -4541,6 +4589,7 @@ struct Simulator {
         
         system.acctime += system.h;
         frame++;
+
 
         if (profiler) {
             auto scope = profiler->scoped("mesh_upload");
@@ -4987,7 +5036,7 @@ int main() {
 
     //ByteMemoryPool<METAL> pool(50*1024*1024*sizeof(Precision));
     Precision h = 1/Precision(240);
-    Index subSteps = 30;
+    Index subSteps = 20;
     ExplicitSystem<Backend, Precision> system(h, subSteps);
     Simulator<Backend, Precision, ExplicitSystem<Backend, Precision>> simulator(system);
     std::cout << "[Main] simulator created" << std::endl;
@@ -5014,7 +5063,7 @@ int main() {
     //simulator.addFloatMesh("src/assets", "horse-gallop-01.obj", {0, -1, 0}, 1.2);
     //simulator.addFloatMesh("src/assets", "camel-gallop-reference.obj", {0, -1, 0}, 1.2);
     simulator.addFloatMesh("src/assets", "Human.obj", {0, -1, 0}, 0.05);
-    simulator.addGround(PlaneDirection::XZPlane, tinym::vec3(0, -1, 0), 5);
+    //simulator.addGround(PlaneDirection::XZPlane, tinym::vec3(0, -1, 0), 5);
 
     std::cout << "[Main] mesh added to scene" << std::endl;
 

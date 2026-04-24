@@ -9,7 +9,8 @@ using namespace metal;
 inline bool pointInTriangleBary(
     float3 p,   // point projected into triangle plane, expressed from t0
     float3 v0,  // t1 - t0
-    float3 v1   // t2 - t0
+    float3 v1,  // t2 - t0
+    thread float3& vary
 ) {
     float d00 = dot(v0, v0);
     float d01 = dot(v0, v1);
@@ -23,6 +24,8 @@ inline bool pointInTriangleBary(
     float b = (d11 * d20 - d01 * d21) / denom;
     float c = (d00 * d21 - d01 * d20) / denom;
     float a = 1.0f - b - c;
+    
+    vary = float3(a, b, c);
 
     return (a >= 0.0f && b >= 0.0f && c >= 0.0f);
 }
@@ -44,6 +47,7 @@ kernel void narrow_pt_tri(
     device const uint* sceneVertexAdjFacetsOffsets [[buffer(8)]],
 
     constant NarrowParams& params                [[buffer(9)]],
+    device const float* thickness                [[buffer(10)]],
     uint id [[thread_position_in_grid]]
 ) {
     if (id >= params.numBroadCollisions) return;
@@ -94,12 +98,13 @@ kernel void narrow_pt_tri(
         l = -l;
     }
 
-    if (l > params.radius + params.thickness) return;
+    if (l > params.radius + thickness[qObjId]+thickness[tObjId]) return;
 
     // 평면 위 투영 벡터
     float3 inplane = p - n * l;
 
-    if (!pointInTriangleBary(inplane, v0, v1)) return;
+    float3 vary;
+    if (!pointInTriangleBary(inplane, v0, v1, vary)) return;
 
     uint outIdx = atomic_fetch_add_explicit(
         numNarrowCollisions,
@@ -115,6 +120,7 @@ kernel void narrow_pt_tri(
     narrowCollisions[outIdx].indexPair = uint2(point, triangle);
     narrowCollisions[outIdx].objPair = bc.objPair;
     narrowCollisions[outIdx].collisionNormalAndDistance = float4(n, l);
+    narrowCollisions[outIdx].varycentricCoord = float4(1, vary);
     narrowCollisions[outIdx].behaviorPair = bc.behaviorPair;
     narrowCollisions[outIdx].shapePair = bc.shapePair;
 }

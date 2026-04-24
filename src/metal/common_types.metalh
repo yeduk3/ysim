@@ -12,14 +12,26 @@ struct NarrowCollision {
     uint2 indexPair;      // point, triangle
     uint2 objPair;        // queryObjId, targetObjId
     float4 collisionNormalAndDistance; // xyz: normal, w: distance
+    float4 varycentricCoord; // x=1, yzw: triangle's varycentricCoord
     uint2 behaviorPair;
     uint2 shapePair;
 };
+
+enum struct BehaviorType : uint {
+    TriangularCloth = 0,
+    FastGridCloth,
+    Elastic,
+    Rigid,
+    Float,
+    Fluid,
+    Generator,
+};
+
+
 struct NarrowParams {
     uint numBroadCollisions;
     uint maxNumCollisions;
     float radius;
-    float thickness;
 };
 
 #endif

@@ -13,8 +13,10 @@ struct SHParams {
     int   resX;               // grid resolution along X
     int   resY;               // grid resolution along Y
     int   resZ;               // grid resolution along Z
-    uint  tableSize;          // hash table capacity (= numTriangles, or next-power-of-two)
+    uint  tableSize;          // hash table capacity (= resX*resY*resZ)
     uint  maxNumCollisions;   // max BroadCollision output
+    packed_float3 sceneMin;   // scene AABB minimum for grid coord offset
+    float _pad;
 };
 
 struct SHTriEntry {
@@ -46,15 +48,13 @@ struct SHCollisionPassParams {
 
 // ─── Helpers ────────────────────────────────────────────────────────
 
-inline int3 gridCoord(float3 centroid, float invCellSize) {
-    return int3(floor(centroid * invCellSize));
+inline int3 gridCoord(float3 centroid, float invCellSize, float3 sceneMin) {
+    return int3(floor((centroid - sceneMin) * invCellSize));
 }
 
 inline uint gridHashFull(int3 gc, int resX, int resY, int resZ) {
-    int x = ((gc.x % resX) + resX) % resX;
-    int y = ((gc.y % resY) + resY) % resY;
-    int z = ((gc.z % resZ) + resZ) % resZ;
-    return uint(z) * uint(resY) * uint(resX) + uint(y) * uint(resX) + uint(x);
+    // Grid coords are guaranteed in [0, res) after sceneMin offset + bounds check
+    return uint(gc.z) * uint(resY) * uint(resX) + uint(gc.y) * uint(resX) + uint(gc.x);
 }
 
 inline uint cellType(int3 gc) {
@@ -168,12 +168,13 @@ kernel void sh_assignCells(
     float3 c = centroids[id];
     float  r = radii[id];
 
-    int3 homeGC = gridCoord(c, params.invCellSize);
+    float3 smin = float3(params.sceneMin);
+    int3 homeGC = gridCoord(c, params.invCellSize, smin);
     uint homeCT = cellType(homeGC);
 
     // Determine which of the 8 surrounding cells the triangle overlaps.
     // The home cell is always included. For each of the 8 cells at offsets (dx,dy,dz) in {0,-1},
-    // check if the sphere overlaps that cell.
+    // check if the sphere overlaps that cell. Skip cells outside grid bounds.
     uint inclusionBits = 0;
     uint count = 0;
     uint baseIdx = id * 8;
@@ -186,10 +187,17 @@ kernel void sh_assignCells(
         for (int dy = 0; dy >= -1; dy--) {
             for (int dx = 0; dx >= -1; dx--) {
                 int3 gc = homeGC + int3(dx, dy, dz);
+
+                // Skip out-of-bounds phantom cells
+                if (gc.x < 0 || gc.y < 0 || gc.z < 0 ||
+                    gc.x >= params.resX || gc.y >= params.resY || gc.z >= params.resZ) {
+                    continue;
+                }
+
                 uint ct = cellType(gc);
 
-                // Check if sphere overlaps this cell
-                float3 cellMin = float3(gc) * params.cellSize;
+                // Check if sphere overlaps this cell (in world space)
+                float3 cellMin = smin + float3(gc) * params.cellSize;
                 float3 cellMax = cellMin + float3(params.cellSize);
 
                 // Closest point on cell AABB to centroid
@@ -388,6 +396,7 @@ struct SHRadixParams {
     uint numElements;
     uint shift;
     uint numBlocks;
+    uint blockSize;
 };
 
 // Unified buffer layout for radix sort:
@@ -403,17 +412,23 @@ kernel void sh_radixCount(
 ) {
     threadgroup uint localHist[256];
 
-    localHist[lid] = 0;
+    // Clear histogram — each thread may cover multiple buckets
+    for (uint b = lid; b < 256; b += params.blockSize) {
+        localHist[b] = 0;
+    }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    uint idx = gid * 256 + lid;
+    uint idx = gid * params.blockSize + lid;
     if (idx < params.numElements) {
         uint bucket = (src[idx].hashValue >> params.shift) & 0xFF;
         atomic_fetch_add_explicit((threadgroup atomic_uint*)&localHist[bucket], 1u, memory_order_relaxed);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    blockHist[gid * 256 + lid] = localHist[lid];
+    // Only first 256 threads write back the 256 histogram buckets
+    if (lid < 256) {
+        blockHist[gid * 256 + lid] = localHist[lid];
+    }
 }
 
 kernel void sh_radixComputeOffsets(
@@ -456,14 +471,15 @@ kernel void sh_radixScatter(
     uint lid [[thread_index_in_threadgroup]],
     uint gid [[threadgroup_position_in_grid]]
 ) {
-    // Reconstruct local histogram prefix for this block
     threadgroup uint localPrefix[256];
     threadgroup uint localCount[256];
 
-    localCount[lid] = 0;
+    for (uint b = lid; b < 256; b += params.blockSize) {
+        localCount[b] = 0;
+    }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    uint idx = gid * 256 + lid;
+    uint idx = gid * params.blockSize + lid;
     uint bucket = 0;
     if (idx < params.numElements) {
         bucket = (src[idx].hashValue >> params.shift) & 0xFF;
@@ -471,7 +487,7 @@ kernel void sh_radixScatter(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // Build local exclusive prefix
+    // Build local exclusive prefix (single thread)
     if (lid == 0) {
         uint sum = 0;
         for (uint b = 0; b < 256; b++) {
@@ -482,7 +498,6 @@ kernel void sh_radixScatter(
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     if (idx < params.numElements) {
-        // Position within local block for this bucket
         uint localPos = atomic_fetch_add_explicit((threadgroup atomic_uint*)&localPrefix[bucket], 1u, memory_order_relaxed);
         uint globalPos = bucketBase[bucket] + blockOff[gid * 256 + bucket] + localPos;
         dst[globalPos] = src[idx];
@@ -744,6 +759,161 @@ inline void narrowCheckTriPair(
                        maxNumCollisions, radius, thickness);
     }
 }
+
+// ─── Kernel: Count collision pairs per active cell ──────────────────
+// For each active cell, compute h*(h-1)/2 + h*p and store per-cell count + cell type.
+
+struct SHCellWork {
+    uint numPairs;    // h*(h-1)/2 + h*p
+    uint cellType;    // cell type (0..7), or 0xFF if no home entries
+    uint cellIdx;     // hash value (index into cellRanges)
+};
+
+kernel void sh_countCollisionPairs(
+    device const SHTriEntry*  sortedEntries  [[buffer(0)]],
+    device const SHCellRange* cellRanges     [[buffer(1)]],
+    device const uint*        activeCells    [[buffer(2)]],
+    constant uint&            numActiveCells [[buffer(3)]],
+    device SHCellWork*        cellWork       [[buffer(4)]],
+    uint id [[thread_position_in_grid]]
+) {
+    if (id >= numActiveCells) return;
+
+    uint cellIdx = activeCells[id];
+    uint start = cellRanges[cellIdx].start;
+    uint end   = cellRanges[cellIdx].end;
+
+    // Find cell type from first home entry
+    uint ct = 0xFF;
+    for (uint i = start; i < end; i++) {
+        if (sortedEntries[i].isHome) {
+            ct = sortedEntries[i].controlBits & 0x7u;
+            break;
+        }
+    }
+
+    uint h = cellRanges[cellIdx].numHome;
+    uint p = cellRanges[cellIdx].numPhantom;
+    uint pairs = (ct != 0xFF) ? (h * (h - 1) / 2 + h * p) : 0;
+
+    cellWork[id].numPairs = pairs;
+    cellWork[id].cellType = ct;
+    cellWork[id].cellIdx  = cellIdx;
+}
+
+// ─── Kernel: Flat collision pass (one thread per collision pair) ─────
+// Each thread resolves its cell via binary search on prefix-sum offsets,
+// then computes which pair within that cell.
+
+kernel void sh_collisionPassFlat(
+    device const SHTriEntry*  sortedEntries  [[buffer(0)]],
+    device const SHCellRange* cellRanges     [[buffer(1)]],
+    device const SHCellWork*  cellWork       [[buffer(2)]],
+    constant SHCollisionPassParams& passParams [[buffer(3)]],
+    device NarrowCollision*   narrowCollisions   [[buffer(4)]],
+    device atomic_uint*       numNarrowCollisions [[buffer(5)]],
+    device const packed_float3* sceneX       [[buffer(6)]],
+    device const packed_uint3*  sceneFacets  [[buffer(7)]],
+    device const uint*          statesOffsets [[buffer(8)]],
+    device const uint*          facetsOffsets [[buffer(9)]],
+    device const uint*          vertexAdjFacets        [[buffer(10)]],
+    device const uint*          vertexAdjFacetsOffsets  [[buffer(11)]],
+    device const uint*          pairOffsets   [[buffer(12)]],  // exclusive prefix sum of numPairs
+    uint id [[thread_position_in_grid]]
+) {
+    if (id >= passParams.numCells) return;  // numCells = totalPairs for this pass
+
+    // Binary search to find which cell this pair belongs to
+    uint lo = 0, hi = passParams.numTriangles;  // numTriangles repurposed as numWorkCells
+    while (lo < hi) {
+        uint mid = (lo + hi) / 2;
+        if (pairOffsets[mid + 1] <= id) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    uint cellWorkIdx = lo;
+    uint localPairIdx = id - pairOffsets[cellWorkIdx];
+
+    uint ct = cellWork[cellWorkIdx].cellType;
+    if (ct != passParams.passIndex) return;
+
+    uint cellIdx = cellWork[cellWorkIdx].cellIdx;
+    uint start = cellRanges[cellIdx].start;
+    uint end   = cellRanges[cellIdx].end;
+
+    // Collect home and phantom entry indices for this cell
+    // Use bounded arrays
+    constexpr uint MAX_PER_CELL = 128;
+    uint homeIndices[MAX_PER_CELL];
+    uint phantomIndices[MAX_PER_CELL];
+    uint nHome = 0, nPhantom = 0;
+
+    for (uint i = start; i < end; i++) {
+        if (sortedEntries[i].isHome && nHome < MAX_PER_CELL) {
+            homeIndices[nHome++] = i;
+        } else if (!sortedEntries[i].isHome && nPhantom < MAX_PER_CELL) {
+            phantomIndices[nPhantom++] = i;
+        }
+    }
+
+    uint numHH = nHome * (nHome - 1) / 2;
+    // uint numHP = nHome * nPhantom;
+
+    uint eiA, eiB;
+    bool isHomePhantom = false;
+
+    if (localPairIdx < numHH) {
+        // Home-home pair: decode linear index to (hi, hj) where hi < hj
+        // localPairIdx = hi*(2*nHome - hi - 1)/2 + (hj - hi - 1)
+        // Use iterative decode
+        uint hi_idx = 0;
+        uint remaining = localPairIdx;
+        while (remaining >= (nHome - hi_idx - 1)) {
+            remaining -= (nHome - hi_idx - 1);
+            hi_idx++;
+        }
+        uint hj_idx = hi_idx + 1 + remaining;
+        eiA = homeIndices[hi_idx];
+        eiB = homeIndices[hj_idx];
+    } else {
+        // Home-phantom pair
+        isHomePhantom = true;
+        uint hpIdx = localPairIdx - numHH;
+        uint hi_idx = hpIdx / nPhantom;
+        uint pi_idx = hpIdx % nPhantom;
+        eiA = homeIndices[hi_idx];
+        eiB = phantomIndices[pi_idx];
+
+        // Duplicate avoidance
+        uint ctrlH = sortedEntries[eiA].controlBits;
+        uint ctrlP = sortedEntries[eiB].controlBits;
+        uint phantomHomeType = ctrlP & 0x7u;
+
+        if (phantomHomeType < passParams.passIndex) {
+            uint inclusionH = ctrlH >> 3;
+            uint inclusionP = ctrlP >> 3;
+            if ((inclusionH & (1u << phantomHomeType)) != 0 &&
+                (inclusionP & (1u << phantomHomeType)) != 0) {
+                return;
+            }
+        }
+    }
+
+    narrowCheckTriPair(
+        sortedEntries[eiA].triIndex, sortedEntries[eiB].triIndex,
+        sortedEntries[eiA].objId,    sortedEntries[eiB].objId,
+        sortedEntries[eiA].behavior, sortedEntries[eiB].behavior,
+        sortedEntries[eiA].shape,    sortedEntries[eiB].shape,
+        sceneX, sceneFacets, statesOffsets, facetsOffsets,
+        vertexAdjFacets, vertexAdjFacetsOffsets,
+        narrowCollisions, numNarrowCollisions,
+        passParams.maxNumCollisions, passParams.radius, passParams.thickness
+    );
+}
+
+// ─── Legacy per-cell collision pass (kept for reference/toggle) ─────
 
 kernel void sh_collisionPass(
     device const SHTriEntry*  sortedEntries  [[buffer(0)]],

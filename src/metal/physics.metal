@@ -31,7 +31,7 @@ kernel void compute_forces(
     float3 vel = v[id];
     
     float3 force = float3(0.0, params.G * m[id], 0.0) + vel * params.kair;
-    f[id] = force;
+    f[id] += force;
 }
 
 kernel void compute_spring_forces(
@@ -150,7 +150,7 @@ kernel void compute_cloth_grid_forces_fast(
     //force += float3(1, 0, 1) * min(row * abs(col-col/2) * abs(cos(params.acctime/2.f)), 50.f);
 
     // 내 메모리에만 기록!
-    f[id] = force;
+    f[id] += force;
 }
 
 kernel void integrate_cloth_grid(
@@ -274,7 +274,7 @@ kernel void compute_tri_spring_forces(
         force += calc_spring(pos, vel, x[other], v[other], restOppLengths[i], clothParams.kbend, simParams.kd);
     }
 
-    f[id] = force;
+    f[id] += force;
 }
 
 kernel void integrate_cloth(
@@ -350,3 +350,78 @@ kernel void integrate_cloth(
 //) {
 //
 //}
+
+
+kernel void clearForces(
+    device float* f [[buffer(0)]],
+    constant uint& statesNum [[buffer(1)]],
+    uint id [[thread_position_in_grid]]
+) {
+    if(id >= statesNum) return;
+    f[id] = 0.f;
+}
+
+struct RepulsionParams {
+    float krepulsion;   // repulsion spring stiffness
+};
+
+kernel void applyRepulsionForces_noSort(
+    device packed_float3* x [[buffer(0)]],
+    device atomic_float* f_flat [[buffer(2)]],
+    device const float* m [[buffer(3)]],
+    device const NarrowCollision* narrowCollisions [[buffer(5)]],
+    device const uint* numNarrowCollisions [[buffer(6)]],
+    constant RepulsionParams& repParams [[buffer(8)]],
+    device const float* thicknesses [[buffer(9)]],
+    device const uint* statesOffsets [[buffer(18)]],
+    device const uint* facetsOffsets [[buffer(19)]],
+    device const packed_uint3* facets [[buffer(20)]],
+    uint id [[thread_position_in_grid]]
+) {
+    if (id >= numNarrowCollisions[0]) return;
+
+    uint qoid = narrowCollisions[id].objPair.x;
+    uint toid = narrowCollisions[id].objPair.y;
+    uint qbtype = narrowCollisions[id].behaviorPair.x;
+    uint tbtype = narrowCollisions[id].behaviorPair.y;
+    uint qsbase = statesOffsets[qoid];
+    uint tsbase = statesOffsets[toid];
+
+    float thickness = thicknesses[qoid] + thicknesses[toid];
+
+    float3 normal = narrowCollisions[id].collisionNormalAndDistance.xyz;
+    float  distance = narrowCollisions[id].collisionNormalAndDistance.w;
+
+    // only apply repulsion when within threshold distance
+    //if (distance >= thickness) return;
+
+    float penetration = thickness - distance;
+    float3 repForce = repParams.krepulsion * penetration * normal;
+
+    uint qbase = qsbase + narrowCollisions[id].indexPair.x;
+    atomic_fetch_add_explicit(&f_flat[qbase * 3 + 0], repForce.x, memory_order_relaxed);
+    atomic_fetch_add_explicit(&f_flat[qbase * 3 + 1], repForce.y, memory_order_relaxed);
+    atomic_fetch_add_explicit(&f_flat[qbase * 3 + 2], repForce.z, memory_order_relaxed);
+    
+    if(tbtype == (uint)BehaviorType::Float) return;
+
+    uint tfbase = facetsOffsets[toid] + narrowCollisions[id].indexPair.y;
+    uint3 facet = facets[tfbase];
+    uint v0base = tsbase + facet.x;
+    uint v1base = tsbase + facet.y;
+    uint v2base = tsbase + facet.z;
+
+    float3 vary = narrowCollisions[id].varycentricCoord.yzw;
+
+
+    atomic_fetch_sub_explicit(&f_flat[v0base * 3 + 0], repForce.x*vary.x, memory_order_relaxed);
+    atomic_fetch_sub_explicit(&f_flat[v0base * 3 + 1], repForce.y*vary.x, memory_order_relaxed);
+    atomic_fetch_sub_explicit(&f_flat[v0base * 3 + 2], repForce.z*vary.x, memory_order_relaxed);
+    atomic_fetch_sub_explicit(&f_flat[v1base * 3 + 0], repForce.x*vary.y, memory_order_relaxed);
+    atomic_fetch_sub_explicit(&f_flat[v1base * 3 + 1], repForce.y*vary.y, memory_order_relaxed);
+    atomic_fetch_sub_explicit(&f_flat[v1base * 3 + 2], repForce.z*vary.y, memory_order_relaxed);
+    atomic_fetch_sub_explicit(&f_flat[v2base * 3 + 0], repForce.x*vary.z, memory_order_relaxed);
+    atomic_fetch_sub_explicit(&f_flat[v2base * 3 + 1], repForce.y*vary.z, memory_order_relaxed);
+    atomic_fetch_sub_explicit(&f_flat[v2base * 3 + 2], repForce.z*vary.z, memory_order_relaxed);
+}
+
