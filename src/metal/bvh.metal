@@ -84,140 +84,114 @@ kernel void fillMortons_Edge(
     mortons[id].index = id;
 }
 
-//kernel void radixSort_Histogram(
-//    mortons,
-//    threadgroup histogram[group][256?],
-//    uint pass;
-//    uint3 tid [[thread_position_in_grid]]
-//) {
-//    // accumulate per-thread-group histogram
-//    // threadgroup uint histogram[threads per threadgroup]
-//    // bucket = (mortons[lid].code >> shift) & MASK
-//    // histogram[thread_group][bucket]++
-//    // 
+
+//#define RADIX_BITS 8u
+//#define RADIX (1u << RADIX_BITS)
+//#define RADIX_MASK (RADIX - 1u)
+//#define RADIX_BLOCK_SIZE 256u
+//
+//struct RadixSortParams {
+//    uint numElements;
+//    uint shift;
+//    uint numBlocks;
+//};
+//
+//inline uint radixBucket(uint code, uint shift) {
+//    return (code >> shift) & RADIX_MASK;
 //}
 //
-//kernel void radixSort_PrefixSum(
-//
+//kernel void radixCountMortonBlocks(
+//    device const MortonNode* src [[buffer(0)]],
+//    constant RadixSortParams& params [[buffer(1)]],
+//    device uint* blockHistograms [[buffer(2)]], // size = numBlocks * 256
+//    uint tid [[thread_position_in_grid]],
+//    uint lid [[thread_index_in_threadgroup]], // per threads in a block(tg)
+//    uint gid [[threadgroup_position_in_grid]] // per blocks(tg) in a grid
 //) {
-//    // 
-//}
-
-//kernel void sortMortons(
-//    device MortonNode* mortons [[buffer()]],
-//    device MortonNode* mortons [[buffer()]],
-//    uint id 
-//) {
+//    if (gid >= params.numBlocks) return;
 //
+//    threadgroup atomic_uint localHist[RADIX];
+//
+//    // init local histogram
+//    if (lid < RADIX) {
+//        atomic_store_explicit(&localHist[lid], 0u, memory_order_relaxed);
+//    }
+//    threadgroup_barrier(mem_flags::mem_threadgroup);
+//
+//    uint blockStart = gid * RADIX_BLOCK_SIZE;
+//    uint idx = blockStart + lid;
+//
+//    // one block = one threadgroup
+//    if (idx < params.numElements) {
+//        uint b = radixBucket(src[idx].code, params.shift);
+//        atomic_fetch_add_explicit(&localHist[b], 1u, memory_order_relaxed);
+//    }
+//
+//    threadgroup_barrier(mem_flags::mem_threadgroup);
+//
+//    // flush to global
+//    if (lid < RADIX) {
+//        blockHistograms[gid * RADIX + lid] =
+//            atomic_load_explicit(&localHist[lid], memory_order_relaxed);
+//    }
 //}
-
-#define RADIX_BITS 8u
-#define RADIX (1u << RADIX_BITS)
-#define RADIX_MASK (RADIX - 1u)
-#define RADIX_BLOCK_SIZE 256u
-
-struct RadixSortParams {
-    uint numElements;
-    uint shift;
-    uint numBlocks;
-};
-
-inline uint radixBucket(uint code, uint shift) {
-    return (code >> shift) & RADIX_MASK;
-}
-
-kernel void radixCountMortonBlocks(
-    device const MortonNode* src [[buffer(0)]],
-    constant RadixSortParams& params [[buffer(1)]],
-    device uint* blockHistograms [[buffer(2)]], // size = numBlocks * 256
-    uint tid [[thread_position_in_grid]],
-    uint lid [[thread_index_in_threadgroup]], // per threads in a block(tg)
-    uint gid [[threadgroup_position_in_grid]] // per blocks(tg) in a grid
-) {
-    if (gid >= params.numBlocks) return;
-
-    threadgroup atomic_uint localHist[RADIX];
-
-    // init local histogram
-    if (lid < RADIX) {
-        atomic_store_explicit(&localHist[lid], 0u, memory_order_relaxed);
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    uint blockStart = gid * RADIX_BLOCK_SIZE;
-    uint idx = blockStart + lid;
-
-    // one block = one threadgroup
-    if (idx < params.numElements) {
-        uint b = radixBucket(src[idx].code, params.shift);
-        atomic_fetch_add_explicit(&localHist[b], 1u, memory_order_relaxed);
-    }
-
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    // flush to global
-    if (lid < RADIX) {
-        blockHistograms[gid * RADIX + lid] =
-            atomic_load_explicit(&localHist[lid], memory_order_relaxed);
-    }
-}
-
-kernel void radixComputeOffsets(
-    constant RadixSortParams& params [[buffer(0)]],
-    device const uint* blockHistograms [[buffer(1)]], // numBlocks * 256
-    device uint* blockOffsets [[buffer(2)]],          // numBlocks * 256
-    device uint* bucketBase [[buffer(3)]],            // 256
-    uint tid [[thread_position_in_grid]]
-) {
-    if (tid != 0) return;
-
-    uint runningGlobal = 0;
-
-    for (uint b = 0; b < RADIX; ++b) {
-        bucketBase[b] = runningGlobal;
-
-        uint runningBucket = 0;
-        for (uint g = 0; g < params.numBlocks; ++g) {
-            uint idx = g * RADIX + b;
-            blockOffsets[idx] = runningBucket;
-            runningBucket += blockHistograms[idx];
-        }
-
-        runningGlobal += runningBucket;
-    }
-}
-
-kernel void radixScatterMortonBlocks(
-    device const MortonNode* src [[buffer(0)]],
-    device MortonNode* dst [[buffer(1)]],
-    constant RadixSortParams& params [[buffer(2)]],
-    device const uint* blockOffsets [[buffer(3)]], // numBlocks * 256
-    device const uint* bucketBase [[buffer(4)]],   // 256
-    uint lid [[thread_index_in_threadgroup]],
-    uint gid [[threadgroup_position_in_grid]]
-) {
-    if (gid >= params.numBlocks) return;
-
-    if (lid != 0) return; // correctness-first stable scatter
-
-    uint localCount[RADIX];
-    for (uint b = 0; b < RADIX; ++b) localCount[b] = 0;
-
-    uint blockStart = gid * RADIX_BLOCK_SIZE;
-    uint blockEnd   = min(blockStart + RADIX_BLOCK_SIZE, params.numElements);
-
-    for (uint i = blockStart; i < blockEnd; ++i) {
-        MortonNode m = src[i];
-        uint b = radixBucket(m.code, params.shift);
-
-        uint dstIndex = bucketBase[b]
-                      + blockOffsets[gid * RADIX + b]
-                      + localCount[b];
-
-        dst[dstIndex] = m;
-        localCount[b]++;
-    }
-}
+//
+//kernel void radixComputeOffsets(
+//    constant RadixSortParams& params [[buffer(0)]],
+//    device const uint* blockHistograms [[buffer(1)]], // numBlocks * 256
+//    device uint* blockOffsets [[buffer(2)]],          // numBlocks * 256
+//    device uint* bucketBase [[buffer(3)]],            // 256
+//    uint tid [[thread_position_in_grid]]
+//) {
+//    if (tid != 0) return;
+//
+//    uint runningGlobal = 0;
+//
+//    for (uint b = 0; b < RADIX; ++b) {
+//        bucketBase[b] = runningGlobal;
+//
+//        uint runningBucket = 0;
+//        for (uint g = 0; g < params.numBlocks; ++g) {
+//            uint idx = g * RADIX + b;
+//            blockOffsets[idx] = runningBucket;
+//            runningBucket += blockHistograms[idx];
+//        }
+//
+//        runningGlobal += runningBucket;
+//    }
+//}
+//
+//kernel void radixScatterMortonBlocks(
+//    device const MortonNode* src [[buffer(0)]],
+//    device MortonNode* dst [[buffer(1)]],
+//    constant RadixSortParams& params [[buffer(2)]],
+//    device const uint* blockOffsets [[buffer(3)]], // numBlocks * 256
+//    device const uint* bucketBase [[buffer(4)]],   // 256
+//    uint lid [[thread_index_in_threadgroup]],
+//    uint gid [[threadgroup_position_in_grid]]
+//) {
+//    if (gid >= params.numBlocks) return;
+//
+//    if (lid != 0) return; // correctness-first stable scatter
+//
+//    uint localCount[RADIX];
+//    for (uint b = 0; b < RADIX; ++b) localCount[b] = 0;
+//
+//    uint blockStart = gid * RADIX_BLOCK_SIZE;
+//    uint blockEnd   = min(blockStart + RADIX_BLOCK_SIZE, params.numElements);
+//
+//    for (uint i = blockStart; i < blockEnd; ++i) {
+//        MortonNode m = src[i];
+//        uint b = radixBucket(m.code, params.shift);
+//
+//        uint dstIndex = bucketBase[b]
+//                      + blockOffsets[gid * RADIX + b]
+//                      + localCount[b];
+//
+//        dst[dstIndex] = m;
+//        localCount[b]++;
+//    }
+//}
 
 
 inline uint findSplit(

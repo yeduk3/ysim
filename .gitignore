@@ -1,4 +1,5 @@
 build/
+buildxc/
 .cache/
 
 compile_commands.json
@@ -7,3 +8,8 @@ compile_commands.json
 
 codex/
 profiles/
+
+.claude/
+CLAUDE.md
+
+uml/

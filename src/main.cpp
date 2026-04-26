@@ -1863,6 +1863,73 @@ enum BVHPRIMITIVE {
 //    }
 //};
 
+template <typename BE, typename Element>
+struct RadixSorter {};
+
+template <typename Element>
+struct RadixSorter<METAL, Element> {
+    uint32_t BITS_PER_PASS = 8;
+    uint32_t NUM_BUCKETS = 1 << BITS_PER_PASS;
+    uint32_t BLOCK_SIZE = 1024; // range limit: 256-1024
+    VectorBase<METAL, Element> dst;
+    VectorBase<METAL, Index> blockHist; // NumBlocks * 2^{BITS_PER_PASS}
+    VectorBase<METAL, Index> hist; // 2^{BITS_PER_PASS}
+    VectorBase<METAL, Index> blockOffset; // NumBlocks * 2^{BITS_PER_PASS}
+
+    MTL::ComputePipelineState* radixCountBlockPSO;
+    MTL::ComputePipelineState* radixScanOffsetPSO;
+    MTL::ComputePipelineState* radixScatterPSO;
+
+
+    struct RadixParams {
+        uint numBlocks;
+        uint numElements;
+        uint blockSize;
+        uint shift;
+    };
+
+    inline uint32_t getNumBlocks(const VectorBase<METAL, Element>& src) {
+        return (src.size + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    }
+
+    RadixSorter() {
+        radixCountBlockPSO = MetalKernelContext::getPSO("radixCountBlock_8Bits");
+        radixScanOffsetPSO = MetalKernelContext::getPSO("radixScanOffset_8Bits");
+        radixScatterPSO = MetalKernelContext::getPSO("radixScatter_8Bits");
+    }
+
+    inline void memoryAllocation(const VectorBase<METAL, Element>& src) {
+        uint32_t numBlocks = getNumBlocks(src);
+        if(!dst.ptr || dst.size < src.size) dst = VectorBase<METAL, Element>(src.size);
+        if(!hist.ptr || hist.size < NUM_BUCKETS) hist = VectorBase<METAL, Index>(NUM_BUCKETS);
+        if(!blockHist.ptr || blockHist.size < NUM_BUCKETS*numBlocks) blockHist = VectorBase<METAL, Index>(NUM_BUCKETS*numBlocks);
+        if(!blockOffset.ptr || blockOffset.size < NUM_BUCKETS*numBlocks) blockOffset = VectorBase<METAL, Index>(NUM_BUCKETS*numBlocks);
+    }
+    void sort(VectorBase<METAL, Element>& src) {
+        memoryAllocation(src);
+
+        RadixParams params;
+        params.numBlocks = getNumBlocks(src);
+        params.numElements = src.size;
+        params.blockSize = BLOCK_SIZE;
+        for(uint32_t r = 0; r < 32; r+=BITS_PER_PASS) {
+            params.shift = r;
+            MetalGlobalContext::setBuffer(src, 0);
+            MetalGlobalContext::setBuffer(blockHist, 1);
+            MetalGlobalContext::setBytes(params, 2);
+            MetalGlobalContext::setBuffer(hist, 3);
+            MetalGlobalContext::setBuffer(blockOffset, 4);
+            MetalGlobalContext::setBuffer(dst, 5);
+
+            MetalGlobalContext::dispatchThreads(radixCountBlockPSO, params.numBlocks*BLOCK_SIZE, BLOCK_SIZE);
+            MetalGlobalContext::dispatchThreads(radixScanOffsetPSO, NUM_BUCKETS, NUM_BUCKETS);
+            MetalGlobalContext::dispatchThreads(radixScatterPSO, params.numBlocks*BLOCK_SIZE, BLOCK_SIZE);
+
+            std::swap(src, dst);
+        }
+    }
+};
+
 
 struct alignas(32) AABB4 {
     union {
@@ -1999,9 +2066,11 @@ struct BVH<BE, PR, BVHMODE::LINEAR, PRIMITIVE> {
     MTL::ComputePipelineState* bottomUpBoxesPSO;
     MTL::ComputePipelineState* queryPointsPSO;
 
-    MTL::ComputePipelineState* radixCountBlocksPSO;
-    MTL::ComputePipelineState* radixComputeOffsetsPSO;
-    MTL::ComputePipelineState* radixScatterBlocksPSO;
+    //MTL::ComputePipelineState* radixCountBlocksPSO;
+    //MTL::ComputePipelineState* radixComputeOffsetsPSO;
+    //MTL::ComputePipelineState* radixScatterBlocksPSO;
+
+    RadixSorter<METAL, MortonNode> sorter;
 
     MTL::ComputePipelineState* initBottomUpReadyPSO;
     MTL::ComputePipelineState* clearBottomUpProgressPSO;
@@ -2032,9 +2101,9 @@ struct BVH<BE, PR, BVHMODE::LINEAR, PRIMITIVE> {
         bottomUpBoxesPSO = MetalKernelContext::getPSO("bottomUpBoxes");
         queryPointsPSO = MetalKernelContext::getPSO("queryPoints");
 
-        radixCountBlocksPSO     = MetalKernelContext::getPSO("radixCountMortonBlocks");
-        radixComputeOffsetsPSO  = MetalKernelContext::getPSO("radixComputeOffsets");
-        radixScatterBlocksPSO   = MetalKernelContext::getPSO("radixScatterMortonBlocks");
+        //radixCountBlocksPSO     = MetalKernelContext::getPSO("radixCountMortonBlocks");
+        //radixComputeOffsetsPSO  = MetalKernelContext::getPSO("radixComputeOffsets");
+        //radixScatterBlocksPSO   = MetalKernelContext::getPSO("radixScatterMortonBlocks");
 
         initBottomUpReadyPSO    = MetalKernelContext::getPSO("initBottomUpReady");
         clearBottomUpProgressPSO= MetalKernelContext::getPSO("clearBottomUpProgress");
@@ -2199,47 +2268,7 @@ struct BVH<BE, PR, BVHMODE::LINEAR, PRIMITIVE> {
         radixSortByMortonCode(mortons.ptr, mortonsTemp.ptr, numPrimitives);
     }
     void radixSortGPU() {
-        Index numPrimitives = primitives.size/PRIMITIVE;
-
-        constexpr uint32_t BLOCK_SIZE = 256;
-        uint32_t numBlocks = (numPrimitives + BLOCK_SIZE - 1) / BLOCK_SIZE;
-
-        VectorBase<METAL, MortonNode>* src = &mortons;
-        VectorBase<METAL, MortonNode>* dst = &mortonsTemp;
-
-        for (uint32_t shift = 0; shift < 32; shift += 8) {
-            RadixSortParamsCPU params = {
-                (uint32_t)numPrimitives,
-                shift,
-                numBlocks
-            };
-
-            // 1) block histograms
-            MetalGlobalContext::setBuffer(*src, 0);
-            MetalGlobalContext::setBytes(params, 1);
-            MetalGlobalContext::setBuffer(radixBlockHistograms, 2);
-            MetalGlobalContext::dispatchThreads(radixCountBlocksPSO, numBlocks * 256, 256);
-            //MetalGlobalContext::commitAndWait();
-
-            // 2) offsets and bucket bases
-            MetalGlobalContext::setBytes(params, 0);
-            MetalGlobalContext::setBuffer(radixBlockHistograms, 1);
-            MetalGlobalContext::setBuffer(radixBlockOffsets, 2);
-            MetalGlobalContext::setBuffer(radixBucketBase, 3);
-            MetalGlobalContext::dispatchThreads(radixComputeOffsetsPSO, 1);
-            //MetalGlobalContext::commitAndWait();
-
-            // 3) stable scatter
-            MetalGlobalContext::setBuffer(*src, 0);
-            MetalGlobalContext::setBuffer(*dst, 1);
-            MetalGlobalContext::setBytes(params, 2);
-            MetalGlobalContext::setBuffer(radixBlockOffsets, 3);
-            MetalGlobalContext::setBuffer(radixBucketBase, 4);
-            MetalGlobalContext::dispatchThreads(radixScatterBlocksPSO, numBlocks * 256, 256);
-            //MetalGlobalContext::commitAndWait();
-
-            std::swap(src, dst);
-        }
+        sorter.sort(mortons);
     }
     void fillMortonsCPU(AABB4& sceneBox) {
         Index numPrimitives = primitives.size/PRIMITIVE;
