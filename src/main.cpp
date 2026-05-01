@@ -1822,7 +1822,13 @@ struct SpatialHashing<METAL, PR> {
     }
 
     void detect() {
-
+        // stage1 - compute the boundary and largest triangle.
+        // stage2 - compute grid size
+        // stage3 - compute cell properties per triangle
+        // stage4 - put triangles into cells (w phantom)
+        // stage5 - recompute phantom 
+        // stage6 - sort
+        // stage7 - detect?
     }
 };
 
