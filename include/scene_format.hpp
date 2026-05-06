@@ -80,14 +80,23 @@ struct Environment {
     Vec3 wind{0.0, 0.0, 0.0};
 };
 
+struct LoadError {
+    std::string message;
+};
+
+// Loader-emitted warnings (e.g. clamped material values). Distinct from
+// LoadError — these do not fail the load (`docs/design/scene_format.md`
+// says "logs a warning and clamps").
+struct LoadWarnings {
+    std::vector<std::string> messages;
+    bool empty() const { return messages.empty(); }
+};
+
 struct SceneSnapshot {
     int formatVersion = kFormatVersion;
     std::vector<Object> objects;
     Environment environment;
-};
-
-struct LoadError {
-    std::string message;
+    LoadWarnings warnings;
 };
 
 template <typename T>
@@ -111,15 +120,27 @@ inline Vec3 clampColor(const Vec3& c) {
     return {clamp01(c[0]), clamp01(c[1]), clamp01(c[2])};
 }
 
-inline void clampInPlace(Material& m) {
-    m.baseColor = clampColor(m.baseColor);
-    m.metallic = clamp01(m.metallic);
-    m.roughness = clamp01(m.roughness);
-    m.specularWeight = clamp01(m.specularWeight);
-    // emissionColor is non-negative; v1 design clamps the lower bound only.
-    m.emissionColor[0] = m.emissionColor[0] < 0.0 ? 0.0 : m.emissionColor[0];
-    m.emissionColor[1] = m.emissionColor[1] < 0.0 ? 0.0 : m.emissionColor[1];
-    m.emissionColor[2] = m.emissionColor[2] < 0.0 ? 0.0 : m.emissionColor[2];
+// Returns true when any field had to be clamped — caller may surface a warning.
+inline bool clampInPlace(Material& m) {
+    bool changed = false;
+    auto clampVec = [&](Vec3& v) {
+        for (int i = 0; i < 3; ++i) {
+            double c = clamp01(v[i]);
+            if (c != v[i]) { v[i] = c; changed = true; }
+        }
+    };
+    auto clampScalar = [&](double& x) {
+        double c = clamp01(x);
+        if (c != x) { x = c; changed = true; }
+    };
+    clampVec(m.baseColor);
+    clampScalar(m.metallic);
+    clampScalar(m.roughness);
+    clampScalar(m.specularWeight);
+    for (int i = 0; i < 3; ++i) {
+        if (m.emissionColor[i] < 0.0) { m.emissionColor[i] = 0.0; changed = true; }
+    }
+    return changed;
 }
 
 namespace detail {
@@ -336,7 +357,8 @@ inline Result<Transform> transformFromJson(const nlohmann::json& j, int idx) {
     return R::success(t);
 }
 
-inline Result<Material> materialFromJson(const nlohmann::json& j, int idx) {
+inline Result<Material> materialFromJson(const nlohmann::json& j, int idx,
+                                          LoadWarnings* warnings = nullptr) {
     using R = Result<Material>;
     Material m;
     std::string path = "objects[" + std::to_string(idx) + "].material";
@@ -350,7 +372,9 @@ inline Result<Material> materialFromJson(const nlohmann::json& j, int idx) {
     auto ec = j.find("emission_color");
     if (ec == j.end()) return R::fail("missing 'emission_color' at " + path);
     if (!detail::readVec3(*ec, m.emissionColor, err, path + ".emission_color")) return R::fail(err);
-    clampInPlace(m);
+    if (clampInPlace(m) && warnings) {
+        warnings->messages.push_back("clamped out-of-range material values at " + path);
+    }
     return R::success(m);
 }
 
@@ -372,7 +396,8 @@ inline Result<Behavior> behaviorFromJson(const nlohmann::json& j, int idx) {
     return R::success(b);
 }
 
-inline Result<Object> objectFromJson(const nlohmann::json& j, int idx) {
+inline Result<Object> objectFromJson(const nlohmann::json& j, int idx,
+                                       LoadWarnings* warnings = nullptr) {
     using R = Result<Object>;
     Object o;
     std::string path = "objects[" + std::to_string(idx) + "]";
@@ -391,7 +416,7 @@ inline Result<Object> objectFromJson(const nlohmann::json& j, int idx) {
     o.transform = std::move(tr.value);
     auto mj = j.find("material");
     if (mj == j.end()) return R::fail("missing 'material' at " + path);
-    auto mr = materialFromJson(*mj, idx);
+    auto mr = materialFromJson(*mj, idx, warnings);
     if (!mr.ok) return R::fail(mr.error.message);
     o.material = std::move(mr.value);
     auto bj = j.find("behavior");
@@ -434,7 +459,7 @@ inline Result<SceneSnapshot> fromJson(const nlohmann::json& j) {
     if (objs == j.end() || !objs->is_array())
         return R::fail("missing or invalid 'objects' array");
     for (size_t i = 0; i < objs->size(); ++i) {
-        auto r = objectFromJson((*objs)[i], (int)i);
+        auto r = objectFromJson((*objs)[i], (int)i, &s.warnings);
         if (!r.ok) return R::fail(r.error.message);
         s.objects.push_back(std::move(r.value));
     }
@@ -479,6 +504,29 @@ inline Result<SceneSnapshot> readFromFile(const std::string& path) {
     std::stringstream ss;
     ss << in.rdbuf();
     return parseString(ss.str());
+}
+
+// Returns the directory portion of `scenePath`, with trailing slash stripped.
+// Empty string when the path has no directory component.
+inline std::string sceneDir(const std::string& scenePath) {
+    auto pos = scenePath.find_last_of('/');
+    if (pos == std::string::npos) return "";
+    return scenePath.substr(0, pos);
+}
+
+inline bool isAbsolutePath(const std::string& p) {
+    return !p.empty() && p[0] == '/';
+}
+
+// Resolve an import path against the directory of the scene file it came
+// from. Absolute imports pass through; relative imports are joined with
+// `dir`. Anchors `BDD-014`'s "import path round-trips" against the
+// schema's "interpreted relative to the scene file's directory" rule.
+inline std::string resolveImportPath(const std::string& dir, const std::string& importPath) {
+    if (isAbsolutePath(importPath)) return importPath;
+    if (dir.empty()) return importPath;
+    if (!dir.empty() && dir.back() == '/') return dir + importPath;
+    return dir + "/" + importPath;
 }
 
 }  // namespace scene_format

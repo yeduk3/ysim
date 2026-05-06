@@ -48,15 +48,34 @@ Each entry in `objects` is an object with these required keys:
 Discriminated by `type`:
 
 ```json
-{ "type": "primitive", "shape": "sphere"|"cube", "size": 1.0, "tessellation": 32 }
+{
+  "type": "primitive",
+  "shape": "grid",
+  "size": 1.0,
+  "tessellation": 32,
+  "direction": "XZPlane",
+  "mass": 0.1,
+  "jiggle": false
+}
 ```
 
 ```json
-{ "type": "import", "path": "assets/teapot.obj" }
+{ "type": "import", "path": "assets/teapot.obj", "scale": 1.0, "mass": 0.1 }
 ```
 
-- `path` is interpreted **relative to the scene file's directory**. Absolute paths are accepted but discouraged (breaks portability).
+### Primitive shape — v1 reality
+
+v1 ships a single primitive shape, `"grid"`, because the only primitive-construction path the engine has today is `MeshGridInitializer` (a tessellated quad / cloth grid). The grid-specific keys (`direction`, `mass`, `jiggle`) are part of the v1 schema; on save they are always emitted and on load they default sensibly if omitted.
+
+`"sphere"` and `"cube"` are reserved-but-not-shipped names: the v1 loader recognises them and fails with a clear `"shape X not available in this build"` error, mirroring the way the loader treats `Rigid`/`Elastic`/`Fluid`/`Generator` behaviors. They become real shipping shapes when the authoring slice that introduces them lands (`BDD-001`).
+
+This is the same additive-evolution rule the rest of the schema uses: the on-disk surface accepts forward-compatible names and refuses to silently downgrade them. See `DECISIONS.md` D-003 for the rationale.
+
+### Import
+
+- `path` is interpreted **relative to the scene file's directory**. Absolute paths are accepted but discouraged (breaks portability). The loader joins relative paths against the directory of the file it was given, so a saved scene moved alongside its assets keeps loading correctly.
 - v1 supports `.obj` only for `import` — the loader inspects the file extension and rejects unsupported extensions with a clear error (does not fall through silently).
+- `scale` and `mass` carry the existing `MeshFileInitializerParams` fields so save/load round-trips them. Both default if omitted.
 
 ## Transform
 

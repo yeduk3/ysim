@@ -254,6 +254,54 @@ TEST_CASE("BDD-016: reject reserved-but-not-shipped behavior type") {
     std::remove(path.c_str());
 }
 
+// ---- Import path resolution (BDD-014/015 Estimator follow-up) ---------
+
+TEST_CASE("import paths resolve relative to scene file directory") {
+    using R = std::string;
+    CHECK(resolveImportPath("/scenes/2026", "assets/teapot.obj") == R("/scenes/2026/assets/teapot.obj"));
+    CHECK(resolveImportPath("scenes", "assets/teapot.obj") == R("scenes/assets/teapot.obj"));
+    CHECK(resolveImportPath("", "assets/teapot.obj") == R("assets/teapot.obj"));
+    // Absolute import paths pass through.
+    CHECK(resolveImportPath("/scenes/2026", "/library/teapot.obj") == R("/library/teapot.obj"));
+    // Trailing slash on dir.
+    CHECK(resolveImportPath("/scenes/2026/", "assets/teapot.obj") == R("/scenes/2026/assets/teapot.obj"));
+}
+
+TEST_CASE("sceneDir extracts directory from a scene file path") {
+    CHECK(sceneDir("/scenes/2026/foo.ysim.json") == "/scenes/2026");
+    CHECK(sceneDir("foo.ysim.json") == "");
+    CHECK(sceneDir("./foo.ysim.json") == ".");
+}
+
+// ---- Material clamping warns (Estimator WARNING follow-up) ------------
+
+TEST_CASE("loader emits a warning and clamps out-of-range material values") {
+    auto path = tempPath("clamp");
+    REQUIRE(writeText(path, R"({
+      "format_version": 1,
+      "objects": [{
+        "id": 0, "name": "x",
+        "source": {"type":"primitive","shape":"grid","size":1.0,"tessellation":2},
+        "transform": {"position":[0,0,0],"rotation":[1,0,0,0]},
+        "material": {"base_color":[1.5, -0.2, 0.5],"metallic":2.0,"roughness":-0.1,"specular_weight":3.0,"emission_color":[-1.0, 0.0, 0.0]},
+        "behavior": {"type":"Float","params":{}}
+      }],
+      "environment": {"gravity":[0,0,0],"wind":[0,0,0]}
+    })"));
+    auto r = readFromFile(path);
+    REQUIRE(r.ok);
+    CHECK_FALSE(r.value.warnings.empty());
+    const auto& m = r.value.objects[0].material;
+    CHECK(m.baseColor[0] == doctest::Approx(1.0));
+    CHECK(m.baseColor[1] == doctest::Approx(0.0));
+    CHECK(m.baseColor[2] == doctest::Approx(0.5));
+    CHECK(m.metallic == doctest::Approx(1.0));
+    CHECK(m.roughness == doctest::Approx(0.0));
+    CHECK(m.specularWeight == doctest::Approx(1.0));
+    CHECK(m.emissionColor[0] == doctest::Approx(0.0));
+    std::remove(path.c_str());
+}
+
 TEST_CASE("BDD-016: reject unsupported import extension") {
     auto path = tempPath("016d");
     REQUIRE(writeText(path, R"({

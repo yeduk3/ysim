@@ -1527,6 +1527,15 @@ struct Material {
     tinym::vec3 emissionColor = tinym::vec3(0.0f);
 };
 
+// Order matches the on-disk schema: [w, x, y, z]. Identity is the v1 default;
+// no consumer applies the rotation yet, but it must round-trip through save/load.
+struct Quat {
+    float w = 1.0f;
+    float x = 0.0f;
+    float y = 0.0f;
+    float z = 0.0f;
+};
+
 
 
 
@@ -1542,6 +1551,7 @@ struct GeneralMesh {
     ShapeType shapeType = ShapeType::Mesh;
     BehaviorParams<PR> behaviorParams;
     Material material;
+    Quat rotationQuat;
     Constraints<BE, PR> constraints;
     ExternalForces<BE, PR> externalForces;
 
@@ -1560,9 +1570,10 @@ struct GeneralMesh {
           behaviorType(other.behaviorType),
           behaviorParams(other.behaviorParams),
           material(std::move(other.material)),
+          rotationQuat(other.rotationQuat),
           constraints(std::move(other.constraints)),
           externalForces(std::move(other.externalForces)),
-          meshGL(std::move(other.meshGL)) 
+          meshGL(std::move(other.meshGL))
     {
         other.initializer = nullptr;
     }
@@ -4585,7 +4596,7 @@ struct Simulator {
         return false;
     }
 
-    static scene_format::SceneSnapshot toSnapshot() {
+    scene_format::SceneSnapshot toSnapshot() {
         using namespace scene_format;
         SceneSnapshot s;
         s.environment.gravity = {Scene<BE,PR>::environment.gravity.x,
@@ -4597,7 +4608,7 @@ struct Simulator {
 
         auto encodeOne = [&](int id, GeneralMeshInitializer<BE,PR>* init,
                               BehaviorType btype, const BehaviorParams<PR>& bparams,
-                              const ::Material& mat, const std::string& name) {
+                              const ::Material& mat, const ::Quat& rot, const std::string& name) {
             Object o;
             o.id = id;
             o.name = name;
@@ -4625,7 +4636,7 @@ struct Simulator {
                 o.source.import.mass = (double)f->params.mass;
                 o.transform.position = {f->params.offset.x, f->params.offset.y, f->params.offset.z};
             }
-            o.transform.rotation = {1, 0, 0, 0};
+            o.transform.rotation = {rot.w, rot.x, rot.y, rot.z};
 
             o.behavior.type = behaviorTypeName(btype);
             o.behavior.params = nlohmann::json::object();
@@ -4656,13 +4667,18 @@ struct Simulator {
         if (!Scene<BE,PR>::meshes.empty()) {
             for (auto& m : Scene<BE,PR>::meshes) {
                 encodeOne(m.id, m.initializer, m.behaviorType, m.behaviorParams,
-                          m.material, "object_" + std::to_string(m.id));
+                          m.material, m.rotationQuat,
+                          "object_" + std::to_string(m.id));
             }
         } else {
             for (auto& r : Scene<BE,PR>::requestsGeneralMeshes) {
                 ::Material defaultMat;
+                ::Quat defaultRot;
+                auto pr = pendingRotations.find(r.id);
+                if (pr != pendingRotations.end()) defaultRot = pr->second;
                 encodeOne(r.id, r.initializer, r.behaviorType, r.behaviorParams,
-                          defaultMat, "object_" + std::to_string(r.id));
+                          defaultMat, defaultRot,
+                          "object_" + std::to_string(r.id));
             }
         }
         return s;
@@ -4682,6 +4698,8 @@ struct Simulator {
         Scene<BE,PR>::requestsGeneralMeshes.clear();
         Scene<BE,PR>::numMeshes = 0;
         Scene<BE,PR>::dirty = true;
+        pendingMaterials.clear();
+        pendingRotations.clear();
 
         Scene<BE,PR>::environment.gravity = tinym::vec3(
             (float)r.value.environment.gravity[0],
@@ -4692,6 +4710,7 @@ struct Simulator {
             (float)r.value.environment.wind[1],
             (float)r.value.environment.wind[2]);
 
+        const std::string sceneDir = scene_format::sceneDir(path);
         for (auto& o : r.value.objects) {
             BehaviorType btype = BehaviorType::Float;
             BehaviorParams<PR> bparams = FloatBehaviorParams<PR>{};
@@ -4732,14 +4751,14 @@ struct Simulator {
                     (PR)o.source.primitive.mass,
                     o.source.primitive.jiggle));
             } else {
-                std::string p = o.source.import.path;
+                std::string resolved = scene_format::resolveImportPath(sceneDir, o.source.import.path);
                 std::string prefix, file;
-                auto slash = p.find_last_of('/');
+                auto slash = resolved.find_last_of('/');
                 if (slash != std::string::npos) {
-                    prefix = p.substr(0, slash);
-                    file = p.substr(slash + 1);
+                    prefix = resolved.substr(0, slash);
+                    file = resolved.substr(slash + 1);
                 } else {
-                    file = p;
+                    file = resolved;
                 }
                 init = new MeshFileInitializer<BE,PR>(MeshFileInitializerParams<PR>(
                     prefix, file, pos,
@@ -4751,10 +4770,8 @@ struct Simulator {
             if (Scene<BE,PR>::numMeshes > 0) {
                 int idx = Scene<BE,PR>::numMeshes - 1;
                 if (idx < (int)Scene<BE,PR>::requestsGeneralMeshes.size()) {
-                    // Material is held on GeneralMesh; the request struct does not
-                    // carry it, so apply on realization. For now, stash into a side
-                    // table keyed by id so the next pack() can paint materials.
-                    pendingMaterials[Scene<BE,PR>::requestsGeneralMeshes[idx].id] = {
+                    int meshId = Scene<BE,PR>::requestsGeneralMeshes[idx].id;
+                    pendingMaterials[meshId] = {
                         tinym::vec3((float)o.material.baseColor[0],
                                     (float)o.material.baseColor[1],
                                     (float)o.material.baseColor[2]),
@@ -4765,6 +4782,12 @@ struct Simulator {
                                     (float)o.material.emissionColor[1],
                                     (float)o.material.emissionColor[2])
                     };
+                    ::Quat q;
+                    q.w = (float)o.transform.rotation[0];
+                    q.x = (float)o.transform.rotation[1];
+                    q.y = (float)o.transform.rotation[2];
+                    q.z = (float)o.transform.rotation[3];
+                    pendingRotations[meshId] = q;
                 }
             }
         }
@@ -4772,15 +4795,17 @@ struct Simulator {
     }
 
     std::unordered_map<int, ::Material> pendingMaterials;
+    std::unordered_map<int, ::Quat> pendingRotations;
 
     void applyPendingMaterials() {
         for (auto& m : Scene<BE,PR>::meshes) {
-            auto it = pendingMaterials.find(m.id);
-            if (it != pendingMaterials.end()) {
-                m.material = it->second;
-            }
+            auto mit = pendingMaterials.find(m.id);
+            if (mit != pendingMaterials.end()) m.material = mit->second;
+            auto rit = pendingRotations.find(m.id);
+            if (rit != pendingRotations.end()) m.rotationQuat = rit->second;
         }
         pendingMaterials.clear();
+        pendingRotations.clear();
     }
 };
 
