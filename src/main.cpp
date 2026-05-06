@@ -893,13 +893,13 @@ struct MeshAdjacencyInitializer {
     using Vector = VectorBase<BE, PR>;
 
     static void initialize(MeshState<BE, PR>& state, MeshAdjacency<BE, PR>& adjacency) {
-        std::cout << "[MeshSpringInitializer initialize] start" << std::endl;
+        //std::cout << "[MeshSpringInitializer initialize] start" << std::endl;
         Index maxNumEdgeInfos = adjacency.facets.size;
         Index numPoints = state.x.size/3;
         DynamicMemoryAllocator<BE> tempPool;
         VectorBase<BE, EdgeInfo> tempEdgeInfos(tempPool.template alloc<EdgeInfo>(maxNumEdgeInfos));
         VectorBase<BE, EdgeInfo> edgeInfos(tempPool.template alloc<EdgeInfo>(maxNumEdgeInfos));
-        std::cout << "[MeshSpringInitializer initialize] temp vector allocated" << std::endl;
+        //std::cout << "[MeshSpringInitializer initialize] temp vector allocated" << std::endl;
 
         // vertex adj facets
         
@@ -919,7 +919,7 @@ struct MeshAdjacencyInitializer {
         for(Index vid = 0; vid < numPoints; ++vid) 
             adjacency.vertexAdjFacetsOffsets[vid+1] += adjacency.vertexAdjFacetsOffsets[vid];
 
-        std::cout << "[MeshSpringInitializer initialize] vertex adj facets offsets set" << std::endl;
+        //std::cout << "[MeshSpringInitializer initialize] vertex adj facets offsets set" << std::endl;
 
         adjacency.vertexAdjFacets = VectorBase<BE, Index>(adjacency.vertexAdjFacetsOffsets[numPoints]);
         
@@ -942,14 +942,14 @@ struct MeshAdjacencyInitializer {
             offsets[v1]++;
             offsets[v2]++;
         }
-        std::cout << "[MeshSpringInitializer initialize] vertex adjacent facets set" << std::endl;
-        for(Index i = 0; i < 10; ++i) {
-            std::cout << i << "-th adjacent facets: ";
-            for(Index fi = adjacency.vertexAdjFacetsOffsets[i]; fi < adjacency.vertexAdjFacetsOffsets[i+1]; ++fi) {
-                std::cout << adjacency.vertexAdjFacets[fi] << ", ";
-            }
-            std::cout << std::endl;
-        }
+        //std::cout << "[MeshSpringInitializer initialize] vertex adjacent facets set" << std::endl;
+        //for(Index i = 0; i < 10; ++i) {
+        //    std::cout << i << "-th adjacent facets: ";
+        //    for(Index fi = adjacency.vertexAdjFacetsOffsets[i]; fi < adjacency.vertexAdjFacetsOffsets[i+1]; ++fi) {
+        //        std::cout << adjacency.vertexAdjFacets[fi] << ", ";
+        //    }
+        //    std::cout << std::endl;
+        //}
 
 
         
@@ -980,16 +980,16 @@ struct MeshAdjacencyInitializer {
             fillEdgeInfos(eIdx++, v1, v2, v0, fid);
             fillEdgeInfos(eIdx++, v2, v0, v1, fid);
         }
-        std::cout << "[MeshSpringInitializer initialize] temp edges are filled" << std::endl;
+        //std::cout << "[MeshSpringInitializer initialize] temp edges are filled" << std::endl;
 
         // Sort the temp edge infos to reduce
         std::sort(tempEdgeInfos.ptr, tempEdgeInfos.ptr+eIdx, [](EdgeInfo& a, EdgeInfo& b) {
             return a.v0 < b.v0 || (a.v0 == b.v0 && a.v1 < b.v1);
         });
-        std::cout << "[MeshSpringInitializer initialize] temp edges are sorted" << std::endl;
-        std::cout << " ---- test output ---- " << std::endl;
-        for(int i = 0; i < 10; i++) 
-            std::cout << tempEdgeInfos[i].v0 << ", " << tempEdgeInfos[i].v1 << " in facet id " << tempEdgeInfos[i].f0 << std::endl;
+        //std::cout << "[MeshSpringInitializer initialize] temp edges are sorted" << std::endl;
+        //std::cout << " ---- test output ---- " << std::endl;
+        //for(int i = 0; i < 10; i++) 
+        //    std::cout << tempEdgeInfos[i].v0 << ", " << tempEdgeInfos[i].v1 << " in facet id " << tempEdgeInfos[i].f0 << std::endl;
 
         // Reduce temp edge infos into unique edge infos
         // And initialize restEdgeLengths
@@ -1029,39 +1029,39 @@ struct MeshAdjacencyInitializer {
             }
         }
         Index edgeNum = edgeid+1;
-        for(int i = 0; i < 10; i++) {
-            std::cout << adjacency.edges[i*2] << ", " << adjacency.edges[i*2+1] << ": " << adjacency.restEdgeLengths[i] << std::endl;
-            //Index vid0 = adjacency.edges[i*2];
-            //Index vid1 = adjacency.edges[i*2+1];
-            //std::cout << state.x[vid0*3] << ", " << state.x[vid0*3+1] << ", " << state.x[vid0*3+2] << std::endl;
-            //std::cout << state.x[vid1*3] << ", " << state.x[vid1*3+1] << ", " << state.x[vid1*3+2] << std::endl;
-        }
+        //for(int i = 0; i < 10; i++) {
+        //    std::cout << adjacency.edges[i*2] << ", " << adjacency.edges[i*2+1] << ": " << adjacency.restEdgeLengths[i] << std::endl;
+        //    Index vid0 = adjacency.edges[i*2];
+        //    Index vid1 = adjacency.edges[i*2+1];
+        //    std::cout << state.x[vid0*3] << ", " << state.x[vid0*3+1] << ", " << state.x[vid0*3+2] << std::endl;
+        //    std::cout << state.x[vid1*3] << ", " << state.x[vid1*3+1] << ", " << state.x[vid1*3+2] << std::endl;
+        //}
 
         for(Index i = 0; i < numPoints; ++i) {
             adjacency.vertexOppVerticesOffsets[i+1] += adjacency.vertexOppVerticesOffsets[i];
             adjacency.vertexAdjEdgesOffsets[i+1] += adjacency.vertexAdjEdgesOffsets[i];
         }
-        std::cout << "vertexOppVerticesOffsets: " << std::endl;
-        for(int i = 0; i < 10; i++) 
-            std::cout << adjacency.vertexOppVerticesOffsets[i] << std::endl;
-        std::cout << "..." << adjacency.vertexOppVerticesOffsets[numPoints] << std::endl;
-        std::cout << "vertexAdjEdgesOffsets: " << std::endl;
-        for(int i = 0; i < 10; i++) 
-            std::cout << adjacency.vertexAdjEdgesOffsets[i] << std::endl;
-        std::cout << "..." << adjacency.vertexAdjEdgesOffsets[numPoints] << std::endl;
-        std::cout << "edgeInfos: " << std::endl;
-        for(Index i = 0; i < 10; i++)
-            std::cout << edgeInfos[i].v0 << " " << edgeInfos[i].v1 << " " << edgeInfos[i].o0 << " " << edgeInfos[i].o1 << " " << edgeInfos[i].f0 << " " << edgeInfos[i].f1 << std::endl;
+        //std::cout << "vertexOppVerticesOffsets: " << std::endl;
+        //for(int i = 0; i < 10; i++) 
+        //    std::cout << adjacency.vertexOppVerticesOffsets[i] << std::endl;
+        //std::cout << "..." << adjacency.vertexOppVerticesOffsets[numPoints] << std::endl;
+        //std::cout << "vertexAdjEdgesOffsets: " << std::endl;
+        //for(int i = 0; i < 10; i++) 
+        //    std::cout << adjacency.vertexAdjEdgesOffsets[i] << std::endl;
+        //std::cout << "..." << adjacency.vertexAdjEdgesOffsets[numPoints] << std::endl;
+        //std::cout << "edgeInfos: " << std::endl;
+        //for(Index i = 0; i < 10; i++)
+        //    std::cout << edgeInfos[i].v0 << " " << edgeInfos[i].v1 << " " << edgeInfos[i].o0 << " " << edgeInfos[i].o1 << " " << edgeInfos[i].f0 << " " << edgeInfos[i].f1 << std::endl;
 
         
         // set vertexOppVertices and vertexAdjEdges
         VectorBase<BE, Index> oppOffsets(tempPool.template zeros<Index>(numPoints));
         VectorBase<BE, Index> adjOffsets(tempPool.template zeros<Index>(numPoints));
-        std::cout << "[MeshSpringInitializer initialize] oppOffsets allocated" << std::endl;
+        //std::cout << "[MeshSpringInitializer initialize] oppOffsets allocated" << std::endl;
         adjacency.vertexOppVertices = VectorBase<BE, Index>(adjacency.vertexOppVerticesOffsets[numPoints], 0);
         adjacency.restOppLengths = VectorBase<BE, PR>(adjacency.vertexOppVerticesOffsets[numPoints]);
         adjacency.vertexAdjEdges = VectorBase<BE, Index>(adjacency.vertexAdjEdgesOffsets[numPoints], 0);
-        std::cout << "[MeshSpringInitializer initialize] vertex opposite vertices allocated" << std::endl;
+        //std::cout << "[MeshSpringInitializer initialize] vertex opposite vertices allocated" << std::endl;
         for(Index ei = 0; ei < edgeNum; ++ei) {
             if(edgeInfos[ei].o1 != -1) {
                 Index o0 = edgeInfos[ei].o0;
@@ -1092,22 +1092,21 @@ struct MeshAdjacencyInitializer {
             adjOffsets[v0]++;
             adjOffsets[v1]++;
         }
-        std::cout << "[MeshSpringInitializer initialize] Opposite vertices set" << std::endl;
-
-        for(Index i = 0; i < 10; i++) {
-            std::cout << i << "-th opposite: ";
-            for(Index oi = adjacency.vertexOppVerticesOffsets[i]; oi < adjacency.vertexOppVerticesOffsets[i+1]; ++oi) {
-                std::cout << adjacency.vertexOppVertices[oi] << ", ";
-            }
-            std::cout << std::endl;
-        }
-        for(Index i = 0; i < 10; i++) {
-            std::cout << i << "-th adj edges: ";
-            for(Index ei = adjacency.vertexAdjEdgesOffsets[i]; ei < adjacency.vertexAdjEdgesOffsets[i+1]; ++ei) {
-                std::cout << adjacency.vertexAdjEdges[ei] << ", ";
-            }
-            std::cout << std::endl;
-        }
+        //std::cout << "[MeshSpringInitializer initialize] Opposite vertices set" << std::endl;
+        //for(Index i = 0; i < 10; i++) {
+        //    std::cout << i << "-th opposite: ";
+        //    for(Index oi = adjacency.vertexOppVerticesOffsets[i]; oi < adjacency.vertexOppVerticesOffsets[i+1]; ++oi) {
+        //        std::cout << adjacency.vertexOppVertices[oi] << ", ";
+        //    }
+        //    std::cout << std::endl;
+        //}
+        //for(Index i = 0; i < 10; i++) {
+        //    std::cout << i << "-th adj edges: ";
+        //    for(Index ei = adjacency.vertexAdjEdgesOffsets[i]; ei < adjacency.vertexAdjEdgesOffsets[i+1]; ++ei) {
+        //        std::cout << adjacency.vertexAdjEdges[ei] << ", ";
+        //    }
+        //    std::cout << std::endl;
+        //}
     }
 };
 
@@ -1809,66 +1808,10 @@ struct Scene {
 
 
 
-// TODO: BroadPhase, SpatialHashing
-template <typename BE, typename PR>
-struct SpatialHashing {};
-
-template<typename PR>
-struct SpatialHashing<METAL, PR> {
-    
-
-    void build() {
-        
-    }
-
-    void detect() {
-        // stage1 - compute the boundary and largest triangle.
-        // stage2 - compute grid size
-        // stage3 - compute cell properties per triangle
-        // stage4 - put triangles into cells (w phantom)
-        // stage5 - recompute phantom 
-        // stage6 - sort
-        // stage7 - detect?
-    }
-};
-
-
-// TODO: BroadPhase, BVH
-template <typename BE, typename PR, Index MODE, Index PRIMITIVE>
-struct BVH {};
-enum BVHMODE {
-    SCENE,
-    LINEAR,
-    SAH,
-};
-enum BVHPRIMITIVE {
-    OBJECT = 0,
-    POINT = 1,
-    EDGE = 2,
-    TRIANGLE = 3,
-};
-
-//struct AABB {
-//    tinym::vec3 min, max;
-//    AABB() : min(0), max(0) {}
-//    AABB(tinym::vec3_view e1, tinym::vec3_view e2) : min(tinym::min(e1, e2)), max(tinym::max(e1, e2)) {}
-//    AABB(tinym::vec3_view t1, tinym::vec3_view t2, tinym::vec3_view t3) : min(tinym::min(t1, t2, t3)), max(tinym::max(t1, t2, t3)) {}
-//    void combine(const tinym::vec3_view& a) {
-//        min = tinym::min(a, min);
-//        max = tinym::max(a, max);
-//    }
-//    void combine(const AABB& aabb) {
-//        min = tinym::min(min, aabb.min);
-//        max = tinym::max(max, aabb.max);
-//    }
-//    bool intersect(const AABB& aabb) const {
-//        if (max.x < aabb.min.x || min.x > aabb.max.x) return false;
-//        if (max.y < aabb.min.y || min.y > aabb.max.y) return false;
-//        if (max.z < aabb.min.z || min.z > aabb.max.z) return false;
-//        return true;
-//    }
-//};
-
+// RadixSorter is declared here (above SpatialHashing) so that
+// SpatialHashing<METAL, PR> can hold a value-typed RadixSorter member.
+// The primary template and METAL specialization were originally further
+// down the file alongside BVH; they were moved up unchanged.
 template <typename BE, typename Element>
 struct RadixSorter {};
 
@@ -1936,6 +1879,980 @@ struct RadixSorter<METAL, Element> {
     }
 };
 
+
+// TODO: BroadPhase, SpatialHashing
+template <typename BE, typename PR>
+struct SpatialHashing {};
+
+// Spatial-hashing broadphase (Pabst-style uniform-grid) for the METAL backend.
+//
+// Implemented step-by-step alongside the existing BVH broadphase; both share
+// the BroadCollision output convention so the rest of the pipeline
+// (narrow_pt_tri, narrowAndSortByVertices) is unchanged.
+//
+// Surface mirrors BVH<METAL, PR, BVHMODE::SCENE, BVHPRIMITIVE::OBJECT> so the
+// `Simulator::BroadPhase` typedef can be swapped at compile time. All methods
+// in Step 0 are no-ops; later steps fill them in.
+//
+// Pipeline (target end state):
+//   1. per-triangle bounding sphere (centroid, radius)         [Step 1]
+//   2. max-radius reduction -> cellSize                        [Step 2]
+//   3. scene AABB + grid resolution (host)                     [Step 3]
+//   4. cell assignment (home + up to 7 phantoms per face)      [Step 4]
+//   5. radix sort entries by cellID                            [Step 5]
+//   6. cell ranges + nH/nP per cell                            [Step 6]
+//   7. pair-count + prefix sum -> P (#candidate pairs)         [Step 7]
+//   8. per-pair broad-phase -> BroadCollision[6 per tri pair]  [Step 8]
+template<typename PR>
+struct SpatialHashing<METAL, PR> {
+    // Host-side mirror of metal's SHParams. Layout must match exactly because
+    // setBytes copies raw bytes to constant memory.
+    struct SHParamsHost {
+        uint32_t numFaces;
+        float    cellSize;
+        float    epsilon;
+        uint32_t gridRes[3];     // packed_uint3 = 3 contiguous uints
+        float    originMin[3];   // packed_float3 = 3 contiguous floats
+    };
+    static_assert(sizeof(SHParamsHost) == 36,
+                  "SHParamsHost must match metal SHParams layout (36 bytes)");
+
+    // 8-byte hash-table entry, layout-compatible with SortPair so the radix
+    // sorter (Step 5) can swap it directly. cellID == 0xFFFFFFFF marks an
+    // unused slot and sorts to the tail.
+    struct SHEntry {
+        uint32_t cellID;
+        uint32_t value;
+    };
+    static_assert(sizeof(SHEntry) == 8, "SHEntry must be 8 bytes");
+
+    // ----- Buffers (allocated lazily; Step 0 leaves them empty) -----
+    VectorBase<METAL, PR>          centroid;             // 3*m floats, packed_float3
+    VectorBase<METAL, PR>          radius;               // m
+    VectorBase<METAL, PR>          maxRadius;            // 1
+    VectorBase<METAL, PR>          radiusReducePartial;  // ceil(m/256)
+    VectorBase<METAL, PR>          radiusReducePartial2; // ceil(m/256/256), ping-pong
+    VectorBase<METAL, Index>       faceObj;              // m, owning object id per global face
+    VectorBase<METAL, uint32_t>    meshBehaviors;        // numMeshes, BehaviorType per mesh
+    VectorBase<METAL, uint32_t>    meshShapes;           // numMeshes, ShapeType per mesh
+    VectorBase<METAL, uint8_t>     faceCB;               // m, 8-bit cell-type bitmask
+    VectorBase<METAL, SHEntry>     entries;              // m*8, cellID=0xFFFFFFFF sentinel
+    VectorBase<METAL, uint32_t>    cellStartFlag;        // m*8, 1 if entry starts a new cell
+    VectorBase<METAL, uint32_t>    cellStartScan;        // m*8, exclusive scan of cellStartFlag
+    // CellProp lives in metal-side struct; on host we mirror it as 5 uints.
+    struct CellPropHost {
+        uint32_t start;
+        uint32_t nH;
+        uint32_t nP;
+        uint32_t pairCnt;
+        uint32_t cellType;
+    };
+    VectorBase<METAL, CellPropHost> cellProp;            // C entries
+    VectorBase<METAL, uint32_t>    pairPrefix;           // C+1, last = P
+    VectorBase<METAL, uint32_t>    numCellsBuf;          // 1
+    VectorBase<METAL, uint32_t>    numCandidatePairsBuf; // 1
+    // sceneBox is small POD; passed via setBytes at Step 3 (no buffer needed).
+
+    // ----- PSO handles (looked up per step as kernels are added) -----
+    // Step 1+ will populate these; Step 0 keeps them null.
+    MTL::ComputePipelineState* buildBVPSO          = nullptr;
+    MTL::ComputePipelineState* reduceMaxRadiusPSO  = nullptr;
+    MTL::ComputePipelineState* reduceFinalPSO      = nullptr;
+    MTL::ComputePipelineState* assignCellsPSO      = nullptr;
+    MTL::ComputePipelineState* markStartsPSO       = nullptr;
+    MTL::ComputePipelineState* fillCellPropPSO     = nullptr;
+    MTL::ComputePipelineState* computePairCountPSO = nullptr;
+    MTL::ComputePipelineState* broadPhasePSO       = nullptr;
+
+    // ----- Scene context cached at build() time -----
+    Scene<METAL, PR>* scenePtr = nullptr;
+    Index numFaces = 0;
+    Index numValidEntries = 0;   // populated after Step 5 (radix sort + scan)
+    Index numCells = 0;          // populated after Step 6 (mark + scan + fill)
+    Index numCandidatePairs = 0; // populated after Step 7 (pair-count + scan)
+
+    // Reused 4-pass 8-bit radix sorter from RadixSorter<METAL, MortonNode>;
+    // SHEntry has the same {uint key=cellID, uint value} byte layout, so the
+    // metal kernels work without modification.
+    RadixSorter<METAL, SHEntry> sorter;
+
+    // Filled in detectCollisions() once per frame; consumed by Steps 4+ via
+    // setBytes. Matches metal SHParams layout exactly (36 bytes).
+    SHParamsHost params{};
+
+    // Optional. If non-null, detectCollisions() emits sh_* timing sections
+    // that line up with the existing bvh_* labels for side-by-side compare.
+    profiler::FrameProfiler* profiler = nullptr;
+
+    // Per-stage timings + workload counters from the most recent
+    // detectCollisions(). Filled every call (cheap), so the simulator can dump
+    // a one-line log per substep without extra GPU work.  Note: when `verbose`
+    // is false, `ms_broad` only times the dispatch (no commit) and `numBroadOut`
+    // is whatever was visible at the last commitAndWait inside the pipeline.
+    struct LastRunStats {
+        Index  numFaces        = 0;
+        Index  numValidEntries = 0;
+        Index  numCells        = 0;
+        Index  numCandidatePairs = 0;
+        Index  numBroadOut     = 0;
+        Index  maxNH           = 0;
+        Index  maxNP           = 0;
+        Index  maxPairCnt      = 0;
+        Index  numPoints       = 0;
+        float    cellSize      = 0.f;
+        float    maxRadius     = 0.f;
+        float    extent[3]     = {0.f, 0.f, 0.f};
+        float    aabbMin[3]    = {0.f, 0.f, 0.f};
+        uint32_t gridRes[3]    = {0, 0, 0};
+        double ms_buildBV    = 0.0;
+        double ms_reduce     = 0.0;
+        double ms_grid       = 0.0;
+        double ms_assign     = 0.0;
+        double ms_sort       = 0.0;
+        double ms_cellprop   = 0.0;
+        double ms_pairprefix = 0.0;
+        double ms_broad      = 0.0;
+        double ms_total      = 0.0;
+    };
+    LastRunStats lastStats{};
+
+    // When true, detectCollisions() commits after the broad-phase dispatch so
+    // ms_broad and numBroadOut reflect actual GPU work (instead of just the
+    // dispatch cost). Adds a sync point — keep off in steady-state.
+    bool verbose = false;
+
+    // Multiplier on the Pabst cell-size rule: cellSize = 2·maxRadius·factor + margin.
+    //   factor = 1.0 (default): exact Pabst rule. Every face's BV fits in a
+    //                            2x2x2 home+phantom cluster, so the 8 entry
+    //                            slots/face in sh_assignCells are sufficient.
+    //   factor < 1.0           : finer grid, but a face's BV may now span more
+    //                            than 2 cells per axis. The current
+    //                            sh_assignCells only emits 8 cells/face, so
+    //                            some overlapped cells will be missed and the
+    //                            large BVs lose collision pairs. Useful as a
+    //                            quick experiment to see whether finer cells
+    //                            relieve a hot cell; if it helps materially,
+    //                            widen the slot budget and switch to the
+    //                            general gMin..gMax cell-range assignment.
+    //   factor > 1.0           : coarser grid, slot budget remains safe.
+    float cellSizeFactor = 1.0f;
+
+    SpatialHashing() = default;
+
+    void memoryAllocation() {
+        if (numFaces == 0) return;
+        if (centroid.ptr && centroid.size == numFaces * 3) return;
+        centroid = VectorBase<METAL, PR>(numFaces * 3);
+        radius   = VectorBase<METAL, PR>(numFaces);
+
+        constexpr Index TG = 256;
+        Index ng1 = (numFaces + TG - 1) / TG;
+        Index ng2 = std::max<Index>((ng1 + TG - 1) / TG, 1);
+        radiusReducePartial  = VectorBase<METAL, PR>(std::max<Index>(ng1, 1));
+        radiusReducePartial2 = VectorBase<METAL, PR>(ng2);
+        if (!maxRadius.ptr) maxRadius = VectorBase<METAL, PR>(1);
+
+        entries = VectorBase<METAL, SHEntry>(numFaces * 8);
+        faceCB  = VectorBase<METAL, uint8_t>(numFaces);
+
+        cellStartFlag = VectorBase<METAL, uint32_t>(numFaces * 8);
+        cellStartScan = VectorBase<METAL, uint32_t>(numFaces * 8);
+    }
+
+    // faceObj[gFace] = owning object id. Walks facetsOffsets once; only
+    // rebuilt when scene size changes.
+    void rebuildFaceObj() {
+        if (!scenePtr) return;
+        auto& packed = Scene<METAL, PR>::packedMeshData;
+        Index m = packed.facets.size / 3;
+        if (faceObj.ptr && faceObj.size == m) return;
+        faceObj = VectorBase<METAL, Index>(m);
+        Index numMeshes = Scene<METAL, PR>::numMeshes;
+        for (Index obj = 0; obj < numMeshes; ++obj) {
+            Index begin = packed.facetsOffsets[obj];
+            Index end   = packed.facetsOffsets[obj + 1];
+            for (Index f = begin; f < end; ++f) faceObj[f] = obj;
+        }
+    }
+
+    // meshBehaviors[obj] / meshShapes[obj] mirror the per-mesh enums into
+    // GPU-readable arrays. Step 8 reads them per pair.
+    void rebuildMeshKinds() {
+        Index numMeshes = Scene<METAL, PR>::numMeshes;
+        if (meshBehaviors.ptr && meshBehaviors.size == numMeshes) return;
+        meshBehaviors = VectorBase<METAL, uint32_t>(numMeshes);
+        meshShapes    = VectorBase<METAL, uint32_t>(numMeshes);
+        auto& meshes = Scene<METAL, PR>::meshes;
+        for (Index i = 0; i < numMeshes; ++i) {
+            meshBehaviors[i] = (uint32_t)meshes[i].behaviorType;
+            meshShapes[i]    = (uint32_t)meshes[i].shapeType;
+        }
+    }
+
+    // Match BVH<SCENE,OBJECT> surface so CollisionPipeline / Simulator can
+    // typedef to either implementation.
+    void build(Scene<METAL, PR>& scene) {
+        scenePtr = &scene;
+        auto& packed = Scene<METAL, PR>::packedMeshData;
+        numFaces = packed.facets.size / 3;
+        rebuildFaceObj();
+        rebuildMeshKinds();
+        memoryAllocation();
+        if (!buildBVPSO)         buildBVPSO         = MetalKernelContext::getPSO("sh_buildBV");
+        if (!reduceMaxRadiusPSO) reduceMaxRadiusPSO = MetalKernelContext::getPSO("sh_reduceMaxRadius");
+        if (!assignCellsPSO)     assignCellsPSO     = MetalKernelContext::getPSO("sh_assignCells");
+        if (!markStartsPSO)      markStartsPSO      = MetalKernelContext::getPSO("sh_markStarts");
+        if (!fillCellPropPSO)    fillCellPropPSO    = MetalKernelContext::getPSO("sh_fillCellProp");
+        if (!computePairCountPSO)computePairCountPSO= MetalKernelContext::getPSO("sh_computePairCount");
+        if (!broadPhasePSO)      broadPhasePSO      = MetalKernelContext::getPSO("sh_broadPhase");
+    }
+
+    // Step 1 dispatch. Uses `params` (filled by computeGrid in Step 3); only
+    // params.numFaces matters to sh_buildBV but we set the whole struct so
+    // the same layout flows into later stages.
+    void runBuildBV() {
+        if (numFaces == 0 || !buildBVPSO) return;
+        auto& packed = Scene<METAL, PR>::packedMeshData;
+        params.numFaces = (uint32_t)numFaces;
+
+        MetalGlobalContext::setBuffer(packed.x, 0);
+        MetalGlobalContext::setBuffer(packed.statesOffsets, 1);
+        MetalGlobalContext::setBuffer(packed.facets, 2);
+        MetalGlobalContext::setBuffer(faceObj, 3);
+        MetalGlobalContext::setBytes(params, 4);
+        MetalGlobalContext::setBuffer(centroid, 5);
+        MetalGlobalContext::setBuffer(radius, 6);
+        MetalGlobalContext::dispatchThreads(buildBVPSO, numFaces);
+    }
+
+    // Iteratively reduce `radius[numFaces]` to a single max in `maxRadius[0]`.
+    // Each pass reduces by a factor of 256 (threadgroup size). Output buffer
+    // alternates between `radiusReducePartial` / `radiusReducePartial2`; the
+    // pass that brings count down to 1 writes directly to `maxRadius`.
+    void runReduceMaxRadius() {
+        if (numFaces == 0 || !reduceMaxRadiusPSO) return;
+        constexpr Index TG = 256;
+
+        auto dispatch = [&](VectorBase<METAL, PR>& in,
+                            VectorBase<METAL, PR>& out,
+                            uint32_t cnt) {
+            Index ng = (cnt + TG - 1) / TG;
+            MetalGlobalContext::setBuffer(in, 0);
+            MetalGlobalContext::setBuffer(out, 1);
+            MetalGlobalContext::setBytes(cnt, 2);
+            MetalGlobalContext::dispatchThreads(reduceMaxRadiusPSO, ng * TG, TG);
+            return ng;
+        };
+
+        // Pass 1: radius -> partial (or maxRadius if it already fits in one group).
+        uint32_t cnt = (uint32_t)numFaces;
+        Index ng = (cnt + TG - 1) / TG;
+        VectorBase<METAL, PR>* dst = (ng == 1) ? &maxRadius : &radiusReducePartial;
+        dispatch(radius, *dst, cnt);
+
+        // Subsequent passes: ping-pong until we drive count to 1.
+        VectorBase<METAL, PR>* src = dst;
+        VectorBase<METAL, PR>* alt = (src == &radiusReducePartial)
+                                     ? &radiusReducePartial2
+                                     : &radiusReducePartial;
+        while (ng > 1) {
+            cnt = (uint32_t)ng;
+            Index ng2 = (cnt + TG - 1) / TG;
+            VectorBase<METAL, PR>* nextDst = (ng2 == 1) ? &maxRadius : alt;
+            dispatch(*src, *nextDst, cnt);
+            ng = ng2;
+            src = nextDst;
+            alt = (alt == &radiusReducePartial) ? &radiusReducePartial2
+                                                : &radiusReducePartial;
+        }
+    }
+
+    // ----- Step 3: scene AABB + grid resolution (host-side) -----
+    //
+    // CPU scan over packedMeshData.x to compute scene min/max, then derive
+    // cellSize and per-axis gridRes. Result is stashed into `params` so the
+    // same struct flows into all subsequent kernel dispatches via setBytes.
+    //
+    // Caller must ensure GPU writes to packedMeshData.x and maxRadius[0]
+    // have completed (commitAndWait) before this runs.
+    void computeGrid(PR margin) {
+        if (numFaces == 0) return;
+        auto& packed = Scene<METAL, PR>::packedMeshData;
+        Index numMeshes = Scene<METAL, PR>::numMeshes;
+        // Walk via statesOffsets so the per-mesh range is explicit. Equivalent
+        // to (0 .. packed.x.size/3) when the scene is well-packed, but makes
+        // any offset/coverage bug observable.
+        Index totalPoints = (numMeshes > 0) ? packed.statesOffsets[numMeshes] : 0;
+        if (totalPoints == 0) return;
+
+        tinym::vec3 mn(packed.x.ptr[0], packed.x.ptr[1], packed.x.ptr[2]);
+        tinym::vec3 mx = mn;
+        Index visited = 0;
+        for (Index obj = 0; obj < numMeshes; ++obj) {
+            Index begin = packed.statesOffsets[obj];
+            Index end   = packed.statesOffsets[obj + 1];
+            for (Index v = begin; v < end; ++v) {
+                tinym::vec3 p(packed.x.ptr[v*3 + 0],
+                              packed.x.ptr[v*3 + 1],
+                              packed.x.ptr[v*3 + 2]);
+                mn = tinym::min(mn, p);
+                mx = tinym::max(mx, p);
+            }
+            visited += (end - begin);
+        }
+        // Sanity: every vertex was visited and the buffer holds nothing extra.
+        // If this fires, statesOffsets is out of sync with packed.x.size.
+        if (visited != totalPoints || totalPoints != packed.x.size / 3) {
+            std::cout << "[SH computeGrid] coverage mismatch: visited="
+                      << visited
+                      << " statesOffsets[numMeshes]=" << totalPoints
+                      << " packed.x.size/3=" << (packed.x.size / 3)
+                      << "\n";
+        }
+
+        float cellSize = 2.0f * (float)maxRadius[0] * cellSizeFactor + (float)margin;
+        // Degenerate scene (single point) or zero radius: fall back to margin.
+        if (cellSize <= 0.f) cellSize = std::max((float)margin, 1e-6f);
+        // One-shot warning when the user goes finer than Pabst — sh_assignCells
+        // only emits 8 cells/face, so larger BVs will miss overlapped cells.
+        static bool warnedFineGrid = false;
+        if (cellSizeFactor < 1.0f && !warnedFineGrid) {
+            std::cout << "[SH computeGrid] cellSizeFactor=" << cellSizeFactor
+                      << " < 1.0 — BVs larger than cellSize/2 along an axis"
+                         " will overflow the 8-slot assignment budget and"
+                         " miss overlapped cells. Use as a diagnostic only.\n";
+            warnedFineGrid = true;
+        }
+
+        params.numFaces    = (uint32_t)numFaces;
+        params.cellSize    = cellSize;
+        params.epsilon     = (float)margin;
+        params.originMin[0] = mn.x;
+        params.originMin[1] = mn.y;
+        params.originMin[2] = mn.z;
+        for (int k = 0; k < 3; ++k) {
+            float extent = mx[k] - mn[k];
+            uint32_t r = (uint32_t)std::ceil(extent / cellSize);
+            if (r == 0) r = 1;
+            params.gridRes[k] = r;
+        }
+        // Keep extent/numPoints/maxRadius for the per-substep log so the user
+        // can correlate "grid is small" with "extent is small" or
+        // "maxRadius (-> cellSize) is huge".
+        lastStats.extent[0]   = mx.x - mn.x;
+        lastStats.extent[1]   = mx.y - mn.y;
+        lastStats.extent[2]   = mx.z - mn.z;
+        lastStats.aabbMin[0]  = mn.x;
+        lastStats.aabbMin[1]  = mn.y;
+        lastStats.aabbMin[2]  = mn.z;
+        lastStats.maxRadius   = (float)maxRadius[0];
+        lastStats.numPoints   = totalPoints;
+    }
+
+    // Step 4 dispatch. Assumes computeGrid() filled `params` and the GPU has
+    // already produced centroid[] and radius[].
+    void runAssignCells() {
+        if (numFaces == 0 || !assignCellsPSO) return;
+        MetalGlobalContext::setBuffer(centroid, 0);
+        MetalGlobalContext::setBuffer(radius,   1);
+        MetalGlobalContext::setBytes(params,    2);
+        MetalGlobalContext::setBuffer(entries,  3);
+        MetalGlobalContext::setBuffer(faceCB,   4);
+        MetalGlobalContext::dispatchThreads(assignCellsPSO, numFaces);
+    }
+
+    // ----- Step 5: radix sort entries by cellID -----
+    //
+    // Uses the 4-pass 8-bit radix sorter that already exists for the BVH's
+    // morton codes. After 4 passes the sorted data is back in `entries`.
+    // Sentinels (cellID=0xFFFFFFFF) sort to the tail.
+    void runRadixSort() {
+        if (numFaces == 0) return;
+        sorter.sort(entries);
+    }
+
+    // Sentinel boundary via binary search. After Step 5 + commitAndWait the
+    // unified-memory `entries.ptr` is coherent on the host.
+    Index findNumValid() {
+        Index n = entries.size;
+        if (n == 0) return 0;
+        if (entries[n - 1].cellID != 0xFFFFFFFFu) return n;
+        if (entries[0].cellID == 0xFFFFFFFFu)     return 0;
+        Index lo = 0, hi = n;
+        while (lo < hi) {
+            Index mid = lo + (hi - lo) / 2;
+            if (entries[mid].cellID == 0xFFFFFFFFu) hi = mid;
+            else                                    lo = mid + 1;
+        }
+        return lo;
+    }
+
+    // ----- Step 6: cell ranges + nH/nP per cell -----
+    //
+    // Three-stage: GPU markStarts -> host inclusive prefix-sum -> GPU
+    // fillCellProp. The host scan is the bottleneck (~m*8 sequential adds);
+    // it can be moved to a Blelloch scan kernel later but is fine on M3 for
+    // v1 because we already commitAndWait between Step 5 and Step 7.
+
+    void runMarkStarts() {
+        if (numValidEntries == 0 || !markStartsPSO) return;
+        uint32_t nv = (uint32_t)numValidEntries;
+        MetalGlobalContext::setBuffer(entries,       0);
+        MetalGlobalContext::setBytes(nv,             1);
+        MetalGlobalContext::setBuffer(cellStartFlag, 2);
+        MetalGlobalContext::dispatchThreads(markStartsPSO, numValidEntries);
+    }
+
+    // Inclusive prefix sum minus 1: `cellStartScan[i] = (sum flag[0..=i]) - 1`,
+    // i.e. the cellIdx that entry `i` belongs to. Final running total is
+    // numCells. Host-side; caller must commitAndWait first.
+    void hostScanCellStarts() {
+        numCells = 0;
+        if (numValidEntries == 0) return;
+        uint32_t running = 0;
+        for (Index i = 0; i < numValidEntries; ++i) {
+            running += cellStartFlag[i];
+            cellStartScan[i] = running - 1;
+        }
+        numCells = running;
+    }
+
+    void runFillCellProp() {
+        if (numCells == 0 || !fillCellPropPSO) return;
+        // (Re-)allocate cellProp sized to numCells, zero-initialised.
+        if (cellProp.size < numCells) {
+            cellProp = VectorBase<METAL, CellPropHost>(numCells);
+        }
+        std::memset(cellProp.ptr, 0, sizeof(CellPropHost) * numCells);
+
+        uint32_t nv = (uint32_t)numValidEntries;
+        MetalGlobalContext::setBuffer(entries,       0);
+        MetalGlobalContext::setBuffer(cellStartFlag, 1);
+        MetalGlobalContext::setBuffer(cellStartScan, 2);
+        MetalGlobalContext::setBytes(nv,             3);
+        MetalGlobalContext::setBytes(params,         4);
+        MetalGlobalContext::setBuffer(cellProp,      5);
+        MetalGlobalContext::dispatchThreads(fillCellPropPSO, numValidEntries);
+    }
+
+    void validateCellProp(Index N = 8) {
+        if (numCells == 0) {
+            std::cout << "[SH Step6] no active cells\n";
+            return;
+        }
+        uint64_t sumH = 0, sumP = 0;
+        Index    badStart = numCells; // sentinel meaning "none"
+        for (Index i = 0; i < numCells; ++i) {
+            sumH += cellProp[i].nH;
+            sumP += cellProp[i].nP;
+            if (i > 0 && cellProp[i].start <= cellProp[i - 1].start
+                && badStart == numCells) {
+                badStart = i;
+            }
+        }
+        bool sumOk     = (sumH + sumP == (uint64_t)numValidEntries);
+        bool startOk   = (badStart == numCells);
+        std::cout << "[SH Step6] cells=" << numCells
+                  << " sum(nH)=" << sumH
+                  << " sum(nP)=" << sumP
+                  << " total=" << (sumH + sumP)
+                  << "/" << numValidEntries
+                  << (sumOk ? " match" : " MISMATCH")
+                  << " starts=" << (startOk ? "increasing" : "BROKEN")
+                  << "\n";
+        if (!startOk) {
+            std::cout << "  first non-increasing start at i=" << badStart
+                      << " start[" << (badStart - 1) << "]="
+                      << cellProp[badStart - 1].start
+                      << " start[" << badStart << "]="
+                      << cellProp[badStart].start << "\n";
+        }
+        Index n = std::min<Index>(N, numCells);
+        for (Index i = 0; i < n; ++i) {
+            const auto& cp = cellProp[i];
+            std::cout << "  cell " << i
+                      << " start=" << cp.start
+                      << " nH=" << cp.nH
+                      << " nP=" << cp.nP
+                      << " type=" << cp.cellType
+                      << " (cellID=" << entries[cp.start].cellID << ")"
+                      << "\n";
+        }
+    }
+
+    // ----- Step 7: per-cell pairCnt + exclusive prefix -> P -----
+    //
+    // pairCnt = nH*(nH-1)/2 + nH*nP. Phantom-only cells (nH==0) produce 0
+    // pairs and are silently dropped (no fictitious-phantom promotion in
+    // v1).  pairPrefix[C+1] is exclusive-scan of pairCnt; the last element
+    // is the total candidate-pair count P consumed by Step 8.
+
+    void runComputePairCount() {
+        if (numCells == 0 || !computePairCountPSO) return;
+        uint32_t nc = (uint32_t)numCells;
+        MetalGlobalContext::setBuffer(cellProp, 0);
+        MetalGlobalContext::setBytes(nc,        1);
+        MetalGlobalContext::dispatchThreads(computePairCountPSO, numCells);
+    }
+
+    void hostScanPairPrefix() {
+        numCandidatePairs = 0;
+        if (numCells == 0) return;
+        if (pairPrefix.size < numCells + 1) {
+            pairPrefix = VectorBase<METAL, uint32_t>(numCells + 1);
+        }
+        uint64_t running = 0;
+        for (Index i = 0; i < numCells; ++i) {
+            pairPrefix[i] = (uint32_t)running;
+            running += cellProp[i].pairCnt;
+        }
+        pairPrefix[numCells] = (uint32_t)running;
+        numCandidatePairs = (Index)running;
+    }
+
+    void validatePairPrefix(Index N = 8) {
+        // Independent recompute of pairCnt from nH/nP, summed.
+        uint64_t cpuTotal = 0;
+        Index    badCnt   = numCells;
+        Index    nonzeroCells = 0;
+        for (Index i = 0; i < numCells; ++i) {
+            uint32_t h = cellProp[i].nH;
+            uint32_t p = cellProp[i].nP;
+            uint32_t expected = (h * (h - 1u)) / 2u + h * p;
+            if (cellProp[i].pairCnt != expected && badCnt == numCells) {
+                badCnt = i;
+            }
+            cpuTotal += expected;
+            if (expected > 0) ++nonzeroCells;
+        }
+        bool totalOk = (cpuTotal == (uint64_t)numCandidatePairs);
+        std::cout << "[SH Step7] P=" << numCandidatePairs
+                  << " (cpu sum=" << cpuTotal
+                  << (totalOk ? " match" : " MISMATCH") << ")"
+                  << " active=" << nonzeroCells << "/" << numCells
+                  << " pairCnt=" << ((badCnt == numCells) ? "ok" : "BAD")
+                  << "\n";
+        if (badCnt != numCells) {
+            uint32_t h = cellProp[badCnt].nH;
+            uint32_t p = cellProp[badCnt].nP;
+            std::cout << "  first bad pairCnt at cell " << badCnt
+                      << " nH=" << h << " nP=" << p
+                      << " expected=" << ((h*(h-1u))/2u + h*p)
+                      << " got=" << cellProp[badCnt].pairCnt << "\n";
+        }
+        Index n = std::min<Index>(N, numCells);
+        for (Index i = 0; i < n; ++i) {
+            std::cout << "  cell " << i
+                      << " nH=" << cellProp[i].nH
+                      << " nP=" << cellProp[i].nP
+                      << " pairCnt=" << cellProp[i].pairCnt
+                      << " pairPrefix=" << pairPrefix[i] << "\n";
+        }
+        std::cout << "  pairPrefix[" << numCells << "]=" << pairPrefix[numCells]
+                  << "\n";
+    }
+
+    // ----- Step 8: per-pair broad-phase emit -----
+    //
+    // Dispatches P threads, one per candidate pair. Output is the same
+    // BroadCollision buffer the BVH path writes to (Scene::packedCollisionData),
+    // so the existing narrow_pt_tri kernel consumes SH output unchanged.
+
+    struct SHBroadParamsHost {
+        uint32_t numCandidatePairs;
+        uint32_t numCells;
+        uint32_t maxNumCollisions;
+        uint32_t enableSelfCollisions;
+        float    epsilon;
+    };
+    static_assert(sizeof(SHBroadParamsHost) == 20,
+                  "SHBroadParamsHost must match metal SHBroadParams (20 bytes)");
+
+    void runBroadPhase(PR margin, bool enableSelfCollisions) {
+        if (numCandidatePairs == 0 || !broadPhasePSO) return;
+        auto& packed    = Scene<METAL, PR>::packedMeshData;
+        auto& packedCol = Scene<METAL, PR>::packedCollisionData;
+
+        SHBroadParamsHost bp{};
+        bp.numCandidatePairs    = (uint32_t)numCandidatePairs;
+        bp.numCells             = (uint32_t)numCells;
+        bp.maxNumCollisions     = (uint32_t)packedCol.maxNumCollisions;
+        bp.enableSelfCollisions = enableSelfCollisions ? 1u : 0u;
+        bp.epsilon              = (float)margin;
+
+        MetalGlobalContext::setBuffer(entries,                   0);
+        MetalGlobalContext::setBuffer(cellProp,                  1);
+        MetalGlobalContext::setBuffer(pairPrefix,                2);
+        MetalGlobalContext::setBuffer(faceCB,                    3);
+        MetalGlobalContext::setBuffer(faceObj,                   4);
+        MetalGlobalContext::setBuffer(packed.facets,             5);
+        MetalGlobalContext::setBuffer(packed.facetsOffsets,      6);
+        MetalGlobalContext::setBuffer(centroid,                  7);
+        MetalGlobalContext::setBuffer(radius,                    8);
+        MetalGlobalContext::setBuffer(meshBehaviors,             9);
+        MetalGlobalContext::setBuffer(meshShapes,               10);
+        MetalGlobalContext::setBytes(bp,                        11);
+        MetalGlobalContext::setBuffer(packedCol.numBroadCollisions, 12);
+        MetalGlobalContext::setBuffer(packedCol.broadCollisions,    13);
+        MetalGlobalContext::dispatchThreads(broadPhasePSO, numCandidatePairs);
+    }
+
+    void validateBroadPhase() {
+        auto& packedCol = Scene<METAL, PR>::packedCollisionData;
+        uint32_t numOut = (uint32_t)packedCol.numBroadCollisions[0];
+        bool overflow   = numOut > (uint32_t)packedCol.maxNumCollisions;
+        std::cout << "[SH Step8] candidatePairs=" << numCandidatePairs
+                  << " broadCollisions=" << numOut
+                  << "/" << packedCol.maxNumCollisions
+                  << (overflow ? " OVERFLOW" : "")
+                  << "\n";
+    }
+
+    void validateRadixSort() {
+        if (numFaces == 0) return;
+        numValidEntries = findNumValid();
+
+        // Cross-check vs Step 4's per-element count.
+        Index step4Valid = 0;
+        for (Index i = 0; i < entries.size; ++i)
+            if (entries[i].cellID != 0xFFFFFFFFu) ++step4Valid;
+
+        // Sortedness on the valid prefix.
+        Index firstViolation = numValidEntries; // sentinel value
+        for (Index i = 1; i < numValidEntries; ++i) {
+            if (entries[i - 1].cellID > entries[i].cellID) {
+                firstViolation = i;
+                break;
+            }
+        }
+        std::cout << "[SH Step5] numValid=" << numValidEntries
+                  << "/" << entries.size
+                  << " (step4 count=" << step4Valid
+                  << ((step4Valid == numValidEntries) ? " match" : " MISMATCH")
+                  << ") sorted="
+                  << ((firstViolation == numValidEntries) ? "yes" : "NO")
+                  << "\n";
+        if (firstViolation != numValidEntries) {
+            std::cout << "  first violation at i=" << firstViolation
+                      << " cellID[" << (firstViolation - 1) << "]="
+                      << entries[firstViolation - 1].cellID
+                      << " > cellID[" << firstViolation << "]="
+                      << entries[firstViolation].cellID << "\n";
+        }
+    }
+
+    // Spot-check: per-face entry counts, CB popcount = entry count, and
+    // the home cell hash recomputed on the CPU.
+    void validateAssignCells(Index N = 5) {
+        if (numFaces == 0) return;
+        Index totalValid = 0;
+        Index minSlots = 8, maxSlots = 0;
+        for (Index i = 0; i < numFaces; ++i) {
+            Index v = 0;
+            for (uint k = 0; k < 8; ++k)
+                if (entries[i * 8 + k].cellID != 0xFFFFFFFFu) ++v;
+            totalValid += v;
+            minSlots = std::min<Index>(minSlots, v);
+            maxSlots = std::max<Index>(maxSlots, v);
+        }
+        std::cout << "[SH Step4] entries: " << totalValid
+                  << " valid / " << (numFaces * 8) << " total ("
+                  << (100.0 * totalValid / (numFaces * 8)) << "%)"
+                  << " per-face min=" << minSlots
+                  << " max=" << maxSlots << "\n";
+
+        Index n = std::min<Index>(N, numFaces);
+        for (Index i = 0; i < n; ++i) {
+            tinym::vec3_view cView(centroid.ptr + i * 3);
+            tinym::vec3 c(cView[0], cView[1], cView[2]);
+            uint32_t gx = (uint32_t)std::floor((c.x - params.originMin[0]) / params.cellSize);
+            uint32_t gy = (uint32_t)std::floor((c.y - params.originMin[1]) / params.cellSize);
+            uint32_t gz = (uint32_t)std::floor((c.z - params.originMin[2]) / params.cellSize);
+            gx = std::min(gx, params.gridRes[0] - 1);
+            gy = std::min(gy, params.gridRes[1] - 1);
+            gz = std::min(gz, params.gridRes[2] - 1);
+            uint32_t cpuHomeHash = gz * params.gridRes[1] * params.gridRes[0]
+                                 + gy * params.gridRes[0]
+                                 + gx;
+            uint32_t cpuHomeT = (gx & 1u) | ((gy & 1u) << 1) | ((gz & 1u) << 2);
+
+            uint32_t gpuHomeHash = entries[i * 8].cellID;
+            uint32_t gpuValue    = entries[i * 8].value;
+            uint32_t gpuHomeT    = gpuValue & 0x7u;
+            uint32_t gpuPhantom  = (gpuValue >> 3) & 0x1u;
+            uint32_t gpuFaceId   = gpuValue >> 4;
+
+            int valid = 0;
+            for (uint k = 0; k < 8; ++k)
+                if (entries[i * 8 + k].cellID != 0xFFFFFFFFu) ++valid;
+
+            uint8_t cb = faceCB[i];
+            int popcount = __builtin_popcount((unsigned)cb);
+
+            std::cout << "  face " << i
+                      << " home cpu/gpu hash=" << cpuHomeHash << "/" << gpuHomeHash
+                      << " homeT cpu/gpu=" << cpuHomeT << "/" << gpuHomeT
+                      << " phantom=" << gpuPhantom
+                      << " faceId=" << gpuFaceId
+                      << " entries=" << valid
+                      << " CB=0x" << std::hex << (int)cb << std::dec
+                      << " popcount=" << popcount
+                      << ((popcount == valid) ? " [ok]" : " [MISMATCH]")
+                      << "\n";
+        }
+    }
+
+    void validateGrid() {
+        std::cout << "[SH Step3] origin=("
+                  << params.originMin[0] << ","
+                  << params.originMin[1] << ","
+                  << params.originMin[2] << ")"
+                  << " cellSize=" << params.cellSize
+                  << " gridRes=("
+                  << params.gridRes[0] << ","
+                  << params.gridRes[1] << ","
+                  << params.gridRes[2] << ")"
+                  << " totalCells=" << ((uint64_t)params.gridRes[0]
+                                       * params.gridRes[1]
+                                       * params.gridRes[2])
+                  << "\n";
+    }
+
+    // Compare GPU `maxRadius[0]` against CPU std::max over the same array.
+    void validateMaxRadius() {
+        if (numFaces == 0) return;
+        float gpuMax = (float)maxRadius[0];
+        float cpuMax = 0.0f;
+        for (Index i = 0; i < numFaces; ++i)
+            cpuMax = std::max(cpuMax, (float)radius[i]);
+        std::cout << "[SH Step2] maxRadius cpu=" << cpuMax
+                  << " gpu=" << gpuMax
+                  << " |diff|=" << std::abs(cpuMax - gpuMax) << "\n";
+    }
+
+    // One-shot sanity check: GPU result vs CPU recompute on the first N
+    // faces. Called manually from Simulator::initialize() while Step 1 is
+    // being verified; remove the call once trust is established.
+    void validateBuildBV(Index N = 5) {
+        if (numFaces == 0) return;
+        auto& packed = Scene<METAL, PR>::packedMeshData;
+        Index n = std::min<Index>(N, numFaces);
+        std::cout << "[SH Step1] verifying BV for first " << n
+                  << " of " << numFaces << " faces:\n";
+        float maxRelErr = 0.0f;
+        for (Index i = 0; i < n; ++i) {
+            uint32_t obj   = (uint32_t)faceObj[i];
+            uint32_t vbase = (uint32_t)packed.statesOffsets[obj];
+            uint32_t f0 = (uint32_t)packed.facets[i * 3 + 0];
+            uint32_t f1 = (uint32_t)packed.facets[i * 3 + 1];
+            uint32_t f2 = (uint32_t)packed.facets[i * 3 + 2];
+            tinym::vec3_view v0(packed.x.ptr + (f0 + vbase) * 3);
+            tinym::vec3_view v1(packed.x.ptr + (f1 + vbase) * 3);
+            tinym::vec3_view v2(packed.x.ptr + (f2 + vbase) * 3);
+            tinym::vec3 c = (v0 + v1 + v2) * (1.0f / 3.0f);
+            float d0 = (c - v0).norm();
+            float d1 = (c - v1).norm();
+            float d2 = (c - v2).norm();
+            float rCpu = std::max({d0, d1, d2});
+
+            tinym::vec3_view gC(centroid.ptr + i * 3);
+            float rGpu = radius[i];
+
+            float dC = (c - gC).norm();
+            float dR = std::abs(rCpu - rGpu);
+            float rel = (rCpu > 1e-6f) ? (dR / rCpu) : dR;
+            maxRelErr = std::max(maxRelErr, rel);
+            std::cout << "  face " << i << " obj=" << obj
+                      << " cpuC=(" << c.x << "," << c.y << "," << c.z << ")"
+                      << " gpuC=(" << gC[0] << "," << gC[1] << "," << gC[2] << ")"
+                      << " cpuR=" << rCpu << " gpuR=" << rGpu
+                      << " |dC|=" << dC << " |dR|=" << dR << "\n";
+        }
+        std::cout << "[SH Step1] max relative radius error: "
+                  << maxRelErr << "\n";
+    }
+
+    void refit() {
+        // The grid is rebuilt every frame inside detectCollisions(); refit()
+        // is intentionally a no-op so the call site mirrors the BVH path.
+    }
+
+    void enlargeTrajectory(PR /*dt*/) {
+        // CCD swept BVs are out of scope for v1.
+    }
+
+    void queryBegin() {
+        Scene<METAL, PR>::packedCollisionData.numBroadCollisions[0] = 0;
+    }
+
+    void detectCollisions(PR margin, bool enableSelfCollisions = true) {
+        // Each stage is wall-time-measured once, and that single number feeds
+        // both `lastStats` (for stdout per-substep logging) and the
+        // FrameProfiler (for the GUI timing window). Avoids two redundant
+        // clock reads per stage.
+        using Clock = std::chrono::steady_clock;
+        auto run = [&](const char* name, auto&& fn, double& dst) {
+            auto a = Clock::now();
+            fn();
+            auto b = Clock::now();
+            dst = std::chrono::duration<double, std::milli>(b - a).count();
+            if (profiler) profiler->addSample(std::string(name), dst);
+        };
+
+        auto t0 = Clock::now();
+        queryBegin();
+
+        run("sh_buildBV",    [&]{ runBuildBV(); },                           lastStats.ms_buildBV);
+        run("sh_reduce",     [&]{
+            runReduceMaxRadius();
+            // Step 3 reads maxRadius[0] and packedMeshData.x on the host, so
+            // we must wait for the kernels above to finish writing.
+            MetalGlobalContext::commitAndWait();
+        }, lastStats.ms_reduce);
+        run("sh_grid",       [&]{ computeGrid(margin); },                    lastStats.ms_grid);
+        run("sh_assign",     [&]{ runAssignCells(); },                       lastStats.ms_assign);
+        run("sh_sort",       [&]{
+            runRadixSort();
+            // Step 6 needs numValidEntries on host, which requires commit + scan.
+            MetalGlobalContext::commitAndWait();
+            numValidEntries = findNumValid();
+        }, lastStats.ms_sort);
+        run("sh_cellprop",   [&]{
+            runMarkStarts();
+            MetalGlobalContext::commitAndWait();
+            hostScanCellStarts();
+            runFillCellProp();
+        }, lastStats.ms_cellprop);
+        run("sh_pairprefix", [&]{
+            runComputePairCount();
+            // Step 7's host scan needs cellProp[].pairCnt visible.
+            MetalGlobalContext::commitAndWait();
+            hostScanPairPrefix();
+        }, lastStats.ms_pairprefix);
+        run("sh_broad",      [&]{
+            runBroadPhase(margin, enableSelfCollisions);
+            // Force a commit when verbose so the host-side ms_broad reflects
+            // actual GPU work and numBroadOut is observable. Steady-state mode
+            // skips this so the broad-phase output stays pipelined into the
+            // narrow phase via the same command buffer.
+            if (verbose) MetalGlobalContext::commitAndWait();
+        }, lastStats.ms_broad);
+
+        auto t1 = Clock::now();
+        lastStats.ms_total = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        lastStats.numFaces          = numFaces;
+        lastStats.numValidEntries   = numValidEntries;
+        lastStats.numCells          = numCells;
+        lastStats.numCandidatePairs = numCandidatePairs;
+        lastStats.cellSize          = params.cellSize;
+        lastStats.gridRes[0]        = params.gridRes[0];
+        lastStats.gridRes[1]        = params.gridRes[1];
+        lastStats.gridRes[2]        = params.gridRes[2];
+
+        if (verbose) {
+            // Scan cellProp host-side for the heavy-cell signal — only when
+            // verbose so we don't pay the O(numCells) sweep every substep.
+            Index maxH = 0, maxP = 0, maxC = 0;
+            for (Index i = 0; i < numCells; ++i) {
+                const auto& cp = cellProp[i];
+                if ((Index)cp.nH      > maxH) maxH = cp.nH;
+                if ((Index)cp.nP      > maxP) maxP = cp.nP;
+                if ((Index)cp.pairCnt > maxC) maxC = cp.pairCnt;
+            }
+            lastStats.maxNH      = maxH;
+            lastStats.maxNP      = maxP;
+            lastStats.maxPairCnt = maxC;
+            lastStats.numBroadOut =
+                Scene<METAL, PR>::packedCollisionData.numBroadCollisions[0];
+        }
+    }
+
+    // One compact line per call. Caller picks frame/substep labels.
+    void printLastStats(std::ostream& os, Index frame, Index substep) const {
+        os << "[F=" << frame << " S=" << substep << "] sh:"
+           << " faces=" << lastStats.numFaces
+           << " valid=" << lastStats.numValidEntries
+           << " cells=" << lastStats.numCells
+           << " pairs=" << lastStats.numCandidatePairs
+           << " broadOut=" << lastStats.numBroadOut
+           << " maxNH=" << lastStats.maxNH
+           << " maxNP=" << lastStats.maxNP
+           << " maxPairCnt=" << lastStats.maxPairCnt
+           << " pts=" << lastStats.numPoints
+           << " ext=" << lastStats.extent[0]
+           << "x" << lastStats.extent[1]
+           << "x" << lastStats.extent[2]
+           << " maxR=" << lastStats.maxRadius
+           << " csF=" << cellSizeFactor
+           << " cellSize=" << lastStats.cellSize
+           << " grid=" << lastStats.gridRes[0]
+           << "x" << lastStats.gridRes[1]
+           << "x" << lastStats.gridRes[2]
+           << " | bv=" << lastStats.ms_buildBV
+           << " red=" << lastStats.ms_reduce
+           << " grid=" << lastStats.ms_grid
+           << " asgn=" << lastStats.ms_assign
+           << " srt=" << lastStats.ms_sort
+           << " cell=" << lastStats.ms_cellprop
+           << " pp=" << lastStats.ms_pairprefix
+           << " brd=" << lastStats.ms_broad
+           << " tot=" << lastStats.ms_total << "ms\n";
+    }
+
+    void queryEnd() {
+        MetalGlobalContext::commitAndWait();
+        auto& packedCol = Scene<METAL, PR>::packedCollisionData;
+        if (packedCol.numBroadCollisions[0] > packedCol.maxNumCollisions) {
+            std::cout << "[SH] broad-phase overflow: "
+                      << packedCol.numBroadCollisions[0]
+                      << "/" << packedCol.maxNumCollisions << "\n";
+        }
+    }
+
+    void showBox()      { /* debug-only; defer */ }
+    void showSceneBox() { /* debug-only; defer */ }
+
+    void queryClickRay(const Ray& /*ray*/) {
+        // Click ray-pick continues to use BVH; SpatialHashing is broadphase-only.
+    }
+};
+
+
+// TODO: BroadPhase, BVH
+template <typename BE, typename PR, Index MODE, Index PRIMITIVE>
+struct BVH {};
+enum BVHMODE {
+    SCENE,
+    LINEAR,
+    SAH,
+};
+enum BVHPRIMITIVE {
+    OBJECT = 0,
+    POINT = 1,
+    EDGE = 2,
+    TRIANGLE = 3,
+};
+
+//struct AABB {
+//    tinym::vec3 min, max;
+//    AABB() : min(0), max(0) {}
+//    AABB(tinym::vec3_view e1, tinym::vec3_view e2) : min(tinym::min(e1, e2)), max(tinym::max(e1, e2)) {}
+//    AABB(tinym::vec3_view t1, tinym::vec3_view t2, tinym::vec3_view t3) : min(tinym::min(t1, t2, t3)), max(tinym::max(t1, t2, t3)) {}
+//    void combine(const tinym::vec3_view& a) {
+//        min = tinym::min(a, min);
+//        max = tinym::max(a, max);
+//    }
+//    void combine(const AABB& aabb) {
+//        min = tinym::min(min, aabb.min);
+//        max = tinym::max(max, aabb.max);
+//    }
+//    bool intersect(const AABB& aabb) const {
+//        if (max.x < aabb.min.x || min.x > aabb.max.x) return false;
+//        if (max.y < aabb.min.y || min.y > aabb.max.y) return false;
+//        if (max.z < aabb.min.z || min.z > aabb.max.z) return false;
+//        return true;
+//    }
+//};
 
 struct alignas(32) AABB4 {
     union {
@@ -3278,6 +4195,22 @@ struct Simulator {
     using NarrowPhase = BruteForce<METAL, PR>;
     CollisionPipeline<BroadPhase, NarrowPhase> collisionPipeline;
 
+    // Spatial-hashing broadphase. Runs alongside the BVH so the active broad
+    // phase can be flipped at runtime (Step 10 A/B compare).
+    //   useSpatialHashing == false -> BVH path (default)
+    //   useSpatialHashing == true  -> SH path
+    // Click-ray pickup and showBox/showSceneBox always go through the BVH —
+    // SpatialHashing is broadphase-only.
+    SpatialHashing<METAL, PR> shBroadPhase;
+    bool useSpatialHashing = true;
+
+    // Per-substep stdout log for the SH path. Toggling this on also enables
+    // shBroadPhase.verbose (forces a commit after the broad-phase dispatch so
+    // the broad-phase ms is faithful). Useful when the GUI window can't keep
+    // up because the substep loop itself is slow.
+    bool logSHPerSubstep = true;
+
+
 
     // sim viewer?
     bool pause = true;
@@ -3289,7 +4222,6 @@ struct Simulator {
 
     PR margin = 0.015;
     PR radius = 0.012;
-
 
     // object select
     int selectedObj = -1;
@@ -3380,11 +4312,11 @@ struct Simulator {
 
         Scene<BE, PR>::pack();
         collisionPipeline.broadPhase.build(scene);
+        shBroadPhase.build(scene);
 
         //Scene<BE, PR>::initialize();
 
         frame = 0;
-
 
         std::cout << "[Simulator Init] All scene objects are initialized" << std::endl;
     }
@@ -3396,15 +4328,25 @@ struct Simulator {
         
         
         if(frame % 10 == 0) {
+            // BVH is always rebuilt — click-ray and showBox/showSceneBox use it
+            // even when the active broadphase is SpatialHashing.
             if (profiler) {
                 auto scope = profiler->scoped("bvh_build");
                 collisionPipeline.broadPhase.build(scene);
             } else {
                 collisionPipeline.broadPhase.build(scene);
             }
+            if (useSpatialHashing) {
+                if (profiler) {
+                    auto scope = profiler->scoped("sh_build");
+                    shBroadPhase.build(scene);
+                } else {
+                    shBroadPhase.build(scene);
+                }
+            }
         }
 
-        
+
         for(int i = 0; i < system.subSteps; i++) {
 
             //if(i % 10 == 0) checkCollision = true;
@@ -3417,17 +4359,40 @@ struct Simulator {
 
 
                 //collisionPipeline.broadPhase.enlargeTrajectory(system.h);
-                if (profiler) {
-                    auto scope = profiler->scoped("broad_refit");
-                    collisionPipeline.broadPhase.refit();
+                if (useSpatialHashing) {
+                    // Mirror the toggle into the SH instance so detectCollisions
+                    // commits the broad-phase dispatch and fills heavy-cell stats.
+                    shBroadPhase.verbose = logSHPerSubstep;
+                    //shBroadPhase.cellSizeFactor = shCellSizeFactor;
+                    if (profiler) {
+                        auto scope = profiler->scoped("broad_refit");
+                        shBroadPhase.refit();
+                    } else {
+                        shBroadPhase.refit();
+                    }
+                    // detectCollisions emits its own per-stage sh_* scopes.
+                    if (profiler) {
+                        auto scope = profiler->scoped("broad_detect");
+                        shBroadPhase.detectCollisions(margin, enableSelfCollisions);
+                    } else {
+                        shBroadPhase.detectCollisions(margin, enableSelfCollisions);
+                    }
+                    if (logSHPerSubstep) {
+                        shBroadPhase.printLastStats(std::cout, frame, i);
+                    }
                 } else {
-                    collisionPipeline.broadPhase.refit();
-                }
-                if (profiler) {
-                    auto scope = profiler->scoped("broad_detect");
-                    collisionPipeline.broadPhase.detectCollisions(margin, enableSelfCollisions);
-                } else {
-                    collisionPipeline.broadPhase.detectCollisions(margin, enableSelfCollisions);
+                    if (profiler) {
+                        auto scope = profiler->scoped("broad_refit");
+                        collisionPipeline.broadPhase.refit();
+                    } else {
+                        collisionPipeline.broadPhase.refit();
+                    }
+                    if (profiler) {
+                        auto scope = profiler->scoped("broad_detect");
+                        collisionPipeline.broadPhase.detectCollisions(margin, enableSelfCollisions);
+                    } else {
+                        collisionPipeline.broadPhase.detectCollisions(margin, enableSelfCollisions);
+                    }
                 }
 
                 if (profiler) {
@@ -3909,8 +4874,9 @@ int main() {
     //simulator.addClothFile("src/assets", "teapot.obj", {0,0,0} 15, 1e4, 0, 2e4, thickness mass);
     //simulator.addClothFile("src/assets", "horse-gallop-01.obj", {0,0,0}, 80, 1e4, 0, 2e4, thickness mass);
     //simulator.addFloatMesh("src/assets", "horse-gallop-01.obj", {0, -1, 0}, 1.2);
-    simulator.addFloatMesh("src/assets", "camel-gallop-reference.obj", {0, -1, 0}, 1.2);
-    simulator.addGround(PlaneDirection::XZPlane, tinym::vec3(0, -1, 0), 5);
+    //simulator.addFloatMesh("src/assets", "camel-gallop-reference.obj", {0, -1, 0}, 1.2);
+    simulator.addFloatMesh("src/assets", "Human.obj", {0, -0.65, 0}, 0.04);
+    //simulator.addGround(PlaneDirection::XZPlane, tinym::vec3(0, -1, 0), 5);
 
     std::cout << "[Main] mesh added to scene" << std::endl;
 
@@ -4056,6 +5022,10 @@ int main() {
             *debugSceneBox = !(*debugSceneBox);
         } else if(key == GLFW_KEY_C && action == GLFW_PRESS) {
             *debugCollisions = !(*debugCollisions);
+        } else if(key == GLFW_KEY_L && action == GLFW_PRESS) {
+            simulator->logSHPerSubstep = !(simulator->logSHPerSubstep);
+            std::cout << "[main] logSHPerSubstep = "
+                      << (simulator->logSHPerSubstep ? "on" : "off") << "\n";
         }
     };
     glfwSetCursorPosCallback(yglwindow->getGLFWWindow(), cursorCallback);
@@ -4067,6 +5037,7 @@ int main() {
     std::cout << "[Main] callbacks are set" << std::endl;
 
     simulator.profiler = &frameProfiler;
+    simulator.shBroadPhase.profiler = &frameProfiler;
 
     auto init = []() {
         glfwSwapInterval(1);
