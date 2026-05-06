@@ -1286,6 +1286,110 @@ struct MeshFileInitializer : GeneralMeshInitializer<BE, PR> {
     InitializerParams<PR>* getParams() override { return &params; }
 };
 
+#include "primitive_geometry.hpp"
+
+template <typename PR>
+struct MeshSphereInitializerParams : InitializerParams<PR> {
+    Index tessellation;
+    PR size;
+    tinym::vec3 center;
+
+    MeshSphereInitializerParams(tinym::vec3 center, Index tessellation, PR size, PR mass)
+        : InitializerParams<PR>(
+              primitive::sphereVertexCount((int)tessellation),
+              primitive::sphereFacetCount((int)tessellation),
+              primitive::sphereEdgeCount((int)tessellation),
+              mass),
+          tessellation(tessellation), size(size), center(center) {}
+};
+
+template <typename BE, typename PR>
+struct MeshSphereInitializer : GeneralMeshInitializer<BE, PR> {
+    using ParamsType = MeshSphereInitializerParams<PR>;
+    ParamsType params;
+
+    MeshSphereInitializer(ParamsType params) : params(params) {}
+
+    void initialize(MeshState<BE, PR>& state, MeshAdjacency<BE, PR>& adjacency) override {
+        state.memoryAllocation(params);
+        adjacency.memoryAllocation(params);
+
+        auto geom = primitive::sphere(
+            (float)params.size, (int)params.tessellation,
+            {params.center.x, params.center.y, params.center.z});
+
+        for (Index v = 0; v < params.numPoints; ++v) {
+            Index vbase = v * 3;
+            state.x[vbase    ] = (PR)geom.positions[vbase    ];
+            state.x[vbase + 1] = (PR)geom.positions[vbase + 1];
+            state.x[vbase + 2] = (PR)geom.positions[vbase + 2];
+        }
+
+        if (adjacency.vertexAdjFacets.ptr) return;
+        for (Index f = 0; f < params.numFacets; ++f) {
+            Index fbase = f * 3;
+            adjacency.facets[fbase    ] = geom.facets[fbase    ];
+            adjacency.facets[fbase + 1] = geom.facets[fbase + 1];
+            adjacency.facets[fbase + 2] = geom.facets[fbase + 2];
+        }
+
+        MeshAdjacencyInitializer<BE, PR>::initialize(state, adjacency);
+    }
+
+    InitializerParams<PR>* getParams() override { return &params; }
+};
+
+template <typename PR>
+struct MeshCubeInitializerParams : InitializerParams<PR> {
+    Index tessellation;
+    PR size;
+    tinym::vec3 center;
+
+    MeshCubeInitializerParams(tinym::vec3 center, Index tessellation, PR size, PR mass)
+        : InitializerParams<PR>(
+              primitive::cubeVertexCount((int)tessellation),
+              primitive::cubeFacetCount((int)tessellation),
+              primitive::cubeEdgeCount((int)tessellation),
+              mass),
+          tessellation(tessellation), size(size), center(center) {}
+};
+
+template <typename BE, typename PR>
+struct MeshCubeInitializer : GeneralMeshInitializer<BE, PR> {
+    using ParamsType = MeshCubeInitializerParams<PR>;
+    ParamsType params;
+
+    MeshCubeInitializer(ParamsType params) : params(params) {}
+
+    void initialize(MeshState<BE, PR>& state, MeshAdjacency<BE, PR>& adjacency) override {
+        state.memoryAllocation(params);
+        adjacency.memoryAllocation(params);
+
+        auto geom = primitive::cube(
+            (float)params.size, (int)params.tessellation,
+            {params.center.x, params.center.y, params.center.z});
+
+        for (Index v = 0; v < params.numPoints; ++v) {
+            Index vbase = v * 3;
+            state.x[vbase    ] = (PR)geom.positions[vbase    ];
+            state.x[vbase + 1] = (PR)geom.positions[vbase + 1];
+            state.x[vbase + 2] = (PR)geom.positions[vbase + 2];
+        }
+
+        if (adjacency.vertexAdjFacets.ptr) return;
+        for (Index f = 0; f < params.numFacets; ++f) {
+            Index fbase = f * 3;
+            adjacency.facets[fbase    ] = geom.facets[fbase    ];
+            adjacency.facets[fbase + 1] = geom.facets[fbase + 1];
+            adjacency.facets[fbase + 2] = geom.facets[fbase + 2];
+        }
+
+        MeshAdjacencyInitializer<BE, PR>::initialize(state, adjacency);
+    }
+
+    InitializerParams<PR>* getParams() override { return &params; }
+};
+
 
 struct alignas(8) IndexPair {
     union {
@@ -4307,6 +4411,22 @@ struct Simulator {
             ClothBehaviorParams<PR>{kstretch, kshear, kbend, thickness}
         );
     };
+    void addSphere(tinym::vec3 center, Index tessellation, PR size, PR mass=PR(0.1)) {
+        scene.addGeneralMesh(
+            new MeshSphereInitializer<BE,PR>(MeshSphereInitializerParams<PR>(
+                center, tessellation, size, mass)),
+            BehaviorType::Float,
+            FloatBehaviorParams<PR>{});
+    }
+
+    void addCube(tinym::vec3 center, Index tessellation, PR size, PR mass=PR(0.1)) {
+        scene.addGeneralMesh(
+            new MeshCubeInitializer<BE,PR>(MeshCubeInitializerParams<PR>(
+                center, tessellation, size, mass)),
+            BehaviorType::Float,
+            FloatBehaviorParams<PR>{});
+    }
+
     void addGround(PlaneDirection dir, tinym::vec3 center, PR size1D, PR mass=0.1) {
         scene.addGeneralMesh(
             new MeshGridInitializer<BE, PR>({
@@ -4627,6 +4747,20 @@ struct Simulator {
                 o.source.primitive.mass = (double)g->params.mass;
                 o.source.primitive.jiggle = g->params.jiggle;
                 o.transform.position = {g->params.center.x, g->params.center.y, g->params.center.z};
+            } else if (auto* sp = dynamic_cast<MeshSphereInitializer<BE,PR>*>(init)) {
+                o.source.kind = Source::Kind::Primitive;
+                o.source.primitive.shape = "sphere";
+                o.source.primitive.size = (double)sp->params.size;
+                o.source.primitive.tessellation = (int)sp->params.tessellation;
+                o.source.primitive.mass = (double)sp->params.mass;
+                o.transform.position = {sp->params.center.x, sp->params.center.y, sp->params.center.z};
+            } else if (auto* cb = dynamic_cast<MeshCubeInitializer<BE,PR>*>(init)) {
+                o.source.kind = Source::Kind::Primitive;
+                o.source.primitive.shape = "cube";
+                o.source.primitive.size = (double)cb->params.size;
+                o.source.primitive.tessellation = (int)cb->params.tessellation;
+                o.source.primitive.mass = (double)cb->params.mass;
+                o.transform.position = {cb->params.center.x, cb->params.center.y, cb->params.center.z};
             } else if (auto* f = dynamic_cast<MeshFileInitializer<BE,PR>*>(init)) {
                 o.source.kind = Source::Kind::Import;
                 std::string p = f->params.prefix;
@@ -4742,14 +4876,28 @@ struct Simulator {
 
             GeneralMeshInitializer<BE,PR>* init = nullptr;
             if (o.source.kind == scene_format::Source::Kind::Primitive) {
-                PlaneDirection dir = PlaneDirection::XZPlane;
-                planeDirectionFromName(o.source.primitive.direction, dir);
-                init = new MeshGridInitializer<BE,PR>(MeshGridInitializerParams<PR>(
-                    dir, pos,
-                    (Index)o.source.primitive.tessellation,
-                    (PR)o.source.primitive.size,
-                    (PR)o.source.primitive.mass,
-                    o.source.primitive.jiggle));
+                if (o.source.primitive.shape == "sphere") {
+                    init = new MeshSphereInitializer<BE,PR>(MeshSphereInitializerParams<PR>(
+                        pos,
+                        (Index)o.source.primitive.tessellation,
+                        (PR)o.source.primitive.size,
+                        (PR)o.source.primitive.mass));
+                } else if (o.source.primitive.shape == "cube") {
+                    init = new MeshCubeInitializer<BE,PR>(MeshCubeInitializerParams<PR>(
+                        pos,
+                        (Index)o.source.primitive.tessellation,
+                        (PR)o.source.primitive.size,
+                        (PR)o.source.primitive.mass));
+                } else {
+                    PlaneDirection dir = PlaneDirection::XZPlane;
+                    planeDirectionFromName(o.source.primitive.direction, dir);
+                    init = new MeshGridInitializer<BE,PR>(MeshGridInitializerParams<PR>(
+                        dir, pos,
+                        (Index)o.source.primitive.tessellation,
+                        (PR)o.source.primitive.size,
+                        (PR)o.source.primitive.mass,
+                        o.source.primitive.jiggle));
+                }
             } else {
                 std::string resolved = scene_format::resolveImportPath(sceneDir, o.source.import.path);
                 std::string prefix, file;
@@ -5315,20 +5463,33 @@ int main() {
         ImGui::NewFrame();
 
         // File menu — Save Scene / Load Scene (BDD-014/015/016)
+        // Create menu — Sphere / Cube primitives (BDD-001)
         static char scenePathBuf[512] = "scene.ysim.json";
         static std::string sceneIOStatus;
+        static float primSize = 1.0f;
+        static int primTess = 16;
+        static float primPos[3] = {0.f, 0.f, 0.f};
         bool openSaveModal = false;
         bool openLoadModal = false;
+        bool openSphereModal = false;
+        bool openCubeModal = false;
         if (ImGui::BeginMainMenuBar()) {
             if (ImGui::BeginMenu("File")) {
                 if (ImGui::MenuItem("Save Scene...")) openSaveModal = true;
                 if (ImGui::MenuItem("Load Scene...")) openLoadModal = true;
                 ImGui::EndMenu();
             }
+            if (ImGui::BeginMenu("Create")) {
+                if (ImGui::MenuItem("Sphere...")) openSphereModal = true;
+                if (ImGui::MenuItem("Cube...")) openCubeModal = true;
+                ImGui::EndMenu();
+            }
             ImGui::EndMainMenuBar();
         }
         if (openSaveModal) ImGui::OpenPopup("Save Scene");
         if (openLoadModal) ImGui::OpenPopup("Load Scene");
+        if (openSphereModal) ImGui::OpenPopup("Create Sphere");
+        if (openCubeModal) ImGui::OpenPopup("Create Cube");
         if (ImGui::BeginPopupModal("Save Scene", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
             ImGui::InputText("Path", scenePathBuf, sizeof(scenePathBuf));
             if (ImGui::Button("Save")) {
@@ -5364,6 +5525,34 @@ int main() {
             if (ImGui::Button("Cancel")) ImGui::CloseCurrentPopup();
             ImGui::EndPopup();
         }
+        auto primitiveModal = [&](const char* title, bool isSphere) {
+            if (ImGui::BeginPopupModal(title, nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+                ImGui::InputFloat("Size", &primSize);
+                ImGui::InputInt("Tessellation", &primTess);
+                ImGui::InputFloat3("Position", primPos);
+                if (ImGui::Button("Create")) {
+                    int t = primTess;
+                    if (isSphere) {
+                        if (t < 3) t = 3;
+                        simulator.addSphere(tinym::vec3(primPos[0], primPos[1], primPos[2]),
+                                            (Index)t, (Precision)primSize);
+                    } else {
+                        if (t < 1) t = 1;
+                        simulator.addCube(tinym::vec3(primPos[0], primPos[1], primPos[2]),
+                                          (Index)t, (Precision)primSize);
+                    }
+                    simulator.initialize();
+                    sceneIOStatus = std::string(isSphere ? "created sphere" : "created cube");
+                    ImGui::CloseCurrentPopup();
+                }
+                ImGui::SameLine();
+                if (ImGui::Button("Cancel")) ImGui::CloseCurrentPopup();
+                ImGui::EndPopup();
+            }
+        };
+        primitiveModal("Create Sphere", true);
+        primitiveModal("Create Cube", false);
+
         if (!sceneIOStatus.empty()) {
             ImGui::Begin("Scene I/O");
             ImGui::TextWrapped("%s", sceneIOStatus.c_str());

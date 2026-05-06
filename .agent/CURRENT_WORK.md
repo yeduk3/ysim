@@ -1,6 +1,6 @@
-# Current Work — Verification & Polish Slice (feat/verify-and-load-warnings)
+# Current Work — Primitive Creation Slice (feat/primitive-creation)
 
 - File in flight: none — slice complete; ready for Estimator.
-- How far: both PLAN.md todos done. `scripts/verify.sh` (strict gate: configure + build all targets + run `ysim_tests`) is on disk and executable. The `Load Scene…` handler in `src/main.cpp` now appends each `r.value.warnings.messages` entry to `sceneIOStatus` after the "loaded: …" prefix, so a load that clamps a material is visible to the user in the existing Scene I/O panel.
-- What's tested: `./scripts/verify.sh` runs clean — `ysim` and `ysim_tests` both build, 9 doctest cases / 142 assertions all pass. The warning-surface change is a string-formatting tweak in the GUI handler; no new BDD, no new test.
-- What's next: Estimator review. The remaining persistence-slice WARNING (no app-level `Simulator::saveScene/loadScene` integration test) is **deliberately out of scope** for this slice — see PLAN.md Non-goals; it is a separate test-harness slice blocked on Q-D (`docs/ARCHITECTURE.md §5`).
+- How far: all 8 PLAN.md todos done. CPU-pure geometry library at `include/primitive_geometry.hpp` (sphere + cube generators with closed-form vertex/facet/edge counts). Runtime `MeshSphereInitializer` and `MeshCubeInitializer` in `src/main.cpp` wrap the generators. `Simulator::addSphere`/`addCube` helpers; `toSnapshot`/`loadScene` round-trip the new shape strings. ImGui `Create > Sphere…` and `Cube…` modals are wired. `scene_format::isKnownShape` accepts sphere/cube; `isReservedShape` is now empty for v1.
+- What's tested: 18 test cases / 1262 assertions across two binaries — `ysim_tests` (9/142) and `ysim_primitive_tests` (9/1120). Both `scripts/verify.sh` and `scripts/verify-light.sh` updated to run both binaries. `ysim` GUI binary builds clean.
+- What's next: Estimator review. The persistence slice's parked WARNING (no app-level Simulator round-trip) is **still parked** — addressing it requires Q-D and is out of scope for this slice (PLAN.md Non-goals).

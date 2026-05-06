@@ -8,5 +8,6 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 cmake -B build >/dev/null
-cmake --build build -j --target ysim_tests
+cmake --build build -j --target ysim_tests ysim_primitive_tests
 ./build/test/ysim_tests
+./build/test/ysim_primitive_tests

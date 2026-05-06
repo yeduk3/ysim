@@ -65,11 +65,15 @@ Discriminated by `type`:
 
 ### Primitive shape — v1 reality
 
-v1 ships a single primitive shape, `"grid"`, because the only primitive-construction path the engine has today is `MeshGridInitializer` (a tessellated quad / cloth grid). The grid-specific keys (`direction`, `mass`, `jiggle`) are part of the v1 schema; on save they are always emitted and on load they default sensibly if omitted.
+v1 ships three primitive shapes:
 
-`"sphere"` and `"cube"` are reserved-but-not-shipped names: the v1 loader recognises them and fails with a clear `"shape X not available in this build"` error, mirroring the way the loader treats `Rigid`/`Elastic`/`Fluid`/`Generator` behaviors. They become real shipping shapes when the authoring slice that introduces them lands (`BDD-001`).
+- `"grid"` — `MeshGridInitializer`, a tessellated quad / cloth grid. Grid-specific keys (`direction`, `jiggle`) are emitted on save and default sensibly on load.
+- `"sphere"` — `MeshSphereInitializer`, a UV sphere. `tessellation` is the longitude segment count and the latitude segment count; closed manifold; pole vertices included.
+- `"cube"` — `MeshCubeInitializer`, six independent face patches each subdivided into `tessellation × tessellation` cells. Faces do not share vertices (disconnected manifold); fine for `Float`-behavior objects in v1.
 
-This is the same additive-evolution rule the rest of the schema uses: the on-disk surface accepts forward-compatible names and refuses to silently downgrade them. See `DECISIONS.md` D-003 for the rationale.
+All three accept the common keys: `size`, `tessellation`, `mass`. Grid additionally consumes `direction` (`"XYPlane"` | `"YZPlane"` | `"XZPlane"`) and `jiggle`; the loader ignores those keys for sphere/cube.
+
+The "reserved-but-not-shipped" pattern is preserved for any future shape names that have not yet shipped — the loader fails them loud rather than silent. As of v1 no names sit in the reserved-but-not-shipped set; see `DECISIONS.md` D-003 (original) and D-010 (membership amendment when sphere/cube shipped).
 
 ### Import
 

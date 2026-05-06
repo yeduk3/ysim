@@ -12,7 +12,7 @@ Use this as the entry point — `docs/TESTS.md` will get long, so find scenarios
 
 | Behavior ID | Scenario                                          | Test address | Status  |
 | ----------- | ------------------------------------------------- | ------------ | ------- |
-| BDD-001     | Create a sphere primitive                         |              | pending |
+| BDD-001     | Create a sphere primitive                         | `test/primitive_test.cpp::BDD-001: sphere primitive — vertex/facet counts match closed-form`, `…sphere primitive — every vertex lies on the sphere surface`, `…sphere primitive — facets reference no out-of-bounds indices`, `…sphere primitive — no degenerate triangle (zero area)`, `…cube primitive — vertex/facet counts match closed-form`, `…cube primitive — every vertex sits on a face plane`, `…cube primitive — center translation moves every vertex`, `…scene_format accepts sphere and cube as primitive shapes`, `…scene_format still rejects unknown primitive shapes` | pass    |
 | BDD-002     | Import a `.obj` mesh                              |              | pending |
 | BDD-003     | Translate a selected object                       |              | pending |
 | BDD-004     | Rotate with quaternion canonical storage          |              | pending |

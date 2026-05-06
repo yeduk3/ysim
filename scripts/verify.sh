@@ -10,3 +10,4 @@ cd "$(dirname "$0")/.."
 cmake -B build
 cmake --build build -j
 ./build/test/ysim_tests
+./build/test/ysim_primitive_tests

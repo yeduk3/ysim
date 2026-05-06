@@ -288,12 +288,15 @@ inline bool isKnownBehavior(const std::string& t) {
     return t == "Float" || t == "TriangularCloth" || t == "FastGridCloth";
 }
 
-inline bool isReservedShape(const std::string& s) {
-    return s == "sphere" || s == "cube";
+inline bool isReservedShape(const std::string& /*s*/) {
+    // v1: no shapes are currently reserved-but-not-shipped. The reserved-shape
+    // *pattern* is preserved so future names can opt into the same loud-fail
+    // behavior; D-010 amends D-003 to record the membership change.
+    return false;
 }
 
 inline bool isKnownShape(const std::string& s) {
-    return s == "grid";
+    return s == "grid" || s == "sphere" || s == "cube";
 }
 
 inline Result<Source> sourceFromJson(const nlohmann::json& j, int idx) {

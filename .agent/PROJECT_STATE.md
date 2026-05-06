@@ -43,22 +43,27 @@ Carried forward from `PRD.md`. Each lists which slice it blocks.
 
 ## Next milestone
 
-**Verification & polish slice** — close the two WARNINGs the Estimator left after the persistence slice landed. Concretely: author `scripts/verify.sh` (the Estimator's strict gate) and surface `LoadWarnings.messages` in the GUI's `sceneIOStatus`. See `.agent/PLAN.md` for the todo list. Small slice, deliberately small — the bigger app-level integration-test question is its own milestone (see below).
+**Primitive creation slice** — implement `BDD-001` (create primitive object). Ships `Create > Sphere` and `Create > Cube` so a fresh ysim scene can be built from primitives via the GUI. See `.agent/PLAN.md` for the concrete todo list.
 
-After that, the open candidates for the next big slice (priority not yet decided) are:
+Why this next:
+- First link of `BDD-101` (the v1 round-trip spine). Without primitives, every other slice is exercised on imported `.obj` meshes only.
+- Spec is unambiguous and self-contained — no PRD open question blocks it.
+- Testable from the CPU-side data layer alone (sphere/cube generators are pure math). No Metal harness required for `BDD-001` acceptance.
+- Promotes `"sphere"`/`"cube"` from reserved-but-not-shipped (D-003) to shipping shape names.
 
-- **Test-harness slice (Metal-backed sim).** Closes the Estimator's other WARNING — that `Simulator::saveScene/loadScene` is unexercised end-to-end. Forces a decision on `Q-D` (`docs/ARCHITECTURE.md §5`): either bring up a CPU-backend `Scene` for tests, or build a headless-Metal harness. Both are real work.
-- **Material editing UI slice (FR-005 / BDD-005).** Q1 has a defensible default; persistence already round-trips the OpenPBR subset.
-- **Behavior assignment UI slice (FR-006 / BDD-006).** Q2 has a defensible default; the underlying behaviors exist.
-- **Rigid body slice (FR-008 / BDD-008).** Blocked on Q4 (Bullet vs Jolt default).
-- **Alembic export slice (FR-013 / BDD-013).** Blocked on Q5 + Q6.
+After this slice, the open candidates remain:
+
+- **Material editing UI slice (FR-005 / BDD-005)** — needs a PBR preview shader to satisfy "preview render reflects the lower roughness", so it ships paired with renderer work.
+- **Behavior assignment UI slice (FR-006 / BDD-006)** — switching behavior in-place reallocates per-mesh state; non-trivial.
+- **Rigid body slice (FR-008 / BDD-008)** — blocked on Q4.
+- **Alembic export slice (FR-013 / BDD-013)** — blocked on Q5 + Q6.
+- **Test-harness slice (Metal-backed sim)** — closes the parked persistence WARNING; forces Q-D.
 
 ## Recent scope changes
 
 - **2026-05-06, persistence slice.** D-007 supersedes D-004: rotation moved from "JSON-only" to a real `GeneralMesh::rotationQuat` field after the Estimator BLOCKed the round-trip gap. No spec change — the design doc already required round-trip; the in-memory mirror was the missing piece. (See `docs/DECISIONS.md` D-004 / D-007.)
 - **2026-05-06, persistence slice.** Design doc `docs/design/scene_format.md` updated to declare `"grid"` as the v1-shipped primitive shape with `"sphere"`/`"cube"` reserved-not-shipped, mirroring D-003. This was a doc/code reconciliation, not a scope change — v1 only ever had a grid initializer.
-
-## What the Estimator should know
+- **Pending in primitive-creation slice (this plan).** D-003 will be *amended* (not superseded) when `"sphere"` and `"cube"` ship as real initializers. The reserved-not-shipped *pattern* survives unchanged; only the membership of the reserved set narrows.
 
 ## What the Estimator should know
 
