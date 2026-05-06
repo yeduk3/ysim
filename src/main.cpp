@@ -1762,6 +1762,11 @@ struct Scene {
         VectorBase<BE, PR> f;
         VectorBase<BE, PR> m;
         VectorBase<BE, PR> n;
+        // External-forces buffer consumed by the cloth kernels
+        // (TriangularClothBehavior / FastGridClothBehavior). Sliced into per
+        // mesh externalForces.externalForces, filled per frame from
+        // Scene::environment by Simulator::applyEnvironmentForces.
+        VectorBase<BE, PR> externalForces;
         // MeshAdjacency
         VectorBase<BE, Index> facets;
         VectorBase<BE, Index> edges;
@@ -1844,7 +1849,8 @@ struct Scene {
                     packedMeshData.m.ptr + packedMeshData.statesOffsets[i+1]*3,
                     masses[i]);
         packedMeshData.n = VectorBase<BE, PR>(numStatesData);
-        
+        packedMeshData.externalForces = VectorBase<BE, PR>(numStatesData, 0);
+
         // allocate MeshAdjacency
         packedMeshData.facets = VectorBase<BE, Index>(packedMeshData.facetsOffsets[numMeshes]*3);
         packedMeshData.edges  = VectorBase<BE, Index>(packedMeshData.edgesOffsets [numMeshes]*2);
@@ -1865,6 +1871,7 @@ struct Scene {
             meshes[i].state.f = VectorBase<BE, PR>(packedMeshData.f, prevNumPoints*3, curNumPoints*3);
             meshes[i].state.m = VectorBase<BE, PR>(packedMeshData.m, prevNumPoints*3, curNumPoints*3);
             meshes[i].state.n = VectorBase<BE, PR>(packedMeshData.n, prevNumPoints*3, curNumPoints*3);
+            meshes[i].externalForces.externalForces = VectorBase<BE, PR>(packedMeshData.externalForces, prevNumPoints*3, curNumPoints*3);
 
             meshes[i].adjacency.facets = VectorBase<BE, Index>(packedMeshData.facets, packedMeshData.facetsOffsets[i]*3, (packedMeshData.facetsOffsets[i+1]-packedMeshData.facetsOffsets[i])*3);
             meshes[i].adjacency.edges  = VectorBase<BE, Index>(packedMeshData.edges, packedMeshData.edgesOffsets[i]*2, (packedMeshData.edgesOffsets[i+1]-packedMeshData.edgesOffsets[i])*2);
@@ -4479,6 +4486,40 @@ struct Simulator {
     }
 
 
+    // Per-frame fill of each mesh's externalForces buffer from
+    // Scene::environment. Float-tagged meshes are left at exactly zero so
+    // BDD-009's strict-equality clause does not depend on integration
+    // cancellation. Wind is force-per-particle (no mass scaling) and only
+    // applied to wind-susceptible behaviors (cloth) — see FR-012.
+    void applyEnvironmentForces() {
+        const auto& env = Scene<BE, PR>::environment;
+        for (auto& mesh : Scene<BE, PR>::meshes) {
+            PR* ext = mesh.externalForces.externalForces.ptr;
+            const PR* mass = mesh.state.m.ptr;
+            if (!ext) continue;
+            const Index numPoints = mesh.state.x.size / 3;
+            if (mesh.behaviorType == BehaviorType::Float) {
+                std::memset(ext, 0, sizeof(PR) * numPoints * 3);
+                continue;
+            }
+            const bool windSusceptible =
+                (mesh.behaviorType == BehaviorType::TriangularCloth ||
+                 mesh.behaviorType == BehaviorType::FastGridCloth);
+            for (Index p = 0; p < numPoints; ++p) {
+                Index b = p * 3;
+                PR mp = mass ? mass[b] : PR(1);
+                ext[b    ] = (PR)env.gravity.x * mp;
+                ext[b + 1] = (PR)env.gravity.y * mp;
+                ext[b + 2] = (PR)env.gravity.z * mp;
+                if (windSusceptible) {
+                    ext[b    ] += (PR)env.wind.x;
+                    ext[b + 1] += (PR)env.wind.y;
+                    ext[b + 2] += (PR)env.wind.z;
+                }
+            }
+        }
+    }
+
     void update() {
         if(pause) return;
         //std::cout << "[Simulator Update] Start update" << std::endl;
@@ -4503,6 +4544,8 @@ struct Simulator {
             }
         }
 
+
+        applyEnvironmentForces();
 
         for(int i = 0; i < system.subSteps; i++) {
 
@@ -5576,6 +5619,23 @@ int main() {
         if (!sceneIOStatus.empty()) {
             ImGui::Begin("Scene I/O");
             ImGui::TextWrapped("%s", sceneIOStatus.c_str());
+            ImGui::End();
+        }
+
+        // Environment panel — gravity / wind live edits land in
+        // Scene::environment immediately; the per-frame applyEnvironmentForces
+        // call picks them up next frame (FR-018 live-edit semantics).
+        {
+            auto& env = Scene<Backend, Precision>::environment;
+            float gravity[3] = {(float)env.gravity.x, (float)env.gravity.y, (float)env.gravity.z};
+            float wind[3]    = {(float)env.wind.x,    (float)env.wind.y,    (float)env.wind.z};
+            ImGui::Begin("Environment");
+            if (ImGui::InputFloat3("Gravity", gravity)) {
+                env.gravity = tinym::vec3(gravity[0], gravity[1], gravity[2]);
+            }
+            if (ImGui::InputFloat3("Wind", wind)) {
+                env.wind = tinym::vec3(wind[0], wind[1], wind[2]);
+            }
             ImGui::End();
         }
 

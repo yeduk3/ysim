@@ -1,65 +1,65 @@
-# Plan — Primitive Creation Slice
+# Plan — Environment Forces Slice
 
 > Owner: **Planner** writes; **Generator** executes; **Estimator** judges.
-> Updated: 2026-05-06
+> Updated: 2026-05-07
 
 ## Goal
 
-Ship `Create > Sphere` and `Create > Cube` so a fresh ysim scene can be built from primitives via the GUI. This is the first link in `BDD-101` (the v1 round-trip spine) and promotes `"sphere"`/`"cube"` from reserved-but-not-shipped (D-003) to shipping shape names.
+Wire the existing `Scene<BE,PR>::environment` (gravity + wind, D-006) into the simulation step so the cloth simulator actually responds to forces. After this slice ships:
 
-When the slice is done: the user opens ysim on an empty scene, picks `Create > Sphere`, sees a sphere appear in the viewport at the origin with default material and `Float` behavior; saves the scene to `.ysim.json`; loads it back and the sphere is in the same place.
+- A `TriangularCloth` or `FastGridCloth` mesh under non-zero gravity falls (mean y-position decreases over time).
+- A `Float`-tagged mesh stays exactly where it was placed regardless of gravity / wind (`BDD-009`'s strict-equality clause).
+- The user can edit gravity and wind from a new `Environment` panel; the change takes effect on the next sim step without restart (matches `FR-018`'s live-edit propagation expectation).
+- Saved scenes round-trip the gravity / wind values (already wired by D-006; this slice doesn't re-touch persistence).
 
 ## Scope
 
-- `BDD-001` — create primitive object (FR-001).
-- New CPU-side geometry generators: `MeshSphereInitializer` and `MeshCubeInitializer`, parallel to the existing `MeshGridInitializer`. Both produce `state.x` + `adjacency.facets`/`edges` in the same shape so the existing collision pipeline picks them up unchanged.
-- ImGui menu wiring under the existing `Create` (or new) menu — minimum: shape, size, tessellation, optional initial position. Same pattern as the persistence slice's text-input modals.
-- Loader / `scene_format.hpp` updates: `"sphere"` and `"cube"` join `"grid"` as known primitive shapes. The reserved-not-shipped rejection path stays for any future names that aren't yet shipping.
-- Design-doc amendment: `docs/design/scene_format.md` is updated so the schema reflects what's actually shipping. D-003 stays as historical record; a new D-NNN entry documents the promotion.
-- Tests (`test/scene_io_test.cpp` + a new `primitive_test.cpp` if cleaner): structural verification that sphere / cube objects round-trip through the JSON layer with the new shape names, and that the CPU-side initializers produce a mesh with the expected vertex/facet counts and a topology that survives the existing adjacency build.
+- `BDD-009` — Float behavior is force-exempt (FR-009).
+- `BDD-011` — Set gravity (FR-011).
+- `BDD-012` — Set wind (FR-012).
+- ImGui `Environment` panel exposing gravity (`vec3`) and wind (`vec3`) text inputs / sliders. Default values are the schema defaults (`gravity = (0, -9.81, 0)`, `wind = (0, 0, 0)`).
+- Per-frame application of gravity to **non-`Float`** meshes' `externalForces.externalForces` buffer; wind to wind-susceptible behaviors (`TriangularCloth`, `FastGridCloth`). The existing kernels already consume the per-mesh `externalForces` buffer (`src/main.cpp:TriangularClothBehavior::setBuffer` line ~1437, `FastGridClothBehavior::setBuffer` line ~1494) — this slice fills it.
 
-Behaviors covered: see `docs/specs/BDD.md#BDD-001`. Tests: `docs/TESTS.md#BDD-001` is already authored. The matrix row `BDD-001` is `pending` and the Generator fills the test address.
+Behaviors covered: see `docs/specs/BDD.md#BDD-009`, `#BDD-011`, `#BDD-012`. Tests / acceptance: `docs/TESTS.md` blocks of the same ids; matrix rows already exist in `docs/TEST_MATRIX.md` as `pending`.
 
 ## Non-goals (this slice)
 
-- **Visual fidelity beyond what the existing renderer already does.** The shader stays diffuse-only; PBR preview belongs to a future renderer slice with the material-editing UI (`BDD-005`). New primitives render as flat-shaded white.
-- **Per-primitive transform gizmo.** Position is specified in the create-modal as `[x, y, z]` text inputs; dragging in the viewport is `BDD-003`'s job.
-- **Behavior assignment UI** (`BDD-006`). New primitives default to `BehaviorType::Float` per the existing planner-resolved decision in `PROJECT_STATE.md`.
-- **Other primitive shapes** (cylinder, capsule, plane-as-primitive, etc.). Out of v1 scope (PRD §4 implicitly — only sphere and cube are listed).
-- **Touching the Metal kernels, simulation pipeline, or shaders.** This slice is geometry generation + GUI + loader; if any change lands under `src/metal/` or `src/shader/`, the Estimator should flag a backend-boundary violation (`BDD-103`).
+- **Wind reformulation as an air velocity field.** PRD §3.3 calls this out as a v2 concern; v1 ships wind as a force vector. The schema is forward-compatible (the v2 slice can extend `Environment` additively).
+- **Adding a new `BehaviorType` consumer.** Existing kernels (`compute_tri_spring_forces`, `compute_cloth_grid_forces_fast`) and the `Float` path already read the per-mesh external-forces buffer — populating it is the slice's job, not adding a new dispatch.
+- **Closing BDD-007 (cloth drapes onto rigid surface).** That's its own slice — needs collision response wired into the cloth path; this slice only delivers the gravity input that BDD-007 then *uses*.
+- **Touching the Metal kernels themselves.** No `.metal` file changes. The slice changes only how the C++-side sets up the existing buffer.
+- **Closing the parked persistence app-level test WARNING.** That requires a Metal-backed test harness (Q-D); deliberately deferred to the next slice. Force-application correctness will be marked "WARNING — manual verification" in the matrix until that harness exists.
 - **Resolving any of PRD Q1, Q2, Q4, Q5, Q6.**
+- **Any UI for behavior switching (BDD-006), per-object transforms (BDD-003), or material editing (BDD-005).** Separate slices.
 
 ## Todo
 
-Ordered. The Generator should execute top-to-bottom.
+Ordered. Generator executes top-to-bottom.
 
-1. **Author tests first (`docs/TESTS.md#BDD-001` already exists).** Add doctest cases that exercise:
-   - `MeshSphereInitializer` produces a mesh with `params.numPoints == expected lat/lon count`, `params.numFacets == 2 * (lat-1) * lon`, every vertex is at distance `≈ size/2` from `params.center` (within FP tolerance), and the adjacency build succeeds (no crash, no zero-area triangles).
-   - `MeshCubeInitializer` produces 6 faces × tessellation² quads → `numFacets = 12 * tessellation²`, all vertices on a face have one coordinate equal to `±size/2`.
-   - The JSON encode/decode for `{ "type": "primitive", "shape": "sphere", ... }` and `{ "shape": "cube", ... }` round-trips correctly through `scene_format::SceneSnapshot`. Reserved-not-shipped rejection still fires for any *other* unknown shape (regression guard).
-   - Fill `docs/TEST_MATRIX.md` row for `BDD-001` with the test addresses.
-2. **Implement `MeshSphereInitializer<BE, PR>`** in `src/main.cpp` next to `MeshGridInitializer` (≈ line 1141). UV-sphere parameterization: `tessellation` is the longitude segment count; latitude segments default to `tessellation / 2`. Pole-vertex collapsing is acceptable for v1 (the existing adjacency build handles degenerate edges by inspection — verify with the test). Reuse `MeshAdjacencyInitializer<BE, PR>::initialize` for adjacency.
-3. **Implement `MeshCubeInitializer<BE, PR>`** similarly. Six face quads, each subdivided into `tessellation × tessellation` cells (mirroring how `MeshGridInitializer` subdivides one plane). Edges along face boundaries are shared.
-4. **Extend `scene_format::PrimitiveSource` and the loader.** `"sphere"` and `"cube"` join `"grid"` in `isKnownShape`. The encoder writes `shape: "sphere"` for `MeshSphereInitializer` and `shape: "cube"` for `MeshCubeInitializer` in `Simulator::toSnapshot`. The loader's primitive branch dispatches to the right initializer based on `shape`. Grid-specific keys (`direction`, `jiggle`) become optional / ignored when `shape != "grid"` — keep them in the JSON for grid only.
-5. **Wire ImGui menu.** Add `Create > Sphere…` and `Create > Cube…` items beside `File > Save Scene…` / `Load Scene…`. Each opens a modal asking for size, tessellation, and position; on confirm, calls a new `Simulator::addPrimitive(shape, size, tessellation, position)` helper that wraps `scene.addGeneralMesh` with the right initializer + `BehaviorType::Float` + `FloatBehaviorParams`. Re-use the `simulator.initialize()` re-run pattern from the load handler so the new mesh appears immediately.
-6. **Update `docs/design/scene_format.md`.** The "Primitive shape — v1 reality" subsection currently lists `"grid"` as the only shipping shape and `"sphere"`/`"cube"` as reserved. Promote `"sphere"` and `"cube"` to shipping; keep the reserved-not-shipped rule for any future names. The grid-specific keys section is unchanged.
-7. **Append a new `D-010` entry to `docs/DECISIONS.md`** documenting the promotion: which initializer ships, what the tessellation parameter means for each shape (lat/lon vs face-cells), and that this amends D-003 without superseding it (the reserved-not-shipped *pattern* still holds for names that aren't yet shipping).
-8. **Stop and hand off to the Estimator.** Do not pull in material UI, behavior UI, or transform gizmo even if they look small — they have their own slices.
+1. **Read the wiring points first.** The existing kernels consume `mesh.externalForces.externalForces` as a flat `numPoints * 3` float buffer — see `src/main.cpp:TriangularClothBehavior::setBuffer` (~1437) and `FastGridClothBehavior::setBuffer` (~1494). The `ExternalForces<BE,PR>` struct is defined ~line 813. The buffer is currently allocated nowhere; this slice owns its allocation + per-frame fill.
+2. **Allocate `mesh.externalForces.externalForces` during `Scene::pack()`.** Matches the existing pattern for `state.x/v/f/m/n` — slice into a packed `packedExternalForces` buffer that lives next to `packedMeshData`. Filled with zeros initially.
+3. **Fill the buffer per simulation step.** Add a force-fill stage in `Simulator::update` *before* the per-substep behavior dispatch:
+   - For each mesh `m`: if `m.behaviorType == Float`, leave `externalForces` zero — this is what makes `BDD-009` strict (no rounding error from an applied-then-cancelled force).
+   - Else: write `(g.x * mass, g.y * mass, g.z * mass)` per particle from `Scene::environment.gravity` and `state.m`. For wind-susceptible behaviors (cloth), add `Scene::environment.wind` (no mass scaling — wind is a force per particle, not per kilogram).
+   - Implementation lives **on the C++ side** writing through `state.f.ptr` / `externalForces.externalForces.ptr` (Apple Silicon unified memory). No new Metal kernel.
+4. **Add an `Environment` ImGui panel.** Place beside the existing Scene I/O panel in the main render loop. Three-component `InputFloat3` for gravity, three-component `InputFloat3` for wind. Default values from `Scene::environment`. Edits write back into `Scene::environment` immediately — the per-step fill picks them up next frame (`FR-018` live-edit semantics, no pause/resume needed).
+5. **Tests (data-layer only — sim correctness needs Metal harness, see Non-goals).**
+   - `BDD-009` data-layer test: build a `SceneSnapshot` with gravity = (0, -9.81, 0), assert the existing scene_format round-trip is unaffected (regression guard for D-006).
+   - `BDD-011` / `BDD-012` UI-state tests: add a small unit test in `test/scene_io_test.cpp` that constructs a `SceneSnapshot` with non-default gravity / wind, round-trips through `toJson`/`fromJson`, asserts the values survive bit-identical (a re-statement of D-006 with explicit values to guard against regression).
+   - `BDD-009` strict-equality clause is **not** unit-testable today (needs sim step). Mark `BDD-009` row `pass` for the data-layer half with a note; the simulation half goes to a `WARNING` once the Estimator runs.
+   - Fill `BDD-011`, `BDD-012` rows in `docs/TEST_MATRIX.md` analogously.
+6. **Stop and hand off to the Estimator.** Do **not** scope cloth-drape acceptance (`BDD-007`), per-object transform UI, behavior switching, or material UI into this slice. Each is a separate planner-tracked candidate.
 
 ## Course corrections
 
-- **Persistence + verify-and-warnings slices both shipped** (commits `7cfc491` and `9455861`). The Estimator's last verdict on `verify-and-warnings` was NOTE — no carry-over follow-ups.
-- **D-003 amendment, not supersession.** The reserved-but-not-shipped *pattern* is correct. Only the specific membership of the reserved set narrows when a primitive ships. D-010 (when authored) should make this explicit so a future planner reading D-003 doesn't assume `"sphere"`/`"cube"` are still reserved.
-- **The persistence slice's parked WARNING** (no app-level `Simulator::saveScene/loadScene` integration test) is **still parked** — this slice does not address it. Q-D in `docs/ARCHITECTURE.md §5` is the gating decision; surface that as the question to resolve when the parked WARNING becomes urgent (likely when Alembic export needs deterministic round-trip verification).
+- **Primitive-creation slice (turn-1 → manual testing → fixes):** Estimator gave NOTE-level on the original commit; user then exercised `Create > Sphere/Cube` manually and surfaced two runtime bugs that the unit-test net could not catch (`CM-002`: shared initializer ownership across re-pack; `CM-003`: BVH buffer not re-sized on `numPrimitives` change). Both fixed in commits `2000aea` and `979f037`. The pattern — runtime bugs slipping past CPU-only tests — is a real signal. Captured in `PROJECT_STATE.md` as a planner-tracked motivation for the **test-harness slice** (next milestone after this one). Do not roll the harness into this slice; that would expand scope past one BDD-cluster.
+- **`Scene::environment` already exists** (D-006). This slice is the *consumer*; persistence already round-trips it. Confirm in step 5 that the existing scene_format tests still pass without any header changes.
 
 ## What to read before writing code
 
-- `docs/specs/FRD.md` FR-001 — functional contract.
-- `docs/specs/BDD.md` BDD-001 — user story.
-- `docs/TESTS.md#BDD-001` — acceptance scenario; both sphere and cube must be covered.
-- `docs/specs/BDD.md#BDD-103` — the backend-boundary invariant; this slice must stay above the Metal line.
-- `docs/design/scene_format.md` — the binding schema; the "Primitive shape" subsection is what gets amended.
-- `docs/DECISIONS.md` D-003 — the reserved-not-shipped decision this slice partially undoes.
-- `src/main.cpp` around `MeshGridInitializer` (≈ line 1141) and the `Simulator::addCloth/addGround/addClothFile/addFloatMesh` helpers (≈ line 4243) — these are the templates for the new initializers and the new `addPrimitive` helper.
-- `include/scene_format.hpp:isKnownShape` and `sourceFromJson` — where the loader's known-shape list lives.
-- `test/scene_io_test.cpp` — the harness pattern; `BDD-001` tests can live here or in a new `primitive_test.cpp` (Generator's call).
+- `docs/specs/FRD.md` FR-009, FR-011, FR-012 — functional contracts.
+- `docs/specs/BDD.md` BDD-009, BDD-011, BDD-012, and **BDD-103** (the boundary invariant the Estimator will check — kernel files must remain untouched).
+- `docs/TESTS.md` blocks for those four BDDs.
+- `src/main.cpp` around `ExternalForces<BE,PR>` (~line 813), the cloth kernel setBuffer paths (~lines 1437 and 1494), `Scene::pack()` (~line 1804) for the allocation pattern, and `Simulator::update()` (~line 4475) for where the force-fill stage goes.
+- `docs/DECISIONS.md` D-006 — confirms the in-memory shape and defaults the slice consumes.
+- `docs/CONVENTIONS.md` — file naming, type/function casing, commit message style.

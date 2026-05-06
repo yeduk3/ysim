@@ -1,26 +1,19 @@
-# Resume — Primitive Creation Slice
+# Resume — Environment Forces Slice
 
 ## Must remember
 
-- **Branch:** `feat/primitive-creation` (off `main`, after `feat/verify-and-load-warnings` was fast-forwarded into `main`).
-- **Geometry library is CPU-pure** (`include/primitive_geometry.hpp`). It deliberately does **not** depend on Metal, GLFW, tinym, or `MeshState`/`MeshAdjacency`. Tests live in a *second* doctest binary (`test/primitive_test.cpp` → `ysim_primitive_tests`) because each doctest source file owns its own `DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN` and one main per binary is the rule. Both verify scripts were updated to run both binaries — keep that in mind when adding a third test binary.
-- **`tessellation` parameter has shape-specific meaning.** For sphere it's the longitude segment count *and* the latitude segment count (so a sphere with `tessellation=16` has 16×16 ish vertices). For cube it's the cells-per-face-edge count (so `tessellation=2` means a cube with 6×9=54 vertices and 6×8=48 triangles). The schema's single `tessellation` integer is fine; just remember the interpretation when reading scenes.
-- **Cube faces are not vertex-shared.** Six independent face patches; the resulting mesh is a disconnected manifold. This is fine for v1 because new primitives default to `Float` behavior (no cloth physics over the surface), and the BVH operates triangle-by-triangle regardless of connectivity. If a future slice runs cloth physics on a cube, it will need a vertex-merging pass first.
-- **`isReservedShape` is empty in v1** but the function still exists. Future shapes that aren't yet shipping go in there to opt into the loud-fail behavior — this is the D-003 / D-010 pattern still alive.
-- **`tinym::vec4` order is `(x, y, z, w)`**, opposite of the schema's `[w, x, y, z]` quaternion order. Use the `Quat` struct in `src/main.cpp` (D-007) when storing rotation; do not re-derive the order from `vec4`.
+- **Branch:** `feat/environment-forces` (off `main`, after `feat/primitive-creation` was fast-forwarded into `main`).
+- **`mesh.externalForces.externalForces` is the canonical force input** for cloth kernels (`compute_tri_spring_forces`, `compute_cloth_grid_forces_fast`). Before this slice it was a placeholder buffer that nobody allocated; now it's a slice of `packedMeshData.externalForces`, allocated and zeroed during `Scene::pack()` and overwritten each frame by `Simulator::applyEnvironmentForces` (which runs once per outer frame, **before** the substep loop). If a future slice wants to add a *different* per-mesh force (e.g. user-applied push-pull), don't compete with this fill — write into `mesh.state.f` directly, or extend `applyEnvironmentForces` so the buffer remains the sole source of truth.
+- **Float is force-exempt by construction**, not by integration cancellation. `applyEnvironmentForces` zeroes the buffer for `BehaviorType::Float`. `BDD-009`'s strict-equality clause leans on this — do not introduce a path that adds gravity then subtracts it for Float; the buffer stays exact-zero.
+- **Wind is force-per-particle (no mass scaling)**, gravity is force-per-particle scaled by mass. This matches FR-011 (gravity vector applied to all non-Float) and FR-012 (wind force vector for wind-susceptible behaviors). PRD §3.3 hints at a v2 reformulation of wind as an air-velocity field; the schema is forward-compatible.
+- **Sim-step correctness is parked behind Q-D.** This slice's `BDD-009/011/012` rows are `warning` — data layer round-trips, but "object accumulates velocity in +x" needs a Metal-backed harness. Same convention as `BDD-015`. PROJECT_STATE explicitly tells the Estimator to expect WARNING, not BLOCK.
 
 ## Last decisions + why
 
-- **D-010** — `"sphere"`/`"cube"` ship as v1 primitives, amending D-003. Pattern (loud-fail on reserved names) preserved; only the membership of the reserved set narrows.
+No new `DECISIONS.md` entries this slice. The change is the consumer side of D-006 (which already established `Scene::environment` as the in-memory source of truth) — no non-obvious tradeoff to record.
 
 ## Next step you were about to take
 
-Slice complete. The next concrete step is the **Estimator's** turn — running `./scripts/verify.sh` and judging whether to merge or send back. After that, the candidate next slices (priority not yet decided; see `PROJECT_STATE.md`):
-
-- Material editing UI (FR-005 / BDD-005) — needs PBR preview shader to satisfy "preview render reflects" clause.
-- Behavior assignment UI (FR-006 / BDD-006) — in-place behavior switch reallocates per-mesh state; non-trivial.
-- Rigid body slice (FR-008 / BDD-008) — blocked on Q4.
-- Alembic export slice (FR-013 / BDD-013) — blocked on Q5/Q6.
-- Test-harness slice — closes the parked persistence WARNING; forces Q-D.
+Slice complete. The next concrete step is the **Estimator's** turn — running `./scripts/verify.sh` and judging whether to merge or send back. After that, per `PROJECT_STATE.md` "Next milestone", the priority is the **test-harness slice** (Metal-backed sim) — concrete motivation now stacked: persistence app-level WARNING, CM-002, CM-003, and now BDD-009/011/012 sim-step clauses. Closing it forces Q-D resolution (CPU backend reference vs. headless-Metal harness) and a `MeshGL` refactor out of `mesh.initialize()`.
 
 See `.agent/PLAN.md` and `.agent/CURRENT_WORK.md` for full plan and progress.

@@ -20,10 +20,10 @@ Use this as the entry point — `docs/TESTS.md` will get long, so find scenarios
 | BDD-006     | Assign behavior type to an object                 |              | pending |
 | BDD-007     | Cloth drapes onto a rigid surface                 |              | pending |
 | BDD-008     | Rigid body falls and rests                        |              | pending |
-| BDD-009     | Float behavior ignores gravity and wind           |              | pending |
+| BDD-009     | Float behavior ignores gravity and wind           | `src/main.cpp::Simulator::applyEnvironmentForces` (Float branch zeroes externalForces; data-layer covered by code review) | warning |
 | BDD-010     | Collision detected between simulated objects      |              | pending |
-| BDD-011     | Change gravity at runtime                         |              | pending |
-| BDD-012     | Apply wind force                                  |              | pending |
+| BDD-011     | Change gravity at runtime                         | `test/scene_io_test.cpp::BDD-011/012: non-default gravity and wind round-trip bit-stable`, `…missing environment falls back to schema defaults` | warning |
+| BDD-012     | Apply wind force                                  | `test/scene_io_test.cpp::BDD-011/012: non-default gravity and wind round-trip bit-stable`, `…missing environment falls back to schema defaults` | warning |
 | BDD-013     | Export simulation to Alembic                      |              | pending |
 | BDD-014     | Save scene to disk                                | `test/scene_io_test.cpp::BDD-014: save populated scene to disk` | pass    |
 | BDD-015     | Load scene reproduces saved state                 | `test/scene_io_test.cpp::BDD-015: load reproduces saved state field-by-field` | pass    |
@@ -41,3 +41,4 @@ Use this as the entry point — `docs/TESTS.md` will get long, so find scenarios
 - `pass` — test exists and last run passed
 - `fail` — test exists and last run failed (Estimator must classify as WARNING/BLOCK)
 - `skipped` — test exists but is intentionally skipped; reason in `DECISIONS.md`
+- `warning` — partial coverage: data-layer half of the BDD has tests and passes, but a sim-step / GPU clause is parked behind the test-harness slice. See `PROJECT_STATE.md` "What the Estimator should know" for the convention.

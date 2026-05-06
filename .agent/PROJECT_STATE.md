@@ -43,27 +43,29 @@ Carried forward from `PRD.md`. Each lists which slice it blocks.
 
 ## Next milestone
 
-**Primitive creation slice** — implement `BDD-001` (create primitive object). Ships `Create > Sphere` and `Create > Cube` so a fresh ysim scene can be built from primitives via the GUI. See `.agent/PLAN.md` for the concrete todo list.
+**Environment forces slice** — wire `Scene::environment` (D-006) into the simulation step. Closes `BDD-009` (Float force-exempt) + `BDD-011` (set gravity) + `BDD-012` (set wind) in one slice. See `.agent/PLAN.md` for the concrete todo list.
 
 Why this next:
-- First link of `BDD-101` (the v1 round-trip spine). Without primitives, every other slice is exercised on imported `.obj` meshes only.
-- Spec is unambiguous and self-contained — no PRD open question blocks it.
-- Testable from the CPU-side data layer alone (sphere/cube generators are pure math). No Metal harness required for `BDD-001` acceptance.
-- Promotes `"sphere"`/`"cube"` from reserved-but-not-shipped (D-003) to shipping shape names.
+- Today's cloth simulator doesn't actually drape — there's no gravity in the kernel input. This slice fills `mesh.externalForces.externalForces` (which the kernels already consume) and adds an Environment panel to the GUI.
+- Three BDDs in one tight slice — vs. material UI (needs PBR shader), behavior UI (needs in-place state realloc), rigid (Q4 blocked), export (Q5/Q6 blocked).
+- No new behavior, no new pipeline → `BDD-103` clean (only extends existing kernel inputs).
+- Unblocks `BDD-007` (cloth drapes onto rigid surface) which literally requires non-zero gravity.
+- Persistence already round-trips gravity / wind; no schema changes.
 
-After this slice, the open candidates remain:
+After this slice, the priority shifts to the **test-harness slice** because two recent runtime bugs (CM-002, CM-003) escaped the CPU-only test net during manual `Create > Sphere/Cube` testing. Standing candidates:
 
-- **Material editing UI slice (FR-005 / BDD-005)** — needs a PBR preview shader to satisfy "preview render reflects the lower roughness", so it ships paired with renderer work.
-- **Behavior assignment UI slice (FR-006 / BDD-006)** — switching behavior in-place reallocates per-mesh state; non-trivial.
+- **Test-harness slice (Metal-backed sim)** — *priority elevated* by CM-002/CM-003. Forces Q-D resolution (CPU backend reference vs headless-Metal harness). The headless-Metal path needs the `MeshGL` constructor moved out of `mesh.initialize()` to drop the GLFW/GL coupling — itself a refactor.
+- **Material editing UI slice (FR-005 / BDD-005)** — needs a PBR preview shader to satisfy "preview render reflects the lower roughness".
+- **Behavior assignment UI slice (FR-006 / BDD-006)** — switching behavior in-place reallocates per-mesh state.
 - **Rigid body slice (FR-008 / BDD-008)** — blocked on Q4.
 - **Alembic export slice (FR-013 / BDD-013)** — blocked on Q5 + Q6.
-- **Test-harness slice (Metal-backed sim)** — closes the parked persistence WARNING; forces Q-D.
 
 ## Recent scope changes
 
 - **2026-05-06, persistence slice.** D-007 supersedes D-004: rotation moved from "JSON-only" to a real `GeneralMesh::rotationQuat` field after the Estimator BLOCKed the round-trip gap. No spec change — the design doc already required round-trip; the in-memory mirror was the missing piece. (See `docs/DECISIONS.md` D-004 / D-007.)
 - **2026-05-06, persistence slice.** Design doc `docs/design/scene_format.md` updated to declare `"grid"` as the v1-shipped primitive shape with `"sphere"`/`"cube"` reserved-not-shipped, mirroring D-003. This was a doc/code reconciliation, not a scope change — v1 only ever had a grid initializer.
 - **Pending in primitive-creation slice (this plan).** D-003 will be *amended* (not superseded) when `"sphere"` and `"cube"` ship as real initializers. The reserved-not-shipped *pattern* survives unchanged; only the membership of the reserved set narrows.
+- **2026-05-06 / 07, primitive-creation slice.** D-010 amended D-003 (sphere/cube shipped). Two runtime bugs surfaced during manual GUI testing and were fixed in `2000aea` and `979f037`: CM-002 (`Scene::pack()` double-frees initializers when re-run because `meshes[i]` and `requestsGeneralMeshes[i]` share the pointer) and CM-003 (`BVH::build` skips re-allocation when primitive count changes, only checking `!tree.ptr`). Both fall in the gap the persistence slice's parked WARNING called out — the unit-test net cannot reach `Simulator::initialize` because of the GLFW/GL coupling in `mesh.initialize()`. This is the concrete motivation for promoting the test-harness slice to the next-after-environment-forces slot.
 
 ## What the Estimator should know
 
@@ -72,3 +74,4 @@ After this slice, the open candidates remain:
 - Reserved-but-not-shipped behaviors (`Elastic`, `Fluid`, `Generator`) keep their enum identifiers — reordering them silently corrupts saved scenes.
 - `GeneralMesh::rotationQuat` exists as of D-007 but no consumer reads it yet. A future render/sim slice that *adds* a consumer is implementing FR-004, not violating BDD-103 — it's reading a field that's already there.
 - The persistence slice's WARNING about app-level coverage (`Simulator::saveScene/loadScene` unexercised end-to-end) is parked until the test-harness slice resolves Q-D. The matrix lists BDD-015 as `pass` because the JSON-layer round-trip is the testable subset today; calling it `pass` is honest under "what we can verify with the harness we have", not under "every claim in TESTS.md#BDD-015 is mechanically checked".
+- For the **environment forces slice** the same partial-pass convention applies: gravity/wind round-trip and Environment-panel wiring are unit-testable, but the "object accumulates velocity in +x" clause from BDD-011 (and the strict-equality clause from BDD-009) require sim-step execution and are parked behind the test-harness slice. Expect a `WARNING` row, not a `BLOCK` — this is the documented gap, not new debt.

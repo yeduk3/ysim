@@ -320,3 +320,37 @@ TEST_CASE("BDD-016: reject unsupported import extension") {
     CHECK(r.error.message.find("foo.fbx") != std::string::npos);
     std::remove(path.c_str());
 }
+
+// ---- BDD-009 / 011 / 012 — env-forces persistence guard ---------------
+
+TEST_CASE("BDD-011/012: non-default gravity and wind round-trip bit-stable") {
+    SceneSnapshot s;
+    s.environment.gravity = {1.5, -3.25, 0.125};
+    s.environment.wind    = {-0.5, 0.0, 2.75};
+    auto path = tempPath("envrt");
+    REQUIRE(writeToFile(s, path));
+    auto r = readFromFile(path);
+    REQUIRE(r.ok);
+    for (int k = 0; k < 3; ++k) {
+        CHECK(s.environment.gravity[k] == doctest::Approx(r.value.environment.gravity[k]));
+        CHECK(s.environment.wind[k]    == doctest::Approx(r.value.environment.wind[k]));
+    }
+    // Save→load→save byte identity.
+    CHECK(toString(s) == toString(r.value));
+    std::remove(path.c_str());
+}
+
+TEST_CASE("BDD-011/012: missing environment falls back to schema defaults") {
+    auto path = tempPath("envdef");
+    REQUIRE(writeText(path, R"({"format_version": 1, "objects": []})"));
+    auto r = readFromFile(path);
+    REQUIRE(r.ok);
+    // Schema default: gravity = (0, -9.81, 0); wind = (0, 0, 0).
+    CHECK(r.value.environment.gravity[0] == doctest::Approx(0.0));
+    CHECK(r.value.environment.gravity[1] == doctest::Approx(-9.81));
+    CHECK(r.value.environment.gravity[2] == doctest::Approx(0.0));
+    CHECK(r.value.environment.wind[0] == doctest::Approx(0.0));
+    CHECK(r.value.environment.wind[1] == doctest::Approx(0.0));
+    CHECK(r.value.environment.wind[2] == doctest::Approx(0.0));
+    std::remove(path.c_str());
+}

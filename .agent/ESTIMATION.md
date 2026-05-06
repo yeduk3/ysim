@@ -1,23 +1,23 @@
-# Estimation — 2026-05-06 turn-2
+# Estimation — 2026-05-07 turn-3
 Status: UPDATED
 
 ## Verdict
-NOTE
+WARNING
 
 ## BLOCK
 - None
 
 ## WARNING
-- None
+- [src/main.cpp](/Users/gyu/codes/ysim/src/main.cpp:4494) wires `Scene::environment` into `Simulator::applyEnvironmentForces`, and [docs/TEST_MATRIX.md](/Users/gyu/codes/ysim/docs/TEST_MATRIX.md:23) records the new rows as `warning`, but there is still no executable test that exercises the sim-step acceptance clauses for `BDD-009`, `BDD-011`, or `BDD-012`. The runtime contract is therefore still parked behind the test-harness slice.
+- [test/scene_io_test.cpp](/Users/gyu/codes/ysim/test/scene_io_test.cpp:326) proves persistence and default fallback for gravity / wind, but it does not verify that the next simulation step actually uses the edited values. That leaves the behavior change partially covered rather than fully closed.
 
 ## NOTE
-- [scripts/verify.sh](/Users/gyu/codes/ysim/scripts/verify.sh:1) now exists as the strict estimator gate and stays separate from `verify-light.sh`, matching the role split and the slice plan.
-- [src/main.cpp](/Users/gyu/codes/ysim/src/main.cpp:5352) surfaces `SceneSnapshot::warnings.messages` in the existing `sceneIOStatus` string, which keeps the warning UX low-risk and avoids introducing a new ImGui surface.
+- None
 
 ## Test matrix delta
-- BDD-014: pass
-- BDD-015: pass
-- BDD-016: pass
+- BDD-009: warning
+- BDD-011: warning
+- BDD-012: warning
 
 ## Verify output (summary)
-`./scripts/verify.sh` succeeded end-to-end: CMake configured the build, `MetalKernels`, `ysim_tests`, and `ysim` all built, and `ysim_tests` passed 9 doctest cases / 142 assertions with no failures.
+`./scripts/verify.sh` passed end-to-end. CMake configured and built `MetalKernels`, `ysim_primitive_tests`, `ysim_tests`, and `ysim`; both doctest binaries succeeded with 11 test cases / 159 assertions and 9 test cases / 1120 assertions respectively. The slice stays within scope, but the new environment-force behavior is still only partially verified at the runtime level.
