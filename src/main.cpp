@@ -4202,13 +4202,13 @@ struct Simulator {
     // Click-ray pickup and showBox/showSceneBox always go through the BVH —
     // SpatialHashing is broadphase-only.
     SpatialHashing<METAL, PR> shBroadPhase;
-    bool useSpatialHashing = true;
+    bool useSpatialHashing = false;
 
     // Per-substep stdout log for the SH path. Toggling this on also enables
     // shBroadPhase.verbose (forces a commit after the broad-phase dispatch so
     // the broad-phase ms is faithful). Useful when the GUI window can't keep
     // up because the substep loop itself is slow.
-    bool logSHPerSubstep = true;
+    bool logSHPerSubstep = false;
 
 
 
@@ -4876,7 +4876,7 @@ int main() {
     //simulator.addFloatMesh("src/assets", "horse-gallop-01.obj", {0, -1, 0}, 1.2);
     //simulator.addFloatMesh("src/assets", "camel-gallop-reference.obj", {0, -1, 0}, 1.2);
     simulator.addFloatMesh("src/assets", "Human.obj", {0, -0.65, 0}, 0.04);
-    //simulator.addGround(PlaneDirection::XZPlane, tinym::vec3(0, -1, 0), 5);
+    simulator.addGround(PlaneDirection::XZPlane, tinym::vec3(0, -1, 0), 5);
 
     std::cout << "[Main] mesh added to scene" << std::endl;
 
