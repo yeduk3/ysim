@@ -1,10 +1,6 @@
-# Current Work — Persistence Slice (feat/persistence)
+# Current Work — Verification & Polish Slice (feat/verify-and-load-warnings)
 
-- File in flight: none — Estimator BLOCK feedback addressed; ready for re-review.
-- How far: 3 BLOCK items + 1 WARNING item from `.agent/ESTIMATION.md` resolved.
-  - **BLOCK 1** (primitive schema drift): `docs/design/scene_format.md` updated to declare `"grid"` as v1-shipped and `"sphere"`/`"cube"` as reserved-but-not-shipped, mirroring D-003.
-  - **BLOCK 2** (rotation dropped): `Quat` struct + `GeneralMesh::rotationQuat` field, `toSnapshot` reads it, `loadScene` stashes it in a `pendingRotations` side-table, `applyPendingMaterials` paints it on realized meshes. D-007 supersedes D-004.
-  - **BLOCK 3** (import path resolution): `scene_format::sceneDir` and `resolveImportPath` helpers in the header; `Simulator::loadScene` joins relative imports against the scene file's directory. D-008 added.
-  - **WARNING** (silent material clamping): `clampInPlace` returns `bool`; `materialFromJson` records into a `LoadWarnings` channel surfaced via `SceneSnapshot::warnings`. D-009 added.
-- What's tested: 9 doctest cases / 142 assertions (was 6/124). New cases: `import paths resolve relative to scene file directory`, `sceneDir extracts directory…`, `loader emits a warning and clamps out-of-range material values`. `BDD-014/015/016` rows in `docs/TEST_MATRIX.md` still pass.
-- What's next: Estimator re-review. The remaining open WARNING (no app-level Simulator end-to-end test) is genuinely blocked on having a Metal harness — surfaced in `RESUME.md` for the next planning loop.
+- File in flight: none — slice complete; ready for Estimator.
+- How far: both PLAN.md todos done. `scripts/verify.sh` (strict gate: configure + build all targets + run `ysim_tests`) is on disk and executable. The `Load Scene…` handler in `src/main.cpp` now appends each `r.value.warnings.messages` entry to `sceneIOStatus` after the "loaded: …" prefix, so a load that clamps a material is visible to the user in the existing Scene I/O panel.
+- What's tested: `./scripts/verify.sh` runs clean — `ysim` and `ysim_tests` both build, 9 doctest cases / 142 assertions all pass. The warning-surface change is a string-formatting tweak in the GUI handler; no new BDD, no new test.
+- What's next: Estimator review. The remaining persistence-slice WARNING (no app-level `Simulator::saveScene/loadScene` integration test) is **deliberately out of scope** for this slice — see PLAN.md Non-goals; it is a separate test-harness slice blocked on Q-D (`docs/ARCHITECTURE.md §5`).

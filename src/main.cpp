@@ -5350,6 +5350,9 @@ int main() {
                 auto r = simulator.loadScene(scenePathBuf);
                 if (r.ok) {
                     sceneIOStatus = std::string("loaded: ") + scenePathBuf;
+                    for (const auto& w : r.value.warnings.messages) {
+                        sceneIOStatus += "\nwarning: " + w;
+                    }
                     simulator.initialize();
                     simulator.applyPendingMaterials();
                 } else {

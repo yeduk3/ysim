@@ -1,60 +1,54 @@
-# Plan — Persistence Slice
+# Plan — Verification & Polish Slice
 
 > Owner: **Planner** writes; **Generator** executes; **Estimator** judges.
-> Updated: 2026-05-06
+> Updated: 2026-05-06 (turn-2)
 
 ## Goal
 
-Add scene save / load / version-reject to ysim, so that every later v1 slice can rely on a durable, structured, human-diffable representation of a scene.
+Close the two persistence-slice WARNINGs from `.agent/ESTIMATION.md` (turn-2) without re-opening the slice itself:
 
-Concretely: when this slice ships, a user can build a small scene, save it to a `.ysim.json` file, quit the app, relaunch, load the file, and resume from an identical state. An unrecognized format version produces an explicit error rather than silent corruption.
+1. The Estimator's full gate `./scripts/verify.sh` does not exist — only the Generator-grade `verify-light.sh` does. The Estimator was forced to fall back. We add the gate.
+2. `SceneSnapshot::warnings` (D-009) carries non-fatal load messages, but the GUI's `sceneIOStatus` line never displays them. After a load that clamped a material, the user sees only "loaded: …" with no hint anything was adjusted. We surface the warnings.
+
+The slice ships when both are visible: `./scripts/verify.sh` exits 0 and the user sees clamped-material warnings after a load.
 
 ## Scope
 
-- `BDD-014` — save scene to disk (FR-014).
-- `BDD-015` — load scene reproduces saved state (FR-015).
-- `BDD-016` — reject incompatible scene file version (FR-016).
-- The on-disk schema for scenes (the resolution of PRD Q3 — JSON).
-- Wiring into the existing ImGui menu surface (`File > Save Scene`, `File > Load Scene`).
+- Author `scripts/verify.sh`: the Estimator's strict gate — configure, build **every** CMake target (`ysim` + `ysim_tests`), run `ysim_tests`. Distinguish from `verify-light.sh` (which only builds the test target so the Generator can iterate without paying the GUI link cost).
+- Thread `SceneSnapshot::warnings.messages` from `Simulator::loadScene` into the existing `sceneIOStatus` string in `src/main.cpp` so the I/O panel shows them. Existing channel — no new ImGui window.
 
-Behaviors covered: see `docs/specs/BDD.md#BDD-014`, `#BDD-015`, `#BDD-016`. Tests: see `docs/TESTS.md` blocks of the same ids; matrix rows already exist in `docs/TEST_MATRIX.md`.
+Behaviors covered: tooling and a live-feedback follow-up under the existing `FR-018` ("inspector edits propagate live"); no new BDDs.
 
 ## Non-goals (this slice)
 
-- Saving simulation results / per-frame caches. That's the **export slice** (`BDD-013`), separate.
-- Embedding mesh data in the scene file. v1 references imported meshes by path (decision in `PROJECT_STATE.md`).
-- Format migration. v1 has exactly one format version; v1→v2 migration is a future slice. The version field exists *only* so v1 can refuse to load anything else.
-- Material export through the scene file's renderer side — material parameters are just data; no rendering changes here.
-- Touching the simulation kernels, the Metal shaders, or the renderer. If this slice modifies anything under `src/metal/` or `src/shader/`, the Estimator should flag a backend-boundary violation (`BDD-103`).
+- App-level `Simulator::saveScene`/`loadScene` integration test. The Estimator's other WARNING is real, but closing it requires either a CPU-backend simulator path or a headless-Metal harness (Q-D in `docs/ARCHITECTURE.md §5`). That is its own slice; carving it into a tooling follow-up would be silent scope creep.
+- Promoting the existing `scene_format.hpp` round-trip test to "BDD-015 fully verified". The matrix already says `pass`, and the JSON-layer round-trip is *part* of the BDD-015 contract — but not the whole. The Estimator can mark it `WARNING` again if they think the matrix overstates coverage; that is their decision to make, not ours to silently re-edit.
+- Resolving `BDD-007/008/010/011/012` (cloth/rigid drape, collision, env forces) — those are simulation slices, not tooling.
 - Resolving any of PRD Q1, Q2, Q4, Q5, Q6.
 
 ## Todo
 
-Ordered. The Generator should execute top-to-bottom. Each item is concrete enough that no re-planning is needed.
+Ordered. Generator executes top-to-bottom.
 
-1. **Read the schema.** Schema is fully specified in `docs/design/scene_format.md` — top-level shape, per-object shape, transform/material/behavior schemas, error-behavior table, save semantics. Implement to match it exactly; do not improvise. If a field is ambiguous, stop and ask the Planner — do not silently choose.
-2. **Add the JSON library.** Drop `nlohmann/json.hpp` (single-header) into `include/` alongside `stb_image.h`. Record the choice in `docs/DECISIONS.md` (this is your first entry — number it `001` and cite `BDD-014`/`BDD-015`/`BDD-016`).
-3. **Implement save (`BDD-014`).** Add a `saveScene(path)` entry point that walks the in-memory scene (objects, transforms, materials, behavior tags + params, global forces) and writes the JSON described in step 1. The function lives next to the scene-management code in `src/main.cpp` for now (consistent with the project's "scene logic in main.cpp" convention per `CLAUDE.md`).
-4. **Implement load (`BDD-015`).** Add a `loadScene(path)` entry point that parses the JSON, validates `format_version == 1` (else: error per `BDD-016`), and reconstructs the scene state. Use the existing `addGeneralMesh`, primitive-creation, and import paths rather than building a parallel construction pipeline — this enforces that loading produces the same in-memory shape as authoring.
-5. **Implement version-reject (`BDD-016`).** When `format_version` is missing, unknown, or not `1`, the loader returns an error result without mutating the current scene. The error message names the version it found vs. the version it expected.
-6. **Wire into ImGui.** Add `File > Save Scene…` and `File > Load Scene…` items. Use a native file dialog if one is already present in the project; otherwise a minimal text-input modal is acceptable for v1 (file dialog polish is a follow-up).
-7. **Tests.** Implement the three scenarios from `docs/TESTS.md`:
-   - `BDD-014` — author a populated scene, save, assert file exists with expected structural keys + `format_version: 1`.
-   - `BDD-015` — save a populated scene, fresh-load it, assert in-memory state field-by-field equals pre-save state; run one simulation step and assert output equals the pre-save first-step output.
-   - `BDD-016` — write a file with `format_version: 999`, attempt to load, assert load fails with an error naming the version mismatch and the in-memory scene is unchanged. Repeat with the version field omitted.
-   Fill the corresponding rows in `docs/TEST_MATRIX.md` with the test addresses and update status to `pass`/`fail`.
-8. **Stop and hand off to the Estimator** before scoping any further capability into this slice. Material UI, behavior UI, gravity/wind sliders, etc., are *separate* slices — do not pull them in even if they look small.
+1. **Author `scripts/verify.sh`.** It must:
+   - `set -euo pipefail`, `cd "$(dirname "$0")/.."`.
+   - `cmake -B build` (configure; do not redirect stdout — the Estimator captures full output).
+   - `cmake --build build -j` (build **all** targets, including `ysim` and the Metal kernel target).
+   - `./build/test/ysim_tests` (run unit tests).
+   - Mark executable. The Estimator's role doc mentions running `verify.sh`, so the file path must match.
+2. **Surface load warnings in the GUI.** In `src/main.cpp` near the existing `simulator.loadScene(scenePathBuf)` call (≈ line 5350): when the load succeeds and `r.value.warnings.messages` is non-empty, append each message to `sceneIOStatus` (one per line). Keep the "loaded: …" prefix as the first line.
+3. **Update `docs/TEST_MATRIX.md` if needed.** No new rows — the existing BDD-014/015/016 rows already point at `test/scene_io_test.cpp`. Touch only if the Generator finds a stale entry.
+4. **Stop and hand off to the Estimator.** Do not pull the Metal-backed integration test in even if it looks small — see Non-goals above. If the warning-surface change requires a new ImGui window, stop and write the question into `CURRENT_WORK.md`; in-place into `sceneIOStatus` is the intended path.
 
 ## Course corrections
 
-(None yet — this is slice #1.)
+- **Persistence slice (turn-1 → turn-2):** Estimator BLOCKed on three issues (primitive schema drift, dropped rotation, unanchored import paths) plus one WARNING (silent clamping). All four were addressed in the turn-2 fix commit (`7cfc491`). The Estimator's turn-2 verdict was WARNING — slice was allowed to commit. This follow-up slice is the planner's response to the two remaining WARNINGs from that verdict; it does **not** re-open the persistence slice.
+- **D-004 was superseded by D-007** mid-slice. Rotation now lives on `GeneralMesh` as `rotationQuat`. If a future slice wires rendering / sim through that field, it does **not** count as a backend-boundary violation (`BDD-103`) — the field exists, the new consumer is just reading what was already there.
 
 ## What to read before writing code
 
-- `docs/design/scene_format.md` — **the schema is binding**, not a sketch.
-- `docs/ARCHITECTURE.md` §4 — boundaries you must not cross (especially §4.1 backend boundary, §4.4 enum identifiers reserved).
-- `docs/CONVENTIONS.md` — file naming, type/function casing, commit message style.
-- `docs/specs/FRD.md` FR-014, FR-015, FR-016 — the functional contract.
-- `docs/specs/BDD.md` BDD-014, BDD-015, BDD-016 (slice work) and **BDD-103** (the invariant the Estimator will check — keep the diff narrow).
-- `docs/TESTS.md` blocks for those four BDDs — these are the acceptance scenarios you must turn into doctest cases.
-- `src/main.cpp` around the `Scene<METAL, PR>` and `GeneralMesh<BE, PR>` definitions (≈ lines 1530–1650), the `BehaviorType` enum (line 794), and the behavior parameter structs (line 1382 onward) — these define the in-memory shape you are serializing.
+- `.agent/ESTIMATION.md` (turn-2) — the source of the two WARNINGs.
+- `docs/roles/ESTIMATOR.md` step 1 — confirms `verify.sh` is the strict gate, separate from `verify-light.sh`.
+- `src/main.cpp` around line 5290–5360 — where the `File > Save Scene…` / `Load Scene…` modals and `sceneIOStatus` live. Surface warnings in that string.
+- `include/scene_format.hpp:LoadWarnings` — the channel D-009 added; messages are `std::vector<std::string>`.
+- `scripts/verify-light.sh` — already present; the new file is its strict sibling, not a replacement.

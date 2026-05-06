@@ -43,19 +43,27 @@ Carried forward from `PRD.md`. Each lists which slice it blocks.
 
 ## Next milestone
 
-**Persistence slice** — implement `BDD-014` (save), `BDD-015` (load), `BDD-016` (version reject). See `.agent/PLAN.md` for the concrete todo list.
+**Verification & polish slice** — close the two WARNINGs the Estimator left after the persistence slice landed. Concretely: author `scripts/verify.sh` (the Estimator's strict gate) and surface `LoadWarnings.messages` in the GUI's `sceneIOStatus`. See `.agent/PLAN.md` for the todo list. Small slice, deliberately small — the bigger app-level integration-test question is its own milestone (see below).
 
-Why this first:
-- Every other v1 capability eventually depends on it (Alembic export reads from a scene; live editing benefits from save-as-checkpoint; v2 LLM control needs a persistence target).
-- Purely additive against current code — no risk to the implemented core (cloth, collision, profiler).
-- Resolvable now: the only blocking open question (Q3) has a defensible default.
+After that, the open candidates for the next big slice (priority not yet decided) are:
+
+- **Test-harness slice (Metal-backed sim).** Closes the Estimator's other WARNING — that `Simulator::saveScene/loadScene` is unexercised end-to-end. Forces a decision on `Q-D` (`docs/ARCHITECTURE.md §5`): either bring up a CPU-backend `Scene` for tests, or build a headless-Metal harness. Both are real work.
+- **Material editing UI slice (FR-005 / BDD-005).** Q1 has a defensible default; persistence already round-trips the OpenPBR subset.
+- **Behavior assignment UI slice (FR-006 / BDD-006).** Q2 has a defensible default; the underlying behaviors exist.
+- **Rigid body slice (FR-008 / BDD-008).** Blocked on Q4 (Bullet vs Jolt default).
+- **Alembic export slice (FR-013 / BDD-013).** Blocked on Q5 + Q6.
 
 ## Recent scope changes
 
-None. (This is the first plan slice.)
+- **2026-05-06, persistence slice.** D-007 supersedes D-004: rotation moved from "JSON-only" to a real `GeneralMesh::rotationQuat` field after the Estimator BLOCKed the round-trip gap. No spec change — the design doc already required round-trip; the in-memory mirror was the missing piece. (See `docs/DECISIONS.md` D-004 / D-007.)
+- **2026-05-06, persistence slice.** Design doc `docs/design/scene_format.md` updated to declare `"grid"` as the v1-shipped primitive shape with `"sphere"`/`"cube"` reserved-not-shipped, mirroring D-003. This was a doc/code reconciliation, not a scope change — v1 only ever had a grid initializer.
+
+## What the Estimator should know
 
 ## What the Estimator should know
 
 - The backend-boundary invariant (`BDD-103`) applies to *every* slice. Any persistence-slice change that touches `src/shader/` or simulation kernels is suspect.
 - "Determinism, scoped" (`BDD-102`) is a *single-machine* promise. Don't escalate cross-machine drift to BLOCK in v1.
 - Reserved-but-not-shipped behaviors (`Elastic`, `Fluid`, `Generator`) keep their enum identifiers — reordering them silently corrupts saved scenes.
+- `GeneralMesh::rotationQuat` exists as of D-007 but no consumer reads it yet. A future render/sim slice that *adds* a consumer is implementing FR-004, not violating BDD-103 — it's reading a field that's already there.
+- The persistence slice's WARNING about app-level coverage (`Simulator::saveScene/loadScene` unexercised end-to-end) is parked until the test-harness slice resolves Q-D. The matrix lists BDD-015 as `pass` because the JSON-layer round-trip is the testable subset today; calling it `pass` is honest under "what we can verify with the harness we have", not under "every claim in TESTS.md#BDD-015 is mechanically checked".

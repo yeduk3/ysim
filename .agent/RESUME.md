@@ -1,30 +1,25 @@
-# Resume — Persistence Slice
+# Resume — Verification & Polish Slice
 
 ## Must remember
 
-- **Branch:** `feat/persistence` (off `main`). Do not write feature code on `main`.
-- **Schema is binding** (`docs/design/scene_format.md`). After the Estimator pass, the doc now matches the implementation: `"grid"` is the v1 primitive shape; `"sphere"`/`"cube"` are reserved-but-not-shipped.
-- **Rotation round-trips through `GeneralMesh::rotationQuat`** (D-007). Quaternion order is `[w, x, y, z]` — this is the schema's order, **not** `tinym::vec4`'s `(x, y, z, w)` order. Use the `Quat` struct in `src/main.cpp`.
-- **Import paths resolve via `scene_format::resolveImportPath(sceneDir, importPath)`** (D-008). Relative paths are anchored to the scene file's directory; absolute paths pass through.
-- **Material clamping is non-fatal** and surfaces via `SceneSnapshot::warnings` (D-009). A `LoadWarnings` is the channel; do not upgrade clamps to errors.
-- **Material name collision** (CM-001): inside `Simulator`, qualify the C++-side struct as `::Material`. Same goes for `::Quat` after the rotation field landed.
-- **Reserved-but-not-shipped pattern.** Both `BehaviorType::Rigid|Elastic|Fluid|Generator` and the schema's `"sphere"|"cube"` shapes are accepted as *known* names by the loader and rejected with a "not available in this build" error. No silent fallback.
-- **Persistence layer is backend-independent.** `include/scene_format.hpp` + `test/scene_io_test.cpp` build without a Metal device. Keep it that way (`docs/ARCHITECTURE.md §4.1`, `BDD-103`).
+- **Branch:** `feat/verify-and-load-warnings` (off `main`, after `feat/persistence` was fast-forwarded into `main`). Do not write feature code on `main`.
+- **`scripts/verify.sh` vs `scripts/verify-light.sh`** are deliberately distinct. `verify.sh` is the Estimator's strict gate (builds **every** CMake target, including the GUI binary `ysim`); `verify-light.sh` is the Generator's quick loop (test target only). If a future change has reason to drop the strict gate down to "tests only", that is a planning question — do not silently merge them.
+- **Load warnings are surfaced inline in `sceneIOStatus`,** not in a new ImGui window. Each warning message is prefixed with `"warning: "` on its own line, after the `"loaded: <path>"` first line. If a future slice needs richer formatting (collapsible list, color, etc.), it can split this string into a structured panel — but a single string was the right cheap call here, matching the PLAN.
+- **`SceneSnapshot::warnings` is non-fatal by design** (D-009). Treat clamping as a soft signal to the user, not as a load failure.
 
 ## Last decisions + why
 
-- **D-001** — Vendor `nlohmann/json` under `include/nlohmann/`.
-- **D-002** — Doctest as v1 test framework, vendored at `include/doctest.h`.
-- **D-003** — `"grid"` is v1 primitive shape; `"sphere"`/`"cube"` reserved-not-shipped.
-- **D-004** — *(Superseded by D-007.)* Initially kept rotation in JSON only.
-- **D-005** — `Material` extended to OpenPBR v1 subset.
-- **D-006** — `Scene::environment` (gravity, wind) static singleton.
-- **D-007** — Per-object rotation lives on `GeneralMesh` as `rotationQuat`. Supersedes D-004 after Estimator flagged a round-trip violation.
-- **D-008** — Import paths resolve relative to the scene file's directory.
-- **D-009** — Material clamping surfaces via `LoadWarnings` channel (non-fatal).
+No new `DECISIONS.md` entries this slice — the changes are tooling and a one-line UX improvement, neither of which has a non-obvious tradeoff a future reader couldn't derive from the diff. The relevant prior entries are still load-bearing: D-009 (`LoadWarnings` channel), D-002 (doctest as the test framework, separate executable, no Metal device).
 
 ## Next step you were about to take
 
-Slice complete pending Estimator re-review. The next concrete step is the **Estimator's** turn. The one remaining WARNING (no app-level `Simulator::saveScene/loadScene` test) is genuinely blocked on a Metal-capable test harness — that's a planning question, not a Generator one. If a future planner wants to close it, the cheapest path is a smoke test that boots the simulator without rendering, calls `saveScene` → `loadScene`, and asserts the in-memory `Scene<METAL,Precision>::meshes` lengths and `environment` round-trip. That requires `MetalGlobalContext` to come up successfully in CI; today the test executable bypasses it entirely.
+Slice complete. The next concrete step is the **Estimator's** turn — running `./scripts/verify.sh` (now actually present) and judging whether to merge or send back. The slice's surface area is intentionally small; if anything blocks it, the cause is structural, not implementation.
+
+After that, the next big slice candidates (decision pending) per `PROJECT_STATE.md`:
+- Test-harness slice (closes the persistence WARNING about app-level coverage; forces Q-D).
+- Material editing UI slice (FR-005 / BDD-005).
+- Behavior assignment UI slice (FR-006 / BDD-006).
+- Rigid body slice (blocked on Q4).
+- Alembic export slice (blocked on Q5/Q6).
 
 See `.agent/PLAN.md` and `.agent/CURRENT_WORK.md` for full plan and progress.
