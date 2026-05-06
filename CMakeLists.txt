@@ -70,3 +70,7 @@ add_subdirectory(src)
 
 add_dependencies(ysim MetalKernels)
 
+# 5. 테스트 (persistence slice — D-002)
+enable_testing()
+add_subdirectory(test)
+

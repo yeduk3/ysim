@@ -25,9 +25,9 @@ Use this as the entry point — `docs/TESTS.md` will get long, so find scenarios
 | BDD-011     | Change gravity at runtime                         |              | pending |
 | BDD-012     | Apply wind force                                  |              | pending |
 | BDD-013     | Export simulation to Alembic                      |              | pending |
-| BDD-014     | Save scene to disk                                |              | pending |
-| BDD-015     | Load scene reproduces saved state                 |              | pending |
-| BDD-016     | Reject incompatible scene file version            |              | pending |
+| BDD-014     | Save scene to disk                                | `test/scene_io_test.cpp::BDD-014: save populated scene to disk` | pass    |
+| BDD-015     | Load scene reproduces saved state                 | `test/scene_io_test.cpp::BDD-015: load reproduces saved state field-by-field` | pass    |
+| BDD-016     | Reject incompatible scene file version            | `test/scene_io_test.cpp::BDD-016: reject scene file with unsupported format_version`, `…missing format_version`, `…reserved-but-not-shipped behavior type`, `…unsupported import extension` | pass    |
 | BDD-017     | Ray-pick selects nearest hit object               |              | pending |
 | BDD-018     | Inspector edits propagate live                    |              | pending |
 | BDD-019     | Frame profiler shows and exports timings          |              | pending |

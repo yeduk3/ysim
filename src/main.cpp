@@ -9,6 +9,7 @@
 #include "ProfilerWindow.hpp"
 #include "program.hpp"
 #include "objreader.hpp"
+#include "scene_format.hpp"
 
 #include "imgui.h"
 #include "imgui_impl_glfw.h"
@@ -1520,6 +1521,10 @@ struct FastGridClothBehavior<METAL, PR> {
 
 struct Material {
     tinym::vec3 baseColor = tinym::vec3(1.0f);
+    float metallic = 0.0f;
+    float roughness = 0.5f;
+    float specularWeight = 1.0f;
+    tinym::vec3 emissionColor = tinym::vec3(0.0f);
 };
 
 
@@ -1595,11 +1600,17 @@ struct RayHit {
 };
 
 
+struct SceneEnvironment {
+    tinym::vec3 gravity = tinym::vec3(0.0f, -9.81f, 0.0f);
+    tinym::vec3 wind    = tinym::vec3(0.0f, 0.0f, 0.0f);
+};
+
 template <typename BE, typename PR>
 struct Scene {
     inline static int numMeshes = 0;
 
     inline static std::vector<GeneralMesh<BE, PR>> meshes;
+    inline static SceneEnvironment environment;
 
     struct RequestGeneralMesh {
         int id;
@@ -4557,6 +4568,220 @@ struct Simulator {
         glLineWidth(2.5f);
         debugLineGL.draw();
     }
+
+    static const char* planeDirectionName(PlaneDirection d) {
+        switch (d) {
+            case PlaneDirection::XYPlane: return "XYPlane";
+            case PlaneDirection::YZPlane: return "YZPlane";
+            case PlaneDirection::XZPlane: return "XZPlane";
+        }
+        return "XZPlane";
+    }
+
+    static bool planeDirectionFromName(const std::string& name, PlaneDirection& out) {
+        if (name == "XYPlane") { out = PlaneDirection::XYPlane; return true; }
+        if (name == "YZPlane") { out = PlaneDirection::YZPlane; return true; }
+        if (name == "XZPlane") { out = PlaneDirection::XZPlane; return true; }
+        return false;
+    }
+
+    static scene_format::SceneSnapshot toSnapshot() {
+        using namespace scene_format;
+        SceneSnapshot s;
+        s.environment.gravity = {Scene<BE,PR>::environment.gravity.x,
+                                  Scene<BE,PR>::environment.gravity.y,
+                                  Scene<BE,PR>::environment.gravity.z};
+        s.environment.wind = {Scene<BE,PR>::environment.wind.x,
+                               Scene<BE,PR>::environment.wind.y,
+                               Scene<BE,PR>::environment.wind.z};
+
+        auto encodeOne = [&](int id, GeneralMeshInitializer<BE,PR>* init,
+                              BehaviorType btype, const BehaviorParams<PR>& bparams,
+                              const ::Material& mat, const std::string& name) {
+            Object o;
+            o.id = id;
+            o.name = name;
+            o.material.baseColor = {mat.baseColor.x, mat.baseColor.y, mat.baseColor.z};
+            o.material.metallic = mat.metallic;
+            o.material.roughness = mat.roughness;
+            o.material.specularWeight = mat.specularWeight;
+            o.material.emissionColor = {mat.emissionColor.x, mat.emissionColor.y, mat.emissionColor.z};
+
+            if (auto* g = dynamic_cast<MeshGridInitializer<BE,PR>*>(init)) {
+                o.source.kind = Source::Kind::Primitive;
+                o.source.primitive.shape = "grid";
+                o.source.primitive.size = (double)g->params.size1D;
+                o.source.primitive.tessellation = (int)g->params.particleNum1D;
+                o.source.primitive.direction = planeDirectionName(g->params.dir);
+                o.source.primitive.mass = (double)g->params.mass;
+                o.source.primitive.jiggle = g->params.jiggle;
+                o.transform.position = {g->params.center.x, g->params.center.y, g->params.center.z};
+            } else if (auto* f = dynamic_cast<MeshFileInitializer<BE,PR>*>(init)) {
+                o.source.kind = Source::Kind::Import;
+                std::string p = f->params.prefix;
+                if (!p.empty() && p.back() != '/') p.push_back('/');
+                o.source.import.path = p + f->params.fileName;
+                o.source.import.scale = (double)f->params.scale;
+                o.source.import.mass = (double)f->params.mass;
+                o.transform.position = {f->params.offset.x, f->params.offset.y, f->params.offset.z};
+            }
+            o.transform.rotation = {1, 0, 0, 0};
+
+            o.behavior.type = behaviorTypeName(btype);
+            o.behavior.params = nlohmann::json::object();
+            std::visit([&](auto&& p) {
+                using P = std::decay_t<decltype(p)>;
+                if constexpr (std::is_same_v<P, ClothBehaviorParams<PR>>) {
+                    o.behavior.params["stretch"] = p.stretch;
+                    o.behavior.params["shear"]   = p.shear;
+                    o.behavior.params["bend"]    = p.bend;
+                    o.behavior.params["thickness"] = p.thickness;
+                } else if constexpr (std::is_same_v<P, FastGridClothBehaviorParams<PR>>) {
+                    o.behavior.params["particle_num_1d"] = p.particleNum1D;
+                    o.behavior.params["stretch_rest"] = p.stretchRest;
+                    o.behavior.params["shear_rest"]   = p.shearRest;
+                    o.behavior.params["bend_rest"]    = p.bendRest;
+                    o.behavior.params["k_stretch"]    = p.kstretch;
+                    o.behavior.params["k_shear"]      = p.kshear;
+                    o.behavior.params["k_bend"]       = p.kbend;
+                    o.behavior.params["thickness"]    = p.thickness;
+                } else { /* FloatBehaviorParams */ }
+            }, bparams);
+
+            s.objects.push_back(std::move(o));
+        };
+
+        // Realized meshes (post-pack) take precedence; otherwise pending requests
+        // describe the authored intent.
+        if (!Scene<BE,PR>::meshes.empty()) {
+            for (auto& m : Scene<BE,PR>::meshes) {
+                encodeOne(m.id, m.initializer, m.behaviorType, m.behaviorParams,
+                          m.material, "object_" + std::to_string(m.id));
+            }
+        } else {
+            for (auto& r : Scene<BE,PR>::requestsGeneralMeshes) {
+                ::Material defaultMat;
+                encodeOne(r.id, r.initializer, r.behaviorType, r.behaviorParams,
+                          defaultMat, "object_" + std::to_string(r.id));
+            }
+        }
+        return s;
+    }
+
+    bool saveScene(const std::string& path, std::string* error = nullptr) {
+        auto snap = toSnapshot();
+        return scene_format::writeToFile(snap, path, error);
+    }
+
+    scene_format::Result<scene_format::SceneSnapshot> loadScene(const std::string& path) {
+        auto r = scene_format::readFromFile(path);
+        if (!r.ok) return r;
+
+        // BDD-016: only mutate the scene after parse + structural validation succeed.
+        Scene<BE,PR>::meshes.clear();
+        Scene<BE,PR>::requestsGeneralMeshes.clear();
+        Scene<BE,PR>::numMeshes = 0;
+        Scene<BE,PR>::dirty = true;
+
+        Scene<BE,PR>::environment.gravity = tinym::vec3(
+            (float)r.value.environment.gravity[0],
+            (float)r.value.environment.gravity[1],
+            (float)r.value.environment.gravity[2]);
+        Scene<BE,PR>::environment.wind = tinym::vec3(
+            (float)r.value.environment.wind[0],
+            (float)r.value.environment.wind[1],
+            (float)r.value.environment.wind[2]);
+
+        for (auto& o : r.value.objects) {
+            BehaviorType btype = BehaviorType::Float;
+            BehaviorParams<PR> bparams = FloatBehaviorParams<PR>{};
+            if (o.behavior.type == "TriangularCloth") {
+                btype = BehaviorType::TriangularCloth;
+                ClothBehaviorParams<PR> p{};
+                p.stretch  = o.behavior.params.value("stretch",  PR(0));
+                p.shear    = o.behavior.params.value("shear",    PR(0));
+                p.bend     = o.behavior.params.value("bend",     PR(0));
+                p.thickness = o.behavior.params.value("thickness", PR(0));
+                bparams = p;
+            } else if (o.behavior.type == "FastGridCloth") {
+                btype = BehaviorType::FastGridCloth;
+                FastGridClothBehaviorParams<PR> p{};
+                p.particleNum1D = o.behavior.params.value("particle_num_1d", 0u);
+                p.stretchRest   = o.behavior.params.value("stretch_rest", PR(0));
+                p.shearRest     = o.behavior.params.value("shear_rest",   PR(0));
+                p.bendRest      = o.behavior.params.value("bend_rest",    PR(0));
+                p.kstretch      = o.behavior.params.value("k_stretch",    PR(0));
+                p.kshear        = o.behavior.params.value("k_shear",      PR(0));
+                p.kbend         = o.behavior.params.value("k_bend",       PR(0));
+                p.thickness     = o.behavior.params.value("thickness",    PR(0));
+                bparams = p;
+            }
+
+            tinym::vec3 pos((float)o.transform.position[0],
+                            (float)o.transform.position[1],
+                            (float)o.transform.position[2]);
+
+            GeneralMeshInitializer<BE,PR>* init = nullptr;
+            if (o.source.kind == scene_format::Source::Kind::Primitive) {
+                PlaneDirection dir = PlaneDirection::XZPlane;
+                planeDirectionFromName(o.source.primitive.direction, dir);
+                init = new MeshGridInitializer<BE,PR>(MeshGridInitializerParams<PR>(
+                    dir, pos,
+                    (Index)o.source.primitive.tessellation,
+                    (PR)o.source.primitive.size,
+                    (PR)o.source.primitive.mass,
+                    o.source.primitive.jiggle));
+            } else {
+                std::string p = o.source.import.path;
+                std::string prefix, file;
+                auto slash = p.find_last_of('/');
+                if (slash != std::string::npos) {
+                    prefix = p.substr(0, slash);
+                    file = p.substr(slash + 1);
+                } else {
+                    file = p;
+                }
+                init = new MeshFileInitializer<BE,PR>(MeshFileInitializerParams<PR>(
+                    prefix, file, pos,
+                    (PR)o.source.import.scale,
+                    (PR)o.source.import.mass));
+            }
+            scene.addGeneralMesh(init, btype, bparams);
+
+            if (Scene<BE,PR>::numMeshes > 0) {
+                int idx = Scene<BE,PR>::numMeshes - 1;
+                if (idx < (int)Scene<BE,PR>::requestsGeneralMeshes.size()) {
+                    // Material is held on GeneralMesh; the request struct does not
+                    // carry it, so apply on realization. For now, stash into a side
+                    // table keyed by id so the next pack() can paint materials.
+                    pendingMaterials[Scene<BE,PR>::requestsGeneralMeshes[idx].id] = {
+                        tinym::vec3((float)o.material.baseColor[0],
+                                    (float)o.material.baseColor[1],
+                                    (float)o.material.baseColor[2]),
+                        (float)o.material.metallic,
+                        (float)o.material.roughness,
+                        (float)o.material.specularWeight,
+                        tinym::vec3((float)o.material.emissionColor[0],
+                                    (float)o.material.emissionColor[1],
+                                    (float)o.material.emissionColor[2])
+                    };
+                }
+            }
+        }
+        return r;
+    }
+
+    std::unordered_map<int, ::Material> pendingMaterials;
+
+    void applyPendingMaterials() {
+        for (auto& m : Scene<BE,PR>::meshes) {
+            auto it = pendingMaterials.find(m.id);
+            if (it != pendingMaterials.end()) {
+                m.material = it->second;
+            }
+        }
+        pendingMaterials.clear();
+    }
 };
 
 
@@ -5063,6 +5288,59 @@ int main() {
         ImGui_ImplOpenGL3_NewFrame();
         ImGui_ImplGlfw_NewFrame();
         ImGui::NewFrame();
+
+        // File menu — Save Scene / Load Scene (BDD-014/015/016)
+        static char scenePathBuf[512] = "scene.ysim.json";
+        static std::string sceneIOStatus;
+        bool openSaveModal = false;
+        bool openLoadModal = false;
+        if (ImGui::BeginMainMenuBar()) {
+            if (ImGui::BeginMenu("File")) {
+                if (ImGui::MenuItem("Save Scene...")) openSaveModal = true;
+                if (ImGui::MenuItem("Load Scene...")) openLoadModal = true;
+                ImGui::EndMenu();
+            }
+            ImGui::EndMainMenuBar();
+        }
+        if (openSaveModal) ImGui::OpenPopup("Save Scene");
+        if (openLoadModal) ImGui::OpenPopup("Load Scene");
+        if (ImGui::BeginPopupModal("Save Scene", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+            ImGui::InputText("Path", scenePathBuf, sizeof(scenePathBuf));
+            if (ImGui::Button("Save")) {
+                std::string err;
+                if (simulator.saveScene(scenePathBuf, &err)) {
+                    sceneIOStatus = std::string("saved: ") + scenePathBuf;
+                } else {
+                    sceneIOStatus = std::string("save failed: ") + err;
+                }
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Cancel")) ImGui::CloseCurrentPopup();
+            ImGui::EndPopup();
+        }
+        if (ImGui::BeginPopupModal("Load Scene", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+            ImGui::InputText("Path", scenePathBuf, sizeof(scenePathBuf));
+            if (ImGui::Button("Load")) {
+                auto r = simulator.loadScene(scenePathBuf);
+                if (r.ok) {
+                    sceneIOStatus = std::string("loaded: ") + scenePathBuf;
+                    simulator.initialize();
+                    simulator.applyPendingMaterials();
+                } else {
+                    sceneIOStatus = std::string("load failed: ") + r.error.message;
+                }
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Cancel")) ImGui::CloseCurrentPopup();
+            ImGui::EndPopup();
+        }
+        if (!sceneIOStatus.empty()) {
+            ImGui::Begin("Scene I/O");
+            ImGui::TextWrapped("%s", sceneIOStatus.c_str());
+            ImGui::End();
+        }
 
         if (collectProfileFrame) {
             auto scope = frameProfiler.scoped("physics_total");
