@@ -27,3 +27,11 @@ When an entry has not recurred for a while and the underlying cause is gone (arc
 - High-level cause: the persistence slice deliberately keeps `scene_format::*` POD types parallel to the C++-side runtime structs, but did not rename either side. The two will keep colliding as more fields are added.
 - Fix direction: inside `Simulator` (and any future code that mixes both), qualify the C++-side struct as `::Material`. The same pattern likely applies to `Source`, `Transform`, `Object`, `Environment` if they ever grow runtime equivalents — check before adding a new collision.
 - First seen: 2026-05-06   Last seen: 2026-05-06
+
+## CM-002 — `Scene::pack()` double-frees initializers when re-run after an existing pack
+
+- Where: `src/main.cpp:Scene<BE,PR>::pack` and any caller that may run pack twice (e.g. `Simulator::loadScene`, the new `Simulator::addSphere/addCube` followed by `simulator.initialize()`).
+- Low-level cause: `meshes[i].initializer` is the **same pointer** stored in `requestsGeneralMeshes[i].initializer` (it's copied, not moved, by `addGeneralMesh` then `meshes.emplace_back`). When `pack()` runs a second time, `meshes.clear()` fires `~GeneralMesh()` which `delete`s the pointer; the rebuild loop then dereferences `requestsGeneralMeshes[i].initializer->getParams()` — freed memory → segfault.
+- High-level cause: ownership of the initializer is split implicitly between two containers without an explicit owner-of-record. The first pack happened to "work" because `meshes` started empty; subsequent packs do not.
+- Fix direction: treat `requestsGeneralMeshes` as the canonical owner. Before any `meshes.clear()`, null out each `meshes[i].initializer` so `~GeneralMesh` becomes a no-op delete. When `requestsGeneralMeshes` itself is wiped (only `loadScene` does this today), explicitly `delete r.initializer` first, then `clear()`. Search this file for `meshes.clear()` before adding a new one — every site needs both halves.
+- First seen: 2026-05-06   Last seen: 2026-05-06

@@ -1807,6 +1807,14 @@ struct Scene {
             return;
         }
 
+        // meshes[i].initializer is the *same* pointer stored in
+        // requestsGeneralMeshes[i].initializer (it was copied, not moved,
+        // by addGeneralMesh + emplace_back). Without nulling here,
+        // ~GeneralMesh would delete it, leaving requestsGeneralMeshes with
+        // dangling pointers; the rebuild loop below would then dereference
+        // freed memory. requestsGeneralMeshes is the canonical owner across
+        // a re-pack; explicit delete only happens in loadScene.
+        for (auto& m : meshes) m.initializer = nullptr;
         meshes.clear();
 
         // count sizes
@@ -4828,7 +4836,12 @@ struct Simulator {
         if (!r.ok) return r;
 
         // BDD-016: only mutate the scene after parse + structural validation succeed.
+        // Match the pack()-side ownership convention: meshes are non-owning
+        // views over requestsGeneralMeshes' initializer pointers. Clear the
+        // views first (without deleting), then free the canonical owner.
+        for (auto& m : Scene<BE,PR>::meshes) m.initializer = nullptr;
         Scene<BE,PR>::meshes.clear();
+        for (auto& r : Scene<BE,PR>::requestsGeneralMeshes) delete r.initializer;
         Scene<BE,PR>::requestsGeneralMeshes.clear();
         Scene<BE,PR>::numMeshes = 0;
         Scene<BE,PR>::dirty = true;
