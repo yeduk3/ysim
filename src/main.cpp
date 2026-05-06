@@ -3381,7 +3381,14 @@ struct BVH<BE, PR, BVHMODE::LINEAR, PRIMITIVE> {
         objShape = ShapeType::Mesh;
         //std::cout << "[BVH Build] positions and primitives are assigned" << std::endl;
         Index numPrimitives = primitives.size/PRIMITIVE;
-        if(!tree.ptr) memoryAllocation();
+        // Reallocate when buffers are missing OR sized for a different
+        // primitive count. The persisted `tree` buffer carries over the
+        // size from the prior build; without the size check, a re-build
+        // with a different N writes past the old allocation. This bites
+        // the SCENE-level BVH whenever scene.numMeshes changes (e.g.
+        // every `Create > Sphere/Cube`).
+        Index expectedNumNodes = (numPrimitives > 0) ? (2 * numPrimitives - 1) : 0;
+        if (!tree.ptr || tree.size != expectedNumNodes) memoryAllocation();
 
         // [stage 1] compute biggest aabb
         // input: each points

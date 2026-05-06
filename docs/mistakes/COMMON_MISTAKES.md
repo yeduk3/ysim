@@ -35,3 +35,11 @@ When an entry has not recurred for a while and the underlying cause is gone (arc
 - High-level cause: ownership of the initializer is split implicitly between two containers without an explicit owner-of-record. The first pack happened to "work" because `meshes` started empty; subsequent packs do not.
 - Fix direction: treat `requestsGeneralMeshes` as the canonical owner. Before any `meshes.clear()`, null out each `meshes[i].initializer` so `~GeneralMesh` becomes a no-op delete. When `requestsGeneralMeshes` itself is wiped (only `loadScene` does this today), explicitly `delete r.initializer` first, then `clear()`. Search this file for `meshes.clear()` before adding a new one — every site needs both halves.
 - First seen: 2026-05-06   Last seen: 2026-05-06
+
+## CM-003 — `BVH::build` skips re-allocation when primitive count changes
+
+- Where: `src/main.cpp:BVH<BE, PR, BVHMODE::LINEAR, PRIMITIVE>::build` (the `build(int oid, …)` overload, ~line 3384). Hits both the per-mesh tri-LBVH and the scene-level tree (which is itself a `LINEAR/EDGE` BVH wrapping object-AABB pairs).
+- Low-level cause: `if (!tree.ptr) memoryAllocation();` skips allocation whenever the buffer pointer is non-null. On a re-build with a different primitive count, the existing `tree`/`treeParent`/`mortons`/radix arrays are sized for the **old** count; `radixSortGPU` and `buildTreeGPU` then dispatch threads that write past the allocation → memory corruption / segfault. The per-mesh trees mostly avoid this because their owning vector (`objTrees`) is reassigned when `scene.numMeshes` changes, which fresh-constructs each tree, but the scene-level inner `tree` persists across `BVH<SCENE, OBJECT>::build()` calls and is the canonical victim.
+- High-level cause: caching pattern conflates "already allocated" with "already correctly sized". For BVHs sized to `2*N - 1` nodes, the size *is* part of the validity check.
+- Fix direction: gate `memoryAllocation()` on both `!tree.ptr` and a size mismatch, e.g. `Index expectedNumNodes = numPrimitives > 0 ? 2*numPrimitives - 1 : 0; if (!tree.ptr || tree.size != expectedNumNodes) memoryAllocation();`. Same pattern likely applies to the SCENE-level container (`positions`, `indices`) — check before adding any new BVH variant that supports growth.
+- First seen: 2026-05-07   Last seen: 2026-05-07
