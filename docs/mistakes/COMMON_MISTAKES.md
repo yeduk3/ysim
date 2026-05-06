@@ -43,3 +43,11 @@ When an entry has not recurred for a while and the underlying cause is gone (arc
 - High-level cause: caching pattern conflates "already allocated" with "already correctly sized". For BVHs sized to `2*N - 1` nodes, the size *is* part of the validity check.
 - Fix direction: gate `memoryAllocation()` on both `!tree.ptr` and a size mismatch, e.g. `Index expectedNumNodes = numPrimitives > 0 ? 2*numPrimitives - 1 : 0; if (!tree.ptr || tree.size != expectedNumNodes) memoryAllocation();`. Same pattern likely applies to the SCENE-level container (`positions`, `indices`) — check before adding any new BVH variant that supports growth.
 - First seen: 2026-05-07   Last seen: 2026-05-07
+
+## CM-004 — Cloth force kernels hardcoded gravity and ignored the bound `externalForces` buffer
+
+- Where: `src/metal/physics.metal::compute_cloth_grid_forces_fast` and `compute_tri_spring_forces`. The C++ side (`TriangularClothBehavior::setBuffer`, `FastGridClothBehavior::setBuffer` in `src/main.cpp` ~lines 1525, 1582) was already binding `mesh.externalForces.externalForces` at slot 7.
+- Low-level cause: `compute_cloth_grid_forces_fast` did not declare buffer 7 at all. `compute_tri_spring_forces` declared it but never read it in the body. Both kernels computed gravity as `float3(0, simParams.G * m[id], 0)` from a hardcoded `SimParams::G` (`-9.8` in the METAL specialization). So the GUI Environment panel and the persistence-side `Scene::environment` had no connection to actual motion — gravity was a compile-time constant.
+- High-level cause: a "the buffer is bound, so the kernel must consume it" assumption written into the persistence and env-forces slice plans, without verifying the kernel signatures matched the C++ binding plan.
+- Fix direction: read `externalForces[id]` as the per-particle environmental force inside both kernels and drop the hardcoded gravity term. Air resistance (`vel * kair`) stays as an internal drag. Whenever a new C++-side `setBuffer` call adds an index, grep the corresponding kernel signature for that `[[buffer(N)]]` and a body reference — do not assume binding and consumption are in sync.
+- First seen: 2026-05-07   Last seen: 2026-05-07

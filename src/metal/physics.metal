@@ -107,11 +107,14 @@ kernel void compute_cloth_grid_forces_fast(
     device const packed_float3* v [[buffer(1)]],
     device packed_float3* f [[buffer(2)]],
     device const float* m [[buffer(3)]],
+    // External-forces buffer (gravity*mass + wind, filled per frame by
+    // Simulator::applyEnvironmentForces from Scene::environment).
+    device const packed_float3* externalForces [[buffer(7)]],
     constant SimParams& params [[buffer(8)]],
     constant ClothGridParams& clothParams [[buffer(9)]],
     uint id [[thread_position_in_grid]]
 ) {
-    if (id >= params.vertexNum) return; 
+    if (id >= params.vertexNum) return;
 
     uint N = clothParams.particleNum1D;
 
@@ -122,8 +125,9 @@ kernel void compute_cloth_grid_forces_fast(
     float3 pos = x[id];
     float3 vel = v[id];
 
-    // 1. 중력 & 공기 저항
-    float3 force = float3(0.0, params.G * m[id], 0.0) + vel * params.kair;
+    // 1. 환경 외력 (중력 + 바람) + 공기 저항. 중력은 더 이상 params.G로 하드코딩하지 않고,
+    //    Scene::environment 가 GUI/JSON 경로로 채운 externalForces 값을 그대로 사용한다.
+    float3 force = float3(externalForces[id]) + vel * params.kair;
 
     // 1D 인덱스를 구하는 람다 함수
     auto get_idx = [N](uint r, uint c) { return r * N + c; };
@@ -226,8 +230,9 @@ kernel void compute_tri_spring_forces(
     device const float* m [[buffer(3)]],
     // constraints
     device const float* fixedParticles [[buffer(4)]],
-    // external forces
-    device packed_float3* externalForces [[buffer(7)]],
+    // External-forces buffer (gravity*mass + wind, filled per frame by
+    // Simulator::applyEnvironmentForces from Scene::environment).
+    device const packed_float3* externalForces [[buffer(7)]],
     // simulation parameters
     constant SimParams& simParams [[buffer(8)]],
     constant ClothParams& clothParams [[buffer(9)]],
@@ -248,8 +253,9 @@ kernel void compute_tri_spring_forces(
 
     float3 pos = x[id];
     float3 vel = v[id];
-    
-    float3 force = float3(0.0, simParams.G * m[id], 0.0) + vel * simParams.kair;
+
+    // 환경 외력 (중력*질량 + 바람) + 공기 저항. simParams.G 하드코딩은 제거.
+    float3 force = float3(externalForces[id]) + vel * simParams.kair;
 
     // stretch
     uint adjEdgesStart = vertexAdjEdgesOffsets[id];
