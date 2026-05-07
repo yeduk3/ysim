@@ -1,13 +1,13 @@
-# Current Work — Cloth-Drape (BDD-007) Slice (feat/cloth-drape)
+# Current Work — Import Mesh UI (BDD-002) Slice (feat/import-mesh-ui)
 
-- File in flight: none — slice complete with **partial coverage**; ready for Estimator. Three of four BDD-007 clauses PASS; the tunneling clause still FAILs because it requires continuous collision detection (CCD), a structural change that is its own slice.
-- How far:
-  1. Block 6 added to `src/main.cpp::runSelfTest`, mechanizing the four "Then" clauses from `docs/TESTS.md#BDD-007` verbatim.
-  2. **Real fix landed** — `collisionPipeline.broadPhase.enlargeTrajectory(system.subh)` was previously commented out in `Simulator::update`'s substep loop. Without it, fast-moving thin cloth's AABB never overlapped the static ground's AABB long enough for the broad phase to fire. Uncommenting + passing `system.subh` (per-substep dt) inflates the cloth's swept AABB and now the broad/narrow phase detect the cloth-on-ground crossing.
-  3. **Cumulative narrow-collision counter** — `Scene::packedCollisionData.cumulativeNarrowCollisions` (size_t, accumulates across substeps). Necessary because the per-substep counter resets in `resetNarrow()`; the harness samples per-frame and would miss contacts that fire mid-frame and reset by the next substep. The harness's BDD-007 contact assertion now reads this cumulative value.
+- File in flight: none — slice complete; ready for Estimator. BDD-002 closes cleanly with 3 new PASS lines on top of the existing harness.
+- How far: all 9 PLAN.md todos done.
+  - `Simulator::importMesh(prefix, fileName, scale, mass, error*)` added with a **path-existence guard** before `addFloatMesh`. Without the guard, `MeshFileInitializer`'s constructor would silently load an empty `ObjData` (loadObject is graceful on open-fail) and queue a zero-vertex mesh, violating BDD-002's "no partial-add" clause.
+  - ImGui `File > Import Mesh…` modal beside Save/Load — text-input for path + scale slider + Float-only behavior caption. Calls `importMesh` then `simulator.initialize()` + `applyPendingMaterials()`. Status flows into the existing `sceneIOStatus` panel.
+  - Block 7 in `runSelfTest` mechanizes BDD-002's two "Then" clauses verbatim from `docs/TESTS.md#BDD-002` — happy path (numMeshes++ + Float behavior + path round-trip via `toSnapshot`) and error path (missing file → numMeshes unchanged + error names "not found").
+  - Block 8 (was Block 7, BDD-015) now resets the scene via `buildSyntheticScene(sim)` first — Block 7 leaves an imported `Human.obj` whose path doesn't resolve when the temp scene file is in `/tmp/`. Independent block, independent setup.
 - What's tested:
-  - 8 self-test blocks pass cleanly: CM-002, CM-003, BDD-009, BDD-011, BDD-012, three of four BDD-007 clauses, BDD-015 numMeshes round-trip, BDD-012 env round-trip, BDD-015 sim-step-after-load.
-  - 1 self-test FAIL: `BDD-007 / no cloth vertex tunnels through ground` — cloth `minY` reaches ~-4.66 below the ground at -1 because the snapshot narrow-phase point-vs-triangle distance test only registers contacts during one substep of the cloth's transit; the single-substep response isn't enough to halt the cloth's downward velocity for all particles.
-  - Doctest binaries (`ysim_tests`, `ysim_primitive_tests`) unchanged.
-  - `TEST_MATRIX.md` `BDD-007` row stays `warning` (3/4 clauses pass).
-- What's next: Estimator review. Expect a continuing BLOCK on `verify.sh` exit-non-zero, but with stronger evidence that the slice ships a real, narrowly-scoped fix (`enlargeTrajectory`) and surfaces the remaining gap (CCD) cleanly. The next planner-tracked milestone is the **cloth-CCD slice** — replace the snapshot point-vs-triangle narrow check with a swept-segment-vs-triangle check; CM-005 has the localization. With CCD wired, BDD-007's tunneling clause should pass without further harness changes.
+  - 14 of 15 self-test assertions PASS. The one FAIL is the pre-existing BDD-007 tunneling clause (CM-005 — parked under cloth-CCD slice). All other clauses including the new BDD-002 trio pass cleanly.
+  - Doctest binaries unchanged.
+  - `docs/TEST_MATRIX.md` row `BDD-002` promoted from `pending` to `pass` with addresses pointing at the new Block 7 strings.
+- What's next: Estimator review. Expect `verify.sh` to continue exiting non-zero because of the BDD-007 tunneling FAIL (CM-005), but the slice's deliverable — BDD-002 acceptance — is complete and verified.

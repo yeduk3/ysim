@@ -4294,6 +4294,23 @@ struct Simulator {
                 FloatBehaviorParams<PR>{}
                 );
     }
+
+    // BDD-002 import path. Path-existence guard runs *before* addFloatMesh so
+    // the scene is not partially mutated when the file is missing — without
+    // this, MeshFileInitializer's constructor would silently load an empty
+    // ObjData (loadObject is graceful on open-fail) and queue a zero-vertex
+    // mesh, violating BDD-002's "no partial-add" clause.
+    bool importMesh(const std::string& prefix, const std::string& fileName,
+                    PR scale, PR mass = PR(0.1), std::string* error = nullptr) {
+        std::string fullPath = prefix.empty() ? fileName : (prefix + "/" + fileName);
+        std::ifstream probe(fullPath);
+        if (!probe.good()) {
+            if (error) *error = "file not found: " + fullPath;
+            return false;
+        }
+        addFloatMesh(prefix, fileName, tinym::vec3(0), scale, mass);
+        return true;
+    }
     void addClothGridFast(Index particleNum1D = 200, PR size1D = 100, PR kstretch=1e5, PR kshear=1e5, PR kbend=3e5, PR thickness=0.001, PR mass=0.1) {
         //particleNum1D(particleNum1D), particleNum2D(particleNum1D*particleNum1D), particleDataNum(particleNum2D*3),{
         //size1D(size1D), stretchRestLength(size1D/PR(particleNum1D-1)), shearRestLength(stretchRestLength*std::sqrt(2)), bendRestLength(stretchRestLength*2) 
@@ -5509,7 +5526,100 @@ static int runSelfTest() {
         }
     }
 
-    // ---- Block 7: BDD-015 — saveScene → loadScene round-trips. -----------
+    // ---- Block 7: BDD-002 — Import .obj via Simulator::importMesh.
+    //              TESTS.md#BDD-002 wording: scene contains a new object whose
+    //              geometry matches the file, with default material and Float
+    //              behavior; persisted state records the import path so a
+    //              later save/reload reproduces the same source. PLUS the
+    //              Notes line: invalid/unreadable file produces a clear error
+    //              and does NOT mutate the scene (no partial-add).
+    {
+        // Reset so importMesh is exercised on a known small scene.
+        resetScene();
+        sim.addCloth(/*particleNum1D=*/4, /*size1D=*/0.5,
+                     tinym::vec3(0.0f, 0.25f, 0.0f),
+                     /*kstretch=*/1e3, /*kshear=*/1e3, /*kbend=*/1e3,
+                     /*thickness=*/0.01, /*mass=*/0.1);
+        sim.initialize();
+        const int beforeImport = Scene<Backend, Precision>::numMeshes;
+
+        std::string err;
+        bool ok = sim.importMesh("src/assets", "Human.obj",
+                                 /*scale=*/(Precision)0.04,
+                                 /*mass=*/(Precision)0.1, &err);
+        if (!ok) {
+            fail("BDD-002 / .obj import via importMesh appears in scene",
+                 "importMesh returned false on the happy path: " + err);
+        } else {
+            sim.initialize();
+            sim.applyPendingMaterials();
+            const int afterImport = Scene<Backend, Precision>::numMeshes;
+            auto* importedMesh = Scene<Backend, Precision>::findById(beforeImport);
+            bool meshOk = (afterImport == beforeImport + 1) &&
+                          importedMesh != nullptr &&
+                          importedMesh->state.x.size > 0 &&
+                          importedMesh->behaviorType == BehaviorType::Float;
+            if (!meshOk) {
+                fail("BDD-002 / .obj import via importMesh appears in scene",
+                     "afterImport=" + std::to_string(afterImport) +
+                     " expected " + std::to_string(beforeImport + 1) +
+                     "; mesh=" + (importedMesh ? "found" : "null") +
+                     "; state.x.size=" +
+                     std::to_string(importedMesh ? importedMesh->state.x.size : 0));
+            } else {
+                pass("BDD-002 / .obj import via importMesh appears in scene");
+            }
+
+            // Source path round-trips through toSnapshot per BDD-002's
+            // "scene's persisted state records the import path" clause.
+            auto snap = sim.toSnapshot();
+            bool found = false;
+            for (const auto& obj : snap.objects) {
+                if (obj.id == beforeImport &&
+                    obj.source.kind == scene_format::Source::Kind::Import) {
+                    const auto& p = obj.source.import.path;
+                    if (p.size() >= 9 &&
+                        p.compare(p.size() - 9, 9, "Human.obj") == 0) {
+                        found = true;
+                        break;
+                    }
+                }
+            }
+            if (!found) {
+                fail("BDD-002 / import path round-trips through toSnapshot",
+                     "no Import-source object with path ending Human.obj in snapshot");
+            } else {
+                pass("BDD-002 / import path round-trips through toSnapshot");
+            }
+        }
+
+        // Error path — missing file must NOT mutate the scene.
+        const int beforeMissing = Scene<Backend, Precision>::numMeshes;
+        std::string missErr;
+        bool missingOk = sim.importMesh("src/assets",
+                                        "ysim_selftest_does_not_exist.obj",
+                                        (Precision)1.0, (Precision)0.1, &missErr);
+        const int afterMissing = Scene<Backend, Precision>::numMeshes;
+        if (missingOk) {
+            fail("BDD-002 / missing import path leaves scene unchanged",
+                 "importMesh returned true for a non-existent file");
+        } else if (afterMissing != beforeMissing) {
+            fail("BDD-002 / missing import path leaves scene unchanged",
+                 "scene mutated: numMeshes " + std::to_string(beforeMissing) +
+                 " → " + std::to_string(afterMissing));
+        } else if (missErr.find("not found") == std::string::npos) {
+            fail("BDD-002 / missing import path leaves scene unchanged",
+                 "expected error to name 'not found'; got: " + missErr);
+        } else {
+            pass("BDD-002 / missing import path leaves scene unchanged");
+        }
+    }
+
+    // ---- Block 8: BDD-015 — saveScene → loadScene round-trips. -----------
+    // Reset to a primitive-only scene so the temp scene file does not need
+    // import paths resolved against /tmp (Block 7 left an imported mesh
+    // whose path resolver expects cwd-relative; not /tmp/-relative).
+    buildSyntheticScene(sim);
     sim.initialize();
     Scene<Backend, Precision>::environment.gravity = tinym::vec3(0.5f, -8.0f, 1.5f);
     Scene<Backend, Precision>::environment.wind    = tinym::vec3(2.0f, 0.0f, -1.25f);
@@ -5796,21 +5906,26 @@ int main(int argc, char** argv) {
         ImGui_ImplGlfw_NewFrame();
         ImGui::NewFrame();
 
-        // File menu — Save Scene / Load Scene (BDD-014/015/016)
+        // File menu — Save Scene / Load Scene (BDD-014/015/016) + Import Mesh (BDD-002)
         // Create menu — Sphere / Cube primitives (BDD-001)
         static char scenePathBuf[512] = "scene.ysim.json";
+        static char importPathBuf[512] = "assets/Human.obj";
+        static float importScale = 1.0f;
         static std::string sceneIOStatus;
         static float primSize = 1.0f;
         static int primTess = 16;
         static float primPos[3] = {0.f, 0.f, 0.f};
         bool openSaveModal = false;
         bool openLoadModal = false;
+        bool openImportModal = false;
         bool openSphereModal = false;
         bool openCubeModal = false;
         if (ImGui::BeginMainMenuBar()) {
             if (ImGui::BeginMenu("File")) {
                 if (ImGui::MenuItem("Save Scene...")) openSaveModal = true;
                 if (ImGui::MenuItem("Load Scene...")) openLoadModal = true;
+                ImGui::Separator();
+                if (ImGui::MenuItem("Import Mesh...")) openImportModal = true;
                 ImGui::EndMenu();
             }
             if (ImGui::BeginMenu("Create")) {
@@ -5822,6 +5937,7 @@ int main(int argc, char** argv) {
         }
         if (openSaveModal) ImGui::OpenPopup("Save Scene");
         if (openLoadModal) ImGui::OpenPopup("Load Scene");
+        if (openImportModal) ImGui::OpenPopup("Import Mesh");
         if (openSphereModal) ImGui::OpenPopup("Create Sphere");
         if (openCubeModal) ImGui::OpenPopup("Create Cube");
         if (ImGui::BeginPopupModal("Save Scene", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
@@ -5852,6 +5968,34 @@ int main(int argc, char** argv) {
                     simulator.applyPendingMaterials();
                 } else {
                     sceneIOStatus = std::string("load failed: ") + r.error.message;
+                }
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Cancel")) ImGui::CloseCurrentPopup();
+            ImGui::EndPopup();
+        }
+        if (ImGui::BeginPopupModal("Import Mesh", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+            ImGui::InputText("Path", importPathBuf, sizeof(importPathBuf));
+            ImGui::InputFloat("Scale", &importScale);
+            ImGui::TextUnformatted("Behavior: Float (BDD-006 will allow choosing later)");
+            if (ImGui::Button("Import")) {
+                std::string path = importPathBuf;
+                std::string prefix, file;
+                auto slash = path.find_last_of('/');
+                if (slash != std::string::npos) {
+                    prefix = path.substr(0, slash);
+                    file = path.substr(slash + 1);
+                } else {
+                    file = path;
+                }
+                std::string err;
+                if (simulator.importMesh(prefix, file, (Precision)importScale, Precision(0.1), &err)) {
+                    simulator.initialize();
+                    simulator.applyPendingMaterials();
+                    sceneIOStatus = std::string("imported: ") + path;
+                } else {
+                    sceneIOStatus = std::string("import failed: ") + err;
                 }
                 ImGui::CloseCurrentPopup();
             }
