@@ -11,3 +11,6 @@ cmake -B build
 cmake --build build -j
 ./build/test/ysim_tests
 ./build/test/ysim_primitive_tests
+# Headless self-test (D-012). cwd must be build/ so the existing
+# `default.metallib` lookup (relative path in MetalKernelContext) resolves.
+(cd build && ./src/ysim --self-test)

@@ -1,20 +1,23 @@
-# Estimation — 2026-05-07 turn-1
+# Estimation — 2026-05-07 turn 2
 Status: UPDATED
 
 ## Verdict
 NOTE
 
 ## BLOCK
-- None
+- None.
 
 ## WARNING
-- None
+- None.
 
 ## NOTE
-- The slice still relies on the user-owned visual regression gate for pixel identity; `./scripts/verify.sh` confirms build + unit tests, but it does not prove the preloaded scene and Create/Load flows are visually unchanged. [src/main.cpp:5538]
+- `src/main.cpp:5396-5428` writes the self-test scene to a fixed `/tmp/ysim_selftest.ysim.json` and only removes it on the success path; a unique temp path or cleanup guard would avoid stale files if save/load exits early.
 
 ## Test matrix delta
-- none
+- BDD-009: pass
+- BDD-011: pass
+- BDD-012: pass
+- BDD-015: pass
 
 ## Verify output (summary)
-`./scripts/verify.sh` rebuilt `ysim`, `ysim_tests`, and `ysim_primitive_tests` cleanly. Both doctest binaries passed: `ysim_tests` ran 11/11 cases with 159/159 assertions passing, and `ysim_primitive_tests` ran 9/9 cases with 1120/1120 assertions passing. The diff stays within the planned render-state decoupling boundary; no build, unit-test, or spec mismatch surfaced in the automated checks.
+`./scripts/verify.sh` configured and built `ysim`, `ysim_tests`, and `ysim_primitive_tests` successfully. Both doctest binaries passed (11/11 and 9/9 cases). `./src/ysim --self-test` exited 0 with `[self-test SKIP] metal-device: MTL::CreateSystemDefaultDevice() returned null (non-macOS host or container without Metal)`, so the Metal-backed assertion branches were not exercised in this container.

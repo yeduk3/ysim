@@ -20,13 +20,13 @@ Use this as the entry point — `docs/TESTS.md` will get long, so find scenarios
 | BDD-006     | Assign behavior type to an object                 |              | pending |
 | BDD-007     | Cloth drapes onto a rigid surface                 |              | pending |
 | BDD-008     | Rigid body falls and rests                        |              | pending |
-| BDD-009     | Float behavior ignores gravity and wind           | `src/main.cpp::Simulator::applyEnvironmentForces` (Float branch zeroes externalForces; data-layer covered by code review) | warning |
+| BDD-009     | Float behavior ignores gravity and wind           | `src/main.cpp::runSelfTest` (`BDD-009 / Float exact x and v under non-zero gravity and wind` block — bitwise compare on full state.x and state.v under non-zero gravity AND wind) + `Simulator::applyEnvironmentForces` Float branch | pass    |
 | BDD-010     | Collision detected between simulated objects      |              | pending |
-| BDD-011     | Change gravity at runtime                         | `test/scene_io_test.cpp::BDD-011/012: non-default gravity and wind round-trip bit-stable`, `…missing environment falls back to schema defaults` | warning |
-| BDD-012     | Apply wind force                                  | `test/scene_io_test.cpp::BDD-011/012: non-default gravity and wind round-trip bit-stable`, `…missing environment falls back to schema defaults` | warning |
+| BDD-011     | Change gravity at runtime                         | `src/main.cpp::runSelfTest` (`BDD-011 / runtime gravity pivot grows cloth +x velocity` block — gravity flips from `(0,-9.81,0)` to `(9.81,0,0)` *without* `simulator.initialize()` between pumps; cloth mean vx grows above tolerance) + `test/scene_io_test.cpp::BDD-011/012: non-default gravity and wind round-trip bit-stable` | pass    |
+| BDD-012     | Apply wind force                                  | `src/main.cpp::runSelfTest` (`BDD-012 / wind (5,0,0) drives cloth +x velocity` block — gravity zero, wind set to `(5,0,0)` from rest, cloth mean vx grows above tolerance; plus `BDD-012 / env round-trip bit-stable through Simulator` for save/load) + `test/scene_io_test.cpp::BDD-011/012: non-default gravity and wind round-trip bit-stable` | pass    |
 | BDD-013     | Export simulation to Alembic                      |              | pending |
 | BDD-014     | Save scene to disk                                | `test/scene_io_test.cpp::BDD-014: save populated scene to disk` | pass    |
-| BDD-015     | Load scene reproduces saved state                 | `test/scene_io_test.cpp::BDD-015: load reproduces saved state field-by-field` | pass    |
+| BDD-015     | Load scene reproduces saved state                 | `src/main.cpp::runSelfTest` (`BDD-015 / numMeshes round-trip`, `…sim step after load is stable`) + `test/scene_io_test.cpp::BDD-015: load reproduces saved state field-by-field` | pass    |
 | BDD-016     | Reject incompatible scene file version            | `test/scene_io_test.cpp::BDD-016: reject scene file with unsupported format_version`, `…missing format_version`, `…reserved-but-not-shipped behavior type`, `…unsupported import extension` | pass    |
 | BDD-017     | Ray-pick selects nearest hit object               |              | pending |
 | BDD-018     | Inspector edits propagate live                    |              | pending |

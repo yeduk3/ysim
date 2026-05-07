@@ -1,20 +1,26 @@
-# Resume — Render-State Decoupling Slice
+# Resume — Headless Self-Test Harness Slice (post BLOCK-fix)
 
 ## Must remember
 
-- **Branch:** `feat/render-state-decoupling` (off `main`, after `feat/environment-forces` was fast-forwarded into `main`).
-- **`MeshGL<CPU>` is now in `include/MeshGL.hpp`** (was inline in `src/main.cpp`). The CPU specialization references `struct CPU;` via forward-declaration; the actual `struct CPU : Backend {}` definition still lives in `src/main.cpp`. If a future header needs `MeshGL<CPU>`, it must include `MeshGL.hpp` *and* be included from a TU that has the `CPU` definition in scope (i.e., `src/main.cpp`).
-- **`MeshRenderState` is keyed by `mesh.id`** and the cached `MeshGL` captures raw pointers into the *current* `packedMeshData`. `Scene::pack()` reallocates those buffers, so `Simulator::initialize` calls `renderState.clear()` immediately after pack. Any future code that re-packs without going through `Simulator::initialize` must clear the render state too — otherwise stale pointers + wrong sizes get rendered (this is the same trap CM-003 hit on a different cache).
-- **GL handles are still leaked** when `MeshRenderState::clear()` runs. `MeshGL` has no destructor, same as before this slice. v1 is a one-shot process (no scene reload churn beyond manual user actions); revisit if the leak becomes measurable.
-- **The dead CPU `ExplicitSystem<CPU,PR>::update` is now a stub.** It was uninstantiated even before the slice (`Backend = METAL` everywhere); the stub keeps it that way without referencing the removed `mesh.meshGL` field.
-- **Visual regression is the user's gate** for this slice. `ysim_tests`/`ysim_primitive_tests` cover data-layer; the renderer's pixel output is not yet mechanically tested.
+- **Branch:** `feat/sim-self-test` (off `main`, after `feat/render-state-decoupling` was fast-forwarded into `main`).
+- **Harness assertions are authored from `docs/TESTS.md` "Then" clauses verbatim.** The first turn's BLOCK was caused by writing assertions from the compressed matrix-row labels instead. The matrix label is too compressed to drive the assertion off — open `TESTS.md` and read the "Then" sentence.
+- **Metal-unavailable is a SKIP, not a FAIL.** Codex (the Estimator) runs in a Linux container without Metal; treating that as a hard failure made `verify.sh` unrunnable for the Estimator. The skip path is implementation detail under D-012, not a separate decision.
+- **`Simulator::update` is pure simulation.** The render-side per-frame mesh-buffer upload lives in `Simulator::uploadMeshes` and is called by the GUI loop only. The harness must NOT touch GL.
+- **`BDD-011`'s "no restart" clause is enforced by code shape**, not by an assertion: there is no `simulator.initialize()` between the two `pumpFrames` calls in Block 4. Future maintainers who add a "reset before phase 2" line to be tidy break the spec — please don't.
+- **Tolerance constants in the harness** (`bdd011_tol = 0.05`, `bdd012_tol = 0.01`) are sized against `subh = h / subSteps = 1/240` and the synthetic 4×4 cloth mass `0.1`. Tightening / loosening them is fine; just keep them well above FP noise and well below "what 4 frames of the configured force / mass would produce".
+- **The harness cloth is small (4×4)** so each pack/init is fast. If a future block needs more vertices, scale the cloth params at the top of `runSelfTest` rather than per-block.
 
 ## Last decisions + why
 
-- **D-011** — Render-side GL state moved out of `GeneralMesh` into `MeshRenderState`. Structural prerequisite for the test-harness slice; strengthens the `ARCHITECTURE §2.2/§2.3` boundary.
+- **D-012** — Headless Metal harness via `--self-test`. Resolves Q-D in favor of reusing the shipping Metal path; rejects CPU backend implementation as v1 work. Unchanged by the BLOCK-fix turn.
 
 ## Next step you were about to take
 
-Slice complete. The next concrete step is the **user's manual visual-regression check** — run `./build/src/ysim`, confirm identical render to before. Then **Estimator's** turn — `./scripts/verify.sh` (now passing) and slice-vs-plan reconciliation. After that lands, the **test-harness slice** (Metal-backed sim fixture) is finally unblocked: with `Simulator::initialize` no longer needing GL, a `test/sim_round_trip_test.cpp` binary can bring up `Scene<METAL,Precision>`, run `addCloth/addSphere/addCube`, save/load, run a sim step, and assert. That slice closes the parked sim-step clauses on BDD-009/011/012/015.
+Slice complete (BLOCK-fix turn). The next concrete step is the **Estimator's re-review**. After that lands, the next planner-tracked candidates per `PROJECT_STATE.md`:
+
+- **BDD-007 cloth drapes onto rigid surface** — newly tractable with the harness; collision response correctness can be added as a Block 6 in the same `runSelfTest` once the planner scopes the slice.
+- **BDD-002 Import .obj mesh via UI** — small slice; underlying paths already work.
+- **BDD-102 determinism mechanization** — extend the harness with two-runs-bit-identical assertion.
+- **Material editing UI / Behavior assignment UI / Rigid / Alembic** — each waits on its respective spec answer or shader work.
 
 See `.agent/PLAN.md` and `.agent/CURRENT_WORK.md` for full plan and progress.
