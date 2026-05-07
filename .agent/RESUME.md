@@ -1,19 +1,20 @@
-# Resume — Environment Forces Slice
+# Resume — Render-State Decoupling Slice
 
 ## Must remember
 
-- **Branch:** `feat/environment-forces` (off `main`, after `feat/primitive-creation` was fast-forwarded into `main`).
-- **`mesh.externalForces.externalForces` is the canonical force input** for cloth kernels (`compute_tri_spring_forces`, `compute_cloth_grid_forces_fast`). Before this slice it was a placeholder buffer that nobody allocated; now it's a slice of `packedMeshData.externalForces`, allocated and zeroed during `Scene::pack()` and overwritten each frame by `Simulator::applyEnvironmentForces` (which runs once per outer frame, **before** the substep loop). If a future slice wants to add a *different* per-mesh force (e.g. user-applied push-pull), don't compete with this fill — write into `mesh.state.f` directly, or extend `applyEnvironmentForces` so the buffer remains the sole source of truth.
-- **Float is force-exempt by construction**, not by integration cancellation. `applyEnvironmentForces` zeroes the buffer for `BehaviorType::Float`. `BDD-009`'s strict-equality clause leans on this — do not introduce a path that adds gravity then subtracts it for Float; the buffer stays exact-zero.
-- **Wind is force-per-particle (no mass scaling)**, gravity is force-per-particle scaled by mass. This matches FR-011 (gravity vector applied to all non-Float) and FR-012 (wind force vector for wind-susceptible behaviors). PRD §3.3 hints at a v2 reformulation of wind as an air-velocity field; the schema is forward-compatible.
-- **Sim-step correctness is parked behind Q-D.** This slice's `BDD-009/011/012` rows are `warning` — data layer round-trips, but "object accumulates velocity in +x" needs a Metal-backed harness. Same convention as `BDD-015`. PROJECT_STATE explicitly tells the Estimator to expect WARNING, not BLOCK.
+- **Branch:** `feat/render-state-decoupling` (off `main`, after `feat/environment-forces` was fast-forwarded into `main`).
+- **`MeshGL<CPU>` is now in `include/MeshGL.hpp`** (was inline in `src/main.cpp`). The CPU specialization references `struct CPU;` via forward-declaration; the actual `struct CPU : Backend {}` definition still lives in `src/main.cpp`. If a future header needs `MeshGL<CPU>`, it must include `MeshGL.hpp` *and* be included from a TU that has the `CPU` definition in scope (i.e., `src/main.cpp`).
+- **`MeshRenderState` is keyed by `mesh.id`** and the cached `MeshGL` captures raw pointers into the *current* `packedMeshData`. `Scene::pack()` reallocates those buffers, so `Simulator::initialize` calls `renderState.clear()` immediately after pack. Any future code that re-packs without going through `Simulator::initialize` must clear the render state too — otherwise stale pointers + wrong sizes get rendered (this is the same trap CM-003 hit on a different cache).
+- **GL handles are still leaked** when `MeshRenderState::clear()` runs. `MeshGL` has no destructor, same as before this slice. v1 is a one-shot process (no scene reload churn beyond manual user actions); revisit if the leak becomes measurable.
+- **The dead CPU `ExplicitSystem<CPU,PR>::update` is now a stub.** It was uninstantiated even before the slice (`Backend = METAL` everywhere); the stub keeps it that way without referencing the removed `mesh.meshGL` field.
+- **Visual regression is the user's gate** for this slice. `ysim_tests`/`ysim_primitive_tests` cover data-layer; the renderer's pixel output is not yet mechanically tested.
 
 ## Last decisions + why
 
-No new `DECISIONS.md` entries this slice. The change is the consumer side of D-006 (which already established `Scene::environment` as the in-memory source of truth) — no non-obvious tradeoff to record.
+- **D-011** — Render-side GL state moved out of `GeneralMesh` into `MeshRenderState`. Structural prerequisite for the test-harness slice; strengthens the `ARCHITECTURE §2.2/§2.3` boundary.
 
 ## Next step you were about to take
 
-Slice complete. The next concrete step is the **Estimator's** turn — running `./scripts/verify.sh` and judging whether to merge or send back. After that, per `PROJECT_STATE.md` "Next milestone", the priority is the **test-harness slice** (Metal-backed sim) — concrete motivation now stacked: persistence app-level WARNING, CM-002, CM-003, and now BDD-009/011/012 sim-step clauses. Closing it forces Q-D resolution (CPU backend reference vs. headless-Metal harness) and a `MeshGL` refactor out of `mesh.initialize()`.
+Slice complete. The next concrete step is the **user's manual visual-regression check** — run `./build/src/ysim`, confirm identical render to before. Then **Estimator's** turn — `./scripts/verify.sh` (now passing) and slice-vs-plan reconciliation. After that lands, the **test-harness slice** (Metal-backed sim fixture) is finally unblocked: with `Simulator::initialize` no longer needing GL, a `test/sim_round_trip_test.cpp` binary can bring up `Scene<METAL,Precision>`, run `addCloth/addSphere/addCube`, save/load, run a sim step, and assert. That slice closes the parked sim-step clauses on BDD-009/011/012/015.
 
 See `.agent/PLAN.md` and `.agent/CURRENT_WORK.md` for full plan and progress.

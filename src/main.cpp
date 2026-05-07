@@ -10,6 +10,8 @@
 #include "program.hpp"
 #include "objreader.hpp"
 #include "scene_format.hpp"
+#include "MeshGL.hpp"
+#include "MeshRenderState.hpp"
 
 #include "imgui.h"
 #include "imgui_impl_glfw.h"
@@ -578,118 +580,8 @@ struct SparseMatrix<CPU, PR> {
 // TODO: Solver?
 
 
-template<typename BE>
-struct MeshGL {};
-
-template <>
-struct MeshGL<CPU> {
-    GLuint vao;
-    GLuint vertexBuffer, normalBuffer, facetBuffer, texCoordBuffer;
-
-    size_t vertexNum;
-    size_t facetNum;
-    float* vertexPtr;
-    unsigned int* facetPtr;
-    float* normalPtr;
-
-    MeshGL() {}
-    MeshGL(size_t vertexNum, float* vertexPtr, size_t facetNum, unsigned int* facetPtr, float* normalPtr, float* texCoordPtr=nullptr) 
-        : vertexNum(vertexNum), vertexPtr(vertexPtr), facetNum(facetNum), facetPtr(facetPtr), normalPtr(normalPtr) {
-        std::cout << "[MeshGL] Try to create..." << std::endl;
-        glGenVertexArrays(1, &vao);
-        glBindVertexArray(vao);
-        
-        glGenBuffers(1, &vertexBuffer);
-        glBindBuffer(GL_ARRAY_BUFFER, vertexBuffer);
-        glBufferData(GL_ARRAY_BUFFER,
-                     vertexNum * sizeof(float) * 3,
-                     vertexPtr,
-                     GL_DYNAMIC_DRAW);
-        glEnableVertexAttribArray(0);
-        glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), 0);
-
-        glGenBuffers(1, &facetBuffer);
-        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, facetBuffer);
-        glBufferData(GL_ELEMENT_ARRAY_BUFFER,
-                     facetNum * sizeof(unsigned int) * 3,
-                     facetPtr,
-                     GL_STATIC_DRAW);
-
-        computeNormal();
-        
-        glGenBuffers(1, &normalBuffer);
-        glBindBuffer(GL_ARRAY_BUFFER, normalBuffer);
-        glBufferData(GL_ARRAY_BUFFER,
-                     vertexNum * sizeof(float) * 3,
-                     normalPtr,
-                     GL_DYNAMIC_DRAW);
-        glEnableVertexAttribArray(1);
-        glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), 0);
-
-        if(texCoordPtr) {
-            glGenBuffers(1, &texCoordBuffer);
-            glBindBuffer(GL_ARRAY_BUFFER, texCoordBuffer);
-            glBufferData(GL_ARRAY_BUFFER,
-                         vertexNum * sizeof(float) * 2,
-                         texCoordPtr,
-                         GL_STATIC_DRAW);
-            glEnableVertexAttribArray(2);
-            glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, 2 * sizeof(float), 0);
-        }
-        std::cout << "[MeshGL] Created!" << std::endl;
-    }
-
-    void computeNormal() {
-        //std::cout << "[MeshGL] Try to compute normal..." << std::endl;
-        Eigen::Map<const Eigen::Matrix<float, 3, Eigen::Dynamic>> V(vertexPtr, 3, vertexNum);
-        Eigen::Map<Eigen::Matrix<unsigned int, 3, Eigen::Dynamic>> F(facetPtr, 3, facetNum); 
-        Eigen::Map<Eigen::Matrix<float, 3, Eigen::Dynamic>> N(normalPtr, 3, vertexNum);
-
-        N.setZero();
-
-        for (size_t i = 0; i < facetNum; ++i) {
-            unsigned int i0 = F(0, i);
-            unsigned int i1 = F(1, i);
-            unsigned int i2 = F(2, i);
-
-            auto v0 = V.col(i0);
-            auto v1 = V.col(i1);
-            auto v2 = V.col(i2);
-
-            Eigen::Vector3f cross = (v1 - v0).cross(v2 - v0);
-
-            N.col(i0) += cross;
-            N.col(i1) += cross;
-            N.col(i2) += cross;
-        }
-
-        for (size_t i = 0; i < vertexNum; ++i) {
-            float len = N.col(i).norm();
-            if (len > 1e-7f) {
-                N.col(i) /= len;
-            }
-        }
-        //std::cout << "[MeshGL] Normal Computed" << std::endl;
-    }
-
-    void updateBuffer(float* newVertexPtr) {
-        glBindBuffer(GL_ARRAY_BUFFER, vertexBuffer);
-        glBufferSubData(GL_ARRAY_BUFFER, 0, vertexNum * sizeof(float) * 3, newVertexPtr);
-
-        computeNormal();
-
-        glBindBuffer(GL_ARRAY_BUFFER, normalBuffer);
-        glBufferSubData(GL_ARRAY_BUFFER, 0, vertexNum * sizeof(float) * 3, normalPtr);
-    }
-
-    void draw(Program& shader, const tinym::vec3& baseColor) {
-        shader.setUniform("diffuseColor", baseColor);
-        glBindVertexArray(vao);
-        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, facetBuffer);
-
-        glDrawElements(GL_TRIANGLES, facetNum*3, GL_UNSIGNED_INT, 0);
-    }
-};
+// MeshGL<CPU> moved to include/MeshGL.hpp; renderer-side ownership in
+// MeshRenderState (include/MeshRenderState.hpp). See D-011 / CM-002–004.
 
 template <typename BE>
 struct DebugLineGL {};
@@ -1659,12 +1551,12 @@ struct GeneralMesh {
     Constraints<BE, PR> constraints;
     ExternalForces<BE, PR> externalForces;
 
-    MeshGL<CPU> meshGL;
+    // Render-side GL state lives in MeshRenderState, keyed by id (D-011).
+    // GeneralMesh no longer owns OpenGL handles, so initialize() is safe to
+    // call from a non-GL context — that's the precondition for the upcoming
+    // Metal-backed test harness.
 
-
-
-
-    GeneralMesh(GeneralMeshInitializer<BE, PR>* initializer, BehaviorType behaviorType, BehaviorParams<PR> behaviorParams) 
+    GeneralMesh(GeneralMeshInitializer<BE, PR>* initializer, BehaviorType behaviorType, BehaviorParams<PR> behaviorParams)
     : initializer(initializer), behaviorType(behaviorType), behaviorParams(behaviorParams) {}
     GeneralMesh(GeneralMesh&& other) noexcept
         : id(other.id),
@@ -1676,8 +1568,7 @@ struct GeneralMesh {
           material(std::move(other.material)),
           rotationQuat(other.rotationQuat),
           constraints(std::move(other.constraints)),
-          externalForces(std::move(other.externalForces)),
-          meshGL(std::move(other.meshGL))
+          externalForces(std::move(other.externalForces))
     {
         other.initializer = nullptr;
     }
@@ -1689,9 +1580,7 @@ struct GeneralMesh {
         initializer->initialize(state, adjacency);
         std::cout << "  - [GeneralMesh initialize] id " << id << " initializer init\n";
         constraints.memoryAllocation(state.x.size/3);
-        std::cout << "  - [GeneralMesh initialize] id " << id << " constraints init\n";
-        meshGL = MeshGL<CPU>(state.x.size/3, state.x.ptr, adjacency.facets.size/3, adjacency.facets.ptr, state.n.ptr);
-        std::cout << "  - [GeneralMesh initialize] id " << id << " meshGL init. finished.\n";
+        std::cout << "  - [GeneralMesh initialize] id " << id << " constraints init. finished.\n";
     }
 
 
@@ -4374,7 +4263,10 @@ struct Simulator {
     // object select
     int selectedObj = -1;
 
-
+    // Renderer-side per-mesh GL state (D-011). Cleared on initialize()
+    // because Scene::pack() reallocates packedMeshData buffers; the cached
+    // MeshGL captured raw pointers into the previous pack and is stale.
+    MeshRenderState renderState;
 
     Simulator(System& system) : system(system) {}
 
@@ -4475,6 +4367,9 @@ struct Simulator {
         std::cout << "[Simulator Init] Memory pool allocated" << std::endl;
 
         Scene<BE, PR>::pack();
+        // Stale MeshGL entries point into the prior pack's buffers; drop them
+        // so the next draw lazy-creates fresh GL state from the new pointers.
+        renderState.clear();
         collisionPipeline.broadPhase.build(scene);
         shBroadPhase.build(scene);
 
@@ -4627,20 +4522,20 @@ struct Simulator {
         if (profiler) {
             auto scope = profiler->scoped("mesh_upload");
             for(auto& mesh : scene.meshes)
-                mesh.meshGL.updateBuffer(mesh.state.x.ptr);
+                renderState.getOrCreate(mesh).updateBuffer(mesh.state.x.ptr);
         } else {
             for(auto& mesh : scene.meshes)
-                mesh.meshGL.updateBuffer(mesh.state.x.ptr);
+                renderState.getOrCreate(mesh).updateBuffer(mesh.state.x.ptr);
         }
 
         //collisionPipeline.broadPhase.build(sceneObjects.squareClothes[0].x, sceneObjects.squareClothes[0].facet);
         //std::cout << "[Simulator Update] Finished update" << std::endl;
     }
-    
-    void draw(Program& shader) {
-        //system.draw();
 
-        for(auto& mesh : scene.meshes) mesh.meshGL.draw(shader, mesh.material.baseColor);
+    void draw(Program& shader) {
+        for(auto& mesh : scene.meshes) {
+            renderState.getOrCreate(mesh).draw(shader, mesh.material.baseColor);
+        }
 
         if(selectedObj >= 0) {
             // Reserved for a future selected-mesh overlay pass.
@@ -5160,12 +5055,13 @@ struct ExplicitSystem<CPU, PR> {
         //    //    X.array() += V.array().rowwise() * Mask.array() * subh;
         //    //}
         //}
-        //for(SquareCloth<CPU, PR>& squareCloth : sceneObjects.squareClothes) 
+        //for(SquareCloth<CPU, PR>& squareCloth : sceneObjects.squareClothes)
         //    squareCloth.mesh.updateBuffer(squareCloth.x.ptr);
-        //for(DeformableMesh<CPU, PR>& deformableMesh : sceneObjects.deformableMeshes) 
+        //for(DeformableMesh<CPU, PR>& deformableMesh : sceneObjects.deformableMeshes)
         //    deformableMesh.mesh.updateBuffer(deformableMesh.x.ptr);
-        for(auto& mesh : sceneObjects.meshes)
-            mesh.meshGL.updateBuffer(mesh.state.x.ptr);
+        // CPU backend is not v1-shipping (ARCHITECTURE §4.5); GL upload here
+        // would now go through MeshRenderState, but the path is uninstantiated.
+        (void)sceneObjects;
     }
 };
 

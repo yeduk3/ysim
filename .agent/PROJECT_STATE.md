@@ -43,22 +43,23 @@ Carried forward from `PRD.md`. Each lists which slice it blocks.
 
 ## Next milestone
 
-**Environment forces slice** — wire `Scene::environment` (D-006) into the simulation step. Closes `BDD-009` (Float force-exempt) + `BDD-011` (set gravity) + `BDD-012` (set wind) in one slice. See `.agent/PLAN.md` for the concrete todo list.
+**Headless self-test harness slice** — add a `--self-test` mode to the `ysim` binary that mechanically verifies the simulator paths the unit-test net cannot reach. Closes the parked sim-step clauses on `BDD-009`/`011`/`012`/`015`. See `.agent/PLAN.md` for the concrete todo list.
 
-Why this next:
-- Today's cloth simulator doesn't actually drape — there's no gravity in the kernel input. This slice fills `mesh.externalForces.externalForces` (which the kernels already consume) and adds an Environment panel to the GUI.
-- Three BDDs in one tight slice — vs. material UI (needs PBR shader), behavior UI (needs in-place state realloc), rigid (Q4 blocked), export (Q5/Q6 blocked).
-- No new behavior, no new pipeline → `BDD-103` clean (only extends existing kernel inputs).
-- Unblocks `BDD-007` (cloth drapes onto rigid surface) which literally requires non-zero gravity.
-- Persistence already round-trips gravity / wind; no schema changes.
+Why this slice now:
+- Render-state decoupling (D-011) just removed the structural blocker — `Simulator::initialize` no longer needs a live GL context. The harness slice was the explicit *next* milestone for the past four planning turns.
+- Pattern of the past four slices: `Generator declares done → manual user test catches Metal-side bug → patch → re-review`. CM-002, CM-003, CM-004, and the persistence-slice WARNING all live in the same untested path. After this slice the failure mode should shift to "verify.sh catches it locally before review".
+- **Q-D resolved (planner-level): headless Metal harness, not CPU backend reference.** v1 is macOS-only; the CPU backend stays as type-system reservation only. CPU sim implementation is multi-slice work that does not pay back inside v1's scope.
+- Scope deliberately narrow: `--self-test` lives inside `src/main.cpp` next to `int main()`. **No** extraction of types into a static library / header-set in this slice — that's a multi-slice refactor of its own.
 
-After this slice, the priority shifts to the **test-harness slice** because two recent runtime bugs (CM-002, CM-003) escaped the CPU-only test net during manual `Create > Sphere/Cube` testing. Standing candidates:
+Standing feature candidates (all deferred one more slice):
 
-- **Test-harness slice (Metal-backed sim)** — *priority elevated* by CM-002/CM-003. Forces Q-D resolution (CPU backend reference vs headless-Metal harness). The headless-Metal path needs the `MeshGL` constructor moved out of `mesh.initialize()` to drop the GLFW/GL coupling — itself a refactor.
-- **Material editing UI slice (FR-005 / BDD-005)** — needs a PBR preview shader to satisfy "preview render reflects the lower roughness".
-- **Behavior assignment UI slice (FR-006 / BDD-006)** — switching behavior in-place reallocates per-mesh state.
+- **BDD-007 cloth drapes onto rigid surface** — newly tractable with gravity wired (`e3a3154`). The self-test landing this slice does NOT cover collision response end-to-end; that's BDD-007's slice.
+- **BDD-002 Import .obj mesh via UI** — small slice; underlying `addClothFile`/`addFloatMesh` paths already work.
+- **Material editing UI (FR-005 / BDD-005)** — needs a PBR preview shader to satisfy "preview render reflects the lower roughness".
+- **Behavior assignment UI (FR-006 / BDD-006)** — in-place behavior switching reallocates per-mesh state.
 - **Rigid body slice (FR-008 / BDD-008)** — blocked on Q4.
 - **Alembic export slice (FR-013 / BDD-013)** — blocked on Q5 + Q6.
+- **Determinism mechanization (BDD-102)** — newly tractable now that the harness exists. Promote two-runs-bit-identical from manual to mechanical when the next harness expansion happens.
 
 ## Recent scope changes
 
@@ -66,6 +67,9 @@ After this slice, the priority shifts to the **test-harness slice** because two 
 - **2026-05-06, persistence slice.** Design doc `docs/design/scene_format.md` updated to declare `"grid"` as the v1-shipped primitive shape with `"sphere"`/`"cube"` reserved-not-shipped, mirroring D-003. This was a doc/code reconciliation, not a scope change — v1 only ever had a grid initializer.
 - **Pending in primitive-creation slice (this plan).** D-003 will be *amended* (not superseded) when `"sphere"` and `"cube"` ship as real initializers. The reserved-not-shipped *pattern* survives unchanged; only the membership of the reserved set narrows.
 - **2026-05-06 / 07, primitive-creation slice.** D-010 amended D-003 (sphere/cube shipped). Two runtime bugs surfaced during manual GUI testing and were fixed in `2000aea` and `979f037`: CM-002 (`Scene::pack()` double-frees initializers when re-run because `meshes[i]` and `requestsGeneralMeshes[i]` share the pointer) and CM-003 (`BVH::build` skips re-allocation when primitive count changes, only checking `!tree.ptr`). Both fall in the gap the persistence slice's parked WARNING called out — the unit-test net cannot reach `Simulator::initialize` because of the GLFW/GL coupling in `mesh.initialize()`. This is the concrete motivation for promoting the test-harness slice to the next-after-environment-forces slot.
+- **2026-05-07, env-forces slice (turn-2).** Estimator gave WARNING on the original commit (`4047af0`); user's manual GUI test caught CM-004 — both cloth force kernels (`compute_cloth_grid_forces_fast` and `compute_tri_spring_forces`) hardcoded gravity from `SimParams::G` and ignored the bound `externalForces` buffer. PLAN.md's "no Metal kernel changes" non-goal was based on a wrong assumption that the kernels consumed the buffer the C++ side bound; they did not. Patched in `e3a3154` (kernels now read `externalForces[id]` and drop the hardcoded gravity term). Pattern is now well-established: three successive slices ended with manual-test-catches-runtime-bug-in-Metal-path. The next planner-tracked milestone is the render-state decoupling slice, which is the structural prerequisite for actually testing these paths.
+- **2026-05-07, render-state decoupling slice.** D-011 — `MeshGL<CPU>` lifted to `include/MeshGL.hpp`; `MeshRenderState` (in `include/MeshRenderState.hpp`) owns per-mesh GL state keyed by `mesh.id`; `GeneralMesh::meshGL` field removed. `Simulator::initialize` no longer touches GL. Estimator: NOTE-level. Strengthens `ARCHITECTURE §2.2/§2.3` boundary. Unblocks the harness slice (next milestone).
+- **2026-05-07, harness slice (this plan).** Q-D resolved by Planner: headless Metal harness, **not** CPU backend reference. The CPU backend stays as type-system reservation only for v1. Resolution will be recorded in `docs/DECISIONS.md` by the Generator when the harness slice ships.
 
 ## What the Estimator should know
 
