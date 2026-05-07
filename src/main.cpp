@@ -1674,6 +1674,10 @@ struct Scene {
         VectorBase<BE, Index> numBroadCollisions;
         VectorBase<BE, NarrowCollision> narrowCollisions;
         VectorBase<BE, Index> numNarrowCollisions;
+        // Cumulative across substeps; the per-substep `numNarrowCollisions[0]`
+        // resets in `resetNarrow()`. The self-test reads this to verify
+        // contacts ever fired during a frame loop (BDD-007 acceptance).
+        size_t cumulativeNarrowCollisions = 0;
         Index approxColsPerPoints = 15;
         Index maxNumCollisions;
         VectorBase<BE, NarrowCollision> vertColFacets;
@@ -3925,16 +3929,15 @@ struct BVH<BE, PR, BVHMODE::SCENE, BVHPRIMITIVE::OBJECT> {
                 Index b = std::max(q, t);
                 if(q == t) {
                     if(!enableSelfCollisions) continue;
-
-                    //std::cout << "BVH Query Meshes with " << a << " and " << b << '\n';
                     queryTree.checkSelfCollisions(margin);
                     checked.insert({a, b});
                     continue;
                 }
-                if(checked.find({a, b}) != checked.end()) continue; // already checked
-                // check root insertection
-                if(objTrees[t].tree[0].aabb.intersect(queryTree.tree[0].aabb)) {
-                    //std::cout << "BVH Query Meshes with " << a << " and " << b << '\n';
+                if(checked.find({a, b}) != checked.end()) continue;
+                auto& qa = queryTree.tree[0].aabb;
+                auto& ta = objTrees[t].tree[0].aabb;
+                bool hit = ta.intersect(qa);
+                if(hit) {
                     objTrees[t].queryPoints(queryTree.objid, margin);
                     checked.insert({a, b});
                 }
@@ -4046,6 +4049,12 @@ struct BruteForce<METAL, PR> {
         if(narrow(radius))
             MetalGlobalContext::commitAndWait();
         else return;
+        // Cumulative narrow-contact counter for the harness — `numNarrowCollisions`
+        // resets between substeps, so a per-frame harness sample misses contacts
+        // that fired in earlier substeps. This static accumulates across the run
+        // and is read by `runSelfTest` to assert "contacts ever fired" (BDD-007).
+        Scene<METAL, PR>::packedCollisionData.cumulativeNarrowCollisions +=
+            Scene<METAL, PR>::packedCollisionData.numNarrowCollisions[0];
 
         typename Scene<METAL, PR>::PackedMeshData& packedMesh = Scene<METAL, PR>::packedMeshData;
         typename Scene<METAL, PR>::PackedCollisionData& packedCol = Scene<METAL, PR>::packedCollisionData;
@@ -4453,7 +4462,6 @@ struct Simulator {
 
 
 
-                //collisionPipeline.broadPhase.enlargeTrajectory(system.h);
                 if (useSpatialHashing) {
                     // Mirror the toggle into the SH instance so detectCollisions
                     // commits the broad-phase dispatch and fills heavy-cell stats.
@@ -4482,6 +4490,13 @@ struct Simulator {
                     } else {
                         collisionPipeline.broadPhase.refit();
                     }
+                    // Inflate per-mesh AABBs by velocity * subh so a thin
+                    // mesh moving a full substep's distance still overlaps
+                    // its target's AABB in the broad-phase intersect test.
+                    // Without this, a flat cloth (~zero-thickness Y AABB)
+                    // crossing a flat ground in one substep is missed —
+                    // CM-005's root cause.
+                    collisionPipeline.broadPhase.enlargeTrajectory(system.subh);
                     if (profiler) {
                         auto scope = profiler->scoped("broad_detect");
                         collisionPipeline.broadPhase.detectCollisions(margin, enableSelfCollisions);
@@ -5388,7 +5403,113 @@ static int runSelfTest() {
         pass("BDD-012 / wind (5,0,0) drives cloth +x velocity");
     }
 
-    // ---- Block 4: BDD-015 — saveScene → loadScene round-trips. -----------
+    // ---- Block 6: BDD-007 — cloth drapes onto static surface.
+    //              TESTS.md#BDD-007 wording: cloth grid above static rigid
+    //              sphere, gravity (0,-9.81,0), wind 0. Then: mean-Y
+    //              decreases over time; contact constraints fire on
+    //              broad/narrow phase; no cloth vertex tunnels through the
+    //              surface; total energy stays bounded (≤ 10× initial PE
+    //              per the Notes line).
+    //
+    //              Substitution: v1 has no Rigid backend (Q4 blocked), so
+    //              the harness uses the existing Float-tagged ground plane
+    //              instead of a sphere. Same "static rigid surface" intent.
+    sim.initialize();
+    Scene<Backend, Precision>::environment.gravity = tinym::vec3(0.f, -9.81f, 0.f);
+    Scene<Backend, Precision>::environment.wind    = tinym::vec3(0.f,  0.f,    0.f);
+    Scene<Backend, Precision>::packedCollisionData.cumulativeNarrowCollisions = 0;
+    {
+        auto* clothMesh = Scene<Backend, Precision>::findById(clothId);
+        if (!clothMesh) {
+            fail("BDD-007 setup", "cloth mesh id=" + std::to_string(clothId) + " not found");
+        } else {
+            const Index n = clothMesh->state.x.size / 3;
+            const double groundY = -1.0;            // matches addGround(center=(0,-1,0))
+            const double clothThickness = 0.01;     // matches addCloth(thickness=0.01)
+            const double tunnelGuard = clothThickness;
+
+            double initialMeanY = 0.0;
+            double initialPE = 0.0;
+            for (Index v = 0; v < n; ++v) {
+                double yi = clothMesh->state.x.ptr[v * 3 + 1];
+                double mi = clothMesh->state.m.ptr[v * 3];
+                initialMeanY += yi;
+                initialPE += mi * 9.81 * (yi - groundY);
+            }
+            initialMeanY /= (double)n;
+
+            // Drop and watch. 60 frames is well past the ~30-frame free-fall
+            // time for the 0.25 → -1.0 = 1.25 m fall under 9.81; gives the
+            // cloth time to contact and partly settle.
+            const int dropFrames = 60;
+            double maxKE = 0.0;
+            double worstTunnel = 0.0;  // (groundY - thickness) - minClothY; > 0 means tunneled.
+            for (int f = 0; f < dropFrames; ++f) {
+                sim.update();
+
+                double frameKE = 0.0;
+                double frameMinY = std::numeric_limits<double>::max();
+                for (Index v = 0; v < n; ++v) {
+                    double vx = clothMesh->state.v.ptr[v * 3 + 0];
+                    double vy = clothMesh->state.v.ptr[v * 3 + 1];
+                    double vz = clothMesh->state.v.ptr[v * 3 + 2];
+                    double mi = clothMesh->state.m.ptr[v * 3];
+                    frameKE += 0.5 * mi * (vx * vx + vy * vy + vz * vz);
+                    double yi = clothMesh->state.x.ptr[v * 3 + 1];
+                    if (yi < frameMinY) frameMinY = yi;
+                }
+                if (frameKE > maxKE) maxKE = frameKE;
+                double tunnelDepth = (groundY - tunnelGuard) - frameMinY;
+                if (tunnelDepth > worstTunnel) worstTunnel = tunnelDepth;
+            }
+            size_t cumulativeNarrow =
+                Scene<Backend, Precision>::packedCollisionData.cumulativeNarrowCollisions;
+
+            double finalMeanY = 0.0;
+            for (Index v = 0; v < n; ++v) finalMeanY += clothMesh->state.x.ptr[v * 3 + 1];
+            finalMeanY /= (double)n;
+
+            // (a) cloth's mean y-position decreases over time
+            if (!(finalMeanY < initialMeanY - 0.01)) {
+                fail("BDD-007 / cloth meanY decreases over time",
+                     "expected finalMeanY < initialMeanY - 0.01; "
+                     "initialMeanY=" + std::to_string(initialMeanY) +
+                     " finalMeanY=" + std::to_string(finalMeanY));
+            } else {
+                pass("BDD-007 / cloth meanY decreases over time");
+            }
+
+            // (b) contact constraints fire on broad/narrow phase
+            if (cumulativeNarrow == 0) {
+                fail("BDD-007 / contact constraints fire on broad/narrow phase",
+                     "cumulativeNarrowCollisions stayed 0 across all " +
+                     std::to_string(dropFrames) + " frames");
+            } else {
+                pass("BDD-007 / contact constraints fire on broad/narrow phase");
+            }
+
+            // (c) no cloth vertex tunnels through ground beyond thickness
+            if (worstTunnel > 0.0) {
+                fail("BDD-007 / no cloth vertex tunnels through ground",
+                     "min cloth Y went " + std::to_string(worstTunnel) +
+                     " below groundY - thickness");
+            } else {
+                pass("BDD-007 / no cloth vertex tunnels through ground");
+            }
+
+            // (d) total energy stays bounded (≤ 10× initial PE per spec Notes)
+            const double keBound = 10.0 * initialPE;
+            if (maxKE > keBound) {
+                fail("BDD-007 / total energy stays bounded",
+                     "max KE=" + std::to_string(maxKE) +
+                     " > 10 * initial PE=" + std::to_string(initialPE));
+            } else {
+                pass("BDD-007 / total energy stays bounded");
+            }
+        }
+    }
+
+    // ---- Block 7: BDD-015 — saveScene → loadScene round-trips. -----------
     sim.initialize();
     Scene<Backend, Precision>::environment.gravity = tinym::vec3(0.5f, -8.0f, 1.5f);
     Scene<Backend, Precision>::environment.wind    = tinym::vec3(2.0f, 0.0f, -1.25f);

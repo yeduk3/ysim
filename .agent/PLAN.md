@@ -1,76 +1,71 @@
-# Plan — Self-Test Harness BLOCK Fix
+# Plan — Cloth Drape (BDD-007) Slice
 
 > Owner: **Planner** writes; **Generator** executes; **Estimator** judges.
-> Updated: 2026-05-07 (fix turn after `BLOCK` verdict)
+> Updated: 2026-05-07
 
 ## Goal
 
-Make `runSelfTest()` actually exercise the BDD wording it claims to verify, and make `./scripts/verify.sh` produce a valid verdict on hosts where Metal is unavailable. Concretely:
+Close `BDD-007` — cloth drapes onto a static rigid surface — by mechanizing the spec's "Then" clauses inside the now-existing `runSelfTest` harness, and confirming visually in the GUI that the cloth actually rests on the ground (or Human.obj torso) instead of falling forever or tunneling through.
 
-- `BDD-009` becomes a strict-equality check on the **full state.x and state.v arrays** of a Float-tagged mesh under **non-zero gravity AND non-zero wind**, not a displacement norm with wind=0.
-- `BDD-011` runs gravity = `(0, -9.81, 0)` for a few frames, then changes gravity to `(9.81, 0, 0)` **without re-initialising the simulator**, and asserts cloth mean x-velocity grows from ~zero to clearly positive — matching the spec's "while the simulation is running... no restart is required" clause.
-- `BDD-012` sets `wind = (5, 0, 0)` on a cloth at rest with zero gravity, runs a few frames, and asserts cloth mean x-velocity is clearly positive — the wind-drives-cloth clause the matrix currently overstates.
-- When `MetalGlobalContext::getDevice()` (or `getLibrary()`) returns null, the harness prints `[self-test SKIP] metal-device: …` and exits **0**, not 1. The gate distinguishes "Metal absent → skipped" from "Metal present → assertion failed".
+When this slice ships:
+- A Block 6 inside `runSelfTest` asserts: (a) cloth mean-Y decreases over time, (b) no cloth vertex tunnels through the static surface beyond cloth thickness, (c) total cloth kinetic energy stays bounded under a coarse "≤ 10× initial potential energy" check (per `TESTS.md#BDD-007` notes).
+- `./scripts/verify.sh` runs the assertion automatically on macOS Apple Silicon and SKIPs on Metal-less hosts.
+- The pre-loaded GUI scene (cloth + Human.obj + ground) actually drapes — cloth lands on Human and ground geometry, no obvious tunneling, no exploding particles.
 
-When this fix ships, `./scripts/verify.sh` is green on macOS Apple Silicon (full self-test runs and asserts) **and** green on a Metal-less Estimator host (build + doctests pass; self-test skips with a clear stderr note).
+If the existing collision pipeline already satisfies these, the slice is purely additive (a new assertion block + matrix row promotion). If it doesn't, the harness localizes the failure to one of: broad phase / narrow phase / cloth-integrator collision response. Bug fixes land in the same slice.
 
 ## Scope
 
-- Rewrite three of the four assertion blocks inside `src/main.cpp::runSelfTest`. The `CM-002` and `CM-003` blocks stay as-is — they are correct.
-- Add the Metal-unavailable skip path at the top of `runSelfTest` (already detects null device but currently *fails*; flip to skip-and-return-0).
-- Update `docs/TEST_MATRIX.md` test addresses for `BDD-009`, `BDD-011`, `BDD-012` to point at the rewritten assertion blocks. Status stays `pass` only after the rewritten blocks actually pass on the user's macOS host.
-- Refresh `.agent/CURRENT_WORK.md` and `.agent/RESUME.md`.
+- `BDD-007` — cloth drapes onto a rigid surface (FR-007 / FR-010 / FR-011 all already wired by prior slices; this slice is the end-to-end acceptance).
+- New Block 6 inside `src/main.cpp::runSelfTest` named `BDD-007 / cloth drapes onto static surface` (or split into multiple PASS lines if helpful).
+- Optionally fix any collision-response bug surfaced by the assertion. Likely candidate areas (do not pre-emptively edit any of these — change only what the failing assertion forces):
+  - The `integrate_cloth_grid` / `integrate_cloth` kernels' collision-response loop (`vertColFacets` consumption, normal-projection, `pos += (thickness - distance) * n`).
+  - `Simulator::update`'s broad-phase rebuild cadence (`if (frame % 10 == 0)` — could miss contact frames).
+  - Stale BVH after re-pack (D-007 / CM-003 territory; the harness already exercises this).
+- `docs/TEST_MATRIX.md` row `BDD-007` promoted from `pending` to `pass`.
+- Manual visual confirmation in `./build/src/ysim` is the user's gate (not a Generator hand-off requirement, but called out in the slice's "ready" state).
 
-## Non-goals (this fix)
+## Non-goals (this slice)
 
-- **Resolving the Estimator's Metal access.** The skip path is the right answer for v1: the Estimator's verdict on the *build + JSON-layer tests* is independent of its ability to spin up a GPU. If a future v1.x slice wants Metal-on-Estimator, that's a separate infra slice.
-- **Adding determinism (`BDD-102`) or cloth-drape (`BDD-007`) coverage.** The harness shape supports both later; not now.
-- **The optional `--self-test=<path>` form** mentioned in the prior plan. Bare `--self-test` is sufficient; the path-arg form is YAGNI.
-- **Re-extracting types out of `main.cpp`.** Still a non-goal; the doctest binary route remains future work.
-- **Touching kernels, persistence, GUI menu code, or the renderer.** This is purely a harness rewrite.
+- **Rigid sphere literally as in the spec.** `TESTS.md#BDD-007` says "above a static rigid sphere"; the v1 simulator does not yet have a Rigid backend (Q4 blocked). The harness substitutes the existing Float-tagged ground plane (and visually, the existing Human.obj). The spec's *intent* — "cloth drapes onto a static surface" — is satisfied by either; the rigid-sphere variant returns when the rigid slice (Q4 resolved) ships.
+- **Self-collision.** Parked at `PRD §4`. Cloth-on-cloth contact stays out of scope.
+- **Multi-cloth scenes.** One cloth is enough for the BDD.
+- **Tuning spring constants / thickness for visual prettiness.** Use the existing GUI scene's defaults; only adjust kernel parameters if the harness assertion forces it.
+- **Alembic export.** BDD-013 stays blocked on Q5/Q6.
+- **Material UI / Behavior UI / Rigid / Determinism mechanization.** Each is its own slice.
+- **Touching `MeshRenderState`, persistence, or scene_format.** Pure simulation-side work.
 - **Resolving any of PRD Q1, Q2, Q4, Q5, Q6, Q7.**
 
 ## Todo
 
 Ordered. Generator executes top-to-bottom.
 
-1. **Read the spec wording verbatim.** Open `docs/TESTS.md` blocks `#BDD-009`, `#BDD-011`, `#BDD-012`. Each "Then" clause is the literal acceptance the harness must mechanise. The Estimator pattern-checks against this wording.
-2. **Flip the Metal-unavailable path to SKIP.** In `runSelfTest`, when `MetalGlobalContext::getDevice()` returns null OR `getLibrary()` returns null, print `[self-test SKIP] <reason>: …` to stderr and `return 0;`. **Do not** print `[self-test FAIL]` and **do not** increment the failure counter for that case. Add a one-line comment naming the Estimator-host context so a future reader does not "fix" the skip back to a fail.
-3. **Rewrite Block 3 (`BDD-009`).**
-   - Snapshot the **full** `state.x` and `state.v` arrays of the ground mesh (`Float`-tagged, id 2) into `std::vector<float>` after `simulator.initialize()` — call this `xRest` and `vRest`.
-   - Set `Scene::environment.gravity = (0, -9.81, 0)` and `Scene::environment.wind = (0.5, 0.25, -0.75)` — both non-zero, the spec demands both.
-   - Run a small number of frames (e.g. 6).
-   - Re-read `state.x` and `state.v` for the same ground mesh; assert each element matches `xRest[i]` and `vRest[i]` **bitwise** (`==`, no tolerance — the spec says "strict equality, no tolerance").
-   - On any mismatch, fail with the offending index and the two values.
-4. **Rewrite Block 4 (`BDD-011`).**
-   - Reset the scene (`simulator.initialize()`) so cloth velocity starts at zero.
-   - Set `Scene::environment.gravity = (0, -9.81, 0)`. Run 4 frames. Read cloth mean x-velocity → should be ~zero (gravity has no x-component yet). Capture as `vxBefore`.
-   - **Without re-initializing**, change `Scene::environment.gravity = (9.81, 0, 0)`. Run 4 more frames. Read cloth mean x-velocity → should be clearly positive (the spec says "begins accumulating in the +x direction within a few steps"). Capture as `vxAfter`.
-   - Assert `vxAfter - vxBefore > <tolerance>` — pick a tolerance that's well above floating-point noise but well below what 4 frames of 9.81 acceleration would produce on a 0.1-mass particle.
-   - The "no restart" clause is enforced by *not* calling `simulator.initialize()` between the two pumps — make sure the test code reads cleanly on this point so the Estimator can verify by inspection.
-5. **Rewrite Block 5 (`BDD-012`).**
-   - Reset the scene. Set `gravity = (0, 0, 0)` and `wind = (5, 0, 0)`.
-   - Run 4 frames.
-   - Read cloth mean x-velocity. Assert it is positive and above the same noise tolerance.
-   - Optionally (cheap, gives the Estimator confidence): also capture mean x-velocity at `wind = (0, 0, 0)` first and compare. Skip if it adds bookkeeping noise.
-6. **Update `docs/TEST_MATRIX.md`.** Replace each row's `Test address` for `BDD-009`/`011`/`012` with the new block names (e.g. `…BDD-009 / Float exact x and v under non-zero gravity and wind`). Keep status `pass`. The new row text must match the `[self-test PASS]` strings the harness prints, so a future Estimator can grep both directions.
-7. **Run `./scripts/verify.sh` locally.** Confirm:
-   - Build clean.
-   - `ysim_tests` + `ysim_primitive_tests` pass.
-   - `./src/ysim --self-test` from cwd=build/ either prints the new PASS lines and exits 0 (Generator's macOS host) or prints SKIP and exits 0 (Metal-less host).
-   - Exit code is 0 either way.
-8. **Refresh `CURRENT_WORK.md` and `RESUME.md`.** Note explicitly that BDD-009/011/012 acceptance now matches the spec wording, and that Metal-unavailable is a SKIP rather than a FAIL.
+1. **Read the spec wording verbatim.** `docs/TESTS.md#BDD-007` is the authoritative source. The "Then" clauses are: mean-Y decreases over time, contact constraints fire, no vertex tunneling beyond cloth thickness, total energy stays bounded (≤ 10× initial PE — see the Notes line). Author the assertion code from these strings.
+2. **Run `./build/src/ysim` and observe current behavior.** Press Space to unpause; watch the cloth fall. Note which of: (a) cloth lands on the ground (the current `addGround(...)` plane at y=-1) and rests, (b) cloth tunnels straight through, (c) cloth explodes / NaNs. The observation drives whether step 4 is "add assertion only" or "also fix a kernel bug".
+3. **Add Block 6 in `runSelfTest`** (after Block 5). Use the existing synthetic scene (cloth at `(0, 0.25, 0)` above ground at `(0, -1, 0)`):
+   - Reset (`simulator.initialize()`), set `gravity = (0, -9.81, 0)`, `wind = (0, 0, 0)`.
+   - Capture cloth particles' initial Y (max, mean, min); compute initial potential energy `PE_0 = sum(m_i * |g| * (y_i - y_min))` so the energy bound is well-defined.
+   - Run enough frames for the cloth to reach the ground — at `h = 1/60` with `subSteps = 4` and a 0.25 → -1.0 fall distance under 9.81, ~30 frames is comfortable; 60 is generous.
+   - Assert (a) `meanY_after < meanY_before - tol`, (b) `min(state.x[i].y) >= groundY - thickness` for every cloth vertex, (c) `KE_after = sum(0.5 * m_i * |v_i|^2) <= 10 * PE_0`.
+   - On any failure, the diagnostic must name which clause broke and the offending value.
+4. **If step 3's assertion fails on a real cloth-on-ground tunnel/explode**, fix in the smallest possible scope. The most likely fix locations are listed in Scope above. Do not refactor surrounding code; the slice is BDD-007, not "cleanup the cloth pipeline".
+5. **Update `docs/TEST_MATRIX.md`.** Promote `BDD-007` row from `pending` to `pass`. The `Test address` cell must point at `src/main.cpp::runSelfTest` (Block 6 name) so a future Estimator can grep both directions like the BDD-009/011/012 rows do.
+6. **Run `./scripts/verify.sh` locally.** Build + doctest binaries clean + 9 self-test PASS lines (the new Block 6 added on top of the existing 8).
+7. **Refresh `CURRENT_WORK.md` and `RESUME.md`.** Note the BDD-007 mechanization; flag any kernel-level fix in `RESUME.md`'s "Must remember" if step 4 fired.
+8. **Stop and hand off to the Estimator.** Do not pile on BDD-002 import UI or BDD-102 determinism even if the cloth-drape passes cleanly and the slice feels small. Each is its own future slice.
 
 ## Course corrections
 
-- **The original self-test slice (turn 1) shipped pattern-matched assertions** that the Estimator caught. Cause: `runSelfTest` was written from the matrix-row labels (`gravity down moves cloth -Y`, `Float exempt under gravity`) instead of the BDD's "Then" clauses verbatim. The fix re-grounds in `docs/TESTS.md` wording. Future harness extensions should open `TESTS.md` first; the matrix label is too compressed to drive an assertion from.
-- **The Metal-unavailable case is not a Generator bug; it is a planner-level scoping miss** — the prior plan's verify.sh wiring assumed Metal everywhere. We accept now that the Estimator host may not have Metal, and the harness skips rather than fails.
-- **No new DECISIONS entry.** D-012 (Q-D resolution: headless Metal harness) is unchanged. The skip path is implementation detail under D-012, not a separate decision.
+- **The harness's value is now testable in production.** This is the first slice that *uses* the harness for real new coverage rather than just regression-protecting prior slices. If Block 6 passes immediately, the harness validates the past three slices' cumulative work. If it fails, the harness localizes the bug — exactly what was missing during CM-002/003/004.
+- **Spec-vs-label discipline carries forward.** The prior slice's BLOCK was caused by writing assertions from compressed matrix-row labels. Block 6 must be authored from `docs/TESTS.md#BDD-007`'s "Then" clauses character-for-character. The Estimator will check.
+- **No PLAN-time "no Metal kernel changes" non-goal.** Past two slices burned on this assumption (CM-004, then no-op). If step 4 needs a kernel patch, it gets one — accompanied by a `CM-NNN` entry naming the trap so a future Generator does not re-introduce it. The non-goal stays "do not refactor surrounding code", not "do not touch kernels at all".
 
 ## What to read before writing code
 
-- `docs/TESTS.md#BDD-009`, `#BDD-011`, `#BDD-012` — the spec's "Then" clauses are what the assertions must check, character-for-character.
-- `docs/specs/BDD.md#BDD-009`/`#BDD-011`/`#BDD-012` — confirms the user-facing intent. Note `BDD-009`'s explicit "no tolerance" notes line.
-- `src/main.cpp::runSelfTest` (the existing block bodies) — keep CM-002 / CM-003 blocks unchanged; rewrite blocks 3, 4, 5 in place.
-- `src/main.cpp::Simulator::applyEnvironmentForces` — confirms gravity is applied as `gravity * mass` per particle (non-Float) and wind as force-per-particle (cloth only). The acceleration the harness expects in BDD-011/012 follows from this — sanity-check tolerances against `subh = h / subSteps` (`h = 1/60`, `subSteps = 4` in the harness).
-- `.agent/ESTIMATION.md` (the BLOCK report) — the three citation triples (`src/main.cpp:line`, `docs/TEST_MATRIX.md:line`, `docs/specs/BDD.md:line`, `docs/TESTS.md:line`) tell the Generator exactly which lines the Estimator will re-read on the next pass.
+- `docs/TESTS.md#BDD-007` — the binding "Then" clauses and the Notes line on energy-bound tolerance ("energy ≤ 10× initial potential energy as a coarse stability check").
+- `docs/specs/BDD.md#BDD-007` and `#BDD-103` — user intent + the boundary invariant. Kernel changes inside `src/metal/physics.metal` for collision-response are within the simulation pipeline; not BDD-103 violations.
+- `src/metal/physics.metal::integrate_cloth_grid` and `integrate_cloth` — the existing collision-response loop. Already reads `vertColFacets` + applies normal-projection + position correction. Inspect it to predict whether step 2 will pass clean or fail.
+- `src/main.cpp::Simulator::update` — broad/narrow phase invocation cadence. The `if (frame % 10 == 0)` BVH rebuild is suspect for cloth-drape: a cloth that lands between rebuilds could tunnel.
+- `src/main.cpp::runSelfTest` — the existing Block 5 (BDD-012) is the structural template for Block 6: reset → set env → pump frames → read state.x / state.v → assert.
+- `docs/CONVENTIONS.md` "Tests" section — every test ID is referenced in the test name or comment; the new Block 6's PASS string follows the established `BDD-007 / <one-line summary>` pattern.
+- `.agent/RESUME.md` — the spec-vs-label trap and the SKIP-not-FAIL convention; both still load-bearing this slice.

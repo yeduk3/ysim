@@ -1,10 +1,13 @@
-# Current Work — Headless Self-Test Harness Slice (feat/sim-self-test, BLOCK-fix turn)
+# Current Work — Cloth-Drape (BDD-007) Slice (feat/cloth-drape)
 
-- File in flight: none — slice complete; ready for Estimator re-review.
-- How far: all 5 fix-plan todos done. The three blocks the Estimator BLOCKed (BDD-009/011/012) are rewritten against the `docs/TESTS.md` "Then" clauses verbatim:
-  - **BDD-009** — full bitwise compare of `state.x` and `state.v` arrays for the `Float`-tagged ground mesh under non-zero gravity `(1.5, -9.81, -2.0)` AND non-zero wind `(0.5, 0.25, -0.75)` after 6 frames. Element-by-element `==`, no tolerance.
-  - **BDD-011** — gravity `(0, -9.81, 0)` for 4 frames, then **without** `simulator.initialize()` flip to `(9.81, 0, 0)` for 4 more; cloth mean vx must grow above tolerance. The "no restart" clause is enforced by absence of any `initialize()` call between pumps.
-  - **BDD-012** — fresh init with gravity `(0,0,0)`, wind `(0,0,0)`; capture vx; flip wind to `(5, 0, 0)` for 4 frames; cloth mean vx must be positive and grew above tolerance.
-- Plus the WARNING fix: `MetalGlobalContext::getDevice()` / `getLibrary()` returning null now prints `[self-test SKIP] …` and returns 0, not 1. The Estimator's Linux container (no Metal) gets a green build + doctest verdict; the user's macOS host still runs the full 8 assertions.
-- What's tested: `./scripts/verify.sh` clean. Doctests unchanged (11 + 9). Self-test prints **8 PASS lines** and exits 0 on macOS Apple Silicon. `docs/TEST_MATRIX.md` test-address strings rewritten to match the new PASS strings so a future Estimator can grep both directions.
-- What's next: Estimator re-review. The BLOCK from turn-1 should resolve cleanly; the slice can ship after that.
+- File in flight: none — slice complete with **partial coverage**; ready for Estimator. Three of four BDD-007 clauses PASS; the tunneling clause still FAILs because it requires continuous collision detection (CCD), a structural change that is its own slice.
+- How far:
+  1. Block 6 added to `src/main.cpp::runSelfTest`, mechanizing the four "Then" clauses from `docs/TESTS.md#BDD-007` verbatim.
+  2. **Real fix landed** — `collisionPipeline.broadPhase.enlargeTrajectory(system.subh)` was previously commented out in `Simulator::update`'s substep loop. Without it, fast-moving thin cloth's AABB never overlapped the static ground's AABB long enough for the broad phase to fire. Uncommenting + passing `system.subh` (per-substep dt) inflates the cloth's swept AABB and now the broad/narrow phase detect the cloth-on-ground crossing.
+  3. **Cumulative narrow-collision counter** — `Scene::packedCollisionData.cumulativeNarrowCollisions` (size_t, accumulates across substeps). Necessary because the per-substep counter resets in `resetNarrow()`; the harness samples per-frame and would miss contacts that fire mid-frame and reset by the next substep. The harness's BDD-007 contact assertion now reads this cumulative value.
+- What's tested:
+  - 8 self-test blocks pass cleanly: CM-002, CM-003, BDD-009, BDD-011, BDD-012, three of four BDD-007 clauses, BDD-015 numMeshes round-trip, BDD-012 env round-trip, BDD-015 sim-step-after-load.
+  - 1 self-test FAIL: `BDD-007 / no cloth vertex tunnels through ground` — cloth `minY` reaches ~-4.66 below the ground at -1 because the snapshot narrow-phase point-vs-triangle distance test only registers contacts during one substep of the cloth's transit; the single-substep response isn't enough to halt the cloth's downward velocity for all particles.
+  - Doctest binaries (`ysim_tests`, `ysim_primitive_tests`) unchanged.
+  - `TEST_MATRIX.md` `BDD-007` row stays `warning` (3/4 clauses pass).
+- What's next: Estimator review. Expect a continuing BLOCK on `verify.sh` exit-non-zero, but with stronger evidence that the slice ships a real, narrowly-scoped fix (`enlargeTrajectory`) and surfaces the remaining gap (CCD) cleanly. The next planner-tracked milestone is the **cloth-CCD slice** — replace the snapshot point-vs-triangle narrow check with a swept-segment-vs-triangle check; CM-005 has the localization. With CCD wired, BDD-007's tunneling clause should pass without further harness changes.

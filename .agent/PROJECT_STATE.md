@@ -43,23 +43,22 @@ Carried forward from `PRD.md`. Each lists which slice it blocks.
 
 ## Next milestone
 
-**Headless self-test harness slice** — add a `--self-test` mode to the `ysim` binary that mechanically verifies the simulator paths the unit-test net cannot reach. Closes the parked sim-step clauses on `BDD-009`/`011`/`012`/`015`. See `.agent/PLAN.md` for the concrete todo list.
+**Cloth-drape (BDD-007) slice** — close `BDD-007` end-to-end: cloth drapes onto a static surface with no tunneling and bounded energy. Mechanizes the acceptance scenario as a Block 6 in `runSelfTest`. See `.agent/PLAN.md` for the concrete todo list.
 
 Why this slice now:
-- Render-state decoupling (D-011) just removed the structural blocker — `Simulator::initialize` no longer needs a live GL context. The harness slice was the explicit *next* milestone for the past four planning turns.
-- Pattern of the past four slices: `Generator declares done → manual user test catches Metal-side bug → patch → re-review`. CM-002, CM-003, CM-004, and the persistence-slice WARNING all live in the same untested path. After this slice the failure mode should shift to "verify.sh catches it locally before review".
-- **Q-D resolved (planner-level): headless Metal harness, not CPU backend reference.** v1 is macOS-only; the CPU backend stays as type-system reservation only. CPU sim implementation is multi-slice work that does not pay back inside v1's scope.
-- Scope deliberately narrow: `--self-test` lives inside `src/main.cpp` next to `int main()`. **No** extraction of types into a static library / header-set in this slice — that's a multi-slice refactor of its own.
+- Closes the next link of the v1 spine (BDD-101). Authoring (BDD-001/002), simulation (BDD-007/009/011/012), and persistence (BDD-014/015/016) are then collectively complete; only Alembic export (BDD-013, blocked on Q5/Q6) and the rigid pipeline (BDD-008, blocked on Q4) remain before the v1 spine is end-to-end.
+- The harness landed last slice — this is the first slice that *uses* it for new coverage rather than regression-protecting prior work. If Block 6 passes immediately, the harness validates everything since the persistence slice. If it fails, the harness localizes the bug.
+- The "static rigid surface" is substituted with the existing Float-tagged ground plane in the harness (and Human.obj visually). The literal "rigid sphere" variant returns when the rigid pipeline (BDD-008 / Q4) is unblocked.
+- Direct user-visible payoff — cloth that actually rests on the ground, the headline cloth-sim moment.
 
-Standing feature candidates (all deferred one more slice):
+Standing feature candidates (deferred):
 
-- **BDD-007 cloth drapes onto rigid surface** — newly tractable with gravity wired (`e3a3154`). The self-test landing this slice does NOT cover collision response end-to-end; that's BDD-007's slice.
 - **BDD-002 Import .obj mesh via UI** — small slice; underlying `addClothFile`/`addFloatMesh` paths already work.
-- **Material editing UI (FR-005 / BDD-005)** — needs a PBR preview shader to satisfy "preview render reflects the lower roughness".
+- **BDD-102 Determinism mechanization** — newly tractable with harness; two-runs-bit-identical assertion + saved-scene baseline.
+- **Material editing UI (FR-005 / BDD-005)** — needs PBR preview shader.
 - **Behavior assignment UI (FR-006 / BDD-006)** — in-place behavior switching reallocates per-mesh state.
 - **Rigid body slice (FR-008 / BDD-008)** — blocked on Q4.
 - **Alembic export slice (FR-013 / BDD-013)** — blocked on Q5 + Q6.
-- **Determinism mechanization (BDD-102)** — newly tractable now that the harness exists. Promote two-runs-bit-identical from manual to mechanical when the next harness expansion happens.
 
 ## Recent scope changes
 
@@ -71,6 +70,7 @@ Standing feature candidates (all deferred one more slice):
 - **2026-05-07, render-state decoupling slice.** D-011 — `MeshGL<CPU>` lifted to `include/MeshGL.hpp`; `MeshRenderState` (in `include/MeshRenderState.hpp`) owns per-mesh GL state keyed by `mesh.id`; `GeneralMesh::meshGL` field removed. `Simulator::initialize` no longer touches GL. Estimator: NOTE-level. Strengthens `ARCHITECTURE §2.2/§2.3` boundary. Unblocks the harness slice (next milestone).
 - **2026-05-07, harness slice (this plan).** Q-D resolved by Planner: headless Metal harness, **not** CPU backend reference. The CPU backend stays as type-system reservation only for v1. Resolution will be recorded in `docs/DECISIONS.md` by the Generator when the harness slice ships.
 - **2026-05-07, harness slice fix turn.** Estimator BLOCKed: `BDD-009`/`011`/`012` self-test bodies pattern-matched the matrix labels rather than mechanising the spec wording (no wind in BDD-009; no runtime-without-restart pivot in BDD-011; no actual wind application in BDD-012). Plus Metal-less host (Codex container) made `verify.sh` exit non-zero before any assertion ran. Fix plan: rewrite the three blocks against `docs/TESTS.md` "Then" clauses verbatim (full state.x/state.v strict equality for Float; gravity-runtime-pivot without re-init for BDD-011; wind-drives-cloth-+x for BDD-012); flip the null-device path from FAIL to SKIP so the Estimator's host is supported. Pattern lesson: harness assertions must be authored from `docs/TESTS.md`, not from the compressed matrix-row labels.
+- **2026-05-07, harness slice second turn (commit `a0b5fca`).** All eight assertion blocks pass on macOS Apple Silicon; Estimator's Linux container takes the SKIP path and `verify.sh` exits 0 cleanly. Slice merged into main (FF-merge after commit). Test matrix rows BDD-009/011/012/015 now `pass` with addresses pointing at the rewritten block names.
 
 ## What the Estimator should know
 

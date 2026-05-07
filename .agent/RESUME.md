@@ -1,26 +1,27 @@
-# Resume — Headless Self-Test Harness Slice (post BLOCK-fix)
+# Resume — Cloth-Drape (BDD-007) Slice (3/4 clauses passing; tunneling parked)
 
 ## Must remember
 
-- **Branch:** `feat/sim-self-test` (off `main`, after `feat/render-state-decoupling` was fast-forwarded into `main`).
-- **Harness assertions are authored from `docs/TESTS.md` "Then" clauses verbatim.** The first turn's BLOCK was caused by writing assertions from the compressed matrix-row labels instead. The matrix label is too compressed to drive the assertion off — open `TESTS.md` and read the "Then" sentence.
-- **Metal-unavailable is a SKIP, not a FAIL.** Codex (the Estimator) runs in a Linux container without Metal; treating that as a hard failure made `verify.sh` unrunnable for the Estimator. The skip path is implementation detail under D-012, not a separate decision.
-- **`Simulator::update` is pure simulation.** The render-side per-frame mesh-buffer upload lives in `Simulator::uploadMeshes` and is called by the GUI loop only. The harness must NOT touch GL.
-- **`BDD-011`'s "no restart" clause is enforced by code shape**, not by an assertion: there is no `simulator.initialize()` between the two `pumpFrames` calls in Block 4. Future maintainers who add a "reset before phase 2" line to be tidy break the spec — please don't.
-- **Tolerance constants in the harness** (`bdd011_tol = 0.05`, `bdd012_tol = 0.01`) are sized against `subh = h / subSteps = 1/240` and the synthetic 4×4 cloth mass `0.1`. Tightening / loosening them is fine; just keep them well above FP noise and well below "what 4 frames of the configured force / mass would produce".
-- **The harness cloth is small (4×4)** so each pack/init is fast. If a future block needs more vertices, scale the cloth params at the top of `runSelfTest` rather than per-block.
+- **Branch:** `feat/cloth-drape` (off `main`, after `feat/sim-self-test` was fast-forwarded into `main`).
+- **`enlargeTrajectory(system.subh)` is now live in `Simulator::update`** (uncommented from CM-005 partial fix). Inflates per-mesh swept AABBs by velocity × subh between `refit()` and `detectCollisions(...)`. Without it, fast-moving thin meshes (cloth = flat XZ plane) never overlap a static surface's AABB long enough for the broad phase to fire. **Do not re-comment.** If a future slice removes the line, the cloth-vs-ground broad phase silently breaks again — same failure mode as CM-005's original symptom.
+- **`Scene::packedCollisionData.cumulativeNarrowCollisions` (size_t)** accumulates narrow-contact counts across substeps inside `narrowAndSortByVertices`. Reset by the harness before each test block; never reset by the engine. Necessary because `resetNarrow()` zeroes the per-substep counter at the start of every detect cycle, which would otherwise hide contacts that fire mid-frame.
+- **Block 6 in `src/main.cpp::runSelfTest`** mechanizes BDD-007's four "Then" clauses verbatim from `docs/TESTS.md`. Three pass; one fails (tunneling). The fail is *not* a harness bug — it's a real CCD gap. Don't relax the assertion to make `verify.sh` green.
+- **CM-005 is updated** to reflect the partial fix. The remaining gap is the snapshot-vs-swept narrow-phase check; that's the next slice's job.
+- **Spec substitution call still in force**: `TESTS.md#BDD-007` says "static rigid sphere"; v1 has no rigid pipeline (Q4 blocked). Harness uses the existing Float-tagged ground plane. Spec intent — "cloth drapes onto a static surface" — is satisfied by either; the rigid-sphere variant returns when the rigid slice ships.
 
 ## Last decisions + why
 
-- **D-012** — Headless Metal harness via `--self-test`. Resolves Q-D in favor of reusing the shipping Metal path; rejects CPU backend implementation as v1 work. Unchanged by the BLOCK-fix turn.
+- No new `DECISIONS.md` entries this slice. The `enlargeTrajectory` change is a bug fix (CM-005), not a structural decision; the `cumulativeNarrowCollisions` counter is harness infrastructure under D-012.
 
 ## Next step you were about to take
 
-Slice complete (BLOCK-fix turn). The next concrete step is the **Estimator's re-review**. After that lands, the next planner-tracked candidates per `PROJECT_STATE.md`:
+Slice complete with partial coverage. The next concrete step is the **Estimator's** turn — `verify.sh` exits non-zero (1 self-test FAIL), Estimator likely BLOCKs to loop the planner.
 
-- **BDD-007 cloth drapes onto rigid surface** — newly tractable with the harness; collision response correctness can be added as a Block 6 in the same `runSelfTest` once the planner scopes the slice.
-- **BDD-002 Import .obj mesh via UI** — small slice; underlying paths already work.
-- **BDD-102 determinism mechanization** — extend the harness with two-runs-bit-identical assertion.
-- **Material editing UI / Behavior assignment UI / Rigid / Alembic** — each waits on its respective spec answer or shader work.
+Next planner-tracked milestone: **cloth-CCD slice**. Localization in CM-005:
+- The narrow-phase kernel `narrow_pt_tri` (`src/metal/bruteforce.metal`) does a snapshot point-vs-triangle distance check. Replace with a swept-segment check: for cloth particle's old position `p0` and current position `p1`, test whether segment `[p0, p1]` crosses the triangle plane and lands inside the triangle. Register contact at the crossing point with full-depth pushback.
+- Quick alternative for the planner to consider: bump `Simulator::radius` from `0.012` to `0.05` (or wider) so the snapshot accepts a wider band. Coarse — introduces false positives — but might pass BDD-007 tunneling clause without writing CCD.
+- Whichever path the planner picks, the BDD-007 Block 6 in this slice should turn the fourth clause green without code changes.
+
+After CCD: BDD-002 import UI; BDD-102 determinism mechanization; material/behavior/rigid/Alembic each blocked on its respective spec answer or shader work.
 
 See `.agent/PLAN.md` and `.agent/CURRENT_WORK.md` for full plan and progress.
