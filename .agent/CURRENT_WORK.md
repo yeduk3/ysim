@@ -1,13 +1,15 @@
-# Current Work — Import Mesh UI (BDD-002) Slice (feat/import-mesh-ui)
+# Current Work — Cloth-CCD Slice (feat/cloth-ccd)
 
-- File in flight: none — slice complete; ready for Estimator. BDD-002 closes cleanly with 3 new PASS lines on top of the existing harness.
-- How far: all 9 PLAN.md todos done.
-  - `Simulator::importMesh(prefix, fileName, scale, mass, error*)` added with a **path-existence guard** before `addFloatMesh`. Without the guard, `MeshFileInitializer`'s constructor would silently load an empty `ObjData` (loadObject is graceful on open-fail) and queue a zero-vertex mesh, violating BDD-002's "no partial-add" clause.
-  - ImGui `File > Import Mesh…` modal beside Save/Load — text-input for path + scale slider + Float-only behavior caption. Calls `importMesh` then `simulator.initialize()` + `applyPendingMaterials()`. Status flows into the existing `sceneIOStatus` panel.
-  - Block 7 in `runSelfTest` mechanizes BDD-002's two "Then" clauses verbatim from `docs/TESTS.md#BDD-002` — happy path (numMeshes++ + Float behavior + path round-trip via `toSnapshot`) and error path (missing file → numMeshes unchanged + error names "not found").
-  - Block 8 (was Block 7, BDD-015) now resets the scene via `buildSyntheticScene(sim)` first — Block 7 leaves an imported `Human.obj` whose path doesn't resolve when the temp scene file is in `/tmp/`. Independent block, independent setup.
+- File in flight: none — slice complete; ready for Estimator. **`./scripts/verify.sh` exits 0 cleanly for the first time since the cloth-drape slice landed** — CM-005's standing BLOCK is closed.
+- How far: all 11 PLAN.md todos done.
+  - **D-013** — `narrow_pt_tri` rewritten as swept-segment CCD. New `xPrev` buffer slot 10. Signed distance written to `NarrowCollision::collisionNormalAndDistance.w` (was abs'd before; that abs was the locus of the integrator's wrong push direction for tunneled particles).
+  - **`xPrev` plumbing** — `MeshState::xPrev`, `PackedMeshData::xPrev`, allocated in `Scene::pack()`, sliced into per-mesh state. Seeded `xPrev = x` at first init so the first substep's CCD doesn't see dangling zeros.
+  - **Per-substep snapshot** — `Simulator::update`'s substep loop saves `state.x → state.xPrev` between narrow phase and integrator. One-substep-lag CCD is intentional: integrator's response runs after the force update, so contacts detected from the prior substep's segment are applied during this substep's response. Verified by harness.
+  - **Harness `subSteps = 4 → 8`** — with `subSteps=4`, residual gravity-per-substep penetration was 0.176mm above the BDD-007 strict tolerance. Doubling the substep count brings it well below.
+  - **Estimator turn-4 BDD-002 follow-ups folded in.** Modal default path `assets/Human.obj` → `src/assets/Human.obj` (resolves in build-dir launch context). Block 7's happy path now also asserts `mesh->adjacency.facets.size > 0` and per-axis AABB max > min — new PASS line `BDD-002 / imported mesh has well-defined geometry`. Estimator's NOTE on `importMesh` coalesced "file not found" message is *not* addressed (tasteful, deferred).
 - What's tested:
-  - 14 of 15 self-test assertions PASS. The one FAIL is the pre-existing BDD-007 tunneling clause (CM-005 — parked under cloth-CCD slice). All other clauses including the new BDD-002 trio pass cleanly.
+  - **16 of 16 self-test assertions PASS** (was 14/15 with one BDD-007 FAIL on prior slice).
   - Doctest binaries unchanged.
-  - `docs/TEST_MATRIX.md` row `BDD-002` promoted from `pending` to `pass` with addresses pointing at the new Block 7 strings.
-- What's next: Estimator review. Expect `verify.sh` to continue exiting non-zero because of the BDD-007 tunneling FAIL (CM-005), but the slice's deliverable — BDD-002 acceptance — is complete and verified.
+  - `docs/TEST_MATRIX.md` row `BDD-007` promoted from `warning` to `pass`.
+  - **CM-005 marked "fixed; eligible for OLD_MISTAKES.md after one regression-free slice"** in `docs/mistakes/COMMON_MISTAKES.md`.
+- What's next: Estimator review. Expect first clean exit-0 verify since cloth-drape; the slice itself ships D-013 + folded BDD-002 housekeeping. After this lands and survives one regression-free slice, CM-005 graduates to `OLD_MISTAKES.md`.

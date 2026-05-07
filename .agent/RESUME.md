@@ -1,28 +1,30 @@
-# Resume — Import Mesh UI (BDD-002) Slice
+# Resume — Cloth-CCD Slice (CM-005 closed)
 
 ## Must remember
 
-- **Branch:** `feat/import-mesh-ui` (off `main`, after `feat/cloth-drape` was fast-forwarded into `main`).
-- **`Simulator::importMesh` is the gatekeeper for `.obj` imports** (`src/main.cpp` ~line 4290). It probes file existence with `std::ifstream(fullPath).good()` *before* calling `addFloatMesh`. **Do not bypass this guard** — `MeshFileInitializer`'s constructor calls `ObjData::loadObject` which is *graceful* on open-fail (returns with `nVertices=0` instead of crashing), so a missing-file `addFloatMesh` would silently queue a zero-vertex mesh and violate BDD-002's "no partial-add" clause.
-- **Block 8 (BDD-015) explicitly calls `buildSyntheticScene(sim)` before its run.** Block 7 (BDD-002) leaves an imported `Human.obj` in the scene; if Block 8 inherits that, its save→load can't resolve `src/assets/Human.obj` relative to `/tmp/` (the persistence layer joins import paths with the scene file directory, per D-008). The reset keeps Block 8 independent of Block 7's mutation.
-- **`importMesh`'s path is `prefix + "/" + fileName`** when prefix is non-empty; bare `fileName` when prefix is empty. The ImGui modal splits the user's path at the last `/` to populate prefix and fileName separately — same convention `loadScene` uses.
-- **CM-005 tunneling FAIL is expected baseline noise.** `verify.sh` continues to exit non-zero because of it. The Estimator should expect a continuing BLOCK driven by CM-005, *not* by anything in this slice. The slice's BDD-002 deliverable is independent and clean.
-- **Spec-vs-label discipline still applies.** Block 7's PASS strings are authored from `docs/TESTS.md#BDD-002`'s "Then" clauses verbatim, not from the matrix-row label.
+- **Branch:** `feat/cloth-ccd` (off `main`, after `feat/import-mesh-ui` was fast-forwarded into `main`).
+- **D-013 is load-bearing.** `narrow_pt_tri` does swept-segment CCD using `xPrev` (slot 10). The kernel writes a **signed** distance — *do not* re-introduce the `if (l < 0) { n = -n; l = -l; }` flip that the prior version had. The integrator's `(thickness - distance) * n` push relies on the negative sign for tunneled particles; abs'ing it pushes the wrong way.
+- **`xPrev` is snapshotted between narrow and integrate** (in `Simulator::update`'s substep loop). NOT before narrow runs — that would make `xPrev == state.x` and degenerate the segment. NOT after integrate — that would make `xPrev` reflect the post-integrate position, which is what `state.x` already holds.
+- **`enlargeTrajectory(system.subh)` is still load-bearing** (from cloth-drape slice). Without it, broad phase doesn't even feed pairs into narrow, so CCD never gets a chance.
+- **Harness `subSteps = 8`** (was 4). At `subSteps = 4`, the one-substep-lag residual gravity-per-substep penetration is 0.176mm — *just* over the BDD-007 strict tolerance. With 8 substeps the lag shrinks. If a future slice cuts substep count for performance, BDD-007's tunneling clause may regress; bump tolerance OR keep 8.
+- **CM-005 is fixed but still listed in `docs/mistakes/COMMON_MISTAKES.md`** as eligible for graduation to `OLD_MISTAKES.md` after one regression-free slice. The next planner that surveys mistakes should move it.
 
 ## Last decisions + why
 
-No new `DECISIONS.md` entries this slice. The path-existence guard in `importMesh` is implementation detail under D-008 (import path resolution); the `MeshRenderState` reuse for imported meshes is unchanged from D-011.
+- **D-013** — Snapshot → swept-segment CCD in `narrow_pt_tri`. Closes CM-005, makes BDD-007 PASS.
+- **Estimator turn-4 BDD-002 follow-ups folded in this slice** — modal default path correction + AABB/facet-count assertion in Block 7. Both items were tiny; a separate housekeeping slice would have been more process overhead than the work itself.
 
 ## Next step you were about to take
 
-Slice complete. The next concrete step is the **Estimator's** turn. Expected verdict: BLOCK on the CM-005 tunneling FAIL, but with explicit acknowledgement that the BDD-002 deliverable lands clean — same shape as the cloth-drape slice's previous review.
+Slice complete. Next concrete step is the **Estimator's** turn — `./scripts/verify.sh` exits 0 cleanly (first time since cloth-drape). Expected: NOTE-level verdict.
 
-Standing planner-tracked candidates after BDD-002:
+After this lands, the next planner-tracked candidates per `PROJECT_STATE.md`:
 
-- **Cloth-CCD slice** — closes BDD-007's tunneling clause (CM-005). Replace snapshot point-vs-triangle narrow-phase check with swept-segment-vs-triangle CCD. Has concrete localization in CM-005.
-- **BDD-102 determinism mechanization** — extend the harness with two-runs-bit-identical assertions against a saved-scene baseline.
+- **CM-005 graduation** — move to `OLD_MISTAKES.md` after one regression-free slice. Trivial cleanup.
+- **BDD-102 Determinism mechanization** — extend the harness with two-runs-bit-identical assertion against a saved-scene baseline.
 - **Material editing UI (FR-005 / BDD-005)** — needs PBR preview shader.
 - **Behavior assignment UI (FR-006 / BDD-006)** — in-place behavior switching reallocates per-mesh state.
+- **BDD-003 Translate object** — needs runtime-editable transform.
 - **Rigid body slice (FR-008 / BDD-008)** — blocked on Q4.
 - **Alembic export slice (FR-013 / BDD-013)** — blocked on Q5 + Q6.
 

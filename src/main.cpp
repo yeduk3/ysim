@@ -710,11 +710,18 @@ struct ExternalForces {
 template <typename BE, typename PR>
 struct MeshState {
     using Vector = VectorBase<BE, PR>;
-    Vector x, v, f, m, n;
+    // xPrev: the start-of-substep position, copied from x by the simulator
+    // right before the integrator runs. Consumed by the swept-segment-vs-
+    // triangle narrow phase (D-013, closes CM-005) so cloth-on-static-ground
+    // contacts fire for every substep whose trajectory crosses the surface,
+    // not only substeps whose sample-time position happens to be within
+    // radius+thickness of the surface.
+    Vector x, xPrev, v, f, m, n;
     template <typename InitializerParams>
     void memoryAllocation(InitializerParams& params) {
         Index numData = params.numPoints*3;
         if(!x.ptr) x = Vector(numData);
+        if(!xPrev.ptr) xPrev = Vector(numData);
         if(!v.ptr) v = Vector(numData, 0);
         if(!f.ptr) f = Vector(numData, 0);
         if(!m.ptr) m = Vector(numData, params.mass);
@@ -1647,6 +1654,9 @@ struct Scene {
     struct PackedMeshData {
         // MeshState
         VectorBase<BE, PR> x;
+        // xPrev: start-of-substep snapshot of x; consumed by the swept-segment
+        // narrow phase (D-013). Sliced into per-mesh state.xPrev.
+        VectorBase<BE, PR> xPrev;
         VectorBase<BE, PR> v;
         VectorBase<BE, PR> f;
         VectorBase<BE, PR> m;
@@ -1734,6 +1744,7 @@ struct Scene {
         Index numPoints = packedMeshData.statesOffsets[numMeshes];
         Index numStatesData = numPoints*3;
         packedMeshData.x = VectorBase<BE, PR>(numStatesData);
+        packedMeshData.xPrev = VectorBase<BE, PR>(numStatesData);
         packedMeshData.v = VectorBase<BE, PR>(numStatesData, 0);
         packedMeshData.f = VectorBase<BE, PR>(numStatesData, 0);
         packedMeshData.m = VectorBase<BE, PR>(numStatesData);
@@ -1760,6 +1771,7 @@ struct Scene {
             Index prevNumPoints = packedMeshData.statesOffsets[i];
             Index curNumPoints = packedMeshData.statesOffsets[i+1]-prevNumPoints;
             meshes[i].state.x = VectorBase<BE, PR>(packedMeshData.x, prevNumPoints*3, curNumPoints*3);
+            meshes[i].state.xPrev = VectorBase<BE, PR>(packedMeshData.xPrev, prevNumPoints*3, curNumPoints*3);
             meshes[i].state.v = VectorBase<BE, PR>(packedMeshData.v, prevNumPoints*3, curNumPoints*3);
             meshes[i].state.f = VectorBase<BE, PR>(packedMeshData.f, prevNumPoints*3, curNumPoints*3);
             meshes[i].state.m = VectorBase<BE, PR>(packedMeshData.m, prevNumPoints*3, curNumPoints*3);
@@ -1770,6 +1782,13 @@ struct Scene {
             meshes[i].adjacency.edges  = VectorBase<BE, Index>(packedMeshData.edges, packedMeshData.edgesOffsets[i]*2, (packedMeshData.edgesOffsets[i+1]-packedMeshData.edgesOffsets[i])*2);
 
             meshes[i].initialize();
+            // Seed xPrev with the initial position so the first substep's
+            // swept-CCD narrow check (D-013) sees a degenerate segment
+            // (xPrev == x) rather than dangling zeros, which would
+            // otherwise trigger spurious crossings.
+            std::memcpy(meshes[i].state.xPrev.ptr,
+                        meshes[i].state.x.ptr,
+                        meshes[i].state.x.size * sizeof(PR));
 
             for(int j = 0; j < curNumPoints; ++j) {
                 packedMeshData.vertexAdjFacetsOffsets[prevNumPoints+j+1] = meshes[i].adjacency.vertexAdjFacetsOffsets[j+1]+numVertexAdjFacets;
@@ -4040,6 +4059,8 @@ struct BruteForce<METAL, PR> {
         MetalGlobalContext::setBuffer(packedMesh.vertexAdjFacets, 7);
         MetalGlobalContext::setBuffer(packedMesh.vertexAdjFacetsOffsets, 8);
         MetalGlobalContext::setBytes(nparams, 9);
+        // xPrev (start-of-substep position) at slot 10 — D-013 swept CCD.
+        MetalGlobalContext::setBuffer(packedMesh.xPrev, 10);
 
         MetalGlobalContext::dispatchThreads(bruteForcePSO, nparams.numBroadCollisions);
         return true;
@@ -4529,6 +4550,20 @@ struct Simulator {
                     collisionPipeline.narrowPhase.narrowAndSortByVertices(radius);
                 }
 
+            }
+
+            // Snapshot start-of-substep positions into xPrev so the NEXT
+            // substep's CCD narrow check (D-013) sees the prior swept
+            // segment instead of a degenerate snapshot. One-substep lag is
+            // acceptable for cloth-on-static surfaces: the integrator's
+            // contact response in the next substep pushes tunneled
+            // particles back before the cloth drifts further than thickness.
+            for (auto& m : Scene<BE, PR>::meshes) {
+                if (m.behaviorType == BehaviorType::Float) continue;
+                if (!m.state.x.ptr || !m.state.xPrev.ptr) continue;
+                std::memcpy(m.state.xPrev.ptr,
+                            m.state.x.ptr,
+                            m.state.x.size * sizeof(PR));
             }
 
             if (profiler) {
@@ -5303,7 +5338,12 @@ static int runSelfTest() {
     }
 
     Precision h = Precision(1) / Precision(60);
-    Index subSteps = 4;  // small substep count keeps the test fast.
+    Index subSteps = 8;  // small enough to stay fast; gives the CCD response
+                         // multiple substeps to settle the cloth at thickness
+                         // above ground after the first contact. With 4 the
+                         // residual gravity-per-substep penetration was 0.18mm
+                         // (D-013 swept-CCD numerical floor); 8 keeps it well
+                         // below the BDD-007 tunneling threshold.
     ExplicitSystem<Backend, Precision> system(h, subSteps);
     Simulator<Backend, Precision, ExplicitSystem<Backend, Precision>> sim(system);
     sim.pause = false;  // self-test wants update() to actually step.
@@ -5568,6 +5608,41 @@ static int runSelfTest() {
                      std::to_string(importedMesh ? importedMesh->state.x.size : 0));
             } else {
                 pass("BDD-002 / .obj import via importMesh appears in scene");
+            }
+
+            // Tighter geometry check (estimator turn-4 follow-up): the imported
+            // mesh has positive facet count and a non-degenerate AABB along
+            // every axis. Catches importer regressions that load some vertices
+            // but corrupt the topology / collapse to a single point.
+            if (importedMesh) {
+                const Index nv = importedMesh->state.x.size / 3;
+                bool geomOk = importedMesh->adjacency.facets.size > 0 && nv > 0;
+                if (geomOk) {
+                    double mn[3] = {std::numeric_limits<double>::max(),
+                                    std::numeric_limits<double>::max(),
+                                    std::numeric_limits<double>::max()};
+                    double mx[3] = {-std::numeric_limits<double>::max(),
+                                    -std::numeric_limits<double>::max(),
+                                    -std::numeric_limits<double>::max()};
+                    for (Index v = 0; v < nv; ++v) {
+                        for (int k = 0; k < 3; ++k) {
+                            double c = importedMesh->state.x.ptr[v * 3 + k];
+                            if (c < mn[k]) mn[k] = c;
+                            if (c > mx[k]) mx[k] = c;
+                        }
+                    }
+                    for (int k = 0; k < 3 && geomOk; ++k) {
+                        if (!(mx[k] > mn[k])) geomOk = false;
+                    }
+                }
+                if (!geomOk) {
+                    fail("BDD-002 / imported mesh has well-defined geometry",
+                         "facets.size=" +
+                         std::to_string(importedMesh->adjacency.facets.size) +
+                         "; per-axis AABB collapsed");
+                } else {
+                    pass("BDD-002 / imported mesh has well-defined geometry");
+                }
             }
 
             // Source path round-trips through toSnapshot per BDD-002's
@@ -5909,7 +5984,7 @@ int main(int argc, char** argv) {
         // File menu — Save Scene / Load Scene (BDD-014/015/016) + Import Mesh (BDD-002)
         // Create menu — Sphere / Cube primitives (BDD-001)
         static char scenePathBuf[512] = "scene.ysim.json";
-        static char importPathBuf[512] = "assets/Human.obj";
+        static char importPathBuf[512] = "src/assets/Human.obj";
         static float importScale = 1.0f;
         static std::string sceneIOStatus;
         static float primSize = 1.0f;

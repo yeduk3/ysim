@@ -27,6 +27,17 @@ inline bool pointInTriangleBary(
     return (a >= 0.0f && b >= 0.0f && c >= 0.0f);
 }
 
+// Swept-segment-vs-triangle narrow phase (D-013). Replaces the prior
+// snapshot point-vs-triangle distance check, which silently missed contacts
+// where a fast-moving thin cloth crossed a static surface between samples
+// (CM-005). The swept check looks at the segment from x_prev (start of the
+// previous substep's integrate, snapshotted by Simulator::update before
+// system.update runs) to x_cur (current position): if the segment crosses
+// the triangle plane OR the current position is within radius+thickness of
+// the plane, register a contact with signed distance. The integrator's
+// `(thickness - distance) * n` push grows correctly for both barely-above
+// and tunneled particles because `distance` is now signed (negative ⇒
+// penetrating), unlike the prior abs'd `l`.
 kernel void narrow_pt_tri(
     device const BroadCollision* broadCollisions [[buffer(0)]],
     device atomic_uint* numNarrowCollisions      [[buffer(1)]],
@@ -44,6 +55,10 @@ kernel void narrow_pt_tri(
     device const uint* sceneVertexAdjFacetsOffsets [[buffer(8)]],
 
     constant NarrowParams& params                [[buffer(9)]],
+
+    // x_prev (start-of-prior-substep position; D-013).
+    device const packed_float3* scenePackedXPrev [[buffer(10)]],
+
     uint id [[thread_position_in_grid]]
 ) {
     if (id >= params.numBroadCollisions) return;
@@ -62,7 +77,6 @@ kernel void narrow_pt_tri(
     uint f2 = tri.z;
 
     if (qObjId == tObjId) { // same object
-        //if (point == f0 || point == f1 || point == f2) return;
         uint gPoint = point+scenePackedPositionsOffsets[tObjId];
         for(uint i = sceneVertexAdjFacetsOffsets[gPoint]; i < sceneVertexAdjFacetsOffsets[gPoint+1]; ++i) {
             uint f = sceneVertexAdjFacets[i];
@@ -70,12 +84,14 @@ kernel void narrow_pt_tri(
         }
     }
 
-    
+    uint qOff = scenePackedPositionsOffsets[qObjId];
+    uint tOff = scenePackedPositionsOffsets[tObjId];
 
-    float3 qpos  = float3(scenePackedPositions[point + scenePackedPositionsOffsets[qObjId]]);
-    float3 t0pos = float3(scenePackedPositions[f0 + scenePackedPositionsOffsets[tObjId]]);
-    float3 t1pos = float3(scenePackedPositions[f1 + scenePackedPositionsOffsets[tObjId]]);
-    float3 t2pos = float3(scenePackedPositions[f2 + scenePackedPositionsOffsets[tObjId]]);
+    float3 qcur  = float3(scenePackedPositions[point + qOff]);
+    float3 qprev = float3(scenePackedXPrev[point + qOff]);
+    float3 t0pos = float3(scenePackedPositions[f0 + tOff]);
+    float3 t1pos = float3(scenePackedPositions[f1 + tOff]);
+    float3 t2pos = float3(scenePackedPositions[f2 + tOff]);
 
     float3 v0 = t1pos - t0pos;
     float3 v1 = t2pos - t0pos;
@@ -85,19 +101,40 @@ kernel void narrow_pt_tri(
     if (nlen2 < 1e-12f) return;
     n *= rsqrt(nlen2);
 
-    float3 p = qpos - t0pos;
-    float l = dot(n, p);
+    // Signed distances from the triangle plane to query positions.
+    float d_prev = dot(n, qprev - t0pos);
+    float d_cur  = dot(n, qcur  - t0pos);
 
-    // query point 기준으로 normal 방향 정렬
-    if (l < 0.0f) {
+    // Orient n outward toward x_prev's side. Falls back to x_cur's side when
+    // d_prev is exactly 0 (degenerate first-substep case where xPrev was
+    // seeded equal to x).
+    float dref = (d_prev != 0.0f) ? d_prev : d_cur;
+    if (dref < 0.0f) {
         n = -n;
-        l = -l;
+        d_prev = -d_prev;
+        d_cur  = -d_cur;
     }
 
-    if (l > params.radius + params.thickness) return;
+    // CCD trigger: segment crossed the plane OR snapshot proximity (slow
+    // particle inside the radius+thickness band).
+    bool crossed   = (d_cur < 0.0f);
+    bool inMargin  = (d_cur < params.radius + params.thickness);
+    if (!crossed && !inMargin) return;
 
-    // 평면 위 투영 벡터
-    float3 inplane = p - n * l;
+    // Choose contact point: crossing of the segment if it actually crossed
+    // the plane (and d_prev was on the outward side); otherwise the current
+    // position projected to the plane.
+    float3 contactPoint;
+    if (crossed && d_prev > 0.0f) {
+        float t = d_prev / (d_prev - d_cur);
+        contactPoint = mix(qprev, qcur, t);
+    } else {
+        contactPoint = qcur;
+    }
+
+    float3 p_contact = contactPoint - t0pos;
+    float l_contact = dot(n, p_contact);
+    float3 inplane = p_contact - n * l_contact;
 
     if (!pointInTriangleBary(inplane, v0, v1)) return;
 
@@ -114,7 +151,9 @@ kernel void narrow_pt_tri(
 
     narrowCollisions[outIdx].indexPair = uint2(point, triangle);
     narrowCollisions[outIdx].objPair = bc.objPair;
-    narrowCollisions[outIdx].collisionNormalAndDistance = float4(n, l);
+    // SIGNED current distance — negative ⇒ tunneled. The integrator's
+    // `(thickness - distance) * n` push grows accordingly.
+    narrowCollisions[outIdx].collisionNormalAndDistance = float4(n, d_cur);
     narrowCollisions[outIdx].behaviorPair = bc.behaviorPair;
     narrowCollisions[outIdx].shapePair = bc.shapePair;
 }

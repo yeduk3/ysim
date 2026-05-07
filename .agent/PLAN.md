@@ -1,71 +1,80 @@
-# Plan — Import Mesh UI (BDD-002) Slice
+# Plan — Cloth-CCD Slice (closes CM-005, BDD-007)
 
 > Owner: **Planner** writes; **Generator** executes; **Estimator** judges.
 > Updated: 2026-05-07
 
 ## Goal
 
-Wire a `File > Import Mesh…` menu item that lets the user load a `.obj` from disk into the running scene, defaulting the new object to `BehaviorType::Float` (per the planner-resolved decision in `PROJECT_STATE.md`). After this slice ships:
+Close `BDD-007`'s tunneling clause by replacing the snapshot point-vs-triangle narrow-phase check with a swept-segment-vs-triangle CCD, so cloth-on-static-ground contact is detected for every substep the cloth's *trajectory* crosses the ground — not only the substep where the cloth happens to be within `radius+thickness=0.022` of the surface at sample time.
 
-- `BDD-002` row in `docs/TEST_MATRIX.md` flips from `pending` to `pass`.
-- The user can pick a `.obj` from the existing `assets/` folder via the modal and see it appear in the scene immediately, render with the default white material, and persist through `Save Scene` / `Load Scene`.
-- `Block 7` in `runSelfTest` exercises the underlying `Simulator::addFloatMesh(...)` path with a deterministic asset and asserts the loaded mesh produces a positive vertex count + valid AABB after `Simulator::initialize()`.
-- `BDD-002`'s `Then` clause that "an invalid or unreadable file produces a clear error and does **not** mutate the scene" is mechanized by an additional self-test assertion that calls `addFloatMesh` with a missing path and confirms the scene's `numMeshes` is unchanged.
+When this slice ships:
+- `[self-test FAIL] BDD-007 / no cloth vertex tunnels through ground` flips to PASS — CM-005's last unresolved clause.
+- `./scripts/verify.sh` exits 0 cleanly on macOS Apple Silicon for the first time since the cloth-drape slice landed (Estimator's BLOCK trigger is gone).
+- `docs/TEST_MATRIX.md` row `BDD-007` promotes from `warning` to `pass`.
+- The slice also folds in two small follow-up todos from the BDD-002 estimator's WARNING (item 4 below).
 
 ## Scope
 
-- `BDD-002` — Import external mesh (FR-002).
-- ImGui `File > Import Mesh…` modal — single text-input for path, behavior dropdown stub (defaulted to Float; rest greyed out — behavior-switching is BDD-006's slice). Optional `scale` input. Calls `Simulator::addFloatMesh(prefix, fileName, offset=0, scale, mass=0.1)` then `simulator.initialize()` then `simulator.applyPendingMaterials()` to mirror the Load handler's lifecycle.
-- `Block 7` in `runSelfTest` (`src/main.cpp`) for BDD-002's two acceptance scenarios:
-  - Happy path: `Simulator::addFloatMesh("assets", "Human.obj", ...)` then init; assert the new mesh exists, has `numPoints > 0`, behavior == `Float`, and source-encoded path round-trips through `toSnapshot()`.
-  - Error path: `Simulator::addFloatMesh("assets", "this_file_does_not_exist.obj", ...)`; assert it does **not** crash and the scene state remains internally consistent (or — depending on `ObjReader` behavior — that `numMeshes` is unchanged from before the call). Note: the current `ObjData::loadObject` path may crash hard on missing files; if so, the slice introduces a path-existence check before queuing the request.
-- Update `docs/TEST_MATRIX.md` row `BDD-002` from `pending` to `pass` with the test address pointing at Block 7.
+- `BDD-007` — cloth drapes onto static rigid surface (4/4 clauses pass after this slice; currently 3/4).
+- **Narrow-phase swept-segment-vs-triangle check** in `src/metal/bruteforce.metal::narrow_pt_tri`. The cloth particle's *previous* position (`x_prev`) and *current* position (`x_cur`) define a swept segment; if it crosses the ground triangle plane between them and the crossing point lies inside the triangle, register a contact at the crossing. Today's snapshot test (`l = |dot(n, p)|`, accept if `l < radius + thickness`) only catches contacts where the current position is close to the surface — fast-moving thin cloth slips through.
+- **`x_prev` plumbing.** The narrow kernel currently only reads `scenePackedPositions` (the *current* state.x). To do CCD it needs the *prior* state.x as well. Cleanest path: a new `packedMeshData.xPrev` buffer, populated by C++ each substep right before `system.update(scene)`. Bind to a new buffer slot in `narrow_pt_tri` (likely buffer(10) or similar — pick a free slot).
+- **C++ wiring.** Allocate `xPrev` in `Scene::pack()` alongside `x`; per-mesh `mesh.state.xPrev` slice. In `Simulator::update`'s substep loop, copy `state.x` into `state.xPrev` *before* the integrator runs (so `xPrev` reflects the position at the *start* of the substep). Bind `xPrev` to the narrow kernel's new buffer slot via `BruteForce::narrow`'s `setBuffer` call.
+- **Integrator response on CCD contacts.** The existing integrator does `if (vn < 0) vel -= vn*n` and `if (distance < thickness) pos += (thickness - distance) * n`. For a CCD-detected crossing, `distance` should be the post-step distance to the triangle plane (signed); the same response logic works as long as `n` points outward from the triangle into the swept space.
+- Estimator follow-up #1 (from `.agent/ESTIMATION.md` turn 4): tighten Block 7's BDD-002 happy-path assertion to also check the imported mesh's AABB is well-defined (`max > min` along each axis) and `numFacets > 0`. One-line change inside the existing block.
+- Estimator follow-up #2: change the import modal's default path from `assets/Human.obj` to `src/assets/Human.obj` so the launch-from-`build/` context (used by `verify.sh`) works as a one-click import smoke without retyping. Single literal change.
 
 ## Non-goals (this slice)
 
-- **Native file dialog.** The persistence slice's text-input modal is the established v1 pattern; same shape works here. File-dialog polish is a follow-up across the whole `File >` menu.
-- **Multi-format support.** v1 supports `.obj` only (FR-002 + design-doc note). Other extensions hit the same reserved-but-not-shipped error pattern the loader already implements (D-008 area).
-- **Behavior selection at import time.** The modal shows a dropdown for visual completeness but it's locked to Float. In-place behavior switching is BDD-006's slice.
-- **Material editing on the imported mesh.** Default white baseColor (BDD-005's slice).
-- **Resolving CM-005 (cloth-drape tunneling).** Stays parked under the cloth-CCD slice. The harness's failing BDD-007 tunneling clause continues to fail; matrix `warning` row stays.
-- **Touching kernels, persistence schema, or render state.** Pure GUI + Simulator-helper wiring.
+- **Cloth-on-cloth (self) collision.** Parked at `PRD §4`. Self-CCD would be a separate, larger slice.
+- **Continuous-time response for inter-substep cloth-on-rigid.** No rigid pipeline yet (Q4 blocked); the slice only addresses Float-tagged static surfaces.
+- **A second narrow-phase kernel.** Modify `narrow_pt_tri` in place rather than introducing a parallel CCD kernel — the existing snapshot path is replaced, not paralleled.
+- **Velocity-aware AABB inflation.** Already done (D-005-area; `enlargeTrajectory(system.subh)` in Simulator::update). Keep that as-is.
+- **Refactoring the narrow-collision struct.** The existing `NarrowCollision::collisionNormalAndDistance` (vec4) carries (n, l) which is sufficient for both snapshot and swept results — the swept kernel writes the same shape.
+- **Resolving the BDD-002 NOTE** about `importMesh`'s coalesced "file not found" error message. Tasteful, deferred.
 - **Resolving any of PRD Q1, Q2, Q4, Q5, Q6, Q7.**
 
 ## Todo
 
 Ordered. Generator executes top-to-bottom.
 
-1. **Read the spec wording.** `docs/TESTS.md#BDD-002` is binding. The two "Then" clauses are: (a) scene contains a new object whose geometry matches the file, with default material and Float behavior, and the persisted state records the import path so a later save/reload reproduces the same source; (b) an invalid or unreadable file produces a clear error and does not mutate the scene (no partial-add). Author Block 7 from these clauses verbatim — same discipline that fixed the BDD-009/011/012 BLOCK two slices ago.
-2. **Inventory the existing import path.** `Simulator::addClothFile` / `addFloatMesh` (`src/main.cpp` ~line 4297 onward) and `MeshFileInitializer` (~line 1238). Confirm:
-   - The constructor calls `data.loadObject(prefix, fileName)`. What happens when the file doesn't exist? If `loadObject` aborts or asserts, the slice must add a guard before queuing. If it returns gracefully with `nVertices == 0`, the slice can dispatch the error path naturally.
-   - The pre-existing `Simulator::addFloatMesh("src/assets", "Human.obj", ...)` call in `main()` works in production — that's the happy-path baseline.
-3. **Wire the ImGui modal.** Add a `File > Import Mesh…` menu item beside `File > Save Scene…` / `Load Scene…` (`src/main.cpp` ~line 5495 area, alongside the `primitiveModal` lambda). Modal fields: `Path` (`InputText`), `Scale` (`InputFloat`, default `1.0`). On `Import`:
-   - Compute `prefix` and `fileName` by splitting `Path` at the last `/` (same pattern `loadScene` already uses).
-   - Call `simulator.addFloatMesh(prefix, fileName, tinym::vec3(0), scale)`.
-   - Call `simulator.initialize()` then `simulator.applyPendingMaterials()`.
-   - Report status into `sceneIOStatus` ("imported: path" / "import failed: …").
-4. **Error guard.** Before constructing `MeshFileInitializer`, verify the file exists via `std::ifstream(prefix + "/" + fileName).good()` (or equivalent). If missing, write `"import failed: file not found: <path>"` into `sceneIOStatus` and **do not** call `addGeneralMesh` — the scene must be unmodified. The Estimator will check the diff for this guard explicitly per BDD-002's "no partial-add" clause.
-5. **Block 7 in `runSelfTest`.** Two assertion blocks:
-   - `BDD-002 / .obj import via addFloatMesh appears in scene`: capture `numMeshes` before, call `simulator.addFloatMesh("assets", "Human.obj", tinym::vec3(0), 0.04)`, `simulator.initialize()`, assert `numMeshes` increased by 1, the new mesh's id is valid, `state.x.size > 0` (positive vertex count), behaviorType is `Float`. Optionally serialize via `simulator.toSnapshot()` and assert the new object's `source.kind == Source::Kind::Import` and `source.import.path` ends with `Human.obj` (round-trip clause).
-   - `BDD-002 / missing import path leaves scene unchanged`: capture `numMeshes` before, call the same path with a non-existent filename `"missing_obj.obj"`. Assert `numMeshes` is unchanged. (If the existing loadObject crashes the binary outright, this assertion will surface as a `verify.sh` BLOCK that the slice must address by adding the step-4 guard before the call.)
-6. **Update `docs/TEST_MATRIX.md`.** Promote `BDD-002` row from `pending` to `pass` with the test address pointing at the new Block 7 names. Use the same pass-string-grep convention as BDD-009/011/012/015.
-7. **Run `./scripts/verify.sh` locally.** Build clean, doctest binaries pass, self-test prints the new BDD-002 PASS lines. The pre-existing BDD-007 tunneling FAIL stays — that's CM-005 territory, not this slice.
-8. **Refresh `CURRENT_WORK.md` and `RESUME.md`.** Note that BDD-002 closes; the `File > Import Mesh…` menu is now first-class user-facing UI; the path-existence guard at step 4 is load-bearing for BDD-002's "no partial-add" clause.
-9. **Stop and hand off to the Estimator.** Do not pile on material/behavior/transform UI. Each is its own slice.
+1. **Read CM-005 and the relevant kernels.** `docs/mistakes/COMMON_MISTAKES.md::CM-005` lays out the snapshot-vs-swept gap and the localization. `src/metal/bruteforce.metal::narrow_pt_tri` (~line 30) is the kernel to rewrite. `src/metal/physics.metal::integrate_cloth` (~line 280) and `integrate_cloth_grid` (~line 156) consume `vertColFacets` — their loops should keep working with the new contact-distance semantics.
+2. **Add `xPrev` to PackedMeshData and per-mesh state.** In `src/main.cpp::Scene::pack()`, allocate `packedMeshData.xPrev = VectorBase<BE, PR>(numStatesData)`, slice into each `meshes[i].state.xPrev`. The `MeshState` struct (~line 819) already has room semantically; either add `Vector xPrev;` next to `x, v, f, m, n` or carry it on the Simulator side as a parallel mirror. The Generator's call which to pick — favor adding to `MeshState` so the field travels with the mesh.
+3. **Populate `xPrev` per substep before the integrator.** In `Simulator::update`'s substep loop, after the broad/narrow phase and **before** `system.update(scene)`, copy `state.x` → `state.xPrev` for every cloth mesh. Use the existing CPU-readable Metal pointers (Apple Silicon unified memory). One memcpy per cloth per substep — cheap.
+4. **Bind `xPrev` to the narrow kernel.** Look at `BruteForce<METAL, PR>::narrow(...)` (~line 4012, where `bruteForcePSO` is dispatched). It already binds `scenePackedPositions` at buffer 3. Add a parallel `setBuffer(packedMesh.xPrev, /*new slot*/)` call. Pick a free slot — current `narrow_pt_tri` uses 0–9; slot 10 is unused. Update the kernel signature to accept `device const packed_float3* xPrevPacked [[buffer(10)]]`.
+5. **Rewrite `narrow_pt_tri` to do swept CCD.** New logic:
+   - Read both `x_prev = xPrev[point + offset]` and `x_cur = scenePackedPositions[point + offset]`.
+   - Compute signed distances `d_prev = dot(n, x_prev - t0)` and `d_cur = dot(n, x_cur - t0)` (n is the triangle's outward normal — keep the existing `cross(v0, v1)` then normalize).
+   - **CCD trigger:** if `sign(d_prev) != sign(d_cur)` (segment crosses the plane) **OR** `|d_cur| < radius + thickness` (snapshot fallback for slow particles already touching), proceed. Otherwise return.
+   - Compute the crossing point parametric `t = d_prev / (d_prev - d_cur)` if signs differ, else `t = 1`. Crossing position `p_cross = lerp(x_prev, x_cur, t)`.
+   - Run the existing `pointInTriangleBary` against the crossing (or against `x_cur`'s in-plane projection — pick whichever stays consistent with the integrator's response).
+   - Write `n` (oriented outward, flipped if the *current* position is on the negative side) and `l = d_cur` (signed) — the integrator already handles `if (distance < thickness) pos += (thickness - distance) * n` which correctly pushes both barely-above and below-surface particles outward.
+6. **Drop the spurious `if (l < 0) { n = -n; l = -l; }` flip.** That existing block makes `l` always positive, which is wrong for tunneled particles (`distance < 0` should remain negative so the integrator's `(thickness - distance)` push grows correctly). Replace with a "set `n` to outward-relative-to-current-position" rule that does **not** flip `l`'s sign.
+7. **Verify locally.** Run `./scripts/verify.sh` from the repo root. Expect:
+   - Build clean.
+   - Doctest binaries pass.
+   - 15 self-test PASS lines (was 14); the BDD-007 tunneling clause flips to PASS.
+   - `verify.sh` exits 0.
+8. **Promote `BDD-007` matrix row from `warning` to `pass`.** The new test address points at the same Block 6 lines (no harness change for BDD-007) — the assertion was already correctly written; the kernel is what changes.
+9. **BDD-002 follow-ups (housekeeping; from estimator turn 4 WARNING).**
+   - In `src/main.cpp` modal init (~line 5912 area): change `static char importPathBuf[512] = "assets/Human.obj";` → `"src/assets/Human.obj";` so the default path resolves in the `verify.sh` launch context.
+   - In Block 7's happy-path assertion (`src/main.cpp::runSelfTest` ~line 5558): after the existing `state.x.size > 0 && behaviorType == Float` check, also assert `mesh->adjacency.facets.size > 0` and that the per-axis AABB max > min over the imported vertex positions. One small loop. Add a third PASS line `BDD-002 / imported mesh has well-defined geometry` — addresses estimator follow-up #1 by widening coverage.
+10. **Update DECISIONS, CURRENT_WORK, RESUME.** Append a new D-NNN entry: "Narrow phase upgraded from snapshot to swept-segment CCD (closes CM-005)". Note the kernel signature change (new `xPrev` buffer slot) so future kernel-side reviewers know to grep for it. Update CM-005 to "fixed in this slice; entry can graduate to `OLD_MISTAKES.md` after one slice with no recurrence" per the file's own promotion rule.
+11. **Stop and hand off to the Estimator.** Do not pile on cloth-on-cloth, rigid, or visual-rendering changes.
 
 ## Course corrections
 
-- **Cloth-drape (BDD-007) slice:** 3 of 4 clauses pass; tunneling clause is parked under CM-005 for a future cloth-CCD slice. Matrix row stays `warning`. The harness's existing FAIL line is *expected* during this slice; do not attempt to "fix" it here.
-- **Spec-vs-label discipline still applies.** Block 7 must be authored from `docs/TESTS.md#BDD-002`'s "Then" clauses verbatim, not from the matrix-row label. The persistence-and-env-forces BLOCK from earlier turns was caused by reading from labels.
-- **Estimator's host has no Metal.** The harness's SKIP path is the correct behavior for the `addFloatMesh` Block 7 too — if no Metal device, skip. Already in place from D-012.
+- **Standing CM-005 BLOCK ends here.** Two slices have shipped with it as the only `verify.sh` failure. After this slice, Estimator's BLOCK signal returns to its proper meaning ("real failure") instead of "the standing tunneling FAIL".
+- **`enlargeTrajectory(system.subh)` from the cloth-drape slice is a *prerequisite* for CCD**, not a substitute. Without trajectory-inflated AABBs, broad phase doesn't even feed pairs to narrow. Both fixes are load-bearing for BDD-007; do not remove either.
+- **The narrow kernel was the locus of the last two structural bugs** (CM-004's hardcoded gravity ignored the bound buffer; CM-005's snapshot test missed swept contacts). Future slices touching `src/metal/bruteforce.metal` or `physics.metal` should grep both the C++ side `setBuffer` index *and* the kernel body for that buffer to confirm consumption — that's the lesson from CM-004 carrying forward.
+- **BDD-002 follow-ups bundled into this slice as housekeeping**, per Planner role: "WARNING adds a follow-up todo." Both items are tiny (≈3 lines each); a separate slice would be process overhead for less than 30 minutes of work.
 
 ## What to read before writing code
 
-- `docs/TESTS.md#BDD-002` — binding "Then" clauses.
-- `docs/specs/FRD.md#FR-002` — functional contract; v1 is `.obj` only.
-- `docs/specs/BDD.md#BDD-002` — user intent; "import a .obj mesh and have it become a normal scene object".
-- `src/main.cpp::Simulator::addFloatMesh` (~line 4297), `MeshFileInitializer` (~line 1238), and `ObjData::loadObject` (`include/objreader.hpp`) — to verify the missing-file behavior before writing the guard.
-- `src/main.cpp` around the `File >` menu setup (~line 5495 area, in `main()`'s render lambda) — model the new modal on the existing `primitiveModal` / Save/Load patterns.
-- `src/main.cpp::Simulator::loadScene` — the path-split + `addGeneralMesh` + `simulator.initialize()` + `applyPendingMaterials()` lifecycle pattern to mirror.
-- `src/main.cpp::Simulator::toSnapshot` — confirms imports already serialize as `Source::Kind::Import` with the path round-tripped.
-- `.agent/RESUME.md` — `enlargeTrajectory` line is load-bearing (do not re-comment); `cumulativeNarrowCollisions` infrastructure carries forward.
+- `docs/mistakes/COMMON_MISTAKES.md::CM-005` — full localization + fix direction.
+- `docs/TESTS.md#BDD-007` — the four "Then" clauses; tunneling clause is `no cloth vertex tunnels through the sphere`.
+- `src/metal/bruteforce.metal::narrow_pt_tri` (~line 30) — the kernel to rewrite.
+- `src/metal/physics.metal::integrate_cloth` (~line 280) and `integrate_cloth_grid` (~line 156) — consumers of `vertColFacets`; the response loop should keep working with signed `l`.
+- `src/main.cpp::Scene::pack` (~line 1804), `MeshState` (~line 819), `Simulator::update`'s substep loop (~line 4470) — for the `xPrev` plumbing.
+- `src/main.cpp::BruteForce::narrow` (~line 4012, `bruteForcePSO` dispatch) — to add the `xPrev` buffer binding.
+- `.agent/ESTIMATION.md` (turn 4) — the two follow-up WARNINGs being folded into todo 9.
+- `.agent/RESUME.md` — `enlargeTrajectory` line is load-bearing; `cumulativeNarrowCollisions` infrastructure carries forward; `importMesh` path-existence guard carries forward.
