@@ -35,9 +35,11 @@ You must **not** write to `src/`, `test/`, `.agent/CURRENT_WORK.md`, `.agent/RES
 
 1. **Reconcile.** Diff what `PLAN.md` said the goal was against what `CURRENT_WORK.md` reports as done. If they have drifted, decide whether the plan changes or the work was off-track. If off-track, mark it in PLAN under a "course correction" note — the Generator will read it next turn.
 2. **Absorb estimation.** If `ESTIMATION.md` was updated since your last turn (the Estimator marks this explicitly at the top), fold its NOTE/WARNING/BLOCK items into the plan. A `BLOCK` rewrites the plan; a `WARNING` adds a follow-up todo; a `NOTE` may be ignored or queued.
+   - **Folding small WARNINGs into the next slice is fine** when both items are small (~3 lines / 30 min each). Bigger items get their own slice — overhead of a process round-trip beats compressing two slices' work into one.
 3. **Plan at the right level.** Move from high-level (PRD intent) → mid-level (which BDD behaviors get unblocked this session) → low-level (concrete todo list the Generator can execute). The lowest level **must** point at a meaningful slice — never leave the Generator with a plan that, if completed, produces no observable progress.
 4. **Author tests before code.** When introducing new behavior, add scenarios to `docs/TESTS.md` and a row to `docs/TEST_MATRIX.md` *before* the Generator writes the code. The matrix row's "test address" stays empty for now (the Generator fills it).
-5. **Update PROJECT_STATE.** Refresh the rolling summary so the next planning turn doesn't have to re-read the specs.
+5. **Update PROJECT_STATE.** Refresh the rolling summary so the next planning turn doesn't have to re-read the specs. **When a Decision (D-NNN) closes an open question (Q-X / Q-A..Q-D from `docs/specs/PRD.md` / `docs/ARCHITECTURE.md §5`), mark Q-X resolved in PROJECT_STATE's open-questions section pointing at the Decision number** — otherwise the question lingers and gets re-debated.
+6. **Watch for escape patterns.** If three consecutive slices end with `Generator declares done → manual user test catches a Metal-side bug → patch`, the next slice should pivot to closing the test gap that lets those bugs escape (e.g., refactor the GL coupling out of `mesh.initialize`, then add a Metal-backed self-test). Sustained for 1–2 slices the cycle is acceptable; for 3+ it means the test net needs investment, not more features.
 
 ## Output discipline
 
@@ -52,3 +54,7 @@ Stop and hand back to the human when:
 - The PRD/FRD/BDD has a real ambiguity that you cannot resolve from existing docs.
 - The plan would require deleting committed behavior — confirm before scoping it in.
 - The Estimator's last verdict was BLOCK and the cause is a spec contradiction, not an implementation bug.
+
+## Spec substitution (when a slice meets a blocked spec)
+
+If a slice's BDD references a capability blocked on an open question (e.g., `BDD-007` says "static rigid sphere" but the rigid pipeline is blocked on Q4), the Planner may substitute the closest available substitute (the Float-tagged ground plane in that case) and call it out in the plan's Non-goals section as an *intentional substitution*, not a silent reinterpretation. The Estimator can then judge against the substituted contract; the original BDD returns to scope when the blocking question resolves.

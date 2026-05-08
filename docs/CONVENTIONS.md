@@ -10,7 +10,7 @@
 - **Platform:** macOS only (v1). The simulation backend is Metal; the build pipeline shells out to `xcrun metal` and `xcrun metallib`.
 - **GPU:** Metal compute for simulation, OpenGL for rendering. ImGui uses the OpenGL backend.
 - **Dependencies:** Eigen 5.0+, GLFW 3.4, GLEW, OpenGL, Metal, Bullet, Jolt (when rigid lands), nlohmann/json (when persistence lands — see `docs/DECISIONS.md`).
-- **Test framework:** **doctest** — single-header, drops in like the existing `stb_image.h`. Wired into CMake by the persistence slice. *Provisional Planner decision; see `docs/DECISIONS.md` once recorded.*
+- **Test framework:** **doctest** — single-header at `include/doctest.h`, separate test executables under `test/`. Wired into CMake by the persistence slice. Decision recorded in `docs/DECISIONS.md` D-002.
 - **Linter / formatter:** none enforced in v1. A `.clang-format` is a planned follow-up but not a v1 requirement.
 
 ## What lives where
@@ -18,13 +18,13 @@
 - `src/` — production code. The bulk of v1 lives in `src/main.cpp` (~5200 lines: simulation setup, main loop, GUI integration). GUI helpers (`mesh_inspector_gui.cpp`, `profiler_gui.cpp`) and Metal C++ glue (`metal_impl.cpp`) live alongside it. Throwaway code goes nowhere — delete instead. (`temp.cpp` and `test_temp.cpp` are pre-existing scratch files; do not add more of them.)
 - `src/metal/` — Metal compute kernels (`.metal`) and their shared types (`common_types.metalh`). One file per pipeline stage (`physics.metal`, `bvh.metal`, `bruteforce.metal`, `radixsort.metal`, `spatialhashing.metal`).
 - `src/shader/` — OpenGL shaders (`.vert`, `.frag`, `.geom`).
-- `include/` — public headers and small third-party single-header libraries (`stb_image.h`).
+- `include/` — public headers and small vendored single-header libraries. Currently: `stb_image.h`, `doctest.h`, `nlohmann/json` tree (D-001), plus first-party `MeshGL.hpp` / `MeshRenderState.hpp` (D-011), `scene_format.hpp` (persistence layer), `primitive_geometry.hpp` (sphere/cube generators).
 - `third_party/` — vendored external libraries (currently `imgui`).
 - `lib/` — built/static libraries (output, not source).
 - `assets/` — runtime assets used by example scenes.
 - `profiles/` — output directory for `FrameProfiler` CSVs. Path is wired via `YSIM_PROJECT_ROOT` CMake define.
-- `test/` — *planned* — created by the persistence slice. Mirrors `src/` structure where a test maps to a single source file; otherwise organize by behavior id.
-- `scripts/` — *planned* — repo automation (verify, checkpoint). Not application code.
+- `test/` — created by the persistence slice. Two binaries today (`ysim_tests` and `ysim_primitive_tests`), plus the live-Metal `ysim --self-test` harness in `src/main.cpp::runSelfTest` (D-012). Tests organize by behavior id.
+- `scripts/` — repo automation. `scripts/verify.sh` is the Estimator's strict gate (build all targets + run both doctest binaries + `ysim --self-test`). `scripts/verify-light.sh` is the Generator's quick loop (test targets only).
 - `docs/` — specs (`docs/specs/`), tests (`docs/TESTS.md`, `docs/TEST_MATRIX.md`), this file, `ARCHITECTURE.md`, `DECISIONS.md`, `mistakes/`, `roles/`, per-slice design notes (`docs/design/`).
 - `.agent/` — Planner/Generator/Estimator working state (`PLAN.md`, `PROJECT_STATE.md`, etc.). Not application code.
 
@@ -49,7 +49,7 @@ The codebase has a *de facto* split — the convention is to **document and foll
 - Prefer integration over heavily-mocked unit tests at module boundaries. Mocks are reserved for external network/IO; ysim has none in v1, so this rarely applies.
 - The CPU backend (`Scene<CPU, PR>`) exists in the type system but is unused. When tests require backend-agnostic behavior (`BDD-102`, `BDD-103`), the test should run against whichever backend is available without `#ifdef`-style branching.
 - A failing test is never deleted to make CI green. It is fixed, marked `WARNING` in the matrix with a reason, or reverted with the code that broke it.
-- `test/` does not exist yet — the persistence slice creates it (`PLAN.md` step 7).
+- For sim-step / GPU acceptance clauses that the doctest binaries can't reach, the `runSelfTest` harness (`ysim --self-test`) is the regression net. Those tests live in `src/main.cpp`'s `runSelfTest` blocks; they SKIP gracefully when no Metal device is available (Estimator host).
 
 ## Comments
 

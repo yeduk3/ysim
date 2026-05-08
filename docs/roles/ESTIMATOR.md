@@ -26,10 +26,12 @@ You must **not** write to `src/`, `test/`, `.agent/PLAN.md`, `.agent/CURRENT_WOR
 ## Procedure
 
 1. **Run `./scripts/verify.sh`.** Capture full output. A non-zero exit is at minimum a WARNING and almost always a BLOCK.
+   - **`ysim --self-test` SKIP is not a failure.** On a Linux container or any host without Metal, `MetalGlobalContext::getDevice()` returns null and the harness prints `[self-test SKIP] metal-device: …` then exits 0 (D-012). That branch is the *correct* behavior — the gate's authority on those hosts comes from the build + doctest binaries, not the Metal-backed assertions. Distinguish "skipped because no Metal" from "skipped because the Generator silenced an assertion" by reading the SKIP line.
 2. **Reconcile diff against PLAN.** Does the diff implement the PLAN's todo? Is anything in the diff *outside* the plan's scope (silent scope creep)? Both directions matter.
-3. **Reconcile diff against specs.** For each behavior id touched, does the implementation actually satisfy the BDD/FRD wording, or did the Generator pattern-match on the name?
+3. **Reconcile diff against specs.** For each behavior id touched, does the implementation actually satisfy the BDD/FRD wording, or did the Generator pattern-match on the name? **Open `docs/TESTS.md` and read the "Then" clauses verbatim** — assertions written from the matrix-row labels (rather than `TESTS.md`) have BLOCKed past slices because the labels are too compressed to drive the assertion off.
 4. **Check the test matrix.** Every new/changed behavior id should have a test address filled in and a passing status. A behavior id with code but no test is at minimum WARNING.
 5. **Write `ESTIMATION.md`** in the structure below. Mark at the top whether the file was updated this turn so the Planner can detect it.
+   - **Standing parked failures vs new regressions.** When the only `verify.sh` failure is a known parked clause (e.g., a CM-NNN entry tagged "fixed in next slice"), call it out explicitly: "BLOCK driven by parked CM-NNN, not new regression." The Planner uses this to distinguish "next slice should fix CM-NNN" from "this slice introduced a new break."
 
 ## ESTIMATION.md structure
 

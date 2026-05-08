@@ -27,13 +27,14 @@ A macOS-only simulation engine targeting cloth and rigid-body shots, sitting bet
 
 Carried forward from `PRD.md`. Each lists which slice it blocks.
 
-- **Q1 — OpenPBR subset.** Blocks the material-editing slice (FR-005 / BDD-005). Proposed minimum: base color, metallic, roughness, specular weight, emission color. Others are added later.
-- **Q2 — Cloth UX surface (one option vs two).** Blocks the behavior-assignment UI slice (FR-006 / BDD-006). Current planner default: two options.
-- **Q3 — Scene file format.** Was blocking the persistence slice. **Provisionally resolved by the Planner: JSON** (see "Decisions" below). Awaiting human confirmation; if overridden, the persistence slice plan changes accordingly.
-- **Q4 — Rigid backend default (Bullet vs Jolt).** Blocks the rigid-body slice (FR-008 / BDD-008). Affects which backend the round-trip acceptance test uses.
-- **Q5 — Alembic schema specifics.** Blocks the export slice (FR-013 / BDD-013).
-- **Q6 — Export FPS / time-step decoupling rule.** Blocks the export slice (FR-013 / BDD-013).
+- **Q1 — OpenPBR subset.** Resolved in practice by **D-005**: v1 ships base color, metallic, roughness, specular weight, emission color; persistence round-trips all five. Material UI slice (FR-005 / BDD-005) can proceed; PBR preview shader is the remaining open work.
+- **Q2 — Cloth UX surface (one option vs two).** Still open. Persistence and primitive slices treat `TriangularCloth` and `FastGridCloth` as two distinct behavior tags (D-005-ish convention); a future Behavior UI slice (FR-006 / BDD-006) decides whether to merge them in the user-facing dropdown.
+- **Q3 — Scene file format.** **Resolved (D-001): JSON**, vendored `nlohmann/json` under `include/nlohmann/`.
+- **Q4 — Rigid backend default (Bullet vs Jolt).** Still open. Blocks the rigid-body slice (FR-008 / BDD-008).
+- **Q5 — Alembic schema specifics.** Still open. Blocks the export slice (FR-013 / BDD-013).
+- **Q6 — Export FPS / time-step decoupling rule.** Still open. Blocks the export slice (FR-013 / BDD-013).
 - **Q7 — Save-file forward migration policy.** Does not block v1 (only v1→v2 transition).
+- **Q-D (from `docs/ARCHITECTURE.md §5`) — Test backend ownership.** **Resolved (D-012): headless Metal harness via `ysim --self-test`**, with SKIP path on hosts without Metal so the Estimator's Linux container can still run `verify.sh`.
 
 ## Decisions (Planner-resolved, awaiting human confirmation)
 
@@ -43,22 +44,20 @@ Carried forward from `PRD.md`. Each lists which slice it blocks.
 
 ## Next milestone
 
-**Cloth-CCD slice** — close `CM-005` and `BDD-007`'s tunneling clause. Replace the snapshot point-vs-triangle narrow-phase check with a swept-segment-vs-triangle CCD so cloth-on-static-ground contacts fire reliably during the cloth's transit, not only at sample boundaries. See `.agent/PLAN.md` for the concrete todo list.
+**Pending Planner decision.** Cloth-CCD slice (`feat/cloth-ccd`) merged into `main` on 2026-05-08; closes `BDD-007` and `CM-005`. `verify.sh` exits 0 cleanly with 16/16 self-test PASS lines. The standing-BLOCK era is over.
 
-Why this slice now:
-- CM-005 has been the standing BLOCK driver for two slices. Closing it is the only path to a green `verify.sh` until the next sim regression. The Estimator's BLOCK signal currently means "the parked CM-005 fail" rather than "this slice broke something" — folding it back to its real meaning is high-leverage.
-- Concrete localization in CM-005: `src/metal/bruteforce.metal::narrow_pt_tri` is the kernel to rewrite; `xPrev` plumbing is the C++-side change.
-- Closes BDD-007 fully (4/4 clauses). Promotes the matrix row from `warning` to `pass`.
-- The slice also folds in two small BDD-002 follow-up items from estimator turn 4 (modal default path; happy-path assertion gets AABB / facet-count check).
+Standing feature candidates, ordered by what closes the most v1 acceptance:
 
-Standing feature candidates (deferred):
-
-- **BDD-102 Determinism mechanization** — small; two-runs-bit-identical harness assertion against a saved-scene baseline.
-- **Material editing UI (FR-005 / BDD-005)** — needs PBR preview shader to satisfy "preview render reflects the lower roughness".
-- **Behavior assignment UI (FR-006 / BDD-006)** — in-place behavior switching reallocates per-mesh state.
-- **BDD-003 Translate object** — needs runtime-editable transform plumbed through render and sim; the persistence slice's D-007 added `rotationQuat` as a precedent for D-004-style decoupling.
-- **Rigid body slice (FR-008 / BDD-008)** — blocked on Q4.
+- **BDD-102 Determinism mechanization** — extend `runSelfTest` with a two-runs-bit-identical assertion against a saved-scene baseline. Smallest slice; uses the harness D-012 already established. Newly tractable now that BDD-007 is stable (no random-tunneling drift to confuse a determinism test).
+- **BDD-003 Translate object** — runtime-editable transform via the inspector. `GeneralMesh::rotationQuat` field exists from D-007 as the precedent; the slice would add `transformPosition` (or thread current state.x updates through a model-matrix path). Visible payoff; small-to-medium.
+- **Material editing UI (FR-005 / BDD-005)** — needs a PBR preview shader to satisfy "preview render reflects the lower roughness". Q1 settled by D-005, so the data-layer side is ready; the renderer-side work is the slice's bulk.
+- **Behavior assignment UI (FR-006 / BDD-006)** — in-place behavior switching reallocates per-mesh state; non-trivial. Q2 still open (one cloth UX option vs two).
+- **BDD-019 Profiler test row** — already implemented in the GUI; add a doctest binding (or a Block in `runSelfTest`) that exercises `FrameProfiler` and asserts CSV export contents. Closes a `pending` matrix row trivially.
+- **BDD-017 / BDD-018 Ray-pick + live-edit propagation** — both already implemented; harder to mechanize without GUI input simulation, so probably skipped until v1 ships.
+- **Rigid body slice (FR-008 / BDD-008)** — blocked on Q4 (Bullet vs Jolt default).
 - **Alembic export slice (FR-013 / BDD-013)** — blocked on Q5 + Q6.
+
+`BDD-101` (the v1 spine: author → simulate → save/reload → export) is structurally complete except for the export step; once Alembic ships, BDD-101's acceptance can be mechanized.
 
 ## Recent scope changes
 
@@ -71,6 +70,8 @@ Standing feature candidates (deferred):
 - **2026-05-07, harness slice (this plan).** Q-D resolved by Planner: headless Metal harness, **not** CPU backend reference. The CPU backend stays as type-system reservation only for v1. Resolution recorded in `docs/DECISIONS.md` D-012 when the harness slice landed.
 - **2026-05-07, cloth-drape (BDD-007) slice.** Three of four BDD-007 clauses pass via Block 6 in `runSelfTest`. Real fix: uncommented `collisionPipeline.broadPhase.enlargeTrajectory(system.subh)` (CM-005 partial fix). New `cumulativeNarrowCollisions` counter in `Scene::packedCollisionData` so the harness can track contacts that fire and reset within a single frame. Tunneling clause still FAILs — parked under CM-005 for a future cloth-CCD slice (replace snapshot narrow-phase distance check with swept-segment-vs-triangle). Matrix row stays `warning`.
 - **2026-05-07, BDD-002 import-mesh-ui slice.** `Simulator::importMesh` added with file-existence guard before `addFloatMesh` (without it, `MeshFileInitializer` silently queues a zero-vertex mesh on missing path — `ObjData::loadObject` is graceful on open-fail). `File > Import Mesh…` modal wired. Block 7 in `runSelfTest` mechanizes BDD-002's two "Then" clauses (happy: numMeshes++ + Float + path round-trip via `toSnapshot`; error: missing file → numMeshes unchanged). Block 8 (BDD-015) now resets the scene first because Block 7's imported mesh has a path that doesn't resolve relative to `/tmp/`. Estimator turn 4 verdict: WARNING (commit allowed) — two follow-ups bundled into the next (cloth-CCD) slice: tighten Block 7's happy-path assertion (AABB / facet-count); fix modal default path from `assets/Human.obj` to `src/assets/Human.obj` for the build-dir launch context.
+- **2026-05-08, cloth-CCD slice (`feat/cloth-ccd` → `main`, commit `95a710f`).** D-013 — `narrow_pt_tri` rewritten as swept-segment CCD using new `xPrev` buffer (slot 10); writes signed distance (was abs'd before, which negated the integrator's push for tunneled particles). Per-substep `state.x → state.xPrev` snapshot in `Simulator::update`. Harness `subSteps = 4 → 8` for one-substep-lag headroom. Folded BDD-002 estimator turn-4 follow-ups (modal default + AABB/facet assertion). 16/16 self-test PASS; `verify.sh` exits 0 cleanly. CM-005 graduated to `OLD_MISTAKES.md` because the snapshot path was structurally removed. BDD-007 matrix row promoted `warning → pass`.
+- **2026-05-08, doc maintenance pass.** `docs/CONVENTIONS.md` planned-status pointers refreshed (test/ + scripts/ exist; D-002 confirms doctest; include/ inventory updated). `docs/ARCHITECTURE.md §5` Q-D marked resolved by D-012. `docs/mistakes/COMMON_MISTAKES.md` CM-005 graduated; `docs/mistakes/OLD_MISTAKES.md` gained the "snapshot-only collision tests miss fast-moving thin geometry" pattern entry. PROJECT_STATE open-questions list synced with decisions (D-001/Q3, D-005/Q1, D-012/Q-D resolved).
 - **2026-05-07, harness slice fix turn.** Estimator BLOCKed: `BDD-009`/`011`/`012` self-test bodies pattern-matched the matrix labels rather than mechanising the spec wording (no wind in BDD-009; no runtime-without-restart pivot in BDD-011; no actual wind application in BDD-012). Plus Metal-less host (Codex container) made `verify.sh` exit non-zero before any assertion ran. Fix plan: rewrite the three blocks against `docs/TESTS.md` "Then" clauses verbatim (full state.x/state.v strict equality for Float; gravity-runtime-pivot without re-init for BDD-011; wind-drives-cloth-+x for BDD-012); flip the null-device path from FAIL to SKIP so the Estimator's host is supported. Pattern lesson: harness assertions must be authored from `docs/TESTS.md`, not from the compressed matrix-row labels.
 - **2026-05-07, harness slice second turn (commit `a0b5fca`).** All eight assertion blocks pass on macOS Apple Silicon; Estimator's Linux container takes the SKIP path and `verify.sh` exits 0 cleanly. Slice merged into main (FF-merge after commit). Test matrix rows BDD-009/011/012/015 now `pass` with addresses pointing at the rewritten block names.
 
