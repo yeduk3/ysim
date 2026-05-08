@@ -42,6 +42,23 @@ void drawMeshInspectorWindow(
         ImGui::TextDisabled("More parameters can be added here later.");
     }
 
+    if (target.transform_position && target.on_translate) {
+        if (ImGui::CollapsingHeader("Transform", ImGuiTreeNodeFlags_DefaultOpen)) {
+            float p[3] = { target.transform_position->x,
+                           target.transform_position->y,
+                           target.transform_position->z };
+            ImGui::InputFloat3("Position", p);
+            // IsItemDeactivatedAfterEdit fires once on commit (Enter / Tab /
+            // focus loss), not per keystroke — keeps state.x mutation off the
+            // typing critical path.
+            if (ImGui::IsItemDeactivatedAfterEdit()) {
+                target.on_translate(target.mesh_id,
+                                    tinym::vec3(p[0], p[1], p[2]));
+                state.status_message = "Position updated.";
+            }
+        }
+    }
+
     if (!state.status_message.empty()) {
         ImGui::Spacing();
         ImGui::TextDisabled("%s", state.status_message.c_str());

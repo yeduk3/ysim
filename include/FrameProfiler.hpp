@@ -27,6 +27,12 @@ struct FrameSnapshot {
     double frame_ms = 0.0;
     double fps = 0.0;
     std::vector<double> section_ms;
+    // Per-frame totals summed across substeps. Simulator::update reads the
+    // packed collision counters after each substep's narrow phase and feeds
+    // them through FrameProfiler::addCollisionCounts. CSV exports the totals;
+    // divide by your subStep count to get per-substep means.
+    uint64_t broad_collisions = 0;
+    uint64_t narrow_collisions = 0;
 };
 
 class FrameProfilerHistory {
@@ -113,7 +119,7 @@ public:
         std::ofstream file(path);
         if (!file.is_open()) return false;
 
-        file << "frame_sequence,wall_time_seconds,frame_ms,fps";
+        file << "frame_sequence,wall_time_seconds,frame_ms,fps,broad_collisions,narrow_collisions";
         for (const auto& name : section_names_) file << ',' << sanitizeHeader(name);
         file << '\n';
 
@@ -121,7 +127,9 @@ public:
             file << frame.sequence << ','
                  << frame.wall_time_seconds << ','
                  << frame.frame_ms << ','
-                 << frame.fps;
+                 << frame.fps << ','
+                 << frame.broad_collisions << ','
+                 << frame.narrow_collisions;
 
             for (std::size_t i = 0; i < section_names_.size(); ++i) {
                 double value = i < frame.section_ms.size() ? frame.section_ms[i] : 0.0;
@@ -198,7 +206,15 @@ public:
         current_wall_time_seconds_ = wall_time_seconds;
         current_frame_start_ = Clock::now();
         current_section_ms_.assign(history_.sectionCount(), 0.0);
+        current_broad_collisions_ = 0;
+        current_narrow_collisions_ = 0;
         frame_open_ = true;
+    }
+
+    void addCollisionCounts(uint64_t broad, uint64_t narrow) {
+        if (!frame_open_) return;
+        current_broad_collisions_ += broad;
+        current_narrow_collisions_ += narrow;
     }
 
     ScopedTimer scoped(const std::string& name) {
@@ -221,6 +237,8 @@ public:
         snapshot.frame_ms = frame_ms;
         snapshot.fps = frame_ms > 0.0 ? 1000.0 / frame_ms : 0.0;
         snapshot.section_ms = current_section_ms_;
+        snapshot.broad_collisions = current_broad_collisions_;
+        snapshot.narrow_collisions = current_narrow_collisions_;
 
         history_.push(std::move(snapshot));
         frame_open_ = false;
@@ -242,6 +260,8 @@ private:
     TimePoint current_frame_start_;
     uint64_t current_sequence_ = 0;
     double current_wall_time_seconds_ = 0.0;
+    uint64_t current_broad_collisions_ = 0;
+    uint64_t current_narrow_collisions_ = 0;
     bool frame_open_ = false;
 };
 

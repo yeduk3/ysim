@@ -1,30 +1,31 @@
-# Resume — Cloth-CCD Slice (CM-005 closed)
+# Resume — Translate-Object Slice (BDD-003 closed)
 
 ## Must remember
 
-- **Branch:** `feat/cloth-ccd` (off `main`, after `feat/import-mesh-ui` was fast-forwarded into `main`).
-- **D-013 is load-bearing.** `narrow_pt_tri` does swept-segment CCD using `xPrev` (slot 10). The kernel writes a **signed** distance — *do not* re-introduce the `if (l < 0) { n = -n; l = -l; }` flip that the prior version had. The integrator's `(thickness - distance) * n` push relies on the negative sign for tunneled particles; abs'ing it pushes the wrong way.
-- **`xPrev` is snapshotted between narrow and integrate** (in `Simulator::update`'s substep loop). NOT before narrow runs — that would make `xPrev == state.x` and degenerate the segment. NOT after integrate — that would make `xPrev` reflect the post-integrate position, which is what `state.x` already holds.
-- **`enlargeTrajectory(system.subh)` is still load-bearing** (from cloth-drape slice). Without it, broad phase doesn't even feed pairs into narrow, so CCD never gets a chance.
-- **Harness `subSteps = 8`** (was 4). At `subSteps = 4`, the one-substep-lag residual gravity-per-substep penetration is 0.176mm — *just* over the BDD-007 strict tolerance. With 8 substeps the lag shrinks. If a future slice cuts substep count for performance, BDD-007's tunneling clause may regress; bump tolerance OR keep 8.
-- **CM-005 is fixed but still listed in `docs/mistakes/COMMON_MISTAKES.md`** as eligible for graduation to `OLD_MISTAKES.md` after one regression-free slice. The next planner that surveys mistakes should move it.
+- **Branch:** `feat/translate-object` (off `main` at `a85aba8`, the doc-maintenance pass).
+- **D-014 is load-bearing.** `GeneralMesh::transformPosition` is the world-space center mirror; pack-time seeds it from the initializer's `center`/`offset` via a `dynamic_cast` cascade over the four initializer subtypes. `Simulator::translateObject(meshId, newPos)` is the **only** mutator and moves `state.x` and `state.xPrev` by `newPos - mesh.transformPosition`. `state.v` is unchanged.
+- **`xPrev` parity with `x` is non-negotiable.** D-013's swept-CCD reads `xPrev` as the start-of-substep position. If `state.x` moves but `state.xPrev` doesn't, the next narrow phase sees a meters-long swept segment and emits spurious tunneling contacts. Any future code path that mutates `state.x` outside the integrator must mutate `state.xPrev` by the same delta.
+- **`scene.dirty` is intentionally NOT set by `translateObject`.** Setting it would force a re-pack on next `Simulator::initialize()`, and pack reseeds `transformPosition` from the initializer's `center` — which would silently undo the translate. Translates are runtime mutations; topology is unchanged.
+- **`MeshRenderState` needs no invalidation hook on translate.** D-011's renderer reads through `mesh.state.x.ptr` each frame in `Simulator::uploadMeshes`. Mutating `state.x` in place means the next upload picks up the new positions automatically.
+- **`loadScene` does NOT need a side-table for `transformPosition`** (unlike D-007's `pendingRotations`). `o.transform.position` is fed into the new initializer's `center`/`offset`, and pack-time then reads that back into `transformPosition`. The round-trip closes implicitly.
+- **CM-006 deferred WARNING.** `BruteForce::narrow` takes a `thickness` parameter now, but the call site passes `PR(0)`. The cloth-CCD turn-6 WARNING (`radius + thickness` slow-touch band) still applies — the integrator's unconditional vn-zero (`physics.metal:202`) needs to be gated behind `(distance < thickness)` first. Out of this slice's scope; recorded as CM-006.
+- **Off-slice cleanup applied.** Reverted an uncommitted `refit() → enlargeTrajectory()` swap that was in `src/main.cpp::Simulator::update`'s working tree at session start (not in any commit). It was hiding a BDD-007 regression independent of my changes.
 
 ## Last decisions + why
 
-- **D-013** — Snapshot → swept-segment CCD in `narrow_pt_tri`. Closes CM-005, makes BDD-007 PASS.
-- **Estimator turn-4 BDD-002 follow-ups folded in this slice** — modal default path correction + AABB/facet-count assertion in Block 7. Both items were tiny; a separate housekeeping slice would have been more process overhead than the work itself.
+- **D-014** — `transformPosition` on `GeneralMesh` + `translateObject` mutates `state.x` (and `state.xPrev`) in place. Rejected: per-mesh model matrix in the renderer (much larger refactor; v1 reads positions directly from `state.x` everywhere). Rejected: mutating the initializer's `center`/`offset` (initializers are deserialization records; mutating them mid-sim conflicts with re-pack flows). Rejected: resetting `state.v` on translate (contradicts BDD-003's "next simulation step uses the new position", which implies physics carries forward).
 
 ## Next step you were about to take
 
-Slice complete. Next concrete step is the **Estimator's** turn — `./scripts/verify.sh` exits 0 cleanly (first time since cloth-drape). Expected: NOTE-level verdict.
+Slice complete. Next concrete step is the **Estimator's** turn — `./scripts/verify.sh` should exit 0 cleanly with 19/19 self-test PASS lines. Expected verdict: NOTE-level.
 
-After this lands, the next planner-tracked candidates per `PROJECT_STATE.md`:
+After this lands, planner-tracked candidates per `PROJECT_STATE.md`:
 
-- **CM-005 graduation** — move to `OLD_MISTAKES.md` after one regression-free slice. Trivial cleanup.
+- **CM-006 follow-up slice** — gate `physics.metal::integrate_cloth*` vn-zero behind `(distance < thickness)`, then wire `nparams.thickness` to `simulator.margin` (or per-mesh cloth thickness). Closes the cloth-CCD turn-6 WARNING properly.
 - **BDD-102 Determinism mechanization** — extend the harness with two-runs-bit-identical assertion against a saved-scene baseline.
 - **Material editing UI (FR-005 / BDD-005)** — needs PBR preview shader.
 - **Behavior assignment UI (FR-006 / BDD-006)** — in-place behavior switching reallocates per-mesh state.
-- **BDD-003 Translate object** — needs runtime-editable transform.
+- **BDD-019 Profiler test row** — already implemented in the GUI; add a Block in `runSelfTest` that exercises `FrameProfiler` and asserts CSV export contents.
 - **Rigid body slice (FR-008 / BDD-008)** — blocked on Q4.
 - **Alembic export slice (FR-013 / BDD-013)** — blocked on Q5 + Q6.
 

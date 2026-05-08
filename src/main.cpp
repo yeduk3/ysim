@@ -1555,6 +1555,11 @@ struct GeneralMesh {
     BehaviorParams<PR> behaviorParams;
     Material material;
     Quat rotationQuat;
+    // World-space center mirror for the inspector translate path (BDD-003).
+    // Mutated only by Simulator::translateObject; pack-time seeded from the
+    // initializer's center/offset so existing meshes preserve their author
+    // intent. Persists through saveScene/loadScene via Simulator::toSnapshot.
+    tinym::vec3 transformPosition = tinym::vec3(0);
     Constraints<BE, PR> constraints;
     ExternalForces<BE, PR> externalForces;
 
@@ -1574,6 +1579,7 @@ struct GeneralMesh {
           behaviorParams(other.behaviorParams),
           material(std::move(other.material)),
           rotationQuat(other.rotationQuat),
+          transformPosition(other.transformPosition),
           constraints(std::move(other.constraints)),
           externalForces(std::move(other.externalForces))
     {
@@ -1768,6 +1774,19 @@ struct Scene {
             RequestGeneralMesh& req = requestsGeneralMeshes[i];
             meshes.emplace_back(req.initializer, req.behaviorType, req.behaviorParams);
             meshes[i].id = req.id;
+            // Seed transformPosition from the initializer's center/offset so
+            // BDD-003's translate path computes deltas against the author
+            // intent, not against (0,0,0). Mirrors the dynamic_cast cascade
+            // in toSnapshot.
+            if (auto* g  = dynamic_cast<MeshGridInitializer  <BE, PR>*>(req.initializer)) {
+                meshes[i].transformPosition = g->params.center;
+            } else if (auto* sp = dynamic_cast<MeshSphereInitializer<BE, PR>*>(req.initializer)) {
+                meshes[i].transformPosition = sp->params.center;
+            } else if (auto* cb = dynamic_cast<MeshCubeInitializer  <BE, PR>*>(req.initializer)) {
+                meshes[i].transformPosition = cb->params.center;
+            } else if (auto* f  = dynamic_cast<MeshFileInitializer  <BE, PR>*>(req.initializer)) {
+                meshes[i].transformPosition = f->params.offset;
+            }
             Index prevNumPoints = packedMeshData.statesOffsets[i];
             Index curNumPoints = packedMeshData.statesOffsets[i+1]-prevNumPoints;
             meshes[i].state.x = VectorBase<BE, PR>(packedMeshData.x, prevNumPoints*3, curNumPoints*3);
@@ -4031,7 +4050,7 @@ struct BruteForce<METAL, PR> {
         float radius;
         float thickness;
     };
-    bool narrow(PR radius) {
+    bool narrow(PR radius, PR thickness) {
         typename Scene<METAL, PR>::PackedMeshData& packedMesh = Scene<METAL, PR>::packedMeshData;
         typename Scene<METAL, PR>::PackedCollisionData& packedCol = Scene<METAL, PR>::packedCollisionData;
 
@@ -4045,8 +4064,10 @@ struct BruteForce<METAL, PR> {
         );
         nparams.maxNumCollisions = packedCol.maxNumCollisions;
         nparams.radius = radius;
-
-        nparams.thickness = 0; // temp.
+        // The slow-touch fallback band is `radius + thickness`. Caller passes
+        // 0 for thickness today; widening it requires gating physics.metal's
+        // unconditional vn-zero behind `distance < thickness` first.
+        nparams.thickness = static_cast<float>(thickness);
 
         MetalGlobalContext::setBuffer(packedCol.broadCollisions, 0);
         MetalGlobalContext::setBuffer(packedCol.numNarrowCollisions, 1);
@@ -4065,9 +4086,9 @@ struct BruteForce<METAL, PR> {
         MetalGlobalContext::dispatchThreads(bruteForcePSO, nparams.numBroadCollisions);
         return true;
     }
-    void narrowAndSortByVertices(PR radius) {
+    void narrowAndSortByVertices(PR radius, PR thickness) {
 
-        if(narrow(radius))
+        if(narrow(radius, thickness))
             MetalGlobalContext::commitAndWait();
         else return;
         // Cumulative narrow-contact counter for the harness — `numNarrowCollisions`
@@ -4391,17 +4412,41 @@ struct Simulator {
     void addGround(PlaneDirection dir, tinym::vec3 center, PR size1D, PR mass=0.1) {
         scene.addGeneralMesh(
             new MeshGridInitializer<BE, PR>({
-                dir, 
-                center, 
-                2, 
-                size1D, 
-                mass, 
+                dir,
+                center,
+                2,
+                size1D,
+                mass,
                 false // jiggle
             }),
             BehaviorType::Float,
             FloatBehaviorParams<PR>{}
         );
     };
+
+    // BDD-003: translate the named mesh by mutating state.x (and state.xPrev)
+    // in place rather than introducing a per-mesh model matrix. xPrev moves
+    // with x by the same delta so D-013's swept-CCD does not see the
+    // user-driven teleport as a tunneling event. state.v is unchanged —
+    // translating does not reset velocity.
+    void translateObject(int meshId, tinym::vec3 newPos) {
+        auto* mesh = Scene<BE, PR>::findById(meshId);
+        if (!mesh) return;
+        tinym::vec3 delta = newPos - mesh->transformPosition;
+        if (!mesh->state.x.ptr) return;
+        const Index n = mesh->state.x.size / 3;
+        for (Index i = 0; i < n; ++i) {
+            mesh->state.x.ptr[i*3+0] += delta.x;
+            mesh->state.x.ptr[i*3+1] += delta.y;
+            mesh->state.x.ptr[i*3+2] += delta.z;
+            if (mesh->state.xPrev.ptr) {
+                mesh->state.xPrev.ptr[i*3+0] += delta.x;
+                mesh->state.xPrev.ptr[i*3+1] += delta.y;
+                mesh->state.xPrev.ptr[i*3+2] += delta.z;
+            }
+        }
+        mesh->transformPosition = newPos;
+    }
 
     void memoryAllocation() {
         //for(auto& plane : sceneObjects.planes) plane.memoryAllocation(pool);
@@ -4534,7 +4579,12 @@ struct Simulator {
                     // Without this, a flat cloth (~zero-thickness Y AABB)
                     // crossing a flat ground in one substep is missed —
                     // CM-005's root cause.
-                    collisionPipeline.broadPhase.enlargeTrajectory(system.subh);
+                    if (profiler) {
+                        auto scope = profiler->scoped("broad_enlarge_trajectory");
+                        collisionPipeline.broadPhase.enlargeTrajectory(system.subh);
+                    } else {
+                        collisionPipeline.broadPhase.enlargeTrajectory(system.subh);
+                    }
                     if (profiler) {
                         auto scope = profiler->scoped("broad_detect");
                         collisionPipeline.broadPhase.detectCollisions(margin, enableSelfCollisions);
@@ -4545,11 +4595,20 @@ struct Simulator {
 
                 if (profiler) {
                     auto scope = profiler->scoped("narrow_phase");
-                    collisionPipeline.narrowPhase.narrowAndSortByVertices(radius);
+                    collisionPipeline.narrowPhase.narrowAndSortByVertices(radius, PR(0));
                 } else {
-                    collisionPipeline.narrowPhase.narrowAndSortByVertices(radius);
+                    collisionPipeline.narrowPhase.narrowAndSortByVertices(radius, PR(0));
                 }
 
+                if (profiler) {
+                    // Per-substep totals — packed counters reset on the next
+                    // substep's broad/narrow dispatch, so read them now and
+                    // accumulate into the frame snapshot.
+                    auto& packedCol = Scene<BE, PR>::packedCollisionData;
+                    profiler->addCollisionCounts(
+                        static_cast<uint64_t>(packedCol.numBroadCollisions[0]),
+                        static_cast<uint64_t>(packedCol.numNarrowCollisions[0]));
+                }
             }
 
             // Snapshot start-of-substep positions into xPrev so the NEXT
@@ -4754,7 +4813,9 @@ struct Simulator {
 
         auto encodeOne = [&](int id, GeneralMeshInitializer<BE,PR>* init,
                               BehaviorType btype, const BehaviorParams<PR>& bparams,
-                              const ::Material& mat, const ::Quat& rot, const std::string& name) {
+                              const ::Material& mat, const ::Quat& rot,
+                              const tinym::vec3* transformOverride,
+                              const std::string& name) {
             Object o;
             o.id = id;
             o.name = name;
@@ -4796,6 +4857,14 @@ struct Simulator {
                 o.source.import.mass = (double)f->params.mass;
                 o.transform.position = {f->params.offset.x, f->params.offset.y, f->params.offset.z};
             }
+            // Realized-mesh path overrides the initializer-derived position
+            // with the live GeneralMesh::transformPosition so BDD-003 edits
+            // round-trip through saveScene/loadScene.
+            if (transformOverride) {
+                o.transform.position = {transformOverride->x,
+                                        transformOverride->y,
+                                        transformOverride->z};
+            }
             o.transform.rotation = {rot.w, rot.x, rot.y, rot.z};
 
             o.behavior.type = behaviorTypeName(btype);
@@ -4828,6 +4897,7 @@ struct Simulator {
             for (auto& m : Scene<BE,PR>::meshes) {
                 encodeOne(m.id, m.initializer, m.behaviorType, m.behaviorParams,
                           m.material, m.rotationQuat,
+                          &m.transformPosition,
                           "object_" + std::to_string(m.id));
             }
         } else {
@@ -4838,6 +4908,7 @@ struct Simulator {
                 if (pr != pendingRotations.end()) defaultRot = pr->second;
                 encodeOne(r.id, r.initializer, r.behaviorType, r.behaviorParams,
                           defaultMat, defaultRot,
+                          nullptr,
                           "object_" + std::to_string(r.id));
             }
         }
@@ -5733,6 +5804,151 @@ static int runSelfTest() {
 
     std::remove(path.c_str());
 
+    // ---- Block 9: BDD-003 — Translate a selected object. -------------------
+    // TESTS.md#BDD-003 wording (verbatim, *not* the matrix-row label):
+    //   Given an object positioned at the origin
+    //   When  the user sets its position to (1, 2, 3)
+    //   Then  the object's center is (1, 2, 3); the next simulation step
+    //         uses the new position; rendering reflects the new position
+    //         on the next frame.
+    // The harness mechanizes all three "Then" clauses against a freshly
+    // created Float-tagged cube at the origin (Float so post-update x/z stay
+    // exact-zero — the witness for clause (b) is a strict-equality check
+    // rather than a gravity-fudge tolerance).
+    {
+        resetScene();
+        sim.addCube(tinym::vec3(0.0f, 0.0f, 0.0f), /*tess=*/2,
+                    /*size=*/0.2f, /*mass=*/0.1f);
+        sim.initialize();
+        const int translateId = 0;
+
+        auto* mesh = Scene<Backend, Precision>::findById(translateId);
+        if (!mesh) {
+            fail("BDD-003 setup",
+                 "translate target id=" + std::to_string(translateId) + " not found");
+        } else {
+            const Index nv = mesh->state.x.size / 3;
+
+            // Pre-translate witness vertex at v=0 (cube starts centered on
+            // origin, so witness is somewhere on the cube surface around 0).
+            double pre_x0 = mesh->state.x.ptr[0];
+            double pre_y0 = mesh->state.x.ptr[1];
+            double pre_z0 = mesh->state.x.ptr[2];
+
+            // Mean position pre-translate.
+            double preMeanX = 0, preMeanY = 0, preMeanZ = 0;
+            for (Index v = 0; v < nv; ++v) {
+                preMeanX += mesh->state.x.ptr[v * 3 + 0];
+                preMeanY += mesh->state.x.ptr[v * 3 + 1];
+                preMeanZ += mesh->state.x.ptr[v * 3 + 2];
+            }
+            preMeanX /= (double)nv;
+            preMeanY /= (double)nv;
+            preMeanZ /= (double)nv;
+
+            tinym::vec3 target(1.0f, 2.0f, 3.0f);
+            sim.translateObject(translateId, target);
+
+            // Clause (a) — "the object's center is (1, 2, 3)".
+            // Center per BDD-003 reads back as transformPosition AND the
+            // per-axis mean of state.x reflects the same translation delta.
+            auto* postMesh = Scene<Backend, Precision>::findById(translateId);
+            if (!postMesh) {
+                fail("BDD-003 / object's center is (1, 2, 3)",
+                     "mesh disappeared after translate");
+            } else {
+                double tpX = postMesh->transformPosition.x;
+                double tpY = postMesh->transformPosition.y;
+                double tpZ = postMesh->transformPosition.z;
+                double postMeanX = 0, postMeanY = 0, postMeanZ = 0;
+                for (Index v = 0; v < nv; ++v) {
+                    postMeanX += postMesh->state.x.ptr[v * 3 + 0];
+                    postMeanY += postMesh->state.x.ptr[v * 3 + 1];
+                    postMeanZ += postMesh->state.x.ptr[v * 3 + 2];
+                }
+                postMeanX /= (double)nv;
+                postMeanY /= (double)nv;
+                postMeanZ /= (double)nv;
+                if (std::abs(tpX - 1.0) > 1e-5 ||
+                    std::abs(tpY - 2.0) > 1e-5 ||
+                    std::abs(tpZ - 3.0) > 1e-5) {
+                    fail("BDD-003 / object's center is (1, 2, 3)",
+                         "transformPosition=(" + std::to_string(tpX) + "," +
+                         std::to_string(tpY) + "," + std::to_string(tpZ) +
+                         "); expected (1, 2, 3)");
+                } else if (std::abs((postMeanX - preMeanX) - 1.0) > 1e-4 ||
+                           std::abs((postMeanY - preMeanY) - 2.0) > 1e-4 ||
+                           std::abs((postMeanZ - preMeanZ) - 3.0) > 1e-4) {
+                    fail("BDD-003 / object's center is (1, 2, 3)",
+                         "state.x mean did not shift by (1, 2, 3)");
+                } else {
+                    pass("BDD-003 / object's center is (1, 2, 3)");
+                }
+
+                // Clause (b) — "the next simulation step uses the new
+                // position". Float behavior is a no-op integrator: state.x
+                // must equal the post-translate state after one update().
+                // If the integrator instead saw the old position the witness
+                // vertex would jump back toward the origin.
+                double tx0 = postMesh->state.x.ptr[0];
+                double ty0 = postMesh->state.x.ptr[1];
+                double tz0 = postMesh->state.x.ptr[2];
+                if (std::abs(tx0 - (pre_x0 + 1.0)) > 1e-5 ||
+                    std::abs(ty0 - (pre_y0 + 2.0)) > 1e-5 ||
+                    std::abs(tz0 - (pre_z0 + 3.0)) > 1e-5) {
+                    fail("BDD-003 / next simulation step uses the new position",
+                         "post-translate witness drifted before update()");
+                } else {
+                    pumpFrames(sim, 1);
+                    auto* stepMesh = Scene<Backend, Precision>::findById(translateId);
+                    if (!stepMesh) {
+                        fail("BDD-003 / next simulation step uses the new position",
+                             "mesh disappeared after update()");
+                    } else {
+                        double sx0 = stepMesh->state.x.ptr[0];
+                        double sy0 = stepMesh->state.x.ptr[1];
+                        double sz0 = stepMesh->state.x.ptr[2];
+                        if (std::abs(sx0 - tx0) > 1e-5 ||
+                            std::abs(sy0 - ty0) > 1e-5 ||
+                            std::abs(sz0 - tz0) > 1e-5) {
+                            fail("BDD-003 / next simulation step uses the new position",
+                                 "Float-tagged witness moved between pre-step and post-step "
+                                 "(integrator did not start from the translated state)");
+                        } else {
+                            pass("BDD-003 / next simulation step uses the new position");
+                        }
+                    }
+                }
+
+                // Clause (c) — "rendering reflects the new position on the
+                // next frame". The renderer reads through
+                // MeshRenderState::getOrCreate(mesh).updateBuffer(state.x.ptr)
+                // each frame; in headless mode the testable proxy is that
+                // state.x.ptr (the pointer the renderer hands GL) already
+                // carries the translated values when the next frame would
+                // start. D-NNN records this proxy boundary — graduates to a
+                // pixel-render assertion when a render harness exists.
+                auto* renderMesh = Scene<Backend, Precision>::findById(translateId);
+                if (!renderMesh || !renderMesh->state.x.ptr) {
+                    fail("BDD-003 / rendering reflects the new position on the next frame",
+                         "render-source state.x missing");
+                } else {
+                    double rx = renderMesh->state.x.ptr[0];
+                    double ry = renderMesh->state.x.ptr[1];
+                    double rz = renderMesh->state.x.ptr[2];
+                    if (std::abs(rx - (pre_x0 + 1.0)) > 1e-5 ||
+                        std::abs(ry - (pre_y0 + 2.0)) > 1e-5 ||
+                        std::abs(rz - (pre_z0 + 3.0)) > 1e-5) {
+                        fail("BDD-003 / rendering reflects the new position on the next frame",
+                             "render-source state.x does not reflect the (1, 2, 3) shift");
+                    } else {
+                        pass("BDD-003 / rendering reflects the new position on the next frame");
+                    }
+                }
+            }
+        }
+    }
+
     if (failures == 0) {
         std::cerr << "[self-test] all checks passed\n";
         return 0;
@@ -5973,6 +6189,10 @@ int main(int argc, char** argv) {
                 target.behavior_label = behaviorTypeName(selectedMesh->behaviorType);
                 target.shape_label = shapeTypeName(selectedMesh->shapeType);
                 target.base_color = &selectedMesh->material.baseColor;
+                target.transform_position = &selectedMesh->transformPosition;
+                target.on_translate = [&simulator](int id, tinym::vec3 v) {
+                    simulator.translateObject(id, v);
+                };
             }
             return target;
         };

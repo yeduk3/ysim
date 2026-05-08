@@ -53,3 +53,20 @@ When an entry has not recurred for a while and the underlying cause is gone (arc
 - First seen: 2026-05-07   Last seen: 2026-05-07
 
 _Note: CM-005 (cloth tunnels through static ground) graduated to `docs/mistakes/OLD_MISTAKES.md` on 2026-05-08 — the structural cause (snapshot narrow-phase) was replaced by swept-segment CCD in D-013, so the failure mode cannot recur in the same form._
+
+## CM-006 — Widening the narrow-phase slow-touch band drains vy off non-penetrating particles via the integrator's unconditional vn-zero
+
+- Where: `src/metal/bruteforce.metal::narrow_pt_tri` (slow-touch trigger `d_cur < radius + thickness`), `src/metal/physics.metal::integrate_cloth` and `integrate_cloth_grid` (vn-zero block at line 202 / equivalent in the second kernel — fires unconditionally on any narrow contact).
+- Low-level cause: any narrow contact that fires causes the integrator to zero the normal-velocity component (`if (vn < 0.0f) vel -= vn * n`), regardless of whether the position-push that follows actually fires (`if (distance < thickness) pos += (thickness - distance) * n`). Setting `nparams.thickness > 0` widens the kernel's `inMargin` band but doesn't change the integrator's gate, so far-from-surface particles whose `d_cur` falls in `[thickness, radius + thickness]` get their vy zeroed without any compensating push.
+- High-level cause: the kernel's "fire a contact" semantic and the integrator's "respond to a contact" semantic are coupled by an implicit assumption that `d_cur < thickness` whenever a contact fires. The cloth-CCD slice broke that assumption (CCD fires contacts on plane-crossing regardless of `d_cur`), but only the position push got a `(distance < thickness)` guard — the vn-zero inherited the old unconditional shape.
+- Fix direction: gate the vn-zero block in both `integrate_cloth*` kernels behind `(distance < thickness)`, matching the position push:
+  ```
+  float distance = vertColFacets[i].collisionNormalAndDistance.w;
+  float thickness = clothParams.thickness;
+  if (distance < thickness) {
+      if (vn < 0.0f) vel -= vn * n;
+      pos += (thickness - distance) * n;
+  }
+  ```
+  Then wire `nparams.thickness` from the call site (`simulator.margin` or per-mesh cloth thickness). Without the kernel-side gate first, plumbing a non-zero `thickness` regresses BDD-007 by ~50µm.
+- First seen: 2026-05-07   Last seen: 2026-05-07
