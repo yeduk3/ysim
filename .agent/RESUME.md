@@ -1,18 +1,17 @@
-# Resume — Cloth Thickness Band Slice (CM-006 closed)
+# Resume — Profiler Pause-Gate Slice
 
 ## Must remember
 
-- **Branch:** `fix/cloth-thickness-band` (off `main` at `b0de64c`).
-- **D-016 is load-bearing.** Both cloth integrator kernels (`integrate_cloth`, `integrate_cloth_grid`) gate vn-zero AND position-push behind the **same** `(distance < thickness)` condition. Re-introducing an unconditional vn-zero (or splitting the two gates) re-opens CM-006 — far-from-surface particles in the slow-touch band lose vy without any compensating push.
-- **Detection band wider than response gate, on purpose.** `narrow_pt_tri`'s `inMargin = (d_cur < radius + thickness)` is wider than the integrator's `(distance < thickness)` gate. The asymmetry is correct: detection catches plane-crossings (D-013 swept-CCD) regardless of `d_cur`, but the integrator only responds when the particle is actually within `thickness` of the surface. Future slices that touch either side need to keep this asymmetry.
-- **`simulator.margin = 0.015` is the v1 slow-touch band.** Per-mesh cloth thickness plumbing is parked. If the harness or a future slice surfaces a need for per-mesh values, plumb them through `packedMeshData` (similar to `statesOffsets`); don't reach into `clothParams` from the narrow kernel.
-- **Substep count stays at 8.** D-013 tuned this to keep BDD-007 tunneling below the 0 threshold. Don't change it as a "speed-up" without a fresh BDD-007 multi-run determinism check.
-- **Both kernels in tandem.** `integrate_cloth` (TriangularCloth, used by `addCloth`) and `integrate_cloth_grid` (FastGridCloth, GUI-reachable) have textually identical contact-loop bodies in this region. Future contact-loop changes need both kernels updated together; editing one silently breaks the other path.
-- **CM-006 graduation breadcrumb** lives in `COMMON_MISTAKES.md` (line ~57). Future planners scanning the active list should see "graduated to OLD_MISTAKES" and not re-debate the open question.
+- **Branch:** `fix/profiler-pause-gate` (off `main` at `ea5e973`).
+- **D-017 is load-bearing.** `ProfilerFrameGate` (in `FrameProfiler.hpp`) is the **single** owner of the `beginFrame` / `endFrame` pairing. Construction with `collect == true` calls `beginFrame`; `close()` (or destructor) calls the matching `endFrame` exactly once. Initial `closed_ = !collect` guarantees `endFrame` is never called without a paired `beginFrame`. Anyone adding a new code path that wants to drive the profiler's per-frame collection must construct a `ProfilerFrameGate`, not call `beginFrame` / `endFrame` directly.
+- **Production calls `frameGate.close()` explicitly** before the window-title read at the end of the render lambda. Destructor-only would change ordering — the title reads `frameProfiler.history().latestFrame()` and needs `endFrame` to have run. Don't move `close()` later or remove it.
+- **Block 10 clause (c) drives the same gate predicate** production uses (`!sim.pause`). If a future refactor changes the predicate (e.g., adds "also pause when window unfocused"), the harness will still drive the new predicate as long as it constructs the gate with `!sim.pause`. Bug-probe-verified.
+- **Pass label wording unchanged** — `BDD-019 / history collection pauses when sim pauses`. Matrix-row test address still correct.
+- **Nested scoped() guards stay** — the `if (collectProfileFrame) { auto scope = frameProfiler.scoped(...); ... }` blocks for `physics_total`, `render_total`, `imgui_draw` etc. are unchanged. They're out of this slice's scope and correct as-is.
 
 ## Last decisions + why
 
-- **D-016** — vn-zero block moved inside the `(distance < thickness)` gate; call site passes `simulator.margin` instead of `PR(0)`. Closes CM-006 (parked since cloth-CCD turn 6). Rejected: ε-padded gate (no justification for the tunable), unconditional vn-zero with bigger constant (overcorrects approaching particles), shrinking detection band to match response gate (negates D-013's swept-CCD design). The asymmetry between detection and response gates is load-bearing and recorded.
+- **D-017** — RAII guard wraps the begin/end pair. Rejected: free lambda-helper (render-loop body spans 290 lines and includes ordering constraints with the post-endFrame window-title read); free predicate function (too thin — doesn't enforce begin/end pairing); leave the proxy (Estimator turn-8 explicitly called it out as a real risk). The RAII guard owns the pairing and is testable in isolation.
 
 ## Next step you were about to take
 
@@ -20,8 +19,7 @@ Slice complete. Next concrete step is the **Estimator's** turn — `./scripts/ve
 
 After this lands, planner-tracked candidates per `PROJECT_STATE.md`:
 
-- **BDD-019 pause-gate refactor (Estimator turn-8 WARNING fold-up)** — extract render loop's `if (collectProfileFrame)` gate into a helper that the harness can also call, so Block 10's pause check exercises the actual gate instead of a proxy. Small (~10 lines + 1 assertion). Next slice.
-- **BDD-102 Determinism mechanization** — extend the harness with two-runs-bit-identical assertion against a saved-scene baseline. Smallest slice.
+- **BDD-102 Determinism mechanization** — extend the harness with two-runs-bit-identical assertion against a saved-scene baseline. Smallest slice. Newly tractable now that BDD-007 is stable and the profiler gate is testable end-to-end.
 - **Material editing UI (FR-005 / BDD-005)** — needs PBR preview shader.
 - **Behavior assignment UI (FR-006 / BDD-006)** — in-place behavior switching reallocates per-mesh state.
 - **Rigid body slice (FR-008 / BDD-008)** — blocked on Q4. When this lands it adds a fifth initializer subtype and triggers D-015's three-site cascade update.

@@ -265,4 +265,38 @@ private:
     bool frame_open_ = false;
 };
 
+// RAII guard that bundles the begin/end pair as a single object gated on a
+// single predicate. Production and the test harness both construct it with
+// the same `collect = !simulator.pause` value so they drive the same
+// gate; a future regression in the predicate (e.g., flipping the
+// condition) breaks the harness immediately. close() is callable
+// explicitly when endFrame() must precede other work (e.g., the window
+// title read after the render loop's profile block); the destructor calls
+// close() as a safety net. closed_ initial value is !collect so close()
+// is a no-op when the gate isn't collecting — endFrame() is never called
+// without a paired beginFrame().
+class ProfilerFrameGate {
+public:
+    ProfilerFrameGate(FrameProfiler& profiler, bool collect,
+                      uint64_t sequence, double wall_time_seconds)
+        : profiler_(profiler), collect_(collect), closed_(!collect) {
+        if (collect_) profiler_.beginFrame(sequence, wall_time_seconds);
+    }
+    ProfilerFrameGate(const ProfilerFrameGate&) = delete;
+    ProfilerFrameGate& operator=(const ProfilerFrameGate&) = delete;
+    ~ProfilerFrameGate() { close(); }
+
+    void close() {
+        if (closed_) return;
+        profiler_.endFrame();
+        closed_ = true;
+    }
+    bool collecting() const { return collect_; }
+
+private:
+    FrameProfiler& profiler_;
+    bool collect_;
+    bool closed_;
+};
+
 } // namespace profiler

@@ -6079,18 +6079,23 @@ static int runSelfTest() {
         }
 
         // Clause (c) [Notes invariant]: paused sim does not collect.
-        // Production gating in main.cpp skips beginFrame/endFrame entirely
-        // when sim.pause is true, so a paused tick must not push a
-        // snapshot. Mechanize that by NOT calling begin/end and confirming
-        // the frame count is unchanged.
+        // Drive ProfilerFrameGate with the same predicate the production
+        // render loop uses (`!sim.pause`). When `collect == false`, the
+        // guard's beginFrame/endFrame both no-op, so a paused tick must
+        // leave history.frames() untouched. This exercises the actual
+        // gate predicate, not just the absence of begin/end calls (D-017
+        // closes Estimator turn-8 WARNING).
         size_t framesBefore = hist.frames().size();
         sim.pause = true;
-        // Intentionally skip beginFrame/endFrame here — that's what
-        // production does when sim.pause is true.
+        {
+            profiler::ProfilerFrameGate pausedGate(harnessProfiler,
+                                                   !sim.pause, 99, 99.0);
+            sim.update();
+        }
         size_t framesAfter = hist.frames().size();
         if (framesAfter != framesBefore) {
             fail("BDD-019 / history collection pauses when sim pauses",
-                 "frame count grew without explicit begin/end on a paused tick");
+                 "ProfilerFrameGate(collect=false) still pushed a snapshot");
         } else {
             pass("BDD-019 / history collection pauses when sim pauses");
         }
@@ -6328,9 +6333,11 @@ int main(int argc, char** argv) {
     auto render = [&]() {
         double currentTime = glfwGetTime();
         bool collectProfileFrame = !simulator.pause;
-        if (collectProfileFrame) {
-            frameProfiler.beginFrame(simulator.frame, currentTime);
-        }
+        // The guard pairs begin/endFrame on `collectProfileFrame`. Block 10
+        // clause (c) constructs the same guard with `!sim.pause` so the
+        // harness drives the production gate predicate (D-017).
+        profiler::ProfilerFrameGate frameGate(frameProfiler, collectProfileFrame,
+                                              simulator.frame, currentTime);
 
         auto buildSelectedMeshTarget = [&]() {
             mesh_inspector::MeshInspectorTarget target;
@@ -6617,9 +6624,9 @@ int main(int argc, char** argv) {
             ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
         }
 
-        if (collectProfileFrame) {
-            frameProfiler.endFrame();
-        }
+        // Close before the window-title read below — title reads
+        // history().latestFrame() and needs endFrame() to have run.
+        frameGate.close();
 
         if (const auto* latest = frameProfiler.history().latestFrame()) {
             char title[256];
