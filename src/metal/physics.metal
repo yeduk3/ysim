@@ -198,15 +198,18 @@ kernel void integrate_cloth_grid(
 
         float vn = dot(vel, n);
 
-        // normal 방향으로 파고드는 속도만 제거
-        if (vn < 0.0f) {
-            vel -= vn * n;
-        }
-
         float distance = vertColFacets[i].collisionNormalAndDistance.w;
         float thickness = clothParams.thickness;
 
+        // D-016: vn-zero and position-push share the (distance < thickness)
+        // gate. The narrow-phase fires contacts on the wider radius+thickness
+        // band, but the integrator's response only fires when the particle is
+        // actually within thickness of the surface. Without this gate, far-
+        // from-surface particles in the slow-touch band drained vn (CM-006).
         if (distance < thickness) {
+            if (vn < 0.0f) {
+                vel -= vn * n;
+            }
             pos += (thickness - distance) * n;
         }
     }
@@ -324,15 +327,18 @@ kernel void integrate_cloth(
 
         float vn = dot(vel, n);
 
-        // normal 방향으로 파고드는 속도만 제거
-        if (vn < 0.0f) {
-            vel -= vn * n;
-        }
-
         float distance = vertColFacets[i].collisionNormalAndDistance.w;
         float thickness = clothParams.thickness;
 
+        // D-016: vn-zero and position-push share the (distance < thickness)
+        // gate. The narrow-phase fires contacts on the wider radius+thickness
+        // band, but the integrator's response only fires when the particle is
+        // actually within thickness of the surface. Without this gate, far-
+        // from-surface particles in the slow-touch band drained vn (CM-006).
         if (distance < thickness) {
+            if (vn < 0.0f) {
+                vel -= vn * n;
+            }
             pos += (thickness - distance) * n;
         }
     }

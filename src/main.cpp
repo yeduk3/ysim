@@ -4064,9 +4064,8 @@ struct BruteForce<METAL, PR> {
         );
         nparams.maxNumCollisions = packedCol.maxNumCollisions;
         nparams.radius = radius;
-        // The slow-touch fallback band is `radius + thickness`. Caller passes
-        // 0 for thickness today; widening it requires gating physics.metal's
-        // unconditional vn-zero behind `distance < thickness` first.
+        // Slow-touch band is radius + thickness; integrator gates vn-zero
+        // and position-push on (distance < thickness) per D-016.
         nparams.thickness = static_cast<float>(thickness);
 
         MetalGlobalContext::setBuffer(packedCol.broadCollisions, 0);
@@ -4611,9 +4610,9 @@ struct Simulator {
 
                 if (profiler) {
                     auto scope = profiler->scoped("narrow_phase");
-                    collisionPipeline.narrowPhase.narrowAndSortByVertices(radius, PR(0));
+                    collisionPipeline.narrowPhase.narrowAndSortByVertices(radius, margin);
                 } else {
-                    collisionPipeline.narrowPhase.narrowAndSortByVertices(radius, PR(0));
+                    collisionPipeline.narrowPhase.narrowAndSortByVertices(radius, margin);
                 }
 
                 if (profiler) {

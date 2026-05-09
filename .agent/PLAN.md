@@ -1,408 +1,273 @@
-# Plan — Translate-Pack Roundtrip + BDD-019 Profiler Test (`fix/translate-pack-and-bdd019`)
+# Plan — CM-006 vn-zero Gate + Slow-Touch Band (`fix/cloth-thickness-band`)
 
 > Owner: **Planner** writes; **Generator** executes; **Estimator** judges.
 > Updated: 2026-05-09
 
 ## Course note: previous slice's verdict
 
-Estimator turn 7 on `feat/translate-object` (now merged at `53fe5a8`)
-returned **WARNING** (commit allowed, two follow-up items). This slice
-absorbs both per PLANNER.md procedure step 2 ("folding small WARNINGs
-into the next slice is fine when both items are small"):
+Estimator turn 8 on `fix/translate-pack-and-bdd019` (now merged at
+`b0de64c`) returned **WARNING** (commit allowed, one item). The
+WARNING is **deliberately not folded** into this slice — see Non-goals
+section below. Reasoning: this slice touches Metal kernels in the
+cloth integrator, which is the most numerically-sensitive area in the
+project (50µm of drift in BDD-007 has BLOCKed past slices). Mixing in
+a profiler refactor expands the slice's surface-area for marginal
+gain. The turn-8 WARNING gets its own next slice.
 
-- **WARNING (a) — translate doesn't survive a re-pack.**
-  `Simulator::translateObject` mutates `state.x`, `state.xPrev`, and
-  `mesh.transformPosition`, but the *initializer's*
-  `center`/`offset` (the canonical owner across `Scene::pack()`) is
-  never updated. Any re-pack triggered by create/import/load silently
-  reseeds `transformPosition` from the stale initializer and undoes
-  the translate. Slice-critical bug — closes here.
-
-- **WARNING (b) — BDD-019 still pending while profiler shipped new
-  CSV columns.** `BDD-019` (frame profiler shows and exports timings)
-  is implemented in code but its matrix row stays `pending`; the
-  prior slice added `broad_collisions` / `narrow_collisions` columns
-  to the CSV without coverage. New Block 10 in `runSelfTest`
-  mechanizes BDD-019 against `docs/TESTS.md#BDD-019` and asserts the
-  new collision-count columns are present.
-
-CM-006 (vn-zero-gate / cloth thickness re-enable) stays parked — its
-fix is a Metal-kernel change in `physics.metal::integrate_cloth*`,
-which is its own slice. Not folded here.
+CM-006 has been **deferred two slices in a row** (cloth-CCD turn 6 →
+translate-object → translate-pack-and-bdd019). Per PLANNER.md
+procedure step 6 (escape-pattern detection), three consecutive
+deferrals would force a pivot. We close it here before that point.
 
 ## Goal
 
-Two targeted closures on `fix/translate-pack-and-bdd019`:
+Close `CM-006` (the parked WARNING from cloth-CCD turn 6). After this
+slice:
 
-1. `Simulator::translateObject` writes the new center back into the
-   initializer's `params.center` / `params.offset` so a subsequent
-   `Scene::pack()` reproduces the translated state. Block 9 in
-   `runSelfTest` gains a "translate → re-pack → still translated"
-   assertion that fails on the current code and passes after the
-   fix.
-2. `BDD-019` matrix row promotes from `pending` to `pass` via a new
-   Block 10 in `runSelfTest` that:
-   - Attaches a `FrameProfiler` to a fresh `Simulator`, calls
-     `beginFrame` / `update` / `endFrame`, and asserts a snapshot
-     was pushed with non-empty section_ms.
-   - Calls `FrameProfilerHistory::exportCsv(...)` to a tmp path and
-     asserts (a) the call returns `true`, (b) the header line
-     contains `frame_sequence,wall_time_seconds,frame_ms,fps,broad_collisions,narrow_collisions`,
-     (c) at least one data row exists.
-   - Verifies the **pause-gating Notes invariant** by toggling
-     `simulator.pause = true` and confirming a frame *not* wrapped
-     in begin/end does NOT add a snapshot.
-
-When this slice ships:
-- `verify.sh` exits 0 with **21/21 self-test PASS** (was 19/19; one
-  new BDD-003 round-trip line + three new BDD-019 lines = +4, but
-  one of the BDD-003 lines might displace into the same block —
-  expect ~22 actually). Generator confirms the count.
-- `docs/TEST_MATRIX.md` row `BDD-019` flips `pending → pass`.
-- BDD-003 row stays `pass` with an extended test address pointing
-  at both the original Block 9 assertions and the new round-trip
-  assertion.
+- `physics.metal::integrate_cloth` and `integrate_cloth_grid` gate
+  the **vn-zero block** behind `(distance < thickness)`, matching the
+  position-push gate that lives below it. Today the vn-zero block
+  fires unconditionally on any narrow contact, so widening the
+  slow-touch band drains normal-velocity off particles that are not
+  actually penetrating.
+- `BruteForce::narrow`'s call site passes `simulator.margin` (not
+  `PR(0)`) so the kernel's slow-touch band is `radius + margin`
+  instead of `radius`. This was the original cloth-CCD turn-6 plan;
+  the call site was clamped to `0` in the prior slice because raising
+  it without the kernel-side gate regressed BDD-007 by ~50µm.
+- `BDD-007`'s tunneling clause (`no cloth vertex tunnels through
+  ground`) **still PASSes**. That is the slice's non-negotiable
+  acceptance gate — the change must not regress the standing 4/4
+  cloth-on-ground clauses.
+- `CM-006` graduates from `docs/mistakes/COMMON_MISTAKES.md` to
+  `docs/mistakes/OLD_MISTAKES.md` per the file's promotion rule
+  ("when an entry has not recurred for a while and the underlying
+  cause is gone").
 
 ## Scope
 
-- **`Simulator::translateObject` writes back to the initializer.**
-  Same `dynamic_cast` cascade as pack-time seeding (in `Scene::pack`
-  ~line 1773 of post-translate-slice main.cpp): for each of
-  `MeshGridInitializer` / `MeshSphereInitializer` /
-  `MeshCubeInitializer`, set `params.center = newPos`; for
-  `MeshFileInitializer`, set `params.offset = newPos`. Idempotent
-  with the existing `mesh.transformPosition = newPos` write. After
-  this, the next `Scene::pack()` rebuilds `state.x` from the
-  *translated* center via the initializer's
-  `initialize(state, adjacency)` path, and pack-time's
-  transformPosition seeding reads back the translated value.
+- **`src/metal/physics.metal::integrate_cloth`** (line ~286). Move
+  the vn-zero `if (vn < 0.0f) vel -= vn * n;` block from line ~327
+  into the existing `if (distance < thickness) { ... }` block at
+  line ~335, *before* the position push:
 
-- **Block 9 (BDD-003) extension.** After the existing three "Then"
-  assertions, add a **fourth** assertion: call
-  `simulator.initialize()` (which triggers `Scene::pack()`), then
-  re-resolve `findById(translateId)` and verify
-  `transformPosition` equals `(1, 2, 3)` AND per-axis state.x mean
-  still reflects the translated center. Pass label:
-  `BDD-003 / translate survives Scene::pack rebuild`.
+  ```cpp
+  float distance = vertColFacets[i].collisionNormalAndDistance.w;
+  float thickness = clothParams.thickness;
+  if (distance < thickness) {
+      if (vn < 0.0f) vel -= vn * n;       // <-- moved
+      pos += (thickness - distance) * n;
+  }
+  ```
 
-- **Block 10 (BDD-019) — new.** Mechanizes BDD-019's three "Then"
-  clauses verbatim from `docs/TESTS.md#BDD-019`:
-  1. *"per-section timings updated each frame"* — assert that after
-     `endFrame()` the latest snapshot's `section_ms` has at least
-     one non-zero entry corresponding to a known section name
-     (`narrow_phase` or `broad_detect` — these run unconditionally
-     in `Simulator::update`'s substep loop).
-  2. *"a CSV file is written under `profiles/` containing the
-     recorded history"* — call `exportCsv("/tmp/ysim_profiler_test.csv")`
-     (using `/tmp` not `profiles/` for harness hygiene; the path
-     suffix is what matters for the BDD wording — adjust pass label
-     accordingly), assert return-true and parse: header contains
-     `broad_collisions,narrow_collisions`, at least one data row.
-  3. *Notes invariant: "history collection must pause when the
-     simulation pauses"* — set `sim.pause = true`, run an "outer
-     frame" without calling `beginFrame`/`endFrame` (matching the
-     production gating at `main.cpp:6180-6182`), assert
-     `history.frames().size()` did not grow.
+  Note that `vn` is computed at line ~325 from `vel` and `n` — it
+  must continue to be computed *before* the gate (the values are
+  read; the **mutation** of `vel` is what gets gated).
 
-- **`docs/TEST_MATRIX.md` updates** for both rows.
+- **`src/metal/physics.metal::integrate_cloth_grid`** (line ~160).
+  Same shape — the kernel is structurally identical in this region
+  (lines ~199–211 mirror the triangular-cloth integrator). Apply
+  the same gating.
+
+- **`src/main.cpp::Simulator::update`** (~line 4609 / 4611). Replace
+  the two `narrowAndSortByVertices(radius, PR(0))` calls with
+  `narrowAndSortByVertices(radius, margin)`. Drop the multi-line
+  comment about "thickness=0 preserves cloth-CCD turn-6 baseline" /
+  "CM-006 / D-NNN" — that comment is now stale; the gate is in
+  place. Replace with a one-liner pointing at D-016.
+
+- **`src/main.cpp::BruteForce::narrow`** (~line 4067). Update the
+  small comment block in front of `nparams.thickness = ...` to
+  reflect the new state: slow-touch band is `radius + thickness`,
+  caller passes a real value, kernel-side vn-zero is gated.
+
+- **CM-006 graduation.** Move CM-006 from
+  `docs/mistakes/COMMON_MISTAKES.md` to
+  `docs/mistakes/OLD_MISTAKES.md` under a `## High-level cause:
+  contact response gates inherit from older code paths` group (or
+  similar). Format per OLD_MISTAKES.md's existing pattern: origin
+  entry id, why it stopped, direction for similar problems.
+
+- **DECISIONS — D-016.** Record the load-bearing pairing: kernel
+  vn-zero gate matches position-push gate, both keyed on
+  `(distance < thickness)`. The narrow phase's `inMargin` band is
+  intentionally **wider** than the integrator's response gate; the
+  asymmetry is fine because the *response* is gated by the
+  integrator itself.
+
+- **`runSelfTest` verification (no new assertions).** Block 6
+  (BDD-007) and Blocks 9–10 (BDD-003 / BDD-019) all stay green. The
+  slice's value is correctness-of-existing-behavior; no new test
+  rows. The Generator confirms 23/23 PASS unchanged after the
+  kernel rebuild + binding wiring.
 
 ## Non-goals (this slice)
 
-- **CM-006 vn-zero gate.** Stays parked. That fix touches
-  `physics.metal::integrate_cloth*`'s response loop and risks
-  re-opening BDD-007. It deserves its own slice with a careful
-  before/after harness comparison.
-- **Profiler GUI changes.** No UI work; the `Export CSV` button
-  is already there. Block 10 hits the underlying
-  `FrameProfilerHistory::exportCsv` directly.
-- **CSV format changes beyond what BDD-003 already shipped.** Don't
-  add fields, don't reorder columns. Block 10's header check is the
-  contract going forward.
-- **Spec rewording.** TESTS.md#BDD-019 says "CSV file is written
-  under `profiles/`"; the harness uses `/tmp` for hygiene. The pass
-  label notes this explicitly so the substitution is auditable —
-  *not* a silent reinterpretation. The spec's intent (a real CSV
-  with the recorded history) is fully satisfied.
+- **Estimator turn-8 WARNING (BDD-019 pause check is proxy-level).**
+  Defers to its own next slice. Reasoning: closing it cleanly likely
+  needs a small refactor (extract the render-loop's `if
+  (collectProfileFrame)` gate into a helper that the harness can
+  also call). That refactor adds API surface and changes production
+  code structure. The Metal-kernel work in this slice is risky
+  enough that I want the slice's surface narrow to BDD-007 +
+  cloth-related regression; mixing in profiler concerns is
+  scope-creep. Recorded as the **next** standing candidate.
+
+- **Per-mesh thickness plumbing into the kernel.** Today
+  `nparams.thickness` is global across all cloth meshes. A future
+  slice can plumb per-mesh thickness through the narrow kernel via
+  packed buffers (similar to `packedMesh.statesOffsets`), but that
+  is its own design problem and out of scope. `simulator.margin`
+  (0.015) is a reasonable global fallback for v1.
+
+- **Cloth-on-cloth (self) collision.** Still parked at PRD §4.
+
+- **Any kernel change beyond the vn-zero gate move.** Don't refactor
+  the contact loop body, don't tweak `nlen2 < 1e-12f` thresholds,
+  don't reorder buffer bindings. The gate move is the slice; that
+  is the entire kernel-side surface.
+
+- **New BDD coverage.** No new matrix rows, no new assertions in
+  `runSelfTest`. The slice is a structural correctness fix — the
+  existing 23/23 PASS is the contract.
+
 - **Resolving any of `Q1`, `Q2`, `Q4`, `Q5`, `Q6`, `Q7`.**
-- **Determinism (BDD-102), material UI (BDD-005), behavior switching
-  (BDD-006), or any other matrix row** — separate slices.
 
 ## Todo
 
 Ordered. Generator executes top-to-bottom.
 
-1. **Branch hygiene.** Already on `fix/translate-pack-and-bdd019`
-   (off `main` at `53fe5a8`). No new branch. Confirm `git status`
-   is clean. This is a `fix:` slice — commit prefix should be `fix:`
-   not `add:`.
+1. **Branch hygiene.** Already on `fix/cloth-thickness-band` (off
+   `main` at `b0de64c`). No new branch. Commit prefix: `fix:`.
 
-2. **Re-read the binding "Then" clauses.** `docs/TESTS.md#BDD-019`
-   (lines 177–183) and `docs/specs/FRD.md#FR-019` (lines 208–216).
-   Block 10 assertions are authored from these verbatim. Compressed
-   matrix-row label "Frame profiler shows and exports timings" is
-   *not* the spec — spec-vs-label trap (codified in
-   `docs/roles/GENERATOR.md` step 3).
+2. **Re-read CM-006.**
+   `docs/mistakes/COMMON_MISTAKES.md` (lines 57–72) lays out the
+   exact fix shape — the planner already cribbed from it; the
+   Generator should re-read so the kernel edit isn't a paraphrase.
 
-3. **Fix `Simulator::translateObject` to write back to the
-   initializer.** In `src/main.cpp::Simulator::translateObject`
-   (~line 4432 post-translate-slice), after the existing
-   `state.x` / `state.xPrev` / `transformPosition` writes, add:
+3. **Edit `src/metal/physics.metal::integrate_cloth_grid`** (line
+   ~160, vn-zero around line ~202): move the
+   `if (vn < 0.0f) vel -= vn * n;` line **inside** the
+   `if (distance < thickness) { ... }` block, *above* the existing
+   `pos += (thickness - distance) * n;` line. The `vn = dot(vel, n)`
+   computation stays where it is (above the gate) — only the
+   mutation of `vel` is gated.
 
-   ```cpp
-   if (auto* g  = dynamic_cast<MeshGridInitializer<BE, PR>*>(mesh->initializer)) {
-       g->params.center = newPos;
-   } else if (auto* sp = dynamic_cast<MeshSphereInitializer<BE, PR>*>(mesh->initializer)) {
-       sp->params.center = newPos;
-   } else if (auto* cb = dynamic_cast<MeshCubeInitializer<BE, PR>*>(mesh->initializer)) {
-       cb->params.center = newPos;
-   } else if (auto* f  = dynamic_cast<MeshFileInitializer<BE, PR>*>(mesh->initializer)) {
-       f->params.offset = newPos;
-   }
-   ```
+4. **Edit `src/metal/physics.metal::integrate_cloth`** (line ~286,
+   vn-zero around line ~327): same gate move. The two kernels are
+   structurally identical in this region; do both in one read-write
+   pass to ensure symmetry.
 
-   This mirrors the pack-time cascade in `Scene::pack`. Note: this
-   read-write is on the **same object** the pack-time cascade reads
-   from, since `mesh->initializer` aliases
-   `requestsGeneralMeshes[i].initializer` (per CM-002 ownership
-   convention). Updating one updates both views.
+5. **Wire `simulator.margin` from the call site.**
+   `src/main.cpp::Simulator::update` (~line 4609 and 4611): change
+   `narrowAndSortByVertices(radius, PR(0))` →
+   `narrowAndSortByVertices(radius, margin)`. Both arms of the
+   `if (profiler) {...} else {...}` block.
 
-4. **Extend Block 9 (BDD-003) with the round-trip assertion.** In
-   `src/main.cpp::runSelfTest` Block 9 (after the three existing
-   assertions), append:
+6. **Update the comment block on `BruteForce::narrow`'s
+   `nparams.thickness =` line** (~`src/main.cpp:4067`). Replace the
+   "thickness=0 preserves cloth-CCD turn-6 baseline" text with one
+   line pointing at D-016: `// Slow-touch band is radius + thickness;
+   integrator gates vn-zero on (distance < thickness) per D-016.`
+   And in `Simulator::update`'s narrow-phase scope, remove the stale
+   multi-line block comment about "CM-006 / D-NNN" — it's now
+   misleading.
 
-   ```cpp
-   // Clause (d) [round-trip] — translate survives Scene::pack.
-   sim.initialize();  // triggers pack(); without the translateObject
-                      // initializer write-back, transformPosition would
-                      // reseed from stale initializer.center == 0.
-   auto* repackedMesh = Scene<Backend, Precision>::findById(translateId);
-   if (!repackedMesh) {
-       fail("BDD-003 / translate survives Scene::pack rebuild",
-            "mesh disappeared after re-init");
-   } else {
-       // transformPosition should still be (1, 2, 3).
-       if (std::abs(repackedMesh->transformPosition.x - 1.0) > 1e-5 ||
-           std::abs(repackedMesh->transformPosition.y - 2.0) > 1e-5 ||
-           std::abs(repackedMesh->transformPosition.z - 3.0) > 1e-5) {
-           fail("BDD-003 / translate survives Scene::pack rebuild",
-                "transformPosition reseeded from stale initializer center");
-       } else {
-           // state.x mean should still match (1, 2, 3) after re-pack.
-           const Index nv2 = repackedMesh->state.x.size / 3;
-           double mx = 0, my = 0, mz = 0;
-           for (Index v = 0; v < nv2; ++v) {
-               mx += repackedMesh->state.x.ptr[v*3+0];
-               my += repackedMesh->state.x.ptr[v*3+1];
-               mz += repackedMesh->state.x.ptr[v*3+2];
-           }
-           mx /= (double)nv2; my /= (double)nv2; mz /= (double)nv2;
-           if (std::abs(mx - 1.0) > 1e-4 ||
-               std::abs(my - 2.0) > 1e-4 ||
-               std::abs(mz - 3.0) > 1e-4) {
-               fail("BDD-003 / translate survives Scene::pack rebuild",
-                    "state.x mean drifted across re-pack");
-           } else {
-               pass("BDD-003 / translate survives Scene::pack rebuild");
-           }
-       }
-   }
-   ```
+7. **Run `./scripts/verify-light.sh`.** Confirm doctest binaries
+   still green.
 
-5. **Verify the bug-then-fix order.** Optional but valuable: build
-   *without* the todo-3 fix and confirm the new clause-(d) assertion
-   FAILs (showing the test catches the bug), then apply the fix and
-   confirm it PASSes. The Generator may skip this if confident — it
-   is a discipline reminder, not a requirement.
+8. **Run `--self-test` 5+ times in a row.** Per the cloth-CCD slice
+   precedent: BDD-007's tunneling tolerance is strict (0.0). The
+   prior slice surfaced a 47µm drift that varied across builds. The
+   integrator change here is small but in the same numerical
+   neighborhood — confirm determinism across multiple runs (or note
+   the variance band if any) before concluding the slice is safe.
+   Expected: **23/23 PASS** consistently. If BDD-007's tunneling
+   clause regresses, **stop and hand back to the Planner** — the
+   gate move may be interacting with `subSteps=8` differently than
+   expected, and bumping substeps further or revisiting the kernel
+   edit is a Planner decision, not a Generator one.
 
-6. **Author Block 10 (BDD-019) in `runSelfTest`.** Append after
-   Block 9. Reset to a known scene first (`buildSyntheticScene`).
-   Concrete shape:
+9. **Graduate CM-006 to OLD_MISTAKES.md.** Move the entry under a
+   new high-level-cause section
+   `## High-level cause: contact-response gates inherit from older
+   code paths` (or a name the Generator picks if better fits).
+   Format per OLD_MISTAKES.md's pattern. Remove from
+   COMMON_MISTAKES.md.
 
-   ```cpp
-   // ---- Block 10: BDD-019 — Frame profiler shows and exports timings.
-   // TESTS.md#BDD-019 wording (verbatim):
-   //   Given a running simulation with at least one named timing section
-   //   When  the user opens the profiler window and then invokes "Export CSV"
-   //   Then  the GUI displays per-section timings updated each frame, and
-   //         a CSV file is written under `profiles/` containing the recorded history.
-   //   Notes: history collection must pause when the simulation pauses.
-   //
-   // Substitution: harness has no GUI, so "GUI displays per-section timings
-   // updated each frame" is mechanized as "FrameProfiler.history() has a
-   // snapshot with non-zero section_ms after one update()". CSV is written
-   // to /tmp instead of profiles/ for hygiene; the BDD's intent (a real
-   // CSV with recorded history) is satisfied. Pause invariant: when sim
-   // is paused, calling endFrame() is gated at the call site (main.cpp
-   // ~line 6180), so a paused frame must not push a snapshot.
-   {
-       resetScene();
-       sim.addCloth(/*particleNum1D=*/4, /*size1D=*/0.5,
-                    tinym::vec3(0.0f, 0.25f, 0.0f),
-                    /*kstretch=*/1e3, /*kshear=*/1e3, /*kbend=*/1e3,
-                    /*thickness=*/0.01, /*mass=*/0.1);
-       sim.addGround(PlaneDirection::XZPlane, tinym::vec3(0, -1, 0),
-                     /*size1D=*/2.0f);
-       sim.initialize();
+10. **Add D-016 to `docs/DECISIONS.md`.** Record the kernel-side gate
+    pairing as a load-bearing decision: vn-zero and position-push
+    must share the same `(distance < thickness)` gate. The asymmetry
+    between the kernel's slow-touch band (`radius + thickness`) and
+    the integrator's response gate (`distance < thickness`) is
+    intentional — the **detection** can be wider than the
+    **response**. File / function / decision /
+    alternatives-considered / rationale per the standard format.
 
-       profiler::FrameProfiler harnessProfiler(64);
-       sim.profiler = &harnessProfiler;
+11. **Update CURRENT_WORK / RESUME.** Four-line max as work proceeds;
+    write RESUME near end of turn.
 
-       // Clause (a): per-section timings updated each frame.
-       harnessProfiler.beginFrame(0, 0.0);
-       sim.update();
-       harnessProfiler.endFrame();
-       const auto& hist = harnessProfiler.history();
-       if (hist.frames().empty()) {
-           fail("BDD-019 / per-section timings updated each frame",
-                "no snapshot pushed after endFrame()");
-       } else {
-           const auto* latest = hist.latestFrame();
-           bool any_nonzero = false;
-           for (double s : latest->section_ms) if (s > 0.0) { any_nonzero = true; break; }
-           if (!any_nonzero) {
-               fail("BDD-019 / per-section timings updated each frame",
-                    "snapshot pushed but all section_ms == 0");
-           } else {
-               pass("BDD-019 / per-section timings updated each frame");
-           }
-       }
-
-       // Clause (b): CSV is written, contains the recorded history,
-       // and includes the new broad_collisions / narrow_collisions
-       // columns shipped in the prior slice.
-       const std::string csvPath = "/tmp/ysim_profiler_test.csv";
-       bool csvOk = hist.exportCsv(csvPath);
-       if (!csvOk) {
-           fail("BDD-019 / CSV written under profiles containing history",
-                "exportCsv returned false");
-       } else {
-           std::ifstream csv(csvPath);
-           std::string header, firstRow;
-           std::getline(csv, header);
-           std::getline(csv, firstRow);
-           bool headerOk =
-               header.find("frame_sequence") != std::string::npos &&
-               header.find("frame_ms") != std::string::npos &&
-               header.find("broad_collisions") != std::string::npos &&
-               header.find("narrow_collisions") != std::string::npos;
-           if (!headerOk || firstRow.empty()) {
-               fail("BDD-019 / CSV written under profiles containing history",
-                    "header missing required columns or no data row");
-           } else {
-               pass("BDD-019 / CSV written under profiles containing history");
-           }
-           std::remove(csvPath.c_str());
-       }
-
-       // Clause (c) [Notes invariant]: paused sim does not collect.
-       size_t framesBefore = hist.frames().size();
-       sim.pause = true;
-       // Match the production gating: skip begin/end when paused.
-       sim.update();  // call the update path under pause; production
-                      // would not even call this (pause loop), but a
-                      // direct call still validates that no snapshot
-                      // is added because begin/end are not invoked.
-       size_t framesAfter = hist.frames().size();
-       if (framesAfter != framesBefore) {
-           fail("BDD-019 / history collection pauses when sim pauses",
-                "frame count grew under pause without explicit begin/end");
-       } else {
-           pass("BDD-019 / history collection pauses when sim pauses");
-       }
-
-       sim.profiler = nullptr;  // detach so later blocks aren't affected.
-       sim.pause = false;       // restore for any later blocks.
-   }
-   ```
-
-   Three new PASS lines. **Important:** the Generator should verify
-   that `Simulator::update` is callable while paused without
-   crashing — if it's not, the harness should construct the pause
-   case differently (e.g., simply not call update at all and just
-   verify the count is stable). Pick whichever matches the
-   production semantics most closely without expanding scope.
-
-7. **Run `./scripts/verify-light.sh`.** Then build `ysim` and run
-   `--self-test`. Expect 22/22 PASS (16 prior + 3 BDD-003 + 1 new
-   BDD-003 round-trip + 3 BDD-019). Generator confirms the count
-   and updates `CURRENT_WORK.md`.
-
-8. **Promote `BDD-019` matrix row.** `docs/TEST_MATRIX.md`:
-   - Row 19 status: `pending → pass`.
-   - Test address: `src/main.cpp::runSelfTest::BDD-019 (Block 10)` —
-     three "Then" clauses + Notes invariant.
-   - Row BDD-003 keeps `pass`; address gains the new round-trip
-     line.
-
-9. **DECISIONS / CURRENT_WORK / RESUME / COMMON_MISTAKES.**
-   - New `D-NNN` entry: "translateObject writes back to the
-     initializer's center/offset so re-pack reproduces the
-     translated state." File / function / decision /
-     alternatives-considered / rationale per the standard format.
-   - `CURRENT_WORK.md` four-line max as work proceeds.
-   - `RESUME.md` near end of turn.
-   - Optionally graduate / refresh CM-006 if its parked
-     state is unaffected by this slice (it should be).
-
-10. **Stop and hand off to the Estimator.** No CM-006 work. No
-    profiler GUI changes. No CSV format mutations.
+12. **Stop and hand off to the Estimator.** Don't touch the BDD-019
+    pause check, don't refactor the integrator beyond the gate move,
+    don't change substep counts.
 
 ## Course corrections
 
-- **Spec-vs-label discipline carries forward.** Block 10's
-  assertions come from `docs/TESTS.md#BDD-019`'s "Then" clauses
-  verbatim, including the Notes invariant. The matrix-row label
-  "Frame profiler shows and exports timings" is too compressed.
-- **Symmetry with pack-time seeding.** D-014's pack-time seed and
-  this slice's translate-time write-back both use the same
-  `dynamic_cast` cascade over the same four initializer subtypes.
-  When a fifth subtype eventually ships (e.g., a future Rigid
-  initializer for FR-008), both sites need updating in tandem —
-  same as the existing `toSnapshot` cascade. Document this
-  invariant in DECISIONS so it doesn't drift.
-- **Spec-substitution discipline.** TESTS.md says "under
-  `profiles/`"; harness uses `/tmp`. This is the same kind of
-  substitution as BDD-007's "static rigid sphere" → ground-plane:
-  the BDD's load-bearing claim (a CSV is written, contains the
-  recorded history) is fully satisfied; the path differs because
-  harness hygiene differs from production. Pass label notes the
-  substitution explicitly so the Estimator can audit without
-  re-reading the spec.
-- **Pause invariant (Notes line).** This is a real claim in the
-  BDD that's been satisfied silently by the call-site gating in
-  `main.cpp:6180-6182`. Block 10's clause (c) makes the invariant
-  testable — the gating is structurally correct, but if a future
-  refactor moves `endFrame()` outside the `if (collectProfileFrame)`
-  guard, the harness will catch it.
-- **Backend-boundary invariant (`BDD-103`).** This slice mutates a
-  struct field (`MeshGridInitializerParams::center` etc.) at runtime
-  via translateObject. The initializer is a CPU-side struct and
-  doesn't cross the kernel boundary, so this is safe — the
-  realized `state.x` (which the kernels read) is updated by the
-  same call. No kernel-ABI surface touched.
+- **Numerical sensitivity guard.** The cloth-CCD slice's last incident
+  was a 47µm BDD-007 regression caused by setting `nparams.thickness
+  > 0` *without* the integrator-side gate. This slice does both
+  changes in one go. The kernel-side gate is *not* an optimization
+  or refactor — it is a load-bearing pre-condition for raising
+  `nparams.thickness`. If the Generator's verify run shows BDD-007
+  drift even by tens of micrometers, that is a slice-critical
+  signal, not noise. Stop and re-plan.
+
+- **Both kernels in one pass.** `integrate_cloth` and
+  `integrate_cloth_grid` are structurally identical in the contact
+  loop region. Editing only one would silently break BDD-007 only
+  for the cloth variant the harness uses. The harness uses
+  `addCloth` (TriangularCloth → `integrate_cloth`), but the
+  FastGridCloth path (`integrate_cloth_grid`) is also reachable via
+  the GUI. Edit both. Do not assume one path is exercised by the
+  harness and the other is dead.
+
+- **Substep count stays at 8.** D-013's `subSteps = 8` was tuned to
+  keep BDD-007 tunneling below the 0 threshold under the
+  `nparams.thickness = 0` band. With the wider band (`+ margin`),
+  the integrator's response fires on more contacts, generally
+  *helping* tunneling. If anything, settling time may shorten. But
+  do **not** lower substeps as a "speed-up" in this slice — that's
+  scope creep with risk.
+
+- **Gate move is symmetry, not behavior change.** The new shape
+  (`if (distance < thickness) { vn-zero; position-push; }`) is what
+  the loop *would have looked like* if it had been written from the
+  start to match the position-push semantic. The asymmetry between
+  vn-zero and position-push was an artifact of the cloth-CCD slice's
+  swept-CCD upgrade — that slice introduced the new contact
+  semantics (CCD can fire on plane-crossing regardless of `d_cur`)
+  but only retrofitted the position-push to gate on
+  `(distance < thickness)`. The vn-zero kept its old unconditional
+  shape because it was working under the old detection rule. This
+  slice closes that asymmetry.
 
 ## What to read before writing code
 
-- `docs/TESTS.md#BDD-003` (lines 39–45) — the original three "Then"
-  clauses, plus the new round-trip assertion the Generator adds.
-- `docs/TESTS.md#BDD-019` (lines 177–183) — verbatim source for
-  Block 10.
-- `docs/specs/FRD.md#FR-019` (lines 208–216) — functional contract.
-- `docs/DECISIONS.md` — D-014 (transformPosition + translateObject;
-  the precedent for the write-back symmetry being added here).
-- `include/FrameProfiler.hpp` — `FrameProfiler` /
-  `FrameProfilerHistory` API surface; `exportCsv` returns bool.
-- `src/profiler_gui.cpp` (lines 113–127) — the GUI export site,
-  for reference on what the harness's clause-(b) is mirroring at
-  the data layer.
-- `src/main.cpp::Scene::pack` (~line 1773 post-translate-slice) —
-  the pack-time seeding cascade, mirrored by the new
-  translateObject write-back.
-- `src/main.cpp::Simulator::translateObject` (~line 4432) — site
-  of the fix.
-- `src/main.cpp::runSelfTest` Block 9 — append the round-trip
-  assertion here. Block 10 is fresh, append after Block 9.
-- `src/main.cpp` ~line 6180 — production pause-gating pattern, the
-  reference for Block 10's clause (c).
-- `.agent/ESTIMATION.md` (turn 7) — the two WARNING items being
-  closed by this slice.
+- `docs/mistakes/COMMON_MISTAKES.md::CM-006` (lines 57–72) — exact
+  fix shape, prescribed by the entry itself.
+- `src/metal/physics.metal::integrate_cloth_grid` (lines 160–218)
+  and `integrate_cloth` (lines 286–344) — the two kernels to edit.
+  Mirror images; do both.
+- `src/main.cpp::Simulator::update` (~line 4609 / 4611) — the call
+  site that currently passes `PR(0)`.
+- `src/main.cpp::BruteForce::narrow` (~line 4067) — the comment
+  block to clean up.
+- `docs/mistakes/OLD_MISTAKES.md` — graduation format.
+- `docs/DECISIONS.md::D-013` — the swept-CCD upgrade that
+  introduced the asymmetry CM-006 documents. D-016 builds on it.
+- `src/main.cpp::runSelfTest` Block 6 (BDD-007) — the load-bearing
+  acceptance gate for this slice. Read so the Generator knows what
+  the assertions look like before running and is not surprised by a
+  PASS/FAIL message format mismatch.
+- `.agent/RESUME.md` (translate-pack slice) — `subSteps = 8` is
+  load-bearing for BDD-007's tunneling tolerance; don't touch.

@@ -1,16 +1,14 @@
-# Current Work — Translate-Pack + BDD-019 Slice (`fix/translate-pack-and-bdd019`)
+# Current Work — Cloth Thickness Band Slice (`fix/cloth-thickness-band`)
 
-- File in flight: none — slice complete; ready for Estimator. **`./src/ysim --self-test` 23/23 PASS**, `./scripts/verify-light.sh` clean.
-- How far: all 10 PLAN todos done.
-  - **D-015** — `Simulator::translateObject` write-back to initializer. Same `dynamic_cast` cascade pattern as `Scene::pack` pack-time seed and `Simulator::toSnapshot` realized-mesh override. Three sites must move together when a fifth initializer subtype ships.
-  - **Block 9 clause (d)** — `BDD-003 / translate survives Scene::pack rebuild`. Calls `sim.initialize()` after the existing three "Then" assertions and re-checks `transformPosition` + per-axis `state.x` mean against the (1, 2, 3) target. Bug-probe (commenting out the write-back cascade) confirmed the assertion FAILs without the fix; restored and PASSes after.
-  - **Block 10 (BDD-019)** — three new PASS lines authored verbatim from `docs/TESTS.md#BDD-019`:
-    - `BDD-019 / per-section timings updated each frame` — fresh `FrameProfiler`, beginFrame → sim.update → endFrame, assert latest snapshot has at least one non-zero `section_ms`.
-    - `BDD-019 / CSV written under profiles containing history` — `exportCsv("/tmp/ysim_profiler_test.csv")` returns true, header contains `frame_sequence`/`frame_ms`/`broad_collisions`/`narrow_collisions`, at least one data row exists. Path substituted to `/tmp` for harness hygiene; substitution noted in block comment per spec-substitution rule.
-    - `BDD-019 / history collection pauses when sim pauses` — set `sim.pause = true`, deliberately skip beginFrame/endFrame (matching production gating at `main.cpp:6180-6182`), assert `history.frames().size()` did not grow.
+- File in flight: none — slice complete; ready for Estimator. **23/23 self-test PASS deterministic across 5 runs**, `./scripts/verify-light.sh` clean.
+- How far: all 12 PLAN todos done.
+  - **D-016** — `integrate_cloth` and `integrate_cloth_grid` move the vn-zero block inside the existing `if (distance < thickness)` gate, matching the position-push semantic. Detection band stays asymmetrically wider (`radius + thickness`) — that's the load-bearing invariant. Gate move applied to both kernels via single Edit with `replace_all=true` because the contact-loop bodies were textually identical.
+  - **Call site wired** — `Simulator::update`'s two `narrowAndSortByVertices(radius, PR(0))` calls now pass `margin` instead. Stale multi-line "thickness=0 baseline / CM-006 / D-NNN" comment dropped; replaced with a one-liner pointing at D-016 in `BruteForce::narrow`.
+  - **CM-006 graduated** — moved from `COMMON_MISTAKES.md` to `OLD_MISTAKES.md` under a new high-level-cause section "contact-response gates fall out of sync when the detection rule changes". Active list now has only CM-001/CM-002/CM-003/CM-004 + the two graduation breadcrumbs (CM-005, CM-006).
+  - **BDD-007 tunneling clause stays PASS** — verified via 5 consecutive `--self-test` runs. No drift, no FAIL, no SKIP. The pre-flight worry from the cloth-CCD slice's 47µm regression did not materialize because the kernel-side gate was the missing piece.
+- Non-goals respected: turn-8 WARNING (BDD-019 pause check) deliberately deferred; no kernel changes beyond the gate move; no substep tuning; no new BDD coverage.
 - What's tested:
-  - **23/23 self-test PASS** on macOS Apple Silicon, deterministic.
+  - **23/23 self-test PASS** on macOS Apple Silicon, deterministic across 5 runs.
   - Doctest binaries unchanged (159 + 1120 assertions, both green).
-  - `docs/TEST_MATRIX.md` row `BDD-019` promoted from `pending` to `pass`. Row `BDD-003` test-address line extended to mention the new round-trip clause + D-015.
-- Non-goals respected: CM-006 vn-zero gate stays parked; no profiler GUI changes; no CSV format mutations.
-- What's next: Estimator review. Expect verdict at NOTE level — both turn-7 WARNINGs are closed, bug-probe was used to verify the new assertion catches the bug pre-fix.
+  - `BDD-007 / no cloth vertex tunnels through ground` repeatedly PASSes — slice's non-negotiable acceptance gate.
+- What's next: Estimator review. Expect verdict at NOTE level — CM-006 closure, BDD-007 stable, scope was kept narrow.
