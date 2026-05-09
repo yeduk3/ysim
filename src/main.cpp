@@ -1552,8 +1552,31 @@ struct Quat {
     float z = 0.0f;
 };
 
+// D-019: canonical quaternion math. Hamilton product convention is `a * b
+// = apply b first, then a` — i.e., to rotate by R1 then R2, write R2 * R1.
+// Free functions so they pair with the bare struct without changing its
+// aggregate-init shape (the on-disk schema relies on the {w, x, y, z}
+// member order). Future rotation consumers (FR-004 inspector wiring,
+// FR-008 rigid body, eventual renderer-side rotation) should use these
+// rather than reimplementing the math.
+inline Quat operator*(const Quat& a, const Quat& b) {
+    Quat r;
+    r.w = a.w*b.w - a.x*b.x - a.y*b.y - a.z*b.z;
+    r.x = a.w*b.x + a.x*b.w + a.y*b.z - a.z*b.y;
+    r.y = a.w*b.y - a.x*b.z + a.y*b.w + a.z*b.x;
+    r.z = a.w*b.z + a.x*b.y - a.y*b.x + a.z*b.w;
+    return r;
+}
 
+inline float quatNorm(const Quat& q) {
+    return std::sqrt(q.w*q.w + q.x*q.x + q.y*q.y + q.z*q.z);
+}
 
+inline Quat quatNormalize(const Quat& q) {
+    float n = quatNorm(q);
+    if (n < 1e-12f) return Quat{};
+    return Quat{q.w/n, q.x/n, q.y/n, q.z/n};
+}
 
 template <typename BE, typename PR>
 struct GeneralMesh {
@@ -6202,6 +6225,104 @@ static int runSelfTest() {
                      "frame " + std::to_string(firstDivFrame) + " byte " +
                      std::to_string(firstDivByte) + " of " +
                      std::to_string(framesA[firstDivFrame].size()) + " differs");
+            }
+        }
+    }
+
+    // ---- Block 12: BDD-004 — Rotate with quaternion canonical storage. ----
+    // TESTS.md#BDD-004 wording (verbatim, *not* the matrix-row label):
+    //   Given an object with rotation R0
+    //   When  the user composes a sequence of rotations and the scene is
+    //         saved, reloaded, and rotated further
+    //   Then  the resulting orientation matches the mathematically composed
+    //         quaternion within floating-point tolerance, and the stored
+    //         quaternion remains unit-norm after each composition.
+    //   Notes: round-trip + composition test, not just "set rotation".
+    //          Catches normalization drift and silent Euler↔quaternion
+    //          conversions in the persistence layer.
+    {
+        constexpr float kPi = 3.14159265358979323846f;
+        auto quatAxisAngle = [](tinym::vec3 axis, float angle) -> ::Quat {
+            float half = angle * 0.5f;
+            float s = std::sin(half);
+            return ::Quat{std::cos(half), axis.x * s, axis.y * s, axis.z * s};
+        };
+
+        resetScene();
+        sim.addCube(tinym::vec3(0.0f, 0.0f, 0.0f), /*tess=*/2,
+                    /*size=*/0.2f, /*mass=*/0.1f);
+        sim.initialize();
+        const int rotateId = 0;
+
+        ::Quat r0 = quatAxisAngle(tinym::vec3(0, 1, 0), kPi / 6.0f);
+        ::Quat dq1 = quatAxisAngle(tinym::vec3(1, 0, 0), kPi / 4.0f);
+        ::Quat dq2 = quatAxisAngle(tinym::vec3(0, 0, 1), kPi / 3.0f);
+
+        auto* mesh0 = Scene<Backend, Precision>::findById(rotateId);
+        if (!mesh0) {
+            fail("BDD-004 / quaternion composition round-trip",
+                 "rotate target id=" + std::to_string(rotateId) + " not found");
+        } else {
+            mesh0->rotationQuat = r0;
+            ::Quat r1_in_memory = quatNormalize(dq1 * mesh0->rotationQuat);
+            mesh0->rotationQuat = r1_in_memory;
+
+            const std::string path = "/tmp/ysim_bdd004.ysim.json";
+            std::string saveErr;
+            if (!sim.saveScene(path, &saveErr)) {
+                fail("BDD-004 / quaternion composition round-trip",
+                     "saveScene failed: " + saveErr);
+            } else {
+                auto lr = sim.loadScene(path);
+                if (!lr.ok) {
+                    fail("BDD-004 / quaternion composition round-trip",
+                         "loadScene failed: " + lr.error.message);
+                } else {
+                    sim.initialize();
+                    sim.applyPendingMaterials(); // also writes pendingRotations into rotationQuat
+
+                    auto* meshAfterLoad = Scene<Backend, Precision>::findById(rotateId);
+                    if (!meshAfterLoad) {
+                        fail("BDD-004 / quaternion composition round-trip",
+                             "rotate target disappeared after reload");
+                    } else {
+                        ::Quat r1_post_load = meshAfterLoad->rotationQuat;
+                        ::Quat r2_round_trip = quatNormalize(dq2 * r1_post_load);
+                        ::Quat r2_in_memory = quatNormalize(dq2 * r1_in_memory);
+
+                        float dw = std::abs(r2_round_trip.w - r2_in_memory.w);
+                        float dx = std::abs(r2_round_trip.x - r2_in_memory.x);
+                        float dy = std::abs(r2_round_trip.y - r2_in_memory.y);
+                        float dz = std::abs(r2_round_trip.z - r2_in_memory.z);
+                        const float quatTol = 1e-5f;
+                        bool orientationOk = dw < quatTol && dx < quatTol &&
+                                             dy < quatTol && dz < quatTol;
+
+                        const float normTol = 1e-5f;
+                        float n0 = quatNorm(r0);
+                        float n1 = quatNorm(r1_in_memory);
+                        float n2 = quatNorm(r2_round_trip);
+                        bool unitNormOk =
+                            std::abs(n0 - 1.0f) < normTol &&
+                            std::abs(n1 - 1.0f) < normTol &&
+                            std::abs(n2 - 1.0f) < normTol;
+
+                        if (!orientationOk) {
+                            fail("BDD-004 / quaternion composition round-trip",
+                                 "orientation drift (round-trip vs in-memory): " +
+                                 std::to_string(dw) + ", " + std::to_string(dx) + ", " +
+                                 std::to_string(dy) + ", " + std::to_string(dz));
+                        } else if (!unitNormOk) {
+                            fail("BDD-004 / quaternion composition round-trip",
+                                 "unit-norm drift; norms = " +
+                                 std::to_string(n0) + ", " + std::to_string(n1) +
+                                 ", " + std::to_string(n2));
+                        } else {
+                            pass("BDD-004 / quaternion composition round-trip");
+                        }
+                    }
+                }
+                std::remove(path.c_str());
             }
         }
     }

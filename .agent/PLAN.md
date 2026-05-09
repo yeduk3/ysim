@@ -1,354 +1,374 @@
-# Plan — BDD-102 Fix-Turn: Deterministic Jiggle + Strict Block 11 (`feat/bdd-102-determinism`)
+# Plan — BDD-004 Quaternion Composition + Round-Trip (`feat/bdd-004-rotation`)
 
 > Owner: **Planner** writes; **Generator** executes; **Estimator** judges.
 > Updated: 2026-05-09
 
-## Course note: previous slice's verdict (BLOCK)
+## Course note: previous slice's verdict
 
-Estimator turn 11 returned **BLOCK** on the same branch. Two
-findings:
-
-- **BLOCK item.** Block 11 turns the discovered divergence into a
-  `SKIP` rather than a failing assertion. The slice's goal was
-  `BDD-102 pending → pass`; SKIP suppresses the signal and leaves
-  the matrix row unclosed. The slice **cannot ship as-is**.
-- **WARNING (acceptable).** Block 11 compares simulator state
-  buffers instead of Alembic bytes. Documented substitution while
-  FR-013 is blocked; not a blocker for this fix-turn.
-
-Per PLANNER.md procedure step 2 ("BLOCK rewrites the plan") and
-GENERATOR.md procedure step 1 ("Bug-fix turns in response to an
-Estimator BLOCK stay on the same slice branch"), this is a fix-turn
-on `feat/bdd-102-determinism`. Commit prefix: `fix:`.
-
-The Generator's earlier code-review feedback (4 items, surfaced by
-the user-issued `/codex:rescue --wait estimator 리뷰`) are folded
-into this plan as concrete edits — see Scope items 2.a/b/c/d. They
-were never written to ESTIMATION.md but are valid observations.
+Estimator turn 12 returned **WARNING** (no BLOCK). The single
+WARNING — BDD-102 mechanizes against `state.x` snapshots rather
+than Alembic bytes — is **not foldable** into this slice. Closing
+it would mean shipping the entire Alembic export pipeline (FR-013),
+which is blocked on Q5 (Alembic schema) + Q6 (export FPS / time-step
+decoupling rule). It stays as a documented structural acknowledgement
+until those open questions resolve.
 
 ## Goal
 
-Close the BLOCK by fixing the underlying nondeterminism (CM-007) so
-Block 11 actually PASSes — not via SKIP-suppression, not via
-test-side workaround. After this slice:
+Promote `BDD-004` from `pending` to `pass` in
+`docs/TEST_MATRIX.md` by adding **Block 12 in `runSelfTest`** that
+mechanizes BDD-004 verbatim against `docs/TESTS.md#BDD-004`. The
+test exercises three properties of the existing
+`GeneralMesh::rotationQuat` field (D-007):
+1. **Quaternion composition is associative through save/load.**
+   Two rotations composed across a save → load boundary equal the
+   same two rotations composed in-memory.
+2. **Unit-norm invariant holds after each composition.** Repeated
+   multiplication followed by normalization keeps `|q|` within
+   tight tolerance of 1.
+3. **Round-trip preserves the orientation, not just the bytes.**
+   The post-load quaternion's rotation action on a witness vector
+   matches the pre-save action within tolerance.
 
-- `MeshGridInitializer` uses a **per-mesh seeded `std::mt19937`**
-  for jiggle instead of global `rand()`. Two consecutive
-  `buildSyntheticScene` calls produce bit-identical `state.x` at
-  init.
-- Block 11's mismatch path is `fail()`, not `skip()` — SKIP is
-  reserved for unsupported environments (Metal-less host) per the
-  Estimator's earlier review point #1.
-- Block 11 compares **per-frame** position snapshots, not just the
-  terminal state — divergence-then-reconvergence can't mask drift
-  (Estimator point #2).
-- Block 11 fails loudly on null `state.x.ptr` rather than silently
-  skipping the mesh (Estimator point #3).
-- Block 11 compares **positions only** (drop `state.v` from the
-  byte buffer) per BDD-102's wording "vertex positions agree"
-  (Estimator point #4). Strict bit-equality on positions stays —
-  same-binary-same-machine deterministic kernels should produce
-  bit-identical positions; loosening to epsilon would mask future
-  ordering bugs that the test exists to catch.
-- `docs/TEST_MATRIX.md` row `BDD-102` flips `pending → pass`.
-- `CM-007` graduates to `OLD_MISTAKES.md` — the structural cause
-  (`rand()`-based jiggle) is replaced.
-- `verify.sh` exits 0 with **24/24 PASS** on macOS Apple Silicon.
-  Linux container takes the Metal SKIP path unchanged.
+When this slice ships:
+- `BDD-004` matrix row flips `pending → pass`.
+- 25/25 self-test PASS (was 24/24; one new BDD-004 line).
+- New `Quat` math helpers (composition, normalization, norm) live
+  alongside the existing struct so the harness — and any future
+  rotation consumer (FR-004 inspector, FR-008 rigid body, etc.) —
+  has a single canonical implementation. Today the struct is bare
+  (just `w, x, y, z` floats); BDD-004 forces the math to land.
 
 ## Scope
 
-### 1. CM-007 fix — per-mesh seeded RNG in `MeshGridInitializer`
+- **`docs/TESTS.md#BDD-004` (lines 47–53)** is the binding "Then"
+  clause:
+  > **Given** an object with rotation R₀
+  > **When**  the user composes a sequence of rotations and the
+  > scene is saved, reloaded, and rotated further
+  > **Then**  the resulting orientation matches the mathematically
+  > composed quaternion within floating-point tolerance, and the
+  > stored quaternion remains unit-norm after each composition.
+  >
+  > *Notes: this is a round-trip + composition test, not just a
+  > "set rotation" test. The point is to catch normalization drift
+  > and any silent Euler↔quaternion conversion in the persistence
+  > layer.*
 
-- **`src/main.cpp::MeshGridInitializerParams`** (~line 1021): add
-  `uint32_t seed = 0;` field. Extend the constructor to accept the
-  seed (defaulted in callers; keep existing call sites
-  source-compatible).
-- **`src/main.cpp::MeshGridInitializer::initialize`** (~line 1063):
-  replace `rand()/PR(RAND_MAX)/10000.f` with a `std::mt19937`
-  seeded from `params.seed`. Use
-  `std::uniform_real_distribution<PR>(0.0, 1.0/10000.0)` to keep
-  the jiggle scale identical. The RNG is local to the
-  `initialize()` call so two calls with the same seed produce
-  identical sequences.
-- **`src/main.cpp::Simulator::addCloth`** (~line 4381): pass a
-  deterministic seed. Two reasonable choices:
-  - **(i)** Hardcoded constant (e.g., `0xC0FFEE`). All cloths in a
-    scene share the same jiggle; trivially deterministic.
-  - **(ii)** Derive from the request id via
-    `Scene<BE,PR>::numMeshes` (the value `addGeneralMesh` will
-    increment). Different cloths in one scene get different
-    jiggles; still deterministic across runs of the same scene.
-  - **Recommendation:** option (ii) — read `Scene<BE,PR>::numMeshes`
-    before the `addGeneralMesh` call and use it as the seed. One
-    line. Each cloth in the scene gets its own deterministic
-    jiggle; reloading the same scene reproduces the exact same
-    positions.
-- **`Simulator::addGround`** uses the grid initializer with
-  `jiggle = false` so no seed change is needed (the jiggle branch
-  short-circuits when `params.jiggle == false`). But still pass the
-  seed parameter for type-completeness; default to 0.
-- **`loadScene`** (~line 5011): when reconstructing
-  `MeshGridInitializerParams` from a saved scene, derive the seed
-  from `o.id` (the saved mesh id) so a saved + reloaded scene
-  produces the same jiggle as the original.
-  - **Open question** — does the saved scene format include the
-    seed? Today `o.source.primitive.jiggle` is a bool. The
-    seed isn't serialized. For BDD-102's single-process scope this
-    is fine because the seed is derived from `mesh.id` deterministically.
-    If `mesh.id` is stable across save/load (it is — D-007/D-014
-    treat ids as stable), the seed is stable too. **No scene
-    format change needed.** Document this in D-018 below.
+- **New `Quat` math helpers in `src/main.cpp`** (~line 1548 area).
+  The existing `struct Quat` is bare. Add:
+  - `Quat operator*(const Quat& a, const Quat& b)` — Hamilton
+    product (rotation composition): `a * b` applies `b` first, then
+    `a`. Standard formula.
+  - `float Quat::norm() const` — `sqrt(w² + x² + y² + z²)`.
+  - `Quat Quat::normalized() const` — divide by norm; if norm <
+    1e-12, return identity (avoids NaN propagation).
 
-### 2. Block 11 cleanup per Estimator's review feedback
+  Place the helpers immediately after the struct definition. Keep
+  the struct itself unchanged so D-007's existing field semantics
+  (default-constructed = identity) stay intact.
 
-- **(a) SKIP → FAIL on mismatch.** Remove the `skip(...)` call;
-  use `fail(...)` for any size or byte mismatch. After CM-007 is
-  fixed, the assertion PASSes; if a future regression breaks
-  determinism, the test FAILs and verify.sh exits non-zero — that
-  is the correct gate behavior. Reserve `skip` for the
-  Metal-device check at the top of `runSelfTest`.
+- **Block 12 in `runSelfTest`.** Append after Block 11 (last block
+  before the `if (failures == 0)` summary). Concrete shape — the
+  Generator may tweak idiomatically:
 
-- **(b) Per-frame snapshot comparison.** Pump 1 frame at a time;
-  snapshot positions after each frame; compare run-A's per-frame
-  vector against run-B's element-wise. First differing frame
-  becomes the diagnostic. Implementation: `std::vector<std::vector
-  <unsigned char>> framesA, framesB;` — push the snapshot at the
-  end of each frame's pump. ~10 lines of additional code.
+  ```cpp
+  // ---- Block 12: BDD-004 — Rotate with quaternion canonical storage. ----
+  // TESTS.md#BDD-004 wording (verbatim, *not* the matrix-row label):
+  //   Given an object with rotation R0
+  //   When  the user composes a sequence of rotations and the scene is
+  //         saved, reloaded, and rotated further
+  //   Then  the resulting orientation matches the mathematically composed
+  //         quaternion within floating-point tolerance, and the stored
+  //         quaternion remains unit-norm after each composition.
+  //   Notes: round-trip + composition test, not just "set rotation".
+  //          Catches normalization drift and silent Euler↔quaternion
+  //          conversions in the persistence layer.
+  {
+      resetScene();
+      sim.addCube(tinym::vec3(0.0f, 0.0f, 0.0f), /*tess=*/2,
+                  /*size=*/0.2f, /*mass=*/0.1f);
+      sim.initialize();
+      const int rotateId = 0;
 
-- **(c) Fail loudly on null buffers.** `snapshotState` currently
-  `continue`s past a mesh with null `state.x.ptr`. Replace with an
-  early-fail: if any mesh has null buffers, that's a real
-  initialization failure and Block 11 should report it (not pretend
-  the mesh doesn't exist). Diagnostic includes mesh id and missing
-  field.
+      // R0: rotation about Y by 30°.
+      Quat r0 = quatAxisAngle(tinym::vec3(0, 1, 0), kPi / 6.0f);
+      // dq1: rotation about X by 45°. dq2: about Z by 60°.
+      Quat dq1 = quatAxisAngle(tinym::vec3(1, 0, 0), kPi / 4.0f);
+      Quat dq2 = quatAxisAngle(tinym::vec3(0, 0, 1), kPi / 3.0f);
 
-- **(d) Positions-only.** Drop `state.v` from the byte buffer. BDD-
-  102's "Then" clause is explicitly about vertex positions
-  ("per-frame vertex positions agree"). Velocity drift could be a
-  symptom of nondeterminism but isn't part of the BDD's contract.
-  Strict bit-equality on positions stays — within one process on
-  the same binary, positions should be bit-identical, and loosening
-  to epsilon would mask future ordering bugs.
+      // Apply R0 to the mesh.
+      auto* mesh0 = Scene<Backend, Precision>::findById(rotateId);
+      mesh0->rotationQuat = r0;
 
-### 3. Bookkeeping
+      // Compose dq1 in-memory: R1 = (dq1 * r0).normalized()
+      Quat r1_in_memory = (dq1 * mesh0->rotationQuat).normalized();
+      mesh0->rotationQuat = r1_in_memory;
 
-- **`docs/TEST_MATRIX.md` row `BDD-102`** — promote `pending → pass`.
-  Test address: `src/main.cpp::runSelfTest::BDD-102 (Block 11)`.
-- **`docs/mistakes/COMMON_MISTAKES.md::CM-007`** — replace the
-  active entry with a graduation breadcrumb (mirror the CM-005 /
-  CM-006 patterns). Add a section to `docs/mistakes/OLD_MISTAKES.md`
-  under a new high-level cause: "Global RNG state leaks across
-  scene reconstructions" (or similar).
-- **`docs/DECISIONS.md`** — new D-018 entry for the per-mesh
-  seeded RNG decision (file/function, decision,
-  alternatives-considered, rationale). Note that `mesh.id`-derived
-  seeds give save/load reproducibility for free (no scene-format
-  change needed).
-- **`.agent/CURRENT_WORK.md` / `RESUME.md`** — update for the
-  fix-turn.
+      // Save → reload.
+      const std::string path = "/tmp/ysim_bdd004.ysim.json";
+      std::string saveErr;
+      if (!sim.saveScene(path, &saveErr)) {
+          fail("BDD-004 / quaternion composition round-trip", "saveScene failed: " + saveErr);
+      } else {
+          auto lr = sim.loadScene(path);
+          if (!lr.ok) {
+              fail("BDD-004 / quaternion composition round-trip",
+                   "loadScene failed: " + lr.error.message);
+          } else {
+              sim.initialize();
+              sim.applyPendingMaterials();  // also applies pendingRotations.
+
+              // Compose dq2 onto the reloaded rotation.
+              auto* meshAfterLoad = Scene<Backend, Precision>::findById(rotateId);
+              Quat r1_post_load = meshAfterLoad->rotationQuat;
+              Quat r2_round_trip = (dq2 * r1_post_load).normalized();
+              meshAfterLoad->rotationQuat = r2_round_trip;
+
+              // Reference: same composition done entirely in-memory.
+              Quat r2_in_memory = (dq2 * r1_in_memory).normalized();
+
+              // Clause: orientation matches within FP tolerance.
+              float dw = std::abs(r2_round_trip.w - r2_in_memory.w);
+              float dx = std::abs(r2_round_trip.x - r2_in_memory.x);
+              float dy = std::abs(r2_round_trip.y - r2_in_memory.y);
+              float dz = std::abs(r2_round_trip.z - r2_in_memory.z);
+              const float quatTol = 1e-5f;
+              bool orientationOk = dw < quatTol && dx < quatTol &&
+                                   dy < quatTol && dz < quatTol;
+
+              // Clause: unit-norm after composition.
+              float norm0 = r0.norm();
+              float norm1 = r1_in_memory.norm();
+              float norm2 = r2_round_trip.norm();
+              const float normTol = 1e-5f;
+              bool unitNormOk =
+                  std::abs(norm0 - 1.0f) < normTol &&
+                  std::abs(norm1 - 1.0f) < normTol &&
+                  std::abs(norm2 - 1.0f) < normTol;
+
+              if (!orientationOk) {
+                  fail("BDD-004 / quaternion composition round-trip",
+                       "orientation drift (round-trip vs in-memory): " +
+                       std::to_string(dw) + ", " + std::to_string(dx) + ", " +
+                       std::to_string(dy) + ", " + std::to_string(dz));
+              } else if (!unitNormOk) {
+                  fail("BDD-004 / quaternion composition round-trip",
+                       "unit-norm drift; norms = " +
+                       std::to_string(norm0) + ", " +
+                       std::to_string(norm1) + ", " +
+                       std::to_string(norm2));
+              } else {
+                  pass("BDD-004 / quaternion composition round-trip");
+              }
+          }
+          std::remove(path.c_str());
+      }
+  }
+  ```
+
+  The helper `quatAxisAngle(axis, angle)` and the constant `kPi`
+  are local to the block (or defined inside `runSelfTest`'s
+  preamble). Generator's call.
+
+- **`docs/TEST_MATRIX.md` row `BDD-004`** — promote `pending →
+  pass`. Test address: `src/main.cpp::runSelfTest::BDD-004 (Block
+  12)`.
+
+- **No new `docs/specs/*` edits.** TESTS.md / FRD.md are not
+  touched.
 
 ## Non-goals (this slice)
 
-- **Persist post-jiggle `state.x` in saved scenes** (CM-007 option
-  b). Heavier; touches scene format. Not needed for BDD-102 single-
-  process determinism — `mesh.id`-derived seed gives load-time
-  reproducibility for free. Defer to a future BDD-101 spine slice
-  if seeding-from-id ever proves insufficient.
-- **Harness `srand(0)` pre-seed** (CM-007 option c). The harness
-  doesn't need a workaround once production is fixed.
-- **Scene-format version bump** for the seed field. Not needed —
-  mesh.id is already serialized via `o.id`.
-- **Alembic-byte compare** instead of state-buffer compare. The
-  Estimator's WARNING called this out as an acceptable substitution
-  while FR-013 is blocked. Not a blocker for this fix-turn.
-- **Epsilon-tolerant comparison.** Strict bit-equality on positions
-  is the most informative tolerance for same-process two-runs;
-  epsilon would mask real ordering bugs. The Estimator's review
-  point #4 was specifically about velocity inclusion, not strict-
-  vs-epsilon for positions.
-- **Removing or refactoring the `state.v` buffer.** Only the
-  comparison drops it; `state.v` itself stays in `MeshState` and
-  in the production path.
+- **`Simulator::rotateObject(meshId, deltaQuat)` API + inspector
+  wiring** — the BDD wording is purely about quaternion math +
+  persistence, not UI. A "user composes rotations" semantic is
+  satisfied by the harness directly mutating `mesh.rotationQuat`.
+  Adding a runtime mutator + inspector control is its own slice
+  (would mirror D-014's translateObject pattern). Defer to a
+  future "rotation editing UI" slice if desired.
+
+- **Renderer-side rotation application.** The mesh draw path still
+  reads `state.x` directly without applying `rotationQuat`. This
+  slice does not change that. Closing the visual side requires
+  either (a) baking the rotation into `state.x` once on commit
+  (D-014 pattern, but rotation has subtleties — pivot point,
+  cloth-in-flight semantics) or (b) a per-mesh model matrix in the
+  shader (renderer rework, much larger). Both are out of scope.
+
+- **Euler↔quaternion conversion path** in the persistence layer.
+  The current scene format stores quaternions directly as
+  `{w, x, y, z}` arrays (per `toSnapshot`/`loadScene`). No Euler
+  conversion exists. The BDD's Notes line "catches silent
+  Euler↔quaternion conversion" is a guard against future drift —
+  Block 12's tolerance check would fire if such a conversion is
+  ever introduced.
+
+- **`Simulator::rotateObject` parallel to `translateObject`**
+  (D-014). Mirrors translate's pattern but adds renderer-side
+  questions (does rotation update state.x? if so, around what
+  pivot? if not, where does it apply?). Defer.
+
+- **Cross-build determinism for Quat math.** v1's
+  same-binary-same-machine scope per PRD §6 is sufficient.
+
 - **Resolving `Q1`, `Q2`, `Q4`, `Q5`, `Q6`, `Q7`.**
 
 ## Todo
 
 Ordered. Generator executes top-to-bottom.
 
-1. **Branch hygiene.** Stay on `feat/bdd-102-determinism`. Commit
-   prefix: `fix:` (per GENERATOR.md "Bug-fix turns in response to
-   an Estimator BLOCK stay on the same slice branch"). The
-   Generator's prior uncommitted changes (Block 11 + CM-007 +
-   bookkeeping) carry forward; this fix-turn modifies them in
-   place.
+1. **Branch hygiene.** Already on `feat/bdd-004-rotation` (off
+   `main` at `992b658`). No new branch. Commit prefix: `add:`.
 
-2. **Add `seed` field to `MeshGridInitializerParams`.** Add
-   `uint32_t seed = 0;` member; extend the constructor to accept it
-   as a defaulted parameter so existing call sites stay
-   source-compatible without edits. (Verify: there are 3 call
-   sites — `addCloth`, `addGround`, `loadScene`. The defaulted
-   parameter keeps `addGround`'s call source-compatible since it
-   uses `jiggle = false` and doesn't care about the seed.)
+2. **Re-read the binding "Then" clause** in
+   `docs/TESTS.md#BDD-004` (lines 47–53) and the Notes line. Block
+   12 assertions are authored from this verbatim.
 
-3. **Replace `rand()` in `MeshGridInitializer::initialize`.**
-   - Add `#include <random>` at the top of `src/main.cpp` if not
-     already present.
-   - Construct `std::mt19937 rng(params.seed);` once outside the
-     particle loop.
-   - Construct `std::uniform_real_distribution<PR> jiggleDist(PR(0),
-     PR(1.0/10000.0));` once.
-   - Replace `pz = params.jiggle ? rand()/PR(RAND_MAX)/10000.f :
-     0.f;` with `pz = params.jiggle ? jiggleDist(rng) : PR(0);`.
-   - The math is equivalent (uniform in `[0, 1/10000)` instead of
-     `[0, 1/10000]`); the visual difference is at the ULP level.
+3. **Add Quat math helpers in `src/main.cpp`** (right after the
+   `struct Quat` definition at line 1548):
 
-4. **Wire seed in `addCloth`.** Read `Scene<BE,PR>::numMeshes`
-   *before* the `addGeneralMesh` call; pass that value as the
-   seed:
    ```cpp
-   uint32_t seed = static_cast<uint32_t>(Scene<BE, PR>::numMeshes);
-   scene.addGeneralMesh(
-       new MeshGridInitializer<BE, PR>({
-           PlaneDirection::XZPlane,
-           center,
-           particleNum1D,
-           size1D,
-           mass,
-           true, // jiggle
-           seed
-       }), ...);
+   inline Quat operator*(const Quat& a, const Quat& b) {
+       Quat r;
+       r.w = a.w*b.w - a.x*b.x - a.y*b.y - a.z*b.z;
+       r.x = a.w*b.x + a.x*b.w + a.y*b.z - a.z*b.y;
+       r.y = a.w*b.y - a.x*b.z + a.y*b.w + a.z*b.x;
+       r.z = a.w*b.z + a.x*b.y - a.y*b.x + a.z*b.w;
+       return r;
+   }
+
+   inline float quatNorm(const Quat& q) {
+       return std::sqrt(q.w*q.w + q.x*q.x + q.y*q.y + q.z*q.z);
+   }
+
+   inline Quat quatNormalize(const Quat& q) {
+       float n = quatNorm(q);
+       if (n < 1e-12f) return Quat{};
+       Quat r{q.w/n, q.x/n, q.y/n, q.z/n};
+       return r;
+   }
    ```
-   `numMeshes` increments inside `addGeneralMesh`, so the value
-   read pre-call is the id this mesh will receive.
 
-5. **Wire seed in `loadScene`.** When reconstructing
-   `MeshGridInitializerParams` from a saved scene, pass `static_cast
-   <uint32_t>(o.id)` as the seed. This makes save/load
-   reproduce the original jiggle since `o.id` is preserved by the
-   scene format.
+   `<cmath>` is already pulled in transitively. If not, add
+   `#include <cmath>` near the other std headers. Generator
+   may prefer member functions on `Quat` instead of free functions
+   — either is fine, just stay consistent.
 
-6. **Block 11 cleanup (Estimator points 1–4):**
+4. **Author Block 12 in `runSelfTest`** per the shape in the Scope
+   section. Concrete details:
+   - `quatAxisAngle(axis, angle)` helper returns
+     `Quat{cos(angle/2), sin(angle/2)*axis.x, ...}`. Local to the
+     block or a sibling lambda inside `runSelfTest`.
+   - `kPi = 3.14159265358979323846f` constant inline.
+   - Use `addCube` (Float-tagged) — rotation composition is a
+     CPU-side mutation that doesn't depend on simulation behavior.
+   - The `pendingRotations` apply path runs inside
+     `applyPendingMaterials` (mis-named for historical reasons —
+     it also applies rotations). Call it after `loadScene + initialize`.
+   - Tolerance: 1e-5 for both orientation and norm. Three
+     compositions of unit quaternions accumulate at most ~3 ULPs
+     of float drift; 1e-5 is comfortably above that.
 
-   - **Drop `state.v`** from the byte buffer. `snapshotState` only
-     copies `state.x`. The buffer name can stay
-     `unsigned char` byte-vector.
-   - **Fail-loud on null buffers.** Replace
-     `if (!m.state.x.ptr || !m.state.v.ptr) continue;` with
-     `if (!m.state.x.ptr) { fail(...); return; }` (or equivalent —
-     break out of Block 11 with a fail). Drop the `state.v` check
-     since we're not snapshotting v anymore.
-   - **Per-frame compare.** Replace the single-snapshot pattern
-     with a per-frame loop: `for (int f = 0; f < detFrames; ++f) {
-     sim.update(); snapshotState(perFrameA[f]); }` — same for
-     run B. After both runs, compare `perFrameA[i]` vs
-     `perFrameB[i]` for each `i`; the first differing frame is
-     reported with the byte offset.
-   - **SKIP → FAIL.** Replace the `skip(...)` call on the mismatch
-     path with `fail(...)`. Keep the existing `pass(...)` on the
-     match path. After CM-007 is fixed (todos 2-5), Block 11 will
-     PASS; this `fail()` is the diagnostic for future regressions.
-   - **Pass-label wording stays unchanged**: `BDD-102 / two runs
-     produce bit-identical state.x and state.v` becomes
-     `BDD-102 / two runs produce bit-identical per-frame state.x`.
-     The matrix-row test address must be updated to match (single
-     line in `docs/TEST_MATRIX.md`). Confirm the new wording is
-     a valid spec-substitution against `docs/TESTS.md#BDD-102`'s
-     "Then" clause: still satisfies "per-frame vertex positions
-     agree".
+5. **Run `./scripts/verify-light.sh`.** Doctest binaries should
+   stay 159/159 + 1120/1120; nothing in their surface changes.
 
-7. **Run `./scripts/verify-light.sh`.** Doctest binaries should
-   stay 159/159 + 1120/1120.
+6. **Run `--self-test` 5+ times.** Quaternion math is fully
+   deterministic on a single machine — expect **25/25 PASS**
+   consistently. If Block 12 FAILs intermittently, the cause is
+   real nondeterminism (saveScene/loadScene side, since the
+   composition itself is pure CPU math). **Stop and hand back to
+   Planner** in that case.
 
-8. **Run `--self-test` 5+ times.** Expect **24/24 PASS**
-   consistently. If Block 11 still FAILs, the cause is something
-   beyond `rand()` — possibly atomic ordering in `narrow_pt_tri`,
-   BVH instability, or a different RNG source elsewhere. **Stop
-   and hand back to the Planner.**
+7. **Optional bug-probe.** For confidence: temporarily change `dq1`
+   to a non-unit quaternion (skip the `.normalized()`) and confirm
+   Block 12 FAILs with the unit-norm clause; or perturb the saved
+   scene's rotation field by hand and confirm the orientation
+   clause FAILs. Same discipline as prior slices.
 
-9. **Promote `BDD-102` matrix row.** `docs/TEST_MATRIX.md:35`:
+8. **Promote `BDD-004` matrix row.** `docs/TEST_MATRIX.md:18`:
    - Status: `pending → pass`.
-   - Test address: `src/main.cpp::runSelfTest::BDD-102 (Block 11)
-     — per-frame bit-identical positions across two runs of
-     buildSyntheticScene; substitution noted (state.x stands in for
-     Alembic outputs while FR-013 blocked).`
+   - Test address: `src/main.cpp::runSelfTest::BDD-004 (Block 12)
+     — quaternion composition round-trip + unit-norm invariant
+     across saveScene/loadScene boundary.`
 
-10. **Graduate CM-007 to `docs/mistakes/OLD_MISTAKES.md`.** Add a
-    new high-level-cause section ("Global RNG state leaks across
-    scene reconstructions" or similar). Replace the active entry
-    in `COMMON_MISTAKES.md` with a one-line graduation breadcrumb
-    mirroring the CM-005 / CM-006 patterns.
+9. **DECISIONS / CURRENT_WORK / RESUME.** New numbered entry in
+   `docs/DECISIONS.md`:
+   > **D-NNN — `Quat` gains a canonical math implementation
+   > (Hamilton product + normalization).** Lives alongside the
+   > existing struct in `src/main.cpp`. The implementation is
+   > load-bearing for BDD-004 mechanization and is the canonical
+   > source any future rotation consumer should use (FR-004
+   > inspector, FR-008 rigid body, eventual renderer-side
+   > rotation). Document this so the next consumer doesn't
+   > duplicate the math.
 
-11. **Add D-018 to `docs/DECISIONS.md`.** Records the per-mesh
-    seeded RNG decision: file/function, decision (`mesh.id` is the
-    seed), alternatives considered (hardcoded constant, persisting
-    post-jiggle state.x, harness pre-seed), rationale (smallest
-    behavior change, save/load reproducibility for free since
-    `o.id` is serialized).
+   Update `CURRENT_WORK.md` and `RESUME.md` per role doc steps
+   6/7.
 
-12. **Update CURRENT_WORK / RESUME.** Four-line max as work
-    proceeds; write RESUME near end of turn.
-
-13. **Stop and hand off to the Estimator.** Don't touch other
-    matrix rows, don't refactor the BVH or narrow phase, don't
-    bump scene format version.
+10. **Stop and hand off to the Estimator.** No inspector wiring,
+    no renderer change, no `Simulator::rotateObject` API, no
+    other matrix rows.
 
 ## Course corrections
 
-- **`mesh.id` is stable across save/load.** D-007 (`rotationQuat`
-  side-table keyed by mesh id) and D-014 (`transformPosition`
-  field on `GeneralMesh`) both rely on this. The persistence layer
-  serializes `o.id` in the scene format. So deriving the jiggle
-  seed from `mesh.id` gives save/load reproducibility for free —
-  no scene-format change. Document this explicitly in D-018 so
-  future maintainers don't add a redundant `seed` field to the
-  scene format.
+- **Spec-vs-label discipline.** Block 12's pass label and
+  assertions come from `docs/TESTS.md#BDD-004`'s "Then" clause
+  verbatim. The matrix-row label "Rotate with quaternion canonical
+  storage" is too compressed — assertions written from labels
+  have BLOCKed past slices.
 
-- **The `numMeshes` read in `addCloth`** is the
-  about-to-be-assigned id (because `addGeneralMesh` does
-  `numMeshes++`). This is the same id that Scene::pack later
-  writes into `meshes[i].id`. Confirm by reading `addGeneralMesh`'s
-  body once before writing the addCloth change; if it differs, use
-  the actual mechanism Scene uses for id assignment.
+- **`pendingRotations` is the load-side mirror.** When `loadScene`
+  parses `o.transform.rotation`, it stashes the quaternion in
+  `pendingRotations[meshId]`. `applyPendingMaterials()` (despite
+  its name) applies both materials and rotations. Block 12's
+  saveScene/loadScene/initialize/applyPendingMaterials sequence
+  must call `applyPendingMaterials` to actually write the
+  rotation back into `mesh.rotationQuat`. Forgetting this would
+  make the assertion compare an identity quaternion against the
+  expected composition and fail with a misleading message.
 
-- **`std::uniform_real_distribution` is implementation-defined** —
-  different libstdc++ versions may produce different sequences.
-  For BDD-102's single-process scope (same binary, same run), this
-  is fine because both runs use the same library version. For
-  cross-build determinism (explicitly out of scope per PRD §6),
-  this is not a guarantee.
+- **`Quat` is a CPU-only struct.** It does not cross the Metal
+  kernel boundary. No buffer binding to verify, no `[[buffer(N)]]`
+  to grep. CM-004's lesson doesn't apply here.
 
-- **The Estimator's WARNING about state-buffer vs Alembic-byte
-  compare** is acknowledged in the spec-substitution comment in
-  Block 11 (was already there pre-block) and stays. Not a blocker.
-  When FR-013 ships, BDD-102 mechanization can extend to compare
-  Alembic bytes too.
+- **Hamilton product convention: `a * b` applies `b` first, then
+  `a`.** This matches the standard "rotate by R₁, then by R₂"
+  reads as `R₂ * R₁`. The BDD wording "composes a sequence of
+  rotations" is direction-agnostic; the test just needs the
+  in-memory and round-trip paths to use the **same** convention.
+  Document the convention in the new D-NNN entry so future
+  consumers don't get it backwards.
 
-- **If a fifth initializer subtype ships** (e.g., FR-008 Rigid),
-  D-015's three-site cascade invariant applies (translateObject,
-  Scene::pack, toSnapshot) AND that subtype needs to consider its
-  own randomness sources. D-018 should mention this so the next
-  initializer subtype starts deterministic.
+- **No D-018 cascade.** D-015's three-site cascade
+  (translateObject + Scene::pack + toSnapshot) is about position
+  write-back. D-018's seed-from-id invariant is about
+  initializer randomness. Neither applies to this slice — the
+  rotation field is mutated directly by the harness, persistence
+  already round-trips it via `pendingRotations`, and there's no
+  randomness involved.
 
 ## What to read before writing code
 
-- `docs/TESTS.md#BDD-102` (lines 195–201) — binding "Then" clause.
-- `docs/mistakes/COMMON_MISTAKES.md::CM-007` (current active entry)
-  — exact diagnosis of the bug being fixed; the Generator should
-  read this to confirm the fix matches the cause.
-- `src/main.cpp::MeshGridInitializerParams` (~line 1021) — params
-  struct to extend with `seed`.
-- `src/main.cpp::MeshGridInitializer::initialize` (~line 1063) —
-  replace `rand()` here.
-- `src/main.cpp::Simulator::addCloth` (~line 4381) — wire
-  `Scene::numMeshes`-derived seed.
-- `src/main.cpp::loadScene` (~line 5011) — wire `o.id`-derived
-  seed.
-- `src/main.cpp::runSelfTest` Block 11 (~line 6107) — Block 11 in
-  its current SKIP state; fix-turn rewrites it per Estimator
-  points 1–4.
-- `src/main.cpp::Scene::addGeneralMesh` — to confirm `numMeshes`
-  increments inside this call (so the pre-call read is the
-  about-to-be-assigned id).
-- `docs/mistakes/OLD_MISTAKES.md` — graduation format.
-- `.agent/ESTIMATION.md` — current BLOCK verdict + WARNING.
+- `docs/TESTS.md#BDD-004` (lines 47–53) — binding "Then" clause +
+  Notes line. Verbatim source for Block 12.
+- `docs/specs/BDD.md#BDD-004` and `docs/specs/FRD.md#FR-004` —
+  user-story framing and functional contract (the FRD entry sets
+  context but BDD-004's spec is purely about the quaternion math
+  / persistence side, not UI).
+- `src/main.cpp::struct Quat` (~line 1548) — the bare struct that
+  will gain math helpers.
+- `src/main.cpp::Simulator::toSnapshot` (~line 4880) — encodes
+  rotation as `o.transform.rotation = {w, x, y, z}` (4-element
+  array). Confirm the format matches Block 12's expectation
+  before writing the assertion.
+- `src/main.cpp::Simulator::loadScene` (~line 5060–5095) —
+  decodes `o.transform.rotation` into `pendingRotations[meshId]`
+  and `applyPendingMaterials()` writes it into
+  `mesh.rotationQuat`. Block 12 must call `applyPendingMaterials`
+  after `loadScene + initialize`.
+- `src/main.cpp::runSelfTest` Block 8 (BDD-015) and Block 9
+  (BDD-003 round-trip) — existing block templates that exercise
+  saveScene/loadScene; mirror their structure.
+- `.agent/RESUME.md` (current) — D-018 invariants don't apply
+  here; rotation is not seed-derived.

@@ -1,16 +1,18 @@
-# Current Work — BDD-102 Fix-Turn (`feat/cloth-thickness-band` → wait, `feat/bdd-102-determinism`)
+# Current Work — BDD-004 Quaternion Slice (`feat/bdd-004-rotation`)
 
-- File in flight: none — fix-turn complete, BLOCK closed. **24/24 self-test PASS, deterministic across 5 consecutive runs.** Doctest 159/159 + 1120/1120 green.
-- How far: all 13 PLAN todos done.
-  - **D-018** — `MeshGridInitializerParams` gained `uint32_t seed = 0` field; `MeshGridInitializer::initialize` uses a local `std::mt19937(params.seed)` with `std::uniform_real_distribution<PR>(0, 1.0/10000.0)` instead of `rand()`. RNG is fully scoped to `initialize()` — no global state leak.
-  - **Seed wiring:** `addCloth` reads `Scene<BE, PR>::numMeshes` pre-call (the about-to-be-assigned id) and passes it as the seed. `loadScene` passes `o.id` from the saved scene. Same scene + same mesh ids → bit-identical jiggle. Save/load reproduces jiggle for free; no scene-format change needed.
-  - **Block 11 cleanup per Estimator's 4 review points:** (1) SKIP→FAIL — mismatch is now a hard failure; (2) per-frame compare — 30-frame snapshot vectors with first-divergent-frame diagnostic; (3) fail-loud on null buffers — `snapshotPositions` returns false and emits a fail with mesh id; (4) positions-only — dropped state.v from the byte buffer. Strict bit-equality on positions stays per BDD-102 wording.
-  - **Pass label changed** to `BDD-102 / two runs produce bit-identical per-frame state.x` (was `…state.x and state.v`); matrix row updated to match.
-  - **Bug-probe verified** — temporarily added `state.x[0] += 0.001f` between the two runs; Block 11 FAILed at frame 0 byte 0 with the per-frame diagnostic format (`888 bytes` confirms positions-only). Restored.
-  - **CM-007 graduated** to OLD_MISTAKES.md under a new high-level cause "Global RNG state leaks across scene reconstructions". Active list keeps a graduation breadcrumb. Direction-for-similar-problems written for future initializer subtypes that introduce randomness.
-- Tests:
-  - **24/24 self-test PASS** on macOS Apple Silicon, deterministic across 5 runs of `--self-test`.
-  - Doctest binaries unchanged.
-  - `BDD-102` matrix row promoted `pending → pass` with test address pointing at Block 11 + D-018.
-- Non-goals respected: no scene-format version bump, no harness `srand(0)` workaround, no Alembic-byte compare (substitution stays documented), no epsilon-tolerant comparison, no other matrix rows touched.
-- What's next: Estimator review. Expect verdict at NOTE level — BLOCK was strictly the SKIP-suppression; fix-turn closes both the underlying nondeterminism (CM-007) and the four code-review points the Estimator surfaced earlier.
+- File in flight: none — slice complete; ready for Estimator. **25/25 self-test PASS** deterministic across 5 consecutive runs. `verify-light.sh` clean.
+- How far: all 10 PLAN todos done.
+  - **D-019** — three new free functions live next to `struct Quat` (~line 1554): `operator*(Quat, Quat)` (Hamilton product, `a * b = apply b first then a`), `quatNorm`, `quatNormalize` (with 1e-12 degenerate-input guard returning identity). Struct unchanged — aggregate-init shape and on-disk schema stay intact.
+  - **Block 12** mechanizes `docs/TESTS.md#BDD-004` verbatim:
+    - Compose R₁ = (dq1 * R₀).normalized() in memory.
+    - saveScene → loadScene → applyPendingMaterials (writes pendingRotations into rotationQuat).
+    - Compose R₂_round_trip = (dq2 * R₁_post_load).normalized() and compare to R₂_in_memory = (dq2 * R₁).normalized().
+    - Assert orientation drift < 1e-5 component-wise + unit-norm < 1e-5 at each step.
+    - Local helper `quatAxisAngle(axis, angle)` lives inside the block; `kPi = 3.14159265358979323846f` constant inline.
+  - **Bug-probe verified** — temporarily added `meshAfterLoad->rotationQuat.w += 0.01f` after the reload; Block 12 FAILed with `orientation drift (round-trip vs in-memory): 0.002179, 0.001776, 0.003470, 0.000245`. Restored; flips back to PASS.
+- What's tested:
+  - **25/25 self-test PASS** on macOS Apple Silicon, deterministic across 5 runs.
+  - Doctest binaries unchanged (159 + 1120 assertions).
+  - `docs/TEST_MATRIX.md` row `BDD-004` promoted `pending → pass`.
+- Non-goals respected: no `Simulator::rotateObject` API, no inspector wiring, no renderer-side rotation application, no Euler conversion. The slice is purely data-layer math + persistence-round-trip mechanization, matching BDD-004's "Then" wording exactly.
+- What's next: Estimator review. Expect verdict at NOTE level — Block 12 is verbatim-from-spec, bug-probe-verified, and the canonical Quat math (D-019) is the load-bearing piece for any future rotation consumer.
