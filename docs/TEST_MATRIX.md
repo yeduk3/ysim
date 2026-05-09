@@ -32,7 +32,7 @@ Use this as the entry point — `docs/TESTS.md` will get long, so find scenarios
 | BDD-018     | Inspector edits propagate live                    |              | pending |
 | BDD-019     | Frame profiler shows and exports timings          | `src/main.cpp::runSelfTest` Block 10 — three clauses PASS (`BDD-019 / per-section timings updated each frame`, `…/ CSV written under profiles containing history`, `…/ history collection pauses when sim pauses`). The CSV path uses `/tmp/` rather than `profiles/` for harness hygiene; spec-substitution noted in the block comment. | pass    |
 | BDD-101     | End-to-end round-trip to Alembic into Unreal      |              | pending |
-| BDD-102     | Single-machine determinism                        |              | pending |
+| BDD-102     | Single-machine determinism                        | `src/main.cpp::runSelfTest` Block 11 — per-frame bit-identical positions across two runs of `buildSyntheticScene` (30 frames, positions only, strict memcmp). Closed by D-018 (per-mesh seeded `std::mt19937` in `MeshGridInitializer`). Substitution noted: state.x stands in for Alembic outputs while FR-013 blocked. | pass    |
 | BDD-103     | Backend-boundary invariant holds                  |              | pending |
 
 ## Status legend

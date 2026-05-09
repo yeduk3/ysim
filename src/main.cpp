@@ -42,6 +42,7 @@ struct METAL : Backend {};
 #include <algorithm>
 #include <chrono>
 #include <cstring>
+#include <random>
 #include <unordered_map>
 #include <vector>
 #include <iostream>
@@ -1026,16 +1027,21 @@ struct MeshGridInitializerParams : InitializerParams<PR> {
     bool jiggle;
     PlaneDirection dir;
     tinym::vec3 center;
+    // Per-mesh RNG seed for jiggle; must be deterministic across runs of the
+    // same scene (D-018). Production wires this from mesh.id (addCloth reads
+    // Scene::numMeshes pre-call; loadScene passes o.id). Value is irrelevant
+    // when jiggle == false — addGround leaves it at the default.
+    uint32_t seed;
 
-    MeshGridInitializerParams(PlaneDirection dir, tinym::vec3 center, Index particleNum1D, PR size1D, PR mass, bool jiggle)
+    MeshGridInitializerParams(PlaneDirection dir, tinym::vec3 center, Index particleNum1D, PR size1D, PR mass, bool jiggle, uint32_t seed = 0)
         : dir(dir), center(center),
-        particleNum1D(particleNum1D), 
+        particleNum1D(particleNum1D),
         InitializerParams<PR>(
                 particleNum1D*particleNum1D, // numPoints
                 2*(particleNum1D-1)*(particleNum1D-1), // numFacets
                 2*(particleNum1D-1)*particleNum1D+2*(particleNum1D-1)*(particleNum1D-1), // numEdges
                 mass),
-        size1D(size1D), jiggle(jiggle) {}
+        size1D(size1D), jiggle(jiggle), seed(seed) {}
 };
 
 template <typename BE, typename PR>
@@ -1047,20 +1053,27 @@ struct MeshGridInitializer : GeneralMeshInitializer<BE, PR> {
 
     void initialize(MeshState<BE, PR>& state, MeshAdjacency<BE, PR>& adjacency) override {
         std::cout << "[MeshGridSpringInitializer initialize] start" << std::endl;
-        
+
         state.memoryAllocation(params); // numPoints
         adjacency.memoryAllocation(params); // numPoints, numFacets, numEdges
 
         PR halfSize = params.size1D / 2.0;
         PR length = params.size1D/PR(params.particleNum1D-1);
 
+        // D-018: per-mesh seeded RNG. Two runs of the same scene produce
+        // bit-identical jiggle because the seed is derived from mesh.id
+        // (preserved across save/load). Replaces global rand() (CM-007,
+        // graduated to OLD_MISTAKES).
+        std::mt19937 rng(params.seed);
+        std::uniform_real_distribution<PR> jiggleDist(PR(0), PR(1.0/10000.0));
+
         for (int row = 0; row < params.particleNum1D; ++row) {
             for (int col = 0; col < params.particleNum1D; ++col) {
-                int base = (row*params.particleNum1D + col)*3; 
-                
+                int base = (row*params.particleNum1D + col)*3;
+
                 PR px =  col*length - halfSize;
                 PR py = -row*length + halfSize;
-                PR pz = params.jiggle ? rand()/PR(RAND_MAX)/10000.f : 0.f;
+                PR pz = params.jiggle ? jiggleDist(rng) : PR(0);
                 
                 switch(params.dir) {
                     case PlaneDirection::XYPlane:
@@ -4379,14 +4392,18 @@ struct Simulator {
     }
 
     void addCloth(Index particleNum1D, PR size1D, tinym::vec3 center, PR kstretch=1e5, PR kshear=1e5, PR kbend=3e5, PR thickness=0.01, PR mass=0.1) {
+        // numMeshes is the about-to-be-assigned id (addGeneralMesh does
+        // numMeshes++); used as the deterministic RNG seed per D-018.
+        uint32_t seed = static_cast<uint32_t>(Scene<BE, PR>::numMeshes);
         scene.addGeneralMesh(
             new MeshGridInitializer<BE, PR>({
-                PlaneDirection::XZPlane, 
+                PlaneDirection::XZPlane,
                 center,
-                particleNum1D, 
-                size1D, 
-                mass, 
-                true // jiggle
+                particleNum1D,
+                size1D,
+                mass,
+                true, // jiggle
+                seed
             }),
             BehaviorType::TriangularCloth,
             ClothBehaviorParams<PR>{kstretch, kshear, kbend, thickness}
@@ -5013,7 +5030,8 @@ struct Simulator {
                         (Index)o.source.primitive.tessellation,
                         (PR)o.source.primitive.size,
                         (PR)o.source.primitive.mass,
-                        o.source.primitive.jiggle));
+                        o.source.primitive.jiggle,
+                        static_cast<uint32_t>(o.id))); // D-018: seed from saved mesh id
                 }
             } else {
                 std::string resolved = scene_format::resolveImportPath(sceneDir, o.source.import.path);
@@ -6102,6 +6120,90 @@ static int runSelfTest() {
 
         sim.profiler = nullptr;
         sim.pause = false;
+    }
+
+    // ---- Block 11: BDD-102 — Single-machine determinism. -----------------
+    // TESTS.md#BDD-102 wording (verbatim, *not* the matrix-row label):
+    //   Given a saved scene file and a fixed build of ysim on one machine
+    //   When  the user runs the full simulate-and-export flow twice in
+    //         succession
+    //   Then  the two Alembic outputs are visually identical (per-frame
+    //         vertex positions agree within a tight floating-point
+    //         tolerance).
+    //   Notes: cross-machine and cross-build determinism are explicitly
+    //          NOT in scope.
+    //
+    // Substitution: v1 has no Alembic exporter (FR-013 blocked on Q5/Q6),
+    // so "two Alembic outputs are visually identical" is mechanized as
+    // "two runs produce bit-identical per-frame state.x" — state.x is the
+    // canonical input the exporter would read once it ships. Positions
+    // only (state.v dropped) per BDD-102's wording. Strict bit equality:
+    // same-binary-same-machine runs have no compiler-reordering drift, so
+    // anything other than bit-identical positions indicates real
+    // nondeterminism. Per-frame compare (not just terminal) catches
+    // divergence-then-reconvergence.
+    {
+        auto snapshotPositions = [&](std::vector<unsigned char>& out) -> bool {
+            out.clear();
+            for (auto& m : Scene<Backend, Precision>::meshes) {
+                if (!m.state.x.ptr) {
+                    fail("BDD-102 / two runs produce bit-identical per-frame state.x",
+                         "mesh id=" + std::to_string(m.id) +
+                         " has null state.x.ptr — initialization failure");
+                    return false;
+                }
+                size_t xBytes = m.state.x.size * sizeof(Precision);
+                size_t base = out.size();
+                out.resize(base + xBytes);
+                std::memcpy(out.data() + base, m.state.x.ptr, xBytes);
+            }
+            return true;
+        };
+
+        const int detFrames = 30;
+        std::vector<std::vector<unsigned char>> framesA(detFrames), framesB(detFrames);
+
+        bool runOk = true;
+
+        buildSyntheticScene(sim);
+        sim.initialize();
+        for (int f = 0; f < detFrames && runOk; ++f) {
+            sim.update();
+            if (!snapshotPositions(framesA[f])) { runOk = false; break; }
+        }
+
+        if (runOk) {
+            buildSyntheticScene(sim);
+            sim.initialize();
+            for (int f = 0; f < detFrames && runOk; ++f) {
+                sim.update();
+                if (!snapshotPositions(framesB[f])) { runOk = false; break; }
+            }
+        }
+
+        if (runOk) {
+            int firstDivFrame = -1;
+            size_t firstDivByte = 0;
+            for (int f = 0; f < detFrames; ++f) {
+                if (framesA[f].size() != framesB[f].size() ||
+                    std::memcmp(framesA[f].data(), framesB[f].data(),
+                                framesA[f].size()) != 0) {
+                    firstDivFrame = f;
+                    while (firstDivByte < framesA[f].size() &&
+                           framesA[f][firstDivByte] == framesB[f][firstDivByte])
+                        ++firstDivByte;
+                    break;
+                }
+            }
+            if (firstDivFrame < 0) {
+                pass("BDD-102 / two runs produce bit-identical per-frame state.x");
+            } else {
+                fail("BDD-102 / two runs produce bit-identical per-frame state.x",
+                     "frame " + std::to_string(firstDivFrame) + " byte " +
+                     std::to_string(firstDivByte) + " of " +
+                     std::to_string(framesA[firstDivFrame].size()) + " differs");
+            }
+        }
     }
 
     if (failures == 0) {

@@ -55,3 +55,5 @@ When an entry has not recurred for a while and the underlying cause is gone (arc
 _Note: CM-005 (cloth tunnels through static ground) graduated to `docs/mistakes/OLD_MISTAKES.md` on 2026-05-08 — the structural cause (snapshot narrow-phase) was replaced by swept-segment CCD in D-013, so the failure mode cannot recur in the same form._
 
 _Note: CM-006 (slow-touch band drained vy off non-penetrating particles via the integrator's unconditional vn-zero) graduated to `docs/mistakes/OLD_MISTAKES.md` on 2026-05-09 — D-016 moved the vn-zero block inside the position-push's `(distance < thickness)` gate so detection and response gates are now symmetric. The failure mode cannot recur in the same form._
+
+_Note: CM-007 (`rand()`-based jiggle in `MeshGridInitializer` breaks BDD-102 single-machine determinism) graduated to `docs/mistakes/OLD_MISTAKES.md` on 2026-05-09 — D-018 replaced `rand()` with a per-mesh seeded `std::mt19937`, so the global-RNG-state-leak failure mode cannot recur in the same form._
