@@ -3815,8 +3815,8 @@ struct BVH<BE, PR, BVHMODE::LINEAR, PRIMITIVE> {
     void queryClickRay(const Ray& ray, const BVHNode& node) {
         RayHit hit;
         if(! node.aabb.intersect(ray, hit)) return;
-        
-        if(node.childA < 0) { // found
+
+        if(node.childA < 0) { // leaf — childB is the primitive id (not a node).
             auto& rayTracedData = Scene<BE, PR>::rayTracedData;
             auto& rayTraced = rayTracedData.clickRayCollisions;
             auto& numTraced = rayTracedData.numClickRayCollisions;
@@ -3824,6 +3824,13 @@ struct BVH<BE, PR, BVHMODE::LINEAR, PRIMITIVE> {
             rayTraced[numTraced[0]] = {
                 (Index)objid, (Index)node.childB, hit.tmin, hit.tmax};
             numTraced[0]++;
+            return; // D-020: must not recurse from a leaf — childA/childB
+                    // here are NOT child node indices (childA == -1 marks
+                    // leaf, childB is the primitive id). Without this
+                    // return, `tree[node.childB]` walks into a random
+                    // sibling node, fills the 4096-slot buffer with
+                    // spurious hits, and starves any further objTrees
+                    // (e.g., the back cube in BDD-017's overlapping case).
         }
 
         if(node.childA > 0) queryClickRay(ray, tree[node.childA]);
@@ -6479,14 +6486,20 @@ static int runSelfTest() {
         const Index cubeAId = 0;
         const Index cubeBId = 1;
 
+        // Reset selectedObj so the assertions below read a freshly-written
+        // value (production callback at src/main.cpp:6718 writes
+        // simulator->selectedObj on every click; harness mirrors).
+        sim.selectedObj = -1;
+
         Ray rayA;
         rayA.origin = tinym::vec3(-1.5f, 0.0f,  10.0f);
         rayA.dir    = tinym::vec3( 0.0f, 0.0f, -1.0f);
         Scene<Backend, Precision>::rayTracedData.numClickRayCollisions[0] = 0;
         sim.collisionPipeline.broadPhase.queryClickRay(rayA);
         Index pickedA = pickClosest();
+        sim.selectedObj = static_cast<int>(pickedA);
 
-        bool clauseAOk = (pickedA == cubeAId);
+        bool clauseAOk = (sim.selectedObj == static_cast<int>(cubeAId));
         if (clauseAOk) {
             Ray rayB;
             rayB.origin = tinym::vec3( 1.5f, 0.0f,  10.0f);
@@ -6494,18 +6507,19 @@ static int runSelfTest() {
             Scene<Backend, Precision>::rayTracedData.numClickRayCollisions[0] = 0;
             sim.collisionPipeline.broadPhase.queryClickRay(rayB);
             Index pickedB = pickClosest();
-            if (pickedB != cubeBId) {
+            sim.selectedObj = static_cast<int>(pickedB);
+            if (sim.selectedObj != static_cast<int>(cubeBId)) {
                 fail("BDD-017 / ray hits the clicked object's id (non-overlapping)",
-                     "expected cubeB id=" + std::to_string(cubeBId) +
-                     ", got " + std::to_string(pickedB));
+                     "expected sim.selectedObj=" + std::to_string(cubeBId) +
+                     " (cubeB), got " + std::to_string(sim.selectedObj));
                 clauseAOk = false;
             } else {
                 pass("BDD-017 / ray hits the clicked object's id (non-overlapping)");
             }
         } else {
             fail("BDD-017 / ray hits the clicked object's id (non-overlapping)",
-                 "expected cubeA id=" + std::to_string(cubeAId) +
-                 ", got " + std::to_string(pickedA));
+                 "expected sim.selectedObj=" + std::to_string(cubeAId) +
+                 " (cubeA), got " + std::to_string(sim.selectedObj));
         }
 
         // --- Clause (b): overlapping case, front-most (smallest tmin). -
@@ -6528,16 +6542,35 @@ static int runSelfTest() {
         Scene<Backend, Precision>::rayTracedData.numClickRayCollisions[0] = 0;
         sim.collisionPipeline.broadPhase.queryClickRay(rayDeep);
         Index numHits = Scene<Backend, Precision>::rayTracedData.numClickRayCollisions[0];
+
+        // Walk the full hit list to verify BOTH cubes participated —
+        // queryClickRay writes per-triangle hits, so numHits >= 2 alone
+        // is satisfiable by a single cube and doesn't prove the back
+        // cube was reached. The both-cubes check closes that gap.
+        bool sawFront = false, sawBack = false;
+        for (Index i = 0; i < numHits; ++i) {
+            Index hitObj = Scene<Backend, Precision>::rayTracedData
+                .clickRayCollisions[i].obj;
+            if (hitObj == cubeFrontId) sawFront = true;
+            if (hitObj == cubeBackId)  sawBack  = true;
+        }
+
         Index pickedDeep = pickClosest();
+        sim.selectedObj = static_cast<int>(pickedDeep);
         if (numHits < 2) {
             fail("BDD-017 / overlapping case: front-most object (smallest ray t) wins",
                  "expected >=2 hits along through-line, got " +
                  std::to_string(numHits));
-        } else if (pickedDeep != cubeFrontId) {
+        } else if (!sawFront || !sawBack) {
             fail("BDD-017 / overlapping case: front-most object (smallest ray t) wins",
-                 "expected cubeFront id=" + std::to_string(cubeFrontId) +
-                 " (cubeBack=" + std::to_string(cubeBackId) +
-                 "), got " + std::to_string(pickedDeep));
+                 "ray hits did not include both cubes (sawFront=" +
+                 std::to_string(sawFront) + ", sawBack=" +
+                 std::to_string(sawBack) + ")");
+        } else if (sim.selectedObj != static_cast<int>(cubeFrontId)) {
+            fail("BDD-017 / overlapping case: front-most object (smallest ray t) wins",
+                 "expected sim.selectedObj=" + std::to_string(cubeFrontId) +
+                 " (cubeFront, cubeBack=" + std::to_string(cubeBackId) +
+                 "), got " + std::to_string(sim.selectedObj));
         } else {
             pass("BDD-017 / overlapping case: front-most object (smallest ray t) wins");
         }

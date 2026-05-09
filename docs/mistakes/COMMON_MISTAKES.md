@@ -58,6 +58,14 @@ _Note: CM-006 (slow-touch band drained vy off non-penetrating particles via the 
 
 _Note: CM-007 (`rand()`-based jiggle in `MeshGridInitializer` breaks BDD-102 single-machine determinism) graduated to `docs/mistakes/OLD_MISTAKES.md` on 2026-05-09 — D-018 replaced `rand()` with a per-mesh seeded `std::mt19937`, so the global-RNG-state-leak failure mode cannot recur in the same form._
 
+## CM-009 — BVH walk that mixes leaf "write hit" with "recurse children" treats `childB` (primitive id) as a node index
+
+- Where: `src/main.cpp::BVH<METAL, PR, BVHMODE::LINEAR, PRIMITIVE>::queryClickRay(const Ray&, const BVHNode&)` (~line 3815, fixed by D-020). Pattern likely recurs in any future BVH walk that follows the same shape: interior nodes encode `childA, childB` as node indices; leaves encode `childA == -1, childB == primitive_id`. If the walk writes the hit and then **falls through** to a generic "recurse if children are positive" block, the leaf's `childB` (a primitive id) gets dereferenced as `tree[childB]` — a random sibling node — and recursion explodes.
+- Low-level cause: the leaf branch lacks an explicit `return` after writing the hit. Both `if (childA > 0)` and `if (childB > 0)` are evaluated next; for a leaf, `childA == -1 < 0` so the first is false, but `childB == primitive_id` is positive, so `tree[primitive_id]` recurses into an unrelated node.
+- High-level cause: the BVH node struct uses a sentinel encoding (`childA < 0` marks leaf) but the walk treats post-write fall-through as the "no special case" path. Two semantics share one storage layout; the walk has to disambiguate.
+- Fix direction: every BVH walk that writes a leaf hit must `return` from the leaf branch — leaves do not have node-index children. Concretely: `if (node.childA < 0) { ... write hit ...; return; }`. Equivalently, restructure as `if (interior) recurse; else leaf-action;`. Any future BVH variant (per-mesh narrow tree, scene-level tree, click-ray walk, ray-cast walk, debug-AABB walk) that copies this loop shape needs the same `return` discipline. Buffer caps (e.g., `approxColsPerRay = 4096`) only mask the symptom — they don't bound spurious recursion in trees with unboundedly-many "valid-looking" childB indices to follow.
+- First seen: 2026-05-10   Last seen: 2026-05-10
+
 ## CM-008 — `BroadPhase::build` skips Float-tagged per-mesh BVH rebuild, so harness scene-swaps reuse stale tree data
 
 - Where: `src/main.cpp::BVH<METAL, PR, BVHMODE::SCENE, BVHPRIMITIVE::OBJECT>::build` (~line 3907: `if(objTrees[i].tree.ptr && objTrees[i].objBehavior == BehaviorType::Float) continue;`). Triggered when consecutive `runSelfTest` blocks use `resetScene()` + new mesh creation but `numMeshes` matches the previous block's count, so `objTrees.size() != scene.numMeshes` is false and the per-slot rebuild loop runs against stale Float entries.
