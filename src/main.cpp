@@ -6287,6 +6287,18 @@ static int runSelfTest() {
                              "rotate target disappeared after reload");
                     } else {
                         ::Quat r1_post_load = meshAfterLoad->rotationQuat;
+                        const float normTol = 1e-5f;
+                        // Estimator turn-13 fold-in: assert the reloaded
+                        // quaternion is unit-norm BEFORE re-multiplying.
+                        // Without this check, quatNormalize(dq2 * r1_post_load)
+                        // below would silently absorb any load-side norm
+                        // regression. TESTS.md#BDD-004's Notes line is
+                        // explicit that the stored quaternion must remain
+                        // unit-norm after each composition.
+                        float n1_post_load = quatNorm(r1_post_load);
+                        bool postLoadNormOk =
+                            std::abs(n1_post_load - 1.0f) < normTol;
+
                         ::Quat r2_round_trip = quatNormalize(dq2 * r1_post_load);
                         ::Quat r2_in_memory = quatNormalize(dq2 * r1_in_memory);
 
@@ -6298,7 +6310,6 @@ static int runSelfTest() {
                         bool orientationOk = dw < quatTol && dx < quatTol &&
                                              dy < quatTol && dz < quatTol;
 
-                        const float normTol = 1e-5f;
                         float n0 = quatNorm(r0);
                         float n1 = quatNorm(r1_in_memory);
                         float n2 = quatNorm(r2_round_trip);
@@ -6307,7 +6318,11 @@ static int runSelfTest() {
                             std::abs(n1 - 1.0f) < normTol &&
                             std::abs(n2 - 1.0f) < normTol;
 
-                        if (!orientationOk) {
+                        if (!postLoadNormOk) {
+                            fail("BDD-004 / quaternion composition round-trip",
+                                 "r1_post_load is not unit-norm; |r1_post_load| = " +
+                                 std::to_string(n1_post_load));
+                        } else if (!orientationOk) {
                             fail("BDD-004 / quaternion composition round-trip",
                                  "orientation drift (round-trip vs in-memory): " +
                                  std::to_string(dw) + ", " + std::to_string(dx) + ", " +
@@ -6324,6 +6339,85 @@ static int runSelfTest() {
                 }
                 std::remove(path.c_str());
             }
+        }
+    }
+
+    // ---- Block 13: BDD-010 — Collision detected between simulated objects.
+    // TESTS.md#BDD-010 wording (verbatim, *not* the matrix-row label):
+    //   Given two simulated meshes positioned so that their AABBs overlap
+    //         on the next step
+    //   When  the broad-phase + narrow-phase pipeline runs once
+    //   Then  the resulting constraint set contains at least one contact
+    //         pair (A, B) between the two objects.
+    //   Notes: also assert that the same scene with non-overlapping AABBs
+    //          produces an empty constraint set (negative case). Self-
+    //          collision is parked (PRD §4); the test scene must not
+    //          trigger self-collision.
+    //
+    // The test exercises the broad + narrow pipeline directly: one
+    // sim.update() per scene, then read packedCollisionData. Self-
+    // collision is filtered by the default enableSelfCollisions = false
+    // plus the (A, B) check only counting contacts with
+    // objPair.query != objPair.target.
+    {
+        // --- Positive: cloth co-located with ground, AABBs overlap. ---
+        // Cloth at y = ground.y means particle Y values land within the
+        // ground's flat AABB at t=0 (modulo D-018 jiggle which is < 1e-4),
+        // so the broad phase's AABB-pair intersection fires immediately
+        // without waiting for velocity inflation to grow the cloth's AABB.
+        resetScene();
+        sim.addCloth(/*particleNum1D=*/4, /*size1D=*/0.5,
+                     tinym::vec3(0.0f, -1.0f, 0.0f),
+                     /*kstretch=*/1e3, /*kshear=*/1e3, /*kbend=*/1e3,
+                     /*thickness=*/0.01, /*mass=*/0.1);
+        sim.addGround(PlaneDirection::XZPlane, tinym::vec3(0, -1, 0),
+                      /*size1D=*/2.0f);
+        sim.initialize();
+        Scene<Backend, Precision>::packedCollisionData.cumulativeNarrowCollisions = 0;
+        sim.update();
+
+        auto& packedColPos = Scene<Backend, Precision>::packedCollisionData;
+        size_t cumPos = packedColPos.cumulativeNarrowCollisions;
+        size_t lastSubstep = packedColPos.numNarrowCollisions[0];
+        bool foundDistinctPair = false;
+        for (size_t i = 0; i < lastSubstep; ++i) {
+            const auto& nc = packedColPos.narrowCollisions[i];
+            if (nc.objPair.query != nc.objPair.target) {
+                foundDistinctPair = true;
+                break;
+            }
+        }
+        if (cumPos == 0) {
+            fail("BDD-010 / overlapping AABBs produce a contact pair between two distinct objects",
+                 "cumulativeNarrowCollisions == 0 — pipeline didn't fire");
+        } else if (!foundDistinctPair) {
+            fail("BDD-010 / overlapping AABBs produce a contact pair between two distinct objects",
+                 "no narrow contact has objPair.query != objPair.target "
+                 "(cumNarrow=" + std::to_string(cumPos) + ", lastSubstep=" +
+                 std::to_string(lastSubstep) + ")");
+        } else {
+            pass("BDD-010 / overlapping AABBs produce a contact pair between two distinct objects");
+        }
+
+        // --- Negative: cloth far above ground, AABBs disjoint. ---
+        resetScene();
+        sim.addCloth(/*particleNum1D=*/4, /*size1D=*/0.5,
+                     tinym::vec3(0.0f, 10.0f, 0.0f),
+                     /*kstretch=*/1e3, /*kshear=*/1e3, /*kbend=*/1e3,
+                     /*thickness=*/0.01, /*mass=*/0.1);
+        sim.addGround(PlaneDirection::XZPlane, tinym::vec3(0, -1, 0),
+                      /*size1D=*/2.0f);
+        sim.initialize();
+        Scene<Backend, Precision>::packedCollisionData.cumulativeNarrowCollisions = 0;
+        sim.update();
+
+        size_t cumNeg = Scene<Backend, Precision>::packedCollisionData.cumulativeNarrowCollisions;
+        if (cumNeg != 0) {
+            fail("BDD-010 / non-overlapping AABBs produce empty constraint set",
+                 "cumulativeNarrowCollisions == " + std::to_string(cumNeg) +
+                 " on a scene with disjoint AABBs");
+        } else {
+            pass("BDD-010 / non-overlapping AABBs produce empty constraint set");
         }
     }
 

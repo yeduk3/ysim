@@ -1,30 +1,29 @@
-# Resume — BDD-004 Quaternion Slice (BDD-004 promoted to pass)
+# Resume — BDD-010 Collision Detection Slice (BDD-010 promoted to pass)
 
 ## Must remember
 
-- **Branch:** `feat/bdd-004-rotation` (off `main` at `992b658`).
-- **D-019 is canonical Quat math.** Three free functions next to `struct Quat` (~line 1554): `operator*` (Hamilton product), `quatNorm`, `quatNormalize`. Convention: `a * b = apply b first, then a`. Future rotation consumers (FR-004 inspector wiring, FR-008 rigid body, eventual renderer-side rotation) **must use these** rather than reimplementing — drift between consumers is the failure mode this avoids.
-- **`pendingRotations` → `applyPendingMaterials` is load-side.** Despite the function name, `applyPendingMaterials()` also writes `pendingRotations[meshId]` into `mesh.rotationQuat`. Block 12's saveScene/loadScene flow calls it after `sim.initialize()`. Forgetting this would make the round-trip read identity instead of the saved rotation.
-- **`Quat` aggregate-init shape stays intact.** The struct is `{w, x, y, z}` POD; on-disk schema relies on this order. Adding member fields (e.g., a precomputed norm cache) would break the aggregate. If a future consumer needs caching, do it externally.
-- **Bug-probe-verified:** `meshAfterLoad->rotationQuat.w += 0.01f` after reload makes Block 12 FAIL with the orientation-drift diagnostic.
-- **Tolerance 1e-5 for both orientation and norm.** Three unit-quaternion compositions accumulate at most ~3 ULPs of float drift; 1e-5 is comfortably above that floor.
+- **Branch:** `feat/bdd-010-collision-detected` (off `main` at `089279b`).
+- **Block 13 cloth at `y = -1.0` (co-located with ground), NOT `y = -0.99`.** At t=0 with zero velocity, the broad phase's `enlargeTrajectory(system.subh)` inflation is zero; both meshes' AABBs are essentially flat planes that don't overlap unless the cloth's particles land within the ground's flat AABB. Co-locating at the same y solves it. If a future slice changes the broad-phase strategy (e.g., adds non-zero default AABB padding), this position can move back up — but Block 13 currently relies on co-location.
+- **`cumulativeNarrowCollisions` reset is explicit.** `resetScene()` does NOT clear it (it's a static member of `PackedCollisionData`). Block 13 sets it to 0 before each `sim.update()`. Same pattern Block 6 (BDD-007) uses.
+- **(A, B) distinct-pair assertion uses `objPair.query != objPair.target`.** This is also the structural safety net against self-collision contributing to the count, even with `enableSelfCollisions = false` already filtering at the broad phase.
+- **Block 12 BDD-004 fold-in:** `r1_post_load` unit-norm is now asserted **before** `quatNormalize(dq2 * r1_post_load)`. The re-normalize can absorb load-side drift; the explicit pre-multiply check catches it. Estimator turn-13 WARNING closed.
+- **No new D-NNN this slice.** Block 13 is mechanization-only; no architectural decision was made.
 
 ## Last decisions + why
 
-- **D-019** — canonical Quat math via free functions. Rejected: member functions (mixes data + math), reverse Hamilton convention (would surprise every consumer), defer-until-needed (BDD-004 needs it now; future consumers would re-implement and drift), GLM dependency (overkill for 30 lines). The convention is documented inline next to the operator so `R₂ * R₁` reads correctly without re-reading DECISIONS.
+- (No new decisions this slice — pure test mechanization + small WARNING fold-in.)
 
 ## Next step you were about to take
 
-Slice complete. Next concrete step is the **Estimator's** turn — `./scripts/verify.sh` should exit 0 with **25/25** self-test PASS lines. Expected verdict: NOTE level.
+Slice complete. Next concrete step is the **Estimator's** turn — `./scripts/verify.sh` should exit 0 with **27/27** self-test PASS lines. Expected verdict: NOTE level.
 
 After this lands, planner-tracked candidates per `PROJECT_STATE.md`:
 
 - **`Simulator::rotateObject(meshId, deltaQuat)` + inspector wiring (FR-004 UI side)** — pairs with D-014's translateObject. Has open design questions (pivot point, cloth-in-flight semantics) that BDD-004 didn't need to answer because the spec is purely data-layer.
-- **BDD-010 Collision detected between simulated objects** — small Block 13 mechanization, two clauses (positive/negative AABB-overlap cases).
-- **BDD-017 Ray-pick** — implementation exists; mechanization needs ray-pick logic extracted into a callable function.
-- **Material editing UI (FR-005 / BDD-005)** — needs PBR preview shader.
+- **BDD-017 Ray-pick** — implementation exists; mechanization needs ray-pick logic extracted into a callable function. Medium-sized.
+- **Material editing UI (FR-005 / BDD-005)** — needs PBR preview shader. Large.
 - **Behavior assignment UI (FR-006 / BDD-006)** — Q2 still open (cloth UX surface).
-- **Rigid body slice (FR-008 / BDD-008)** — blocked on Q4. When this lands it adds a fifth initializer subtype; D-015's three-site cascade applies AND D-018's seed-from-mesh-id invariant applies.
-- **Alembic export slice (FR-013 / BDD-013)** — blocked on Q5 + Q6. When this lands, BDD-102 mechanization can extend to compare Alembic bytes too.
+- **Rigid body slice (FR-008 / BDD-008)** — blocked on Q4. When this lands it adds a fifth initializer subtype; D-015's three-site cascade applies AND D-018's seed-from-mesh-id invariant applies. D-019's canonical Quat math is also load-bearing for any rotation a rigid body needs.
+- **Alembic export slice (FR-013 / BDD-013)** — blocked on Q5 + Q6. When this lands, BDD-102 mechanization can extend to compare Alembic bytes too (closes the standing turn-12 WARNING).
 
 See `.agent/PLAN.md` and `.agent/CURRENT_WORK.md` for full plan and progress.

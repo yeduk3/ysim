@@ -1,18 +1,16 @@
-# Current Work — BDD-004 Quaternion Slice (`feat/bdd-004-rotation`)
+# Current Work — BDD-010 Collision Detection Slice (`feat/bdd-010-collision-detected`)
 
-- File in flight: none — slice complete; ready for Estimator. **25/25 self-test PASS** deterministic across 5 consecutive runs. `verify-light.sh` clean.
+- File in flight: none — slice complete; ready for Estimator. **27/27 self-test PASS** deterministic across 5 consecutive runs. Doctest 159/159 + 1120/1120 green.
 - How far: all 10 PLAN todos done.
-  - **D-019** — three new free functions live next to `struct Quat` (~line 1554): `operator*(Quat, Quat)` (Hamilton product, `a * b = apply b first then a`), `quatNorm`, `quatNormalize` (with 1e-12 degenerate-input guard returning identity). Struct unchanged — aggregate-init shape and on-disk schema stay intact.
-  - **Block 12** mechanizes `docs/TESTS.md#BDD-004` verbatim:
-    - Compose R₁ = (dq1 * R₀).normalized() in memory.
-    - saveScene → loadScene → applyPendingMaterials (writes pendingRotations into rotationQuat).
-    - Compose R₂_round_trip = (dq2 * R₁_post_load).normalized() and compare to R₂_in_memory = (dq2 * R₁).normalized().
-    - Assert orientation drift < 1e-5 component-wise + unit-norm < 1e-5 at each step.
-    - Local helper `quatAxisAngle(axis, angle)` lives inside the block; `kPi = 3.14159265358979323846f` constant inline.
-  - **Bug-probe verified** — temporarily added `meshAfterLoad->rotationQuat.w += 0.01f` after the reload; Block 12 FAILed with `orientation drift (round-trip vs in-memory): 0.002179, 0.001776, 0.003470, 0.000245`. Restored; flips back to PASS.
+  - **Block 13** mechanizes BDD-010's two clauses verbatim:
+    - Positive: cloth (4×4 grid, mass=0.1) co-located at `y = -1` with the ground plane → AABBs overlap at t=0 → after one `sim.update()`, assert `cumulativeNarrowCollisions > 0` AND last-substep `narrowCollisions` has at least one entry with `objPair.query != objPair.target` (the (A, B) distinct-mesh contact pair).
+    - Negative: cloth at `y = 10` above ground → AABBs disjoint → after one `sim.update()`, assert `cumulativeNarrowCollisions == 0`.
+  - **Cloth-position discovery during build:** initial plan placed cloth at `y = -0.99` (touching ground from above). At t=0 with zero velocity, the broad phase couldn't fire — both AABBs are essentially flat planes at distinct y values, and `enlargeTrajectory(system.subh)` only inflates by velocity·subh which is initially zero. Moved to `y = -1.0` so cloth particles land within the ground's flat AABB at t=0 (modulo D-018 jiggle ~1e-4); broad fires immediately. Comment in Block 13 explains why.
+  - **BDD-004 fold-in (Estimator turn-13 WARNING):** Block 12 now asserts `quatNorm(r1_post_load) ≈ 1` *before* the re-multiply. If load-side norm regression occurs, the failure surfaces as `r1_post_load is not unit-norm; |r1_post_load| = ...` — without this gate, `quatNormalize(dq2 * r1_post_load)` would silently absorb it.
+  - **Bug-probe verified:** moved the negative case's cloth y to `-1.0` (overlapping); negative clause FAILed with `cumulativeNarrowCollisions == 92 on a scene with disjoint AABBs`. Restored; flips back to PASS.
 - What's tested:
-  - **25/25 self-test PASS** on macOS Apple Silicon, deterministic across 5 runs.
-  - Doctest binaries unchanged (159 + 1120 assertions).
-  - `docs/TEST_MATRIX.md` row `BDD-004` promoted `pending → pass`.
-- Non-goals respected: no `Simulator::rotateObject` API, no inspector wiring, no renderer-side rotation application, no Euler conversion. The slice is purely data-layer math + persistence-round-trip mechanization, matching BDD-004's "Then" wording exactly.
-- What's next: Estimator review. Expect verdict at NOTE level — Block 12 is verbatim-from-spec, bug-probe-verified, and the canonical Quat math (D-019) is the load-bearing piece for any future rotation consumer.
+  - **27/27 self-test PASS** on macOS Apple Silicon, deterministic across 5 runs.
+  - Doctest binaries unchanged.
+  - `docs/TEST_MATRIX.md` row `BDD-010` promoted `pending → pass`.
+- Non-goals respected: no cloth-on-cloth, no multi-frame collision, no cloth-vs-cube/sphere targets, no `enableSelfCollisions` flag flip, no spec edits, no new D-NNN (mechanization-only slice).
+- What's next: Estimator review. Expect verdict at NOTE level — Block 13 verbatim from spec, two clauses both bug-probe-verified, BDD-004 fold-in closes the prior turn's WARNING.
