@@ -1,4 +1,5 @@
-# Estimation — 2026-05-07 turn 6
+# Estimation — 2026-05-08 turn 7
+
 Status: UPDATED
 
 ## Verdict
@@ -8,14 +9,15 @@ WARNING
 - none
 
 ## WARNING
-- [src/main.cpp:4049](/Users/gyu/codes/ysim/src/main.cpp#L4049), [src/metal/bruteforce.metal:121](/Users/gyu/codes/ysim/src/metal/bruteforce.metal#L121) - the new CCD path still hardcodes `nparams.thickness = 0`, so the slow-touch fallback is radius-only instead of the `radius + cloth-thickness` band the slice plan called for. That narrows the acceptance window and leaves the result more dependent on the `subSteps = 8` bump.
+- `src/main.cpp:4432-4448` and `src/main.cpp:1773-1789` - `translateObject()` updates only the realized-mesh state. Any later `Scene::pack()` triggered by create/import/load flows will rebuild from the stale initializer data and silently drop a prior translate.
+- `include/FrameProfiler.hpp:24-140`, `src/main.cpp:4603-4610`, and `scripts/analyze_profile.py:1-245` - profiler collision-count export/analysis tooling was added outside the BDD-003 plan, while `docs/TEST_MATRIX.md:33` still leaves BDD-019 pending. That is scope creep plus missing coverage for the new profiler behavior.
 
 ## NOTE
-- [src/main.cpp:5485-5552](/Users/gyu/codes/ysim/src/main.cpp#L5485-L5552) - Block 6 still uses the Float ground plane as the rigid stand-in, while `docs/TESTS.md#BDD-007` names a sphere. The plan documents this substitution because v1 has no Rigid backend, so it is acceptable as a surrogate but not a literal match to the BDD wording.
+- `src/main.cpp:4070` and `docs/mistakes/COMMON_MISTAKES.md:57-71` - CM-006 remains parked on purpose; the folded `nparams.thickness` warning was deferred instead of being resolved, because plumbing a non-zero thickness reintroduced the BDD-007 regression.
 
 ## Test matrix delta
-- BDD-002: pass
-- BDD-007: pass
+- BDD-003: pass
+- BDD-019: pending
 
 ## Verify output (summary)
-`./scripts/verify.sh` rebuilt `ysim`, `ysim_tests`, and `ysim_primitive_tests` successfully. Both doctest binaries passed (11/11 and 9/9 cases). The headless `--self-test` step exited 0 but skipped on this host because `MTL::CreateSystemDefaultDevice()` returned null, so the Metal-backed regression path was not exercised in this environment.
+`./scripts/verify.sh` completed successfully. CMake configured and built `ysim`, `ysim_tests`, and `ysim_primitive_tests`; both doctest binaries passed (11/11 and 9/9 test cases, 159 and 1120 assertions); the `ysim --self-test` harness exited 0 with the expected `[self-test SKIP] metal-device ...` line because this host does not provide Metal.
