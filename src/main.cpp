@@ -6421,6 +6421,128 @@ static int runSelfTest() {
         }
     }
 
+    // ---- Block 14: BDD-017 — Ray-pick selects nearest hit object. ---------
+    // TESTS.md#BDD-017 wording (verbatim, *not* the matrix-row label):
+    //   Given a scene with two objects whose screen-space projections do
+    //         not overlap
+    //   When  the user clicks on one object's screen position
+    //   Then  that object becomes the selected object; the inspector
+    //         displays its parameters.
+    //   Notes: also test the overlapping case — the front-most object
+    //          (smallest ray t) wins.
+    //
+    // Substitution: harness has no GLFW/ImGui, so "click on screen
+    // position" is mechanized as a world-space Ray fed directly to
+    // BroadPhase::queryClickRay (mirroring the production callback at
+    // src/main.cpp:6577 minus the camera unprojection). The BDD's
+    // load-bearing claim — that the ray hits the clicked object's id —
+    // is fully exercised by the BVH query + smallest-tmin walk.
+    // "Inspector displays its parameters" is BDD-018's concern.
+    {
+        const Index kNoHit = static_cast<Index>(-1);
+        auto pickClosest = [&]() -> Index {
+            auto& rt = Scene<Backend, Precision>::rayTracedData;
+            Index n = rt.numClickRayCollisions[0];
+            if (n == 0) return kNoHit;
+            Index closest = rt.clickRayCollisions[0].obj;
+            float tmin = rt.clickRayCollisions[0].tmin;
+            for (Index i = 1; i < n; ++i) {
+                if (rt.clickRayCollisions[i].tmin < tmin) {
+                    tmin = rt.clickRayCollisions[i].tmin;
+                    closest = rt.clickRayCollisions[i].obj;
+                }
+            }
+            return closest;
+        };
+
+        // --- Clause (a): non-overlapping screen projections. -----------
+        // cubeA at x=-1.5, cubeB at x=+1.5 (both y=0, z=0, size=0.5). Their
+        // AABBs are disjoint along x; rays cast straight down -z through
+        // each cube's x line miss the other.
+        //
+        // Force per-mesh BVHs to rebuild from scratch — broadPhase.build
+        // (src/main.cpp:3907) skips re-allocating Float-tagged trees when
+        // the slot is already populated, which is correct for production
+        // (Float meshes don't change shape) but breaks the harness pattern
+        // of consecutive distinct scenes reusing the same mesh indices.
+        sim.collisionPipeline.broadPhase.objTrees.clear();
+        resetScene();
+        sim.addCube(tinym::vec3(-1.5f, 0.0f, 0.0f), /*tess=*/2,
+                    /*size=*/0.5f, /*mass=*/0.1f);
+        sim.addCube(tinym::vec3( 1.5f, 0.0f, 0.0f), /*tess=*/2,
+                    /*size=*/0.5f, /*mass=*/0.1f);
+        sim.initialize();
+        // Production refits the scene-level BVH on every sim.update() before
+        // the click callback runs. One update() here mirrors that —
+        // Float-tagged cubes don't move, so AABBs are stable post-refit.
+        sim.update();
+        const Index cubeAId = 0;
+        const Index cubeBId = 1;
+
+        Ray rayA;
+        rayA.origin = tinym::vec3(-1.5f, 0.0f,  10.0f);
+        rayA.dir    = tinym::vec3( 0.0f, 0.0f, -1.0f);
+        Scene<Backend, Precision>::rayTracedData.numClickRayCollisions[0] = 0;
+        sim.collisionPipeline.broadPhase.queryClickRay(rayA);
+        Index pickedA = pickClosest();
+
+        bool clauseAOk = (pickedA == cubeAId);
+        if (clauseAOk) {
+            Ray rayB;
+            rayB.origin = tinym::vec3( 1.5f, 0.0f,  10.0f);
+            rayB.dir    = tinym::vec3( 0.0f, 0.0f, -1.0f);
+            Scene<Backend, Precision>::rayTracedData.numClickRayCollisions[0] = 0;
+            sim.collisionPipeline.broadPhase.queryClickRay(rayB);
+            Index pickedB = pickClosest();
+            if (pickedB != cubeBId) {
+                fail("BDD-017 / ray hits the clicked object's id (non-overlapping)",
+                     "expected cubeB id=" + std::to_string(cubeBId) +
+                     ", got " + std::to_string(pickedB));
+                clauseAOk = false;
+            } else {
+                pass("BDD-017 / ray hits the clicked object's id (non-overlapping)");
+            }
+        } else {
+            fail("BDD-017 / ray hits the clicked object's id (non-overlapping)",
+                 "expected cubeA id=" + std::to_string(cubeAId) +
+                 ", got " + std::to_string(pickedA));
+        }
+
+        // --- Clause (b): overlapping case, front-most (smallest tmin). -
+        // cubeFront at z=+2 (closer to ray origin at z=+10), cubeBack at
+        // z=-2. Both share x=0; ray straight down -z passes through both.
+        sim.collisionPipeline.broadPhase.objTrees.clear();
+        resetScene();
+        sim.addCube(tinym::vec3(0.0f, 0.0f,  2.0f), /*tess=*/2,
+                    /*size=*/0.5f, /*mass=*/0.1f);
+        sim.addCube(tinym::vec3(0.0f, 0.0f, -2.0f), /*tess=*/2,
+                    /*size=*/0.5f, /*mass=*/0.1f);
+        sim.initialize();
+        sim.update(); // refit scene-level BVH AABBs (see clause a comment).
+        const Index cubeFrontId = 0;
+        const Index cubeBackId  = 1;
+
+        Ray rayDeep;
+        rayDeep.origin = tinym::vec3(0.0f, 0.0f, 10.0f);
+        rayDeep.dir    = tinym::vec3(0.0f, 0.0f, -1.0f);
+        Scene<Backend, Precision>::rayTracedData.numClickRayCollisions[0] = 0;
+        sim.collisionPipeline.broadPhase.queryClickRay(rayDeep);
+        Index numHits = Scene<Backend, Precision>::rayTracedData.numClickRayCollisions[0];
+        Index pickedDeep = pickClosest();
+        if (numHits < 2) {
+            fail("BDD-017 / overlapping case: front-most object (smallest ray t) wins",
+                 "expected >=2 hits along through-line, got " +
+                 std::to_string(numHits));
+        } else if (pickedDeep != cubeFrontId) {
+            fail("BDD-017 / overlapping case: front-most object (smallest ray t) wins",
+                 "expected cubeFront id=" + std::to_string(cubeFrontId) +
+                 " (cubeBack=" + std::to_string(cubeBackId) +
+                 "), got " + std::to_string(pickedDeep));
+        } else {
+            pass("BDD-017 / overlapping case: front-most object (smallest ray t) wins");
+        }
+    }
+
     if (failures == 0) {
         std::cerr << "[self-test] all checks passed\n";
         return 0;
