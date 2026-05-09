@@ -71,3 +71,28 @@ When an entry has not recurred for a while and the underlying cause is gone, mov
 - Plan is ambiguous or contradicts specs → write the question in `CURRENT_WORK.md`, stop.
 - A test that should pass is failing for reasons outside the current slice → record in `COMMON_MISTAKES.md`, surface in `RESUME.md`, stop. **This is the correct action**, not "keep digging until I fix the pre-existing bug." Trying to expand a slice into pipeline archaeology is what produces multi-day stalls; let the planner scope the fix as its own slice.
 - You are about to write to a file outside your write set → stop, that is the wrong role.
+
+## Bug-probe discipline
+
+When a new assertion lands on a real bug, **bug-probe before declaring done**: temporarily flip a value to break the assertion's premise, build, run, confirm the assertion FAILs with the expected diagnostic, restore, confirm it PASSes again. The probe proves the assertion catches what it claims to catch. Skipping it has bitten past slices — Block 9 (BDD-003) needed bug-probe to confirm the round-trip clause caught the missing translateObject write-back; Block 11 (BDD-102) needed it to confirm the per-frame compare caught a forced perturbation; Block 14 (BDD-017) needed it both to confirm SKIP→FAIL conversion and to confirm the production D-020 fix was load-bearing.
+
+Always grep for `BUG-PROBE` before committing — the marker comment is the easiest leftover to forget.
+
+## Build-time discoveries (small fix-on-the-way OR hand back)
+
+When a harness assertion fails for a reason outside the slice's stated scope (e.g., production code has a bug the test exposes), there are two clean paths:
+
+- **Fix on the way** if the production fix is genuinely small (≤ 5 lines, single function, no kernel-side coordination, no ABI change). Add a `D-NNN` to record the fix's invariant and a `CM-NNN` for the trap pattern. Examples: D-020 BVH leaf-return one-line fix, D-015 translateObject write-back to initializer, CM-008 harness `objTrees.clear()` workaround.
+- **Hand back** when the fix would expand the slice meaningfully — multiple call-site changes, kernel-side coordination, ABI change, design questions you can't answer without the Planner. Examples: CM-007 (`rand()`-jiggle determinism — three fix-direction options needed Planner choice; first attempt to mask via SKIP got BLOCKed).
+
+Don't silence the failing assertion to pass the gate. The Estimator BLOCKs SKIP-as-suppression; FAIL on a slice-critical assertion is the right signal that the scope needs re-planning.
+
+## Stable harness gotchas (read before writing a new Block)
+
+- **CWD for `--self-test` is `build/`.** The binary needs `default.metallib` adjacent. Running `./build/src/ysim --self-test` from project root SKIP-exits with "Metal-library not loadable from cwd"; running from `build/` works.
+- **`sim.update()` once after `sim.initialize()`** if your block reads BVH state (e.g., `BroadPhase::queryClickRay`). Production refits every frame before the click callback fires; harness mirrors that explicitly.
+- **`sim.collisionPipeline.broadPhase.objTrees.clear();`** before `sim.initialize()` if your block creates a fresh scene with the same `numMeshes` count as the previous block (CM-008). The Float-mesh skip in `BroadPhase::build` reuses stale trees otherwise.
+- **`Scene<...>::packedCollisionData.cumulativeNarrowCollisions = 0;`** before each `sim.update()` if your block asserts on the counter. `resetScene()` doesn't clear it (it's a static).
+- **`sim.applyPendingMaterials()`** (despite the name) writes both materials AND `pendingRotations[mesh.id]` into `mesh.rotationQuat`. Call it after `loadScene + initialize` if your block reads rotation post-load.
+- **Pass-label wording stays verbatim from `docs/TESTS.md` "Then" clauses.** The matrix-row label is too compressed; assertions written from labels have BLOCKed past slices. Spec-substitutions go in the **block comment** + **pass label** explicitly so the Estimator can audit without re-reading the spec.
+- **`numMeshes` pre-call read in `addCloth`/`addCube`/etc.** is the about-to-be-assigned mesh id (D-015 / D-018 invariant). Read it BEFORE the `addGeneralMesh` call; reading after gets the next id.

@@ -87,3 +87,33 @@ Skip:
 
 - Diff is empty → write a single-line ESTIMATION saying so, status UPDATED, verdict NOTE.
 - You cannot judge alignment because a spec is missing → BLOCK with "spec gap" as the reason. The Planner needs to author the spec before this loops again.
+
+## SKIP-as-suppression is BLOCK-worthy
+
+`runSelfTest`'s `skip(...)` lambda is reserved for **unsupported environments** — Metal-less host, missing `default.metallib`, etc. — where the assertion *cannot* be exercised on this hardware. Using SKIP to silence a failing assertion (as a workaround for a discovered production bug or a spec gap) is suppression, and it BLOCKs.
+
+Precedent: Block 11 (BDD-102) initially converted FAIL → SKIP when the rand()-jiggle nondeterminism surfaced. Estimator turn 11 BLOCKed because:
+- The matrix row was promoted to `pass` while the assertion was SKIP — dishonest about coverage.
+- The slice's stated goal (`pending → pass` on bit-equality) was not met; SKIP suppresses the signal but doesn't satisfy the goal.
+
+If the assertion FAILs on a real production bug, the right options are: **(a) fix on the way** if the production fix is genuinely small, **or (b) hand back** to the Planner with the matrix row staying `pending` and a CM entry capturing the discovery. Both options keep the FAIL signal visible. SKIP is not on the menu.
+
+## Stricter-than-spec assertions are valuable signal
+
+When the Generator authors an assertion that's **stronger** than the BDD's literal "Then" wording (e.g., "both objects' hits appear in `clickRayCollisions[]`" vs the spec's "ray hits the right id"), don't push back as scope creep — that strictness is what catches real bugs the literal wording would mask. Block 14's both-cubes-present check exposed D-020 (4096-spurious-hit BVH bug) that production was masking via smallest-tmin walk; Block 12's component-wise quaternion compare exposed potential sign-flip drift before persistence canonicalizes signs.
+
+If the stricter assertion catches a regression, the Estimator's verdict is **NOTE** (or WARNING, depending on the regression's severity) for the *coverage win*, not BLOCK for "you fixed more than the plan said." Document the scope expansion as informational.
+
+## Standing structural WARNINGs
+
+Some WARNINGs persist across multiple slices because their close requires upstream work the slice can't do (e.g., BDD-102's "state.x snapshot stands in for Alembic bytes" is a documented substitution while FR-013 is blocked on Q5/Q6). The Estimator should:
+
+- Re-flag standing WARNINGs the first time they appear, then carry them forward as PROJECT_STATE acknowledgements.
+- **Not** re-flag them every estimation turn — that's noise. Once it's documented, the next turn's verdict can drop the line unless the situation changed.
+- Distinguish "standing structural WARNING" from "new regression" explicitly in the verdict text. A turn-N WARNING that says "BDD-102 still uses state.x not Alembic bytes" is fine; "BDD-102 still uses state.x not Alembic bytes (new this turn)" would be wrong.
+
+## Pass-label coverage gaps deserve WARNING even when verify.sh exits 0
+
+A clean `verify.sh` exit + green doctest binaries does not absolve the Estimator from reading what the harness assertions actually exercise. Estimator turn 8's BDD-019 pause-gate WARNING (the harness's "skip begin/end and assert no snapshot" was proxy-level) and turn 15's BDD-017 WARNINGs (overlapping numHits-only check + missing selectedObj assignment) both surfaced through diff-reading, not through verify.sh failures.
+
+Trust the diff over the green checkmark. The Generator's CURRENT_WORK.md may say "29/29 PASS bug-probe-verified" but if the assertion's logical shape lets a real regression slip through, that's a WARNING regardless of run count. Estimator's job is to catch the gap before it's load-bearing.

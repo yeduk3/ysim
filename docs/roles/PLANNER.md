@@ -40,6 +40,20 @@ You must **not** write to `src/`, `test/`, `.agent/CURRENT_WORK.md`, `.agent/RES
 4. **Author tests before code.** When introducing new behavior, add scenarios to `docs/TESTS.md` and a row to `docs/TEST_MATRIX.md` *before* the Generator writes the code. The matrix row's "test address" stays empty for now (the Generator fills it).
 5. **Update PROJECT_STATE.** Refresh the rolling summary so the next planning turn doesn't have to re-read the specs. **When a Decision (D-NNN) closes an open question (Q-X / Q-A..Q-D from `docs/specs/PRD.md` / `docs/ARCHITECTURE.md §5`), mark Q-X resolved in PROJECT_STATE's open-questions section pointing at the Decision number** — otherwise the question lingers and gets re-debated.
 6. **Watch for escape patterns.** If three consecutive slices end with `Generator declares done → manual user test catches a Metal-side bug → patch`, the next slice should pivot to closing the test gap that lets those bugs escape (e.g., refactor the GL coupling out of `mesh.initialize`, then add a Metal-backed self-test). Sustained for 1–2 slices the cycle is acceptable; for 3+ it means the test net needs investment, not more features.
+7. **Author assertions stricter than the BDD's literal wording when it costs almost nothing.** A BDD-017 plan's "ray hits the right id" can be mechanized as either "smallest tmin matches" (literal) or "both objects' hits appear in the buffer AND smallest tmin matches" (stricter). The stricter form caught D-020 (a 4096-spurious-hit BVH bug that was masked in production). When two assertion shapes both satisfy the BDD's "Then" wording, prefer the one that fails noisier on regressions — production code that satisfies "spec literal" but not "stricter assertion" usually has a real bug worth surfacing.
+8. **Architectural invariants propagate through slices.** When a Decision sets a structural pattern (D-015 three-site cascade for translateObject, D-018 mesh.id-derived seed for jiggle, D-019 canonical Quat math, D-020 BVH leaf-return), the next slice that touches an adjacent area must call out which invariants apply in its **Course corrections** section. New initializer subtypes hit D-015 + D-018; new BVH walks hit D-020; new rotation consumers hit D-019. Listing them up-front keeps the Generator from re-deriving them.
+
+## Spec-substitution log
+
+When a slice meets a blocked spec (e.g., FR-013 Alembic blocked on Q5/Q6, but BDD-102 needs an output to compare against), the Planner may substitute the closest available equivalent. Document the substitution explicitly in **PLAN.md's Scope** AND in the harness's **pass label** (or block comment) so the Estimator can audit without re-reading the spec.
+
+Substitutions used so far:
+- **BDD-007 sphere → ground plane** (rigid pipeline blocked on Q4).
+- **BDD-019 `profiles/` path → `/tmp`** (harness hygiene; spec wording is "under `profiles/`" but the load-bearing claim is "a CSV is written").
+- **BDD-102 Alembic outputs → state.x snapshots** (FR-013 blocked on Q5/Q6; state.x is the canonical buffer the exporter will read).
+- **BDD-017 click → world-space `Ray` directly** (no GLFW/ImGui in harness; production-side unprojection is harness-skippable plumbing).
+
+A substitution that stays open across multiple slices (e.g., BDD-102 vs Alembic-bytes) becomes a **standing structural WARNING** the Estimator carries forward without re-flagging — the Planner records it in PROJECT_STATE so future slices know the gap is documented, not new debt.
 
 ## Output discipline
 
