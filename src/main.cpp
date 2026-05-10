@@ -3042,6 +3042,40 @@ struct alignas(32) AABB4 {
         return tmax >= 0.0f;
     }
 };
+
+// D-024: ray-vs-triangle (Möller–Trumbore). Used by BVH::queryClickRay's
+// leaf to write the actual triangle intersection's t into
+// clickRayCollisions, so the smallest-tmin walk on the consumer side
+// (production callback + harness) ranks by triangle hits, not by leaf
+// AABB hits. Returns true and writes outT (= ray.origin + outT * ray.dir
+// is the intersection point) when the ray hits the triangle (p0, p1, p2)
+// at outT > 0 with valid barycentric coords. 1e-6 epsilon for the
+// determinant test rejects parallel/grazing cases that would divide by
+// near-zero; cube triangles in the harness are not grazing the test ray
+// so the choice doesn't load-bear there.
+inline bool rayTriangleIntersect(const Ray& ray,
+                                 const tinym::vec3& p0,
+                                 const tinym::vec3& p1,
+                                 const tinym::vec3& p2,
+                                 float& outT) {
+    const float kEps = 1e-6f;
+    tinym::vec3 e1 = p1 - p0;
+    tinym::vec3 e2 = p2 - p0;
+    tinym::vec3 pvec = ray.dir.cross(e2);
+    float det = e1.dot(pvec);
+    if (std::abs(det) < kEps) return false;
+    float invDet = 1.0f / det;
+    tinym::vec3 tvec = ray.origin - p0;
+    float u = tvec.dot(pvec) * invDet;
+    if (u < 0.0f || u > 1.0f) return false;
+    tinym::vec3 qvec = tvec.cross(e1);
+    float v = ray.dir.dot(qvec) * invDet;
+    if (v < 0.0f || u + v > 1.0f) return false;
+    float t = e2.dot(qvec) * invDet;
+    if (t <= 0.0f) return false;
+    outT = t;
+    return true;
+}
 static_assert(sizeof(AABB4) == 32);
 
 
@@ -3835,20 +3869,43 @@ struct BVH<BE, PR, BVHMODE::LINEAR, PRIMITIVE> {
         if(! node.aabb.intersect(ray, hit)) return;
 
         if(node.childA < 0) { // leaf — childB is the primitive id (not a node).
+            // D-024: write the actual ray-vs-triangle hit, not the leaf
+            // AABB intersect. A rotated mesh's leaf AABB can extend far
+            // beyond the triangle itself (the AABB grows with the
+            // triangle's diagonal extent under rotation); writing AABB-
+            // tmin would let a tilted Plane envelop the camera frustum
+            // and steal every click. The smallest-tmin walk on the
+            // consumer side (production callback at ~src/main.cpp:6996,
+            // harness pickClosest in Block 14) ranks by the values we
+            // write here, so triangle-precision must land at the leaf.
+            Index triId = static_cast<Index>(node.childB);
+            // PRIMITIVE = 3 (triangle) for TRI_LBVH; primitives.ptr holds
+            // 3*M facet indices, positions.ptr holds 3*N float coords.
+            Index v0 = primitives.ptr[3 * triId + 0];
+            Index v1 = primitives.ptr[3 * triId + 1];
+            Index v2 = primitives.ptr[3 * triId + 2];
+            tinym::vec3 p0(positions.ptr[3*v0+0],
+                           positions.ptr[3*v0+1],
+                           positions.ptr[3*v0+2]);
+            tinym::vec3 p1(positions.ptr[3*v1+0],
+                           positions.ptr[3*v1+1],
+                           positions.ptr[3*v1+2]);
+            tinym::vec3 p2(positions.ptr[3*v2+0],
+                           positions.ptr[3*v2+1],
+                           positions.ptr[3*v2+2]);
+            float triT;
+            if (!rayTriangleIntersect(ray, p0, p1, p2, triT)) return;
+
             auto& rayTracedData = Scene<BE, PR>::rayTracedData;
             auto& rayTraced = rayTracedData.clickRayCollisions;
             auto& numTraced = rayTracedData.numClickRayCollisions;
             if(numTraced[0] >= rayTracedData.approxColsPerRay) return;
             rayTraced[numTraced[0]] = {
-                (Index)objid, (Index)node.childB, hit.tmin, hit.tmax};
+                (Index)objid, triId, triT, triT};
             numTraced[0]++;
             return; // D-020: must not recurse from a leaf — childA/childB
                     // here are NOT child node indices (childA == -1 marks
-                    // leaf, childB is the primitive id). Without this
-                    // return, `tree[node.childB]` walks into a random
-                    // sibling node, fills the 4096-slot buffer with
-                    // spurious hits, and starves any further objTrees
-                    // (e.g., the back cube in BDD-017's overlapping case).
+                    // leaf, childB is the primitive id).
         }
 
         if(node.childA > 0) queryClickRay(ray, tree[node.childA]);
@@ -6824,6 +6881,76 @@ static int runSelfTest() {
                  "post-rotate witness at x=0.30 returned 0 hits — BVH still on pre-rotate AABB");
         } else {
             pass("FR-004 UI / rotateObject refits BVH so click-pick reads new pose");
+        }
+    }
+
+    // ---- Block 17: D-024 — click-pick uses triangle-precision ranking. ----
+    // The bug: queryClickRay's leaf write used AABB-tmin, so a rotated
+    // mesh with a leaf AABB extending toward the camera could win the
+    // smallest-tmin race even when its actual triangle was farther
+    // along the ray than a smaller object's triangle. The user-reported
+    // case (Plane rotated by quat (1, 2, 0, 0) normalized) actually
+    // had the Plane geometrically in front of the cube — so picking
+    // Plane was correct in that specific scene. To DISCRIMINATE
+    // AABB-precision from triangle-precision, this test uses a scene
+    // where the Plane's AABB extends toward the camera (so old AABB-
+    // tmin makes Plane win) but its actual triangle plane crosses the
+    // click ray BEHIND the cube (so triangle-tmin makes the cube win).
+    //
+    // Setup: large ground (size 30) at y=-1 tilted 60deg around X. Plane
+    // normal post-rotation = (0, 0.5, 0.866); plane passes through
+    // (0, -1, 0). Click ray from (0, 0, 10) toward -z crosses the
+    // plane at z = -0.577 (t = 10.577). Cube at origin: triangle hit
+    // at t = 9.75. Cube triangle is closer → click must select cube.
+    // Plane AABB after rotation: z extent ≈ ±7.5; camera at z=10 sees
+    // AABB tmin = 2.5 (much smaller than cube's 9.75) — old AABB-only
+    // logic would have picked Plane.
+    {
+        sim.collisionPipeline.broadPhase.objTrees.clear();
+        resetScene();
+        sim.addCube(tinym::vec3(0.0f, 0.0f, 0.0f), /*tess=*/2,
+                    /*size=*/0.5f, /*mass=*/0.1f);
+        sim.addGround(PlaneDirection::XZPlane, tinym::vec3(0, -1, 0),
+                      /*size1D=*/30.0f);
+        sim.initialize();
+        sim.update();
+        const Index cubeIdQ   = 0;
+        const Index groundIdQ = 1;
+
+        // 60deg around X via axis-angle quat: (cos(30deg), sin(30deg), 0, 0).
+        constexpr float kPi17 = 3.14159265358979323846f;
+        float halfAngle = (kPi17 / 3.0f) * 0.5f; // 60deg / 2 = 30deg
+        ::Quat tilt60{std::cos(halfAngle), std::sin(halfAngle), 0.0f, 0.0f};
+        sim.rotateObject(static_cast<int>(groundIdQ), tilt60);
+
+        Ray rayClick;
+        rayClick.origin = tinym::vec3(0.0f, 0.0f, 10.0f);
+        rayClick.dir    = tinym::vec3(0.0f, 0.0f, -1.0f);
+        Scene<Backend, Precision>::rayTracedData.numClickRayCollisions[0] = 0;
+        sim.collisionPipeline.broadPhase.queryClickRay(rayClick);
+
+        // Production-style smallest-tmin walk on the populated buffer.
+        auto& rt17 = Scene<Backend, Precision>::rayTracedData;
+        Index num17 = rt17.numClickRayCollisions[0];
+        int picked17 = -1;
+        if (num17 > 0) {
+            picked17 = static_cast<int>(rt17.clickRayCollisions[0].obj);
+            float bestT17 = rt17.clickRayCollisions[0].tmin;
+            for (Index i = 1; i < num17; ++i) {
+                if (rt17.clickRayCollisions[i].tmin < bestT17) {
+                    bestT17 = rt17.clickRayCollisions[i].tmin;
+                    picked17 = static_cast<int>(rt17.clickRayCollisions[i].obj);
+                }
+            }
+        }
+
+        if (picked17 != static_cast<int>(cubeIdQ)) {
+            fail("FR-002 / click-pick selects nearest triangle, not nearest AABB",
+                 "tilted ground stole the click; expected cube id=" +
+                 std::to_string(cubeIdQ) + " got " + std::to_string(picked17) +
+                 " (groundId=" + std::to_string(groundIdQ) + ")");
+        } else {
+            pass("FR-002 / click-pick selects nearest triangle, not nearest AABB");
         }
     }
 
