@@ -1,21 +1,23 @@
-# Estimation — 2026-05-10 turn 15
+# Estimation — 2026-05-10 turn 17
 
 Status: UPDATED
 
 ## Verdict
-NOTE
+WARNING
 
 ## BLOCK
 - None
 
 ## WARNING
-- None
+- /Users/gyu/codes/ysim/src/main.cpp:4496, /Users/gyu/codes/ysim/src/main.cpp:4545, /Users/gyu/codes/ysim/src/main.cpp:4635, /Users/gyu/codes/ysim/src/main.cpp:4697, /Users/gyu/codes/ysim/src/main.cpp:6545, /Users/gyu/codes/ysim/src/main.cpp:6856, /Users/gyu/codes/ysim/docs/specs/FRD.md:192 - translateObject and rotateObject move the live mesh, but click selection still walks the BVH that is only refit inside sim.update(). On a paused sim, or on the first click before the next update tick, the picker can still select from the old pose instead of the visible translated/rotated mesh. The current BDD-017 coverage only exercises queryClickRay after a refit, so this path is untested.
 
 ## NOTE
-- `src/main.cpp:3819-3833`, `docs/DECISIONS.md:186-192`, `docs/mistakes/COMMON_MISTAKES.md:61-67` — the slice also picked up a production BVH leaf-return fix (D-020 / CM-009) after the stricter overlapping assertion exposed it. The fix is sound and documented, but it is a scope expansion beyond the original two turn-15 fold-ins.
+- None
 
 ## Test matrix delta
-- `BDD-017`: pass
+- BDD-003: pass
+- BDD-004: pass
+- BDD-017: pass
 
 ## Verify output (summary)
-`./scripts/verify.sh` rebuilt successfully; both doctest binaries passed (`159/159` and `1120/1120` assertions), and `ysim --self-test` took the expected `[self-test SKIP] metal-device: MTL::CreateSystemDefaultDevice() returned null (non-macOS host or container without Metal)` path on this host, so the script exited 0 without running the Metal-backed assertions.
+./scripts/verify.sh rebuilt successfully; both doctest binaries passed (159/159 and 1120/1120 assertions), and the Metal-backed self-test took the expected SKIP path on this host: `[self-test SKIP] metal-device: MTL::CreateSystemDefaultDevice() returned null (non-macOS host or container without Metal)`. The script exited 0 with no build/test failures.
