@@ -1578,6 +1578,24 @@ inline Quat quatNormalize(const Quat& q) {
     return Quat{q.w/n, q.x/n, q.y/n, q.z/n};
 }
 
+// D-022: extends D-019's canonical Quat math family.
+// quatConjugate flips the sign of the imaginary parts; for unit
+// quaternions it equals the inverse, which is what rotation
+// composition uses. rotateVector applies the canonical Hamilton
+// sandwich q * v_pure * conjugate(q) — D-019's operator* left-
+// associates so the expression reads as written. Caller must pass a
+// unit-norm q (callers that build rotations via quatAxisAngle or
+// quatNormalize satisfy this).
+inline Quat quatConjugate(const Quat& q) {
+    return Quat{q.w, -q.x, -q.y, -q.z};
+}
+
+inline tinym::vec3 rotateVector(const Quat& q, const tinym::vec3& v) {
+    Quat vp{0.0f, v.x, v.y, v.z};
+    Quat r = q * vp * quatConjugate(q);
+    return tinym::vec3(r.x, r.y, r.z);
+}
+
 template <typename BE, typename PR>
 struct GeneralMesh {
     int id;
@@ -4510,6 +4528,51 @@ struct Simulator {
         }
     }
 
+    // FR-004 / D-021: set the named mesh's absolute orientation to newQuat.
+    // Particles in state.x and state.xPrev are rotated around the mesh's
+    // transformPosition pivot by the delta from the current rotationQuat;
+    // mesh.rotationQuat is updated to newQuat (normalized). xPrev moves
+    // with x by the same delta (D-013 invariant) so the next narrow phase
+    // does not see the rotate as a tunneling event. state.v is unchanged
+    // — rotating does not reset velocity.
+    //
+    // Pack-roundtrip — mirroring D-015 for translateObject — is NOT
+    // covered by this slice. Re-pack rebuilds state.x from the
+    // initializer's geometry, which loses the rotation effect on state.x.
+    // The rotate analog of D-015's write-back is deferred to its own
+    // slice with a Planner design call about auto-calling
+    // applyPendingMaterials() from Simulator::initialize().
+    void rotateObject(int meshId, ::Quat newQuat) {
+        auto* mesh = Scene<BE, PR>::findById(meshId);
+        if (!mesh) return;
+        if (!mesh->state.x.ptr) return;
+
+        Quat newAbs = quatNormalize(newQuat);
+        Quat delta  = quatNormalize(newAbs * quatConjugate(mesh->rotationQuat));
+        tinym::vec3 pivot = mesh->transformPosition;
+
+        const Index n = mesh->state.x.size / 3;
+        for (Index i = 0; i < n; ++i) {
+            tinym::vec3 p_curr(mesh->state.x.ptr[i*3+0],
+                               mesh->state.x.ptr[i*3+1],
+                               mesh->state.x.ptr[i*3+2]);
+            tinym::vec3 p_rot = pivot + rotateVector(delta, p_curr - pivot);
+            mesh->state.x.ptr[i*3+0] = p_rot.x;
+            mesh->state.x.ptr[i*3+1] = p_rot.y;
+            mesh->state.x.ptr[i*3+2] = p_rot.z;
+            if (mesh->state.xPrev.ptr) {
+                tinym::vec3 prev(mesh->state.xPrev.ptr[i*3+0],
+                                 mesh->state.xPrev.ptr[i*3+1],
+                                 mesh->state.xPrev.ptr[i*3+2]);
+                tinym::vec3 prev_rot = pivot + rotateVector(delta, prev - pivot);
+                mesh->state.xPrev.ptr[i*3+0] = prev_rot.x;
+                mesh->state.xPrev.ptr[i*3+1] = prev_rot.y;
+                mesh->state.xPrev.ptr[i*3+2] = prev_rot.z;
+            }
+        }
+        mesh->rotationQuat = newAbs;
+    }
+
     void memoryAllocation() {
         //for(auto& plane : sceneObjects.planes) plane.memoryAllocation(pool);
         for(auto& mesh : scene.meshes) mesh.memoryAllocation();
@@ -6576,6 +6639,87 @@ static int runSelfTest() {
         }
     }
 
+    // ---- Block 15: FR-004 UI — rotate-object via Simulator::rotateObject. -
+    // FR-004 wording (FRD.md): "the user shall rotate the center of any
+    // selected object, with rotation stored canonically as a quaternion;
+    // the same quaternion is used for rendering, simulation, and
+    // persistence." Block 12 (BDD-004) already covers the math/persistence
+    // side. This block covers the UI side: rotateObject mutates state.x
+    // by rotating around transformPosition pivot, and the next sim step /
+    // render reads the rotated positions.
+    //
+    // Substitution for "rendering reflects": same as Block 9's clause (c)
+    // — headless harness has no pixel render, so the testable proxy is
+    // "render-source state.x already carries the rotated values".
+    {
+        constexpr float kPi15 = 3.14159265358979323846f;
+        auto quatAxisAngleLocal = [](tinym::vec3 axis, float angle) {
+            float half = angle * 0.5f;
+            float s = std::sin(half);
+            return ::Quat{std::cos(half), axis.x * s, axis.y * s, axis.z * s};
+        };
+
+        sim.collisionPipeline.broadPhase.objTrees.clear();
+        resetScene();
+        sim.addCube(tinym::vec3(0.0f, 0.0f, 0.0f), /*tess=*/2,
+                    /*size=*/0.5f, /*mass=*/0.1f);
+        sim.initialize();
+        const int rotateId = 0;
+
+        auto* mesh0 = Scene<Backend, Precision>::findById(rotateId);
+        if (!mesh0) {
+            fail("FR-004 UI / rotate sets state.x rotated around pivot",
+                 "rotate target id=" + std::to_string(rotateId) + " not found");
+        } else {
+            // Witness vertex: state.x[0] (some corner of the cube). cube is
+            // centered on transformPosition=(0,0,0), so the pivot equals
+            // origin and (x, y, z) -> (-y, x, z) under a 90-degree Z rotation.
+            double x0 = mesh0->state.x.ptr[0];
+            double y0 = mesh0->state.x.ptr[1];
+            double z0 = mesh0->state.x.ptr[2];
+
+            ::Quat newAbs = quatAxisAngleLocal(tinym::vec3(0, 0, 1), kPi15 / 2.0f);
+            sim.rotateObject(rotateId, newAbs);
+
+            auto* meshAfter = Scene<Backend, Precision>::findById(rotateId);
+            double rx = meshAfter->state.x.ptr[0];
+            double ry = meshAfter->state.x.ptr[1];
+            double rz = meshAfter->state.x.ptr[2];
+
+            const double posTol = 1e-5;
+            bool rotateOk =
+                std::abs(rx - (-y0)) < posTol &&
+                std::abs(ry - ( x0)) < posTol &&
+                std::abs(rz - ( z0)) < posTol;
+
+            if (!rotateOk) {
+                fail("FR-004 UI / rotate sets state.x rotated around pivot",
+                     "expected 90deg-Z (" + std::to_string(-y0) + ", " +
+                     std::to_string(x0) + ", " + std::to_string(z0) +
+                     ") got (" + std::to_string(rx) + ", " +
+                     std::to_string(ry) + ", " + std::to_string(rz) + ")");
+            } else {
+                pass("FR-004 UI / rotate sets state.x rotated around pivot");
+
+                // Float-tagged cube doesn't move; strict equality after one
+                // sim.update() — mirrors Block 9's clause (b)/(c) shape.
+                pumpFrames(sim, 1);
+                auto* meshStep = Scene<Backend, Precision>::findById(rotateId);
+                double sx = meshStep->state.x.ptr[0];
+                double sy = meshStep->state.x.ptr[1];
+                double sz = meshStep->state.x.ptr[2];
+                if (std::abs(sx - rx) > posTol ||
+                    std::abs(sy - ry) > posTol ||
+                    std::abs(sz - rz) > posTol) {
+                    fail("FR-004 UI / next sim step preserves rotated state.x",
+                         "Float-tagged witness drifted between rotate and post-step");
+                } else {
+                    pass("FR-004 UI / next sim step preserves rotated state.x");
+                }
+            }
+        }
+    }
+
     if (failures == 0) {
         std::cerr << "[self-test] all checks passed\n";
         return 0;
@@ -6821,6 +6965,10 @@ int main(int argc, char** argv) {
                 target.transform_position = &selectedMesh->transformPosition;
                 target.on_translate = [&simulator](int id, tinym::vec3 v) {
                     simulator.translateObject(id, v);
+                };
+                target.rotation_wxyz = &selectedMesh->rotationQuat.w;
+                target.on_rotate = [&simulator](int id, float w, float x, float y, float z) {
+                    simulator.rotateObject(id, ::Quat{w, x, y, z});
                 };
             }
             return target;

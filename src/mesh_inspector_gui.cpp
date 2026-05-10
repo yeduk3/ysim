@@ -59,6 +59,18 @@ void drawMeshInspectorWindow(
         }
     }
 
+    if (target.rotation_wxyz && target.on_rotate) {
+        if (ImGui::CollapsingHeader("Rotation", ImGuiTreeNodeFlags_DefaultOpen)) {
+            float q[4] = { target.rotation_wxyz[0], target.rotation_wxyz[1],
+                           target.rotation_wxyz[2], target.rotation_wxyz[3] };
+            ImGui::InputFloat4("Quat (w,x,y,z)", q);
+            if (ImGui::IsItemDeactivatedAfterEdit()) {
+                target.on_rotate(target.mesh_id, q[0], q[1], q[2], q[3]);
+                state.status_message = "Rotation updated.";
+            }
+        }
+    }
+
     if (!state.status_message.empty()) {
         ImGui::Spacing();
         ImGui::TextDisabled("%s", state.status_message.c_str());
