@@ -4637,6 +4637,12 @@ struct Simulator {
         // D-023: refit the BVH so click-pick reads the rotated pose
         // immediately, even on a paused sim before the next sim.update().
         collisionPipeline.broadPhase.refit();
+        // D-025: stash the absolute rotation in pendingRotations so a
+        // subsequent Scene::pack() (triggered by addCube/addCloth/etc.)
+        // can re-apply it during initialize()'s auto-applyPendingMaterials
+        // step. Without this, re-pack rebuilds state.x from the
+        // initializer's geometry and the rotation is silently lost.
+        pendingRotations[meshId] = newAbs;
     }
 
     void memoryAllocation() {
@@ -4659,6 +4665,13 @@ struct Simulator {
         //Scene<BE, PR>::initialize();
 
         frame = 0;
+
+        // D-025: auto-apply pendingRotations + pendingMaterials so any
+        // edit-time rotation (rotateObject) or load-time rotation
+        // (loadScene) survives Scene::pack rebuild. Existing explicit
+        // applyPendingMaterials() calls (after loadScene in main.cpp /
+        // runSelfTest) become no-ops because the maps are cleared here.
+        applyPendingMaterials();
 
         std::cout << "[Simulator Init] All scene objects are initialized" << std::endl;
     }
@@ -5240,11 +5253,24 @@ struct Simulator {
     std::unordered_map<int, ::Quat> pendingRotations;
 
     void applyPendingMaterials() {
+        // Snapshot rotation entries before the loop. rotateObject() itself
+        // writes pendingRotations[id] = newAbs (D-025), so iterating the
+        // map directly while calling rotateObject inside would mutate the
+        // container under the iterator. Snapshot, apply, then clear.
+        std::vector<std::pair<int, ::Quat>> rotations;
+        rotations.reserve(pendingRotations.size());
+        for (auto& kv : pendingRotations) rotations.push_back(kv);
+
         for (auto& m : Scene<BE,PR>::meshes) {
             auto mit = pendingMaterials.find(m.id);
             if (mit != pendingMaterials.end()) m.material = mit->second;
-            auto rit = pendingRotations.find(m.id);
-            if (rit != pendingRotations.end()) m.rotationQuat = rit->second;
+        }
+        // D-025: re-apply rotation by calling rotateObject so fresh state.x
+        // (just rebuilt by Scene::pack) gets rotated around the pivot, not
+        // just the rotationQuat field set. Without this, the rotation
+        // effect on state.x is silently lost on every re-pack.
+        for (auto& kv : rotations) {
+            rotateObject(kv.first, kv.second);
         }
         pendingMaterials.clear();
         pendingRotations.clear();
@@ -6951,6 +6977,66 @@ static int runSelfTest() {
                  " (groundId=" + std::to_string(groundIdQ) + ")");
         } else {
             pass("FR-002 / click-pick selects nearest triangle, not nearest AABB");
+        }
+    }
+
+    // ---- Block 18: D-025 — rotateObject survives Scene::pack rebuild. ----
+    // Mirrors BDD-003 clause (d) shape (translate-survives-re-pack) for
+    // rotation. Re-pack rebuilds state.x from the initializer's geometry,
+    // which loses rotateObject's effect on state.x. D-025 closes the gap
+    // by writing pendingRotations[id] inside rotateObject AND auto-
+    // calling applyPendingMaterials() from Simulator::initialize().
+    {
+        sim.collisionPipeline.broadPhase.objTrees.clear();
+        resetScene();
+        sim.addCube(tinym::vec3(0.0f, 0.0f, 0.0f), /*tess=*/2,
+                    /*size=*/0.5f, /*mass=*/0.1f);
+        sim.initialize();
+        const int rotateRoundTripId = 0;
+
+        auto* m0_pre = Scene<Backend, Precision>::findById(rotateRoundTripId);
+        if (!m0_pre) {
+            fail("FR-004 / rotateObject survives Scene::pack rebuild",
+                 "cube id=" + std::to_string(rotateRoundTripId) + " not found pre-rotate");
+        } else {
+            // 90deg-Z rotation; witness vertex (x, y, z) -> (-y, x, z).
+            constexpr float kPi18 = 3.14159265358979323846f;
+            float halfA = (kPi18 / 2.0f) * 0.5f;
+            ::Quat newAbs = ::Quat{std::cos(halfA), 0.0f, 0.0f, std::sin(halfA)};
+            sim.rotateObject(rotateRoundTripId, newAbs);
+
+            double rx = m0_pre->state.x.ptr[0];
+            double ry = m0_pre->state.x.ptr[1];
+            double rz = m0_pre->state.x.ptr[2];
+
+            // Force a re-pack: addCube + sim.initialize().
+            sim.addCube(tinym::vec3(5.0f, 0.0f, 0.0f), /*tess=*/2,
+                        /*size=*/0.5f, /*mass=*/0.1f);
+            sim.initialize();  // pack + auto-applyPendingMaterials (D-025)
+
+            auto* m0_after = Scene<Backend, Precision>::findById(rotateRoundTripId);
+            if (!m0_after) {
+                fail("FR-004 / rotateObject survives Scene::pack rebuild",
+                     "cube id=" + std::to_string(rotateRoundTripId) +
+                     " disappeared after re-pack");
+            } else {
+                const double posTol = 1e-5;
+                double rrx = m0_after->state.x.ptr[0];
+                double rry = m0_after->state.x.ptr[1];
+                double rrz = m0_after->state.x.ptr[2];
+                if (std::abs(rrx - rx) > posTol ||
+                    std::abs(rry - ry) > posTol ||
+                    std::abs(rrz - rz) > posTol) {
+                    fail("FR-004 / rotateObject survives Scene::pack rebuild",
+                         "post-repack state.x[0] drifted from rotated value: "
+                         "expected (" + std::to_string(rx) + ", " +
+                         std::to_string(ry) + ", " + std::to_string(rz) +
+                         ") got (" + std::to_string(rrx) + ", " +
+                         std::to_string(rry) + ", " + std::to_string(rrz) + ")");
+                } else {
+                    pass("FR-004 / rotateObject survives Scene::pack rebuild");
+                }
+            }
         }
     }
 

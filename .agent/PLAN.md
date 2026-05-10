@@ -1,286 +1,244 @@
-# Plan — Triangle-precision click-pick (`fix/click-triangle-precision`)
+# Plan — Rotate pack-roundtrip (`feat/rotate-pack-roundtrip`)
 
 > Owner: **Planner** writes; **Generator** executes; **Estimator** judges.
 > Updated: 2026-05-10
 
-## Forensic: what regressed and when
+## Course note: previous slice's verdict
 
-**Reported bug.** Plane (`addGround`)을 quat `(1, 2, 0, 0)` normalized로
-회전시키면 (≈ 127° around X), Plane의 leaf AABB가 scene 전체를 감싸게
-되어 모든 click이 Plane만 선택함. 사용자 기대: ray가 실제로 통과하는
-triangle 중 가장 가까운 것을 선택.
+Estimator turn 18 returned **WARNING** (no BLOCK) on the
+click-triangle-precision slice. Single item: `docs/TEST_MATRIX.md`'s
+BDD-017 row + `.agent/PLAN.md` don't cross-reference Block 17.
+Tiny (~1 line) — folded into this slice as the bookkeeping todo.
 
-**Root cause — latent, just exposed.** `BVH::queryClickRay`
-(`src/main.cpp:3833-3855`, current numbering after D-020) writes the
-**leaf AABB's** `tmin` / `tmax` into `clickRayCollisions[]`:
+## Escape-pattern note
 
-```cpp
-RayHit hit;
-if(! node.aabb.intersect(ray, hit)) return;          // line 3835
-...
-if(node.childA < 0) { // leaf — childB is the primitive id
-    rayTraced[numTraced[0]] = {
-        (Index)objid, (Index)node.childB, hit.tmin, hit.tmax};   // line 3843
-    numTraced[0]++;
-    return;
-}
-```
+The rotate pack-roundtrip gap has been **deferred 5 slices in a
+row** in RESUME's "next candidates" carry-forward (translate-pack /
+profiler-gate / cloth-thickness / BDD-102 / BDD-004 / BDD-010 /
+BDD-017 / refit-after-edit / click-triangle-precision). Per
+PLANNER.md procedure step 6 (escape-pattern detection), this
+slice closes the gap before the deferral itself becomes the
+problem.
 
-`hit`은 leaf의 **AABB**와 ray의 교차에서 나온 값이지 triangle과의
-교차가 아님. 호출자(production callback `src/main.cpp:6996-7002`,
-harness Block 14의 `pickClosest`)는 이 AABB-tmin을 기준으로
-smallest-tmin object를 고름.
+## Design call (the question that's been blocking this)
 
-축이 정렬된 cube/ground에서는 leaf AABB가 triangle을 거의 딱 맞게
-감싸니까 AABB-tmin ≈ triangle-tmin이 되어 표면적으로 정확. 회전된
-triangle의 AABB는 실제 triangle보다 훨씬 커져서 어긋남. 회전된
-Plane의 leaf AABB가 camera frustum까지 침범하면 ray의 AABB-tmin이
-0 근처로 작아져서 항상 Plane이 이김.
+D-014 / D-015 closed translate's pack-roundtrip via an **initializer
+write-back**: `translateObject` writes the new center into
+`mesh->initializer->params.center`, and pack-time reads it back
+when constructing fresh state.x. Symmetric with how
+`transformPosition` is seeded.
 
-**No specific commit "broke" click-pick.** `queryClickRay`의 leaf
-write 형태는 파일 history 내내 AABB-tmin을 써왔음. 변한 건 visibility:
+For rotate, the analogous shapes are:
 
-- **D-021** (commit `d550f82`)이 `Simulator::rotateObject`를 도입
-- **D-023** (commit `9c8da75`)이 `rotateObject` 끝에 `broadPhase.refit()`을 추가
+- **Shape A — initializer carries rotation.** Add `Quat rotation`
+  to each initializer's params; each initializer's `initialize()`
+  applies the rotation to state.x as a post-step around
+  `params.center`; `rotateObject` writes back to `params.rotation`
+  via the same dynamic_cast cascade. Pack-time also seeds
+  `mesh.rotationQuat = params.rotation`. Mirrors D-015 exactly.
+  **Cost:** modify 4 initializer classes + dynamic_cast cascade
+  in rotateObject. Larger surface area than D-015 (which only
+  touched the cascade — initializer.center was already a
+  build-time input).
 
-이 둘이 비축-정렬 pose를 reachable하게 만들면서 latent bug가 표면화됨.
-"원래 그렇게 되어있었음"은 reachable한 scene 내에서는 사실: AABB
-근사가 충분히 tight해서 click이 옳게 동작했음. tilted pose가 사용
-가능해진 지금은 근사가 깨짐.
+- **Shape B — re-apply via pendingRotations + auto applyPendingMaterials.**
+  `rotateObject` writes `pendingRotations[id] = newAbs` (in
+  addition to its existing state.x mutation). `Simulator::initialize()`
+  auto-calls `applyPendingMaterials()` at the end. The
+  `applyPendingMaterials` body is updated: instead of just setting
+  `mesh.rotationQuat = pendingRotations[id]`, it calls
+  `rotateObject(mesh.id, pendingRotations[id])`. The rotateObject
+  call rotates fresh state.x by the saved quat around the
+  (already-correctly-seeded) `transformPosition` pivot, sets
+  `mesh.rotationQuat`, and triggers `broadPhase.refit()`.
+  **Cost:** ~5 lines: one auto-call in `Simulator::initialize`,
+  a `rotateObject` swap inside `applyPendingMaterials`, an
+  additional `pendingRotations[id] = newAbs;` write inside
+  `rotateObject`. **No initializer changes.**
+
+**Decision: Shape B.** Reasons:
+
+1. **Smaller surface area.** Shape A modifies 4 initializer
+   classes' `initialize()` plus the cascade; Shape B is a 5-line
+   contract change to `Simulator::initialize` + `applyPendingMaterials`
+   + `rotateObject`.
+2. **Re-uses the existing `pendingRotations` mechanism.** The
+   side-table was already designed for `loadScene`'s flow — making
+   it serve `rotateObject` too is consistent.
+3. **`applyPendingMaterials` becomes the canonical "post-pack
+   restoration" path** for both load-time AND edit-time
+   rotations. Its name slightly under-sells what it does, but
+   the contract is unified.
+4. **`Simulator::initialize` auto-calling `applyPendingMaterials`**
+   is a contract change — but the existing explicit call sites
+   (after `loadScene` in main.cpp and runSelfTest) become
+   no-ops on the second call (the map is cleared after the
+   auto-call). Backwards-compatible.
+
+D-025 records the choice.
 
 ## Goal
 
-Click-pick이 ray가 실제로 통과하는 **triangle**의 가장 가까운 것을
-선택하도록 수정. 이 slice 후:
+After this slice:
 
-- `BVH::queryClickRay`의 leaf branch가 ray-vs-triangle (Möller–
-  Trumbore)을 직접 돌려서 진짜 triangle 교차의 `t`를
-  `clickRayCollisions[]`에 기록한다. AABB만 hit하고 triangle은
-  miss인 leaf는 buffer에 기록되지 않음.
-- 호출자(production callback, harness Block 14의 `pickClosest`)는
-  **변경 없음** — 기존의 smallest-tmin walk가 그대로 정확한 답을
-  돌려준다 (왜냐하면 이제 tmin이 진짜 triangle-tmin).
-- Plane이 회전해서 AABB가 cube를 감싸도, click ray가 실제로
-  Plane triangle을 통과하지 않으면 cube만 후보로 남는다.
-- Block 17이 user-reported scenario를 그대로 재현 + 검증.
+- `Simulator::rotateObject(id, q)` writes both `state.x` (current
+  behavior) AND `pendingRotations[id] = q` (new).
+- `Simulator::initialize()` auto-calls `applyPendingMaterials()` at
+  the very end (after `broadPhase.build` and friends).
+- `applyPendingMaterials()`'s rotation branch calls
+  `rotateObject(m.id, rit->second)` instead of just setting
+  `mesh.rotationQuat`. This rotates fresh state.x by the saved
+  quat AND updates rotationQuat AND triggers BVH refit.
+- A `rotateObject` then `addCube + sim.initialize()` sequence
+  preserves the rotation on the originally-rotated cube. Click-
+  pick remains correct on the rotated cube.
+- Block 18 in `runSelfTest` mechanizes the round-trip explicitly.
+  Pass label mirrors BDD-003 clause (d) shape:
+  `FR-004 / rotateObject survives Scene::pack rebuild`.
+- Estimator turn-18 WARNING closed via a 1-line cross-reference
+  in `docs/TEST_MATRIX.md` BDD-017 row's test address.
 
 ## Scope
 
-### 1. New helper — `rayTriangleIntersect` (Möller–Trumbore)
+### 1. Production fix — D-025 — Shape B
 
-`AABB::intersect` 근처(~`src/main.cpp:3014`)에 inline free function
-으로 둔다. ~20 lines.
+**`src/main.cpp::Simulator::rotateObject`** (~line 4545): after
+`mesh->rotationQuat = newAbs;` and `broadPhase.refit();`, add:
 
 ```cpp
-// Returns true and writes outT (= ray.origin + outT * ray.dir 가 교차점)
-// when the ray hits the triangle (p0, p1, p2) at outT > 0 with valid
-// barycentric coords. Standard Möller–Trumbore; uses 1e-6 epsilon for
-// the determinant test (smaller epsilons reject grazing cases that
-// could be valid hits; this is large enough for v1's mesh sizes).
-inline bool rayTriangleIntersect(const Ray& ray,
-                                 const tinym::vec3& p0,
-                                 const tinym::vec3& p1,
-                                 const tinym::vec3& p2,
-                                 float& outT) {
-    const float kEps = 1e-6f;
-    tinym::vec3 e1 = p1 - p0;
-    tinym::vec3 e2 = p2 - p0;
-    tinym::vec3 pvec = cross(ray.dir, e2);
-    float det = dot(e1, pvec);
-    if (std::abs(det) < kEps) return false;
-    float invDet = 1.0f / det;
-    tinym::vec3 tvec = ray.origin - p0;
-    float u = dot(tvec, pvec) * invDet;
-    if (u < 0.0f || u > 1.0f) return false;
-    tinym::vec3 qvec = cross(tvec, e1);
-    float v = dot(ray.dir, qvec) * invDet;
-    if (v < 0.0f || u + v > 1.0f) return false;
-    float t = dot(e2, qvec) * invDet;
-    if (t <= 0.0f) return false;
-    outT = t;
-    return true;
+pendingRotations[meshId] = newAbs;
+```
+
+**`src/main.cpp::Simulator::initialize`** (~line 4582 area, end of
+function): add `applyPendingMaterials();` as the final line.
+Document that auto-calling is the new contract.
+
+**`src/main.cpp::Simulator::applyPendingMaterials`** (~line 5242):
+update the rotation branch from:
+
+```cpp
+auto rit = pendingRotations.find(m.id);
+if (rit != pendingRotations.end()) m.rotationQuat = rit->second;
+```
+
+to:
+
+```cpp
+auto rit = pendingRotations.find(m.id);
+if (rit != pendingRotations.end()) {
+    // D-025: re-apply the rotation to fresh state.x via rotateObject,
+    // not just by setting rotationQuat. After Scene::pack rebuilds
+    // state.x from the initializer's geometry, the rotation effect
+    // is gone; rotateObject's pivot-aware rotation writes it back.
+    rotateObject(static_cast<int>(m.id), rit->second);
 }
 ```
 
-`tinym`이 `cross`/`dot`을 노출하는지 확인 (likely yes; `vec3` ops 있음).
-없으면 즉석에서 component-wise 계산.
+The `rotateObject` call inside `applyPendingMaterials` will
+itself try to write `pendingRotations[id] = newAbs` (via D-025's
+own write-back). That's fine — the map gets re-populated with
+the same value, then cleared at the end of the loop. Net effect:
+idempotent.
 
-### 2. BVH-side change — store mesh data refs + use them in leaf
+**Side note: `m.rotationQuat` after pack is identity** (default).
+`rotateObject` computes `delta = newAbs * conjugate(identity) =
+newAbs`. Applies delta to fresh state.x → state.x rotated.
+Sets `m.rotationQuat = newAbs`. ✓
 
-`BVH<METAL, PR, BVHMODE::LINEAR, BVHPRIMITIVE::TRIANGLE>` (=
-`TRI_LBVH`)에 두 개의 raw 포인터 멤버를 추가:
+### 2. Block 18 — `runSelfTest` mechanization
 
-```cpp
-const PR*    xPositions   = nullptr;  // points into mesh.state.x.ptr
-const Index* facetIndices = nullptr;  // points into mesh.adjacency.facets.ptr
-```
-
-**Lifetime invariant.** state.x.ptr / facets.ptr 은 Scene::pack 단위로
-안정적이고, BVH 자체도 Scene::pack 시 재빌드(`broadPhase.build(scene)`
-in `Simulator::initialize`)되므로 BVH의 lifetime과 정확히 같다. D-023의
-`broadPhase.refit()`은 state.x의 *값*만 다시 읽고, ptr 자체는 그대로
-유지하므로 안전. 새 invariant: **TRI_LBVH가 살아있는 동안 xPositions/
-facetIndices가 가리키는 mesh data가 유효해야 한다.** D-024가 명시한다.
-
-`BVH::build(GeneralMesh& mesh)` (~`src/main.cpp:3164`)에서 이 두
-포인터를 저장:
+Append after Block 17 (the click-triangle-precision block).
 
 ```cpp
-void build(GeneralMesh<METAL, PR>& mesh) {
-    xPositions   = mesh.state.x.ptr;
-    facetIndices = mesh.adjacency.facets.ptr;
-    build(mesh.id, mesh.state.x, mesh.adjacency.facets);
-}
-```
-
-`build(int oid, ...)` overload도 같은 위치에 호환되는 wiring (or
-공통 setter 호출)을 두지만, click-pick 경로에서 사용되는 path는
-`build(GeneralMesh&)`이므로 거기만 챙겨도 충분. 다른 build overload는
-ground-truth 비교용이거나 SCENE-level이므로 손대지 않음.
-
-`BVH::queryClickRay(const Ray&, const BVHNode&)`의 leaf branch를
-교체:
-
-```cpp
-if (node.childA < 0) {
-    auto& rayTracedData = Scene<BE, PR>::rayTracedData;
-    auto& rayTraced     = rayTracedData.clickRayCollisions;
-    auto& numTraced     = rayTracedData.numClickRayCollisions;
-    if (numTraced[0] >= rayTracedData.approxColsPerRay) return;
-
-    // D-024: write the actual triangle-vs-ray hit, not the leaf
-    // AABB intersect. Without this, a leaf AABB much larger than its
-    // triangle (e.g., a rotated mesh) hijacks the smallest-tmin walk
-    // even when the ray never crosses the triangle itself.
-    Index triId = static_cast<Index>(node.childB);
-    Index v0    = facetIndices[3 * triId + 0];
-    Index v1    = facetIndices[3 * triId + 1];
-    Index v2    = facetIndices[3 * triId + 2];
-    tinym::vec3 p0(xPositions[3*v0+0], xPositions[3*v0+1], xPositions[3*v0+2]);
-    tinym::vec3 p1(xPositions[3*v1+0], xPositions[3*v1+1], xPositions[3*v1+2]);
-    tinym::vec3 p2(xPositions[3*v2+0], xPositions[3*v2+1], xPositions[3*v2+2]);
-
-    float triT;
-    if (!rayTriangleIntersect(ray, p0, p1, p2, triT)) return;
-
-    rayTraced[numTraced[0]] = {(Index)objid, triId, triT, triT};
-    numTraced[0]++;
-    return;  // D-020 invariant — leaves don't recurse.
-}
-```
-
-`hit.tmin` / `hit.tmax`는 더 이상 leaf write에 안 쓰이지만, AABB
-filter는 그대로 (`if(! node.aabb.intersect(ray, hit)) return;`)
-유지 — leaf까지 못 가는 nodes는 cheap한 AABB로 거름.
-
-### 3. 호출자 측 변경 없음
-
-Production mouse-callback (`src/main.cpp:6996-7002`)의 smallest-tmin
-walk와 harness Block 14의 `pickClosest` lambda는 **그대로 둔다**.
-이제 `tmin`이 진짜 triangle-tmin이라서 두 walk 모두 자동으로 정확.
-
-### 4. Block 17 in `runSelfTest`
-
-Block 16 뒤에 추가. user의 reported scenario를 그대로 재현:
-
-```cpp
-// ---- Block 17: D-024 — click-pick uses triangle-precision ranking. ----
-// Reproduces the user-reported regression: a Plane rotated so its
-// leaf AABBs envelop the scene must NOT steal clicks aimed at smaller
-// nearby objects. queryClickRay's old leaf write used AABB-vs-ray
-// tmin, which is tight enough for axis-aligned scenes but not for
-// rotated triangles whose AABB grows much larger than the triangle.
-// D-024 makes the leaf write the actual ray-vs-triangle hit.
+// ---- Block 18: D-025 — rotateObject survives Scene::pack rebuild. ----
+// Mirrors BDD-003's clause (d) shape (translate-survives-re-pack)
+// for rotation. Re-pack rebuilds state.x from the initializer's
+// geometry, which loses rotateObject's effect on state.x. D-025
+// closes the gap by writing pendingRotations[id] inside rotateObject
+// AND auto-calling applyPendingMaterials() from Simulator::initialize().
 {
     sim.collisionPipeline.broadPhase.objTrees.clear();
     resetScene();
-    // Cube near the click target.
     sim.addCube(tinym::vec3(0.0f, 0.0f, 0.0f), /*tess=*/2,
                 /*size=*/0.5f, /*mass=*/0.1f);
-    // Ground below; rotated quat (1, 2, 0, 0)-normalized ≈ 127deg-X
-    // so its AABB tilts to envelop the cube above it.
-    sim.addGround(PlaneDirection::XZPlane, tinym::vec3(0, -1, 0),
-                  /*size1D=*/4.0f);
     sim.initialize();
-    sim.update();
-    const Index cubeId   = 0;
-    const Index groundId = 1;
+    const int rotateRoundTripId = 0;
 
-    ::Quat tilted = quatNormalize(::Quat{1.0f, 2.0f, 0.0f, 0.0f});
-    sim.rotateObject(groundId, tilted);
+    auto* m0 = Scene<Backend, Precision>::findById(rotateRoundTripId);
+    if (!m0) {
+        fail("FR-004 / rotateObject survives Scene::pack rebuild",
+             "cube id=" + std::to_string(rotateRoundTripId) + " not found pre-rotate");
+    } else {
+        // 90deg-Z rotation; witness vertex (0.25, -0.25, -0.25) → (0.25, 0.25, -0.25).
+        constexpr float kPi18 = 3.14159265358979323846f;
+        float halfA = (kPi18 / 2.0f) * 0.5f;
+        ::Quat newAbs = ::Quat{std::cos(halfA), 0.0f, 0.0f, std::sin(halfA)};
+        sim.rotateObject(rotateRoundTripId, newAbs);
 
-    // Click straight down at the cube.
-    Ray rayClick;
-    rayClick.origin = tinym::vec3(0.0f, 0.0f, 10.0f);
-    rayClick.dir    = tinym::vec3(0.0f, 0.0f, -1.0f);
-    Scene<Backend, Precision>::rayTracedData.numClickRayCollisions[0] = 0;
-    sim.collisionPipeline.broadPhase.queryClickRay(rayClick);
+        double rx = m0->state.x.ptr[0];
+        double ry = m0->state.x.ptr[1];
+        double rz = m0->state.x.ptr[2];
 
-    // Production-style smallest-tmin walk on the populated buffer.
-    auto& rt = Scene<Backend, Precision>::rayTracedData;
-    Index num = rt.numClickRayCollisions[0];
-    int picked = -1;
-    if (num > 0) {
-        picked = static_cast<int>(rt.clickRayCollisions[0].obj);
-        float bestT = rt.clickRayCollisions[0].tmin;
-        for (Index i = 1; i < num; ++i) {
-            if (rt.clickRayCollisions[i].tmin < bestT) {
-                bestT = rt.clickRayCollisions[i].tmin;
-                picked = static_cast<int>(rt.clickRayCollisions[i].obj);
+        // Force a re-pack: add another mesh and re-initialize.
+        sim.addCube(tinym::vec3(5.0f, 0.0f, 0.0f), /*tess=*/2,
+                    /*size=*/0.5f, /*mass=*/0.1f);
+        sim.initialize();  // pack + applyPendingMaterials (auto via D-025)
+
+        auto* m0_after = Scene<Backend, Precision>::findById(rotateRoundTripId);
+        if (!m0_after) {
+            fail("FR-004 / rotateObject survives Scene::pack rebuild",
+                 "cube id=" + std::to_string(rotateRoundTripId) + " disappeared after re-pack");
+        } else {
+            const double posTol = 1e-5;
+            double rrx = m0_after->state.x.ptr[0];
+            double rry = m0_after->state.x.ptr[1];
+            double rrz = m0_after->state.x.ptr[2];
+            if (std::abs(rrx - rx) > posTol ||
+                std::abs(rry - ry) > posTol ||
+                std::abs(rrz - rz) > posTol) {
+                fail("FR-004 / rotateObject survives Scene::pack rebuild",
+                     "post-repack state.x[0] drifted from rotated value: "
+                     "expected (" + std::to_string(rx) + ", " +
+                     std::to_string(ry) + ", " + std::to_string(rz) + ") "
+                     "got (" + std::to_string(rrx) + ", " +
+                     std::to_string(rry) + ", " + std::to_string(rrz) + ")");
+            } else {
+                pass("FR-004 / rotateObject survives Scene::pack rebuild");
             }
         }
-    }
-
-    if (picked != static_cast<int>(cubeId)) {
-        fail("FR-002 / click-pick selects nearest triangle, not nearest AABB",
-             "tilted ground stole the click; expected cube id=" +
-             std::to_string(cubeId) + " got " + std::to_string(picked));
-    } else {
-        pass("FR-002 / click-pick selects nearest triangle, not nearest AABB");
     }
 }
 ```
 
-Pass label은 `FR-002` 태그(generic "click-pick selects an object"
-의미). spec-vs-label discipline대로 BDD-017 변형이 아니라 별개의
-clause로 두고, 매트릭스 row 갱신은 안 함 (BDD-017 row가 이 clause를
-은유적으로 포함하긴 하지만, `triangle-precision` 자체가 별도 BDD가
-아니므로 row promotion 안 함).
+### 3. Bookkeeping fold-in (Estimator turn-18 WARNING)
 
-### 5. Bookkeeping
+`docs/TEST_MATRIX.md` BDD-017 row's test address line — append
+"+ Block 17 (D-024 triangle-precision sister mechanization)" after
+the existing Block 14 reference. ~1 line edit.
 
-- **`docs/DECISIONS.md`** — new `D-024`: click-pick BVH leaf does
-  ray-vs-triangle directly; mesh-data pointer invariant on
-  `TRI_LBVH`; Möller–Trumbore as the canonical math helper for
-  click-pick / ray-cast / future hit-test consumers.
-- **`docs/mistakes/COMMON_MISTAKES.md`** — new `CM-010`: BVH
-  consumer treating leaf AABB-tmin as triangle-tmin. Future BVH
-  walks (shadow rays, hit-test API, pickup interactions) should
-  do real primitive-vs-ray at the leaf, not just AABB.
-- **`docs/TEST_MATRIX.md`** — no row promotion (Block 17 is a
-  triangle-precision sister to BDD-017's mechanization). Add a
-  one-line cross-reference in BDD-017's test address.
-- **`.agent/CURRENT_WORK.md` / `RESUME.md`** — update for the
-  slice.
+### 4. Bookkeeping (slice's own)
+
+- `docs/DECISIONS.md` — D-025: the rotateObject pack-roundtrip
+  decision. File / function / decision (Shape B over Shape A) /
+  alternatives-considered / rationale per the standard format.
+- `.agent/CURRENT_WORK.md` / `RESUME.md` — update for the
+  slice. RESUME finally drops the "rotate pack-roundtrip" item
+  from the carry-forward list. Promote next candidates: CM-008
+  production-side fix (theoretical), inspector ergonomics for
+  rotation, BDD-018, BDD-005, BDD-006, BDD-008/013 (Q-blocked).
 
 ## Non-goals (this slice)
 
-- **Triangle-vs-ray for narrow-phase collision detection** — narrow
-  phase already uses Metal kernel `narrow_pt_tri` (D-013). This
-  slice only fixes click-pick (CPU side, separate code path).
-- **Per-mesh BVH refactor.** Only TRI_LBVH gets the mesh-data
-  pointers. SCENE-level BVH (object AABBs) stays unchanged — its
-  leaves represent objects, not triangles, and click-pick walks
-  through it via the existing `objTree.tree[0].aabb.intersect`
-  filter at line 4067.
-- **Optimize ray-vs-triangle.** Möller–Trumbore is fine for v1.
-- **Optimize the BVH walk** to early-out when current best-t is
-  smaller than node-AABB tmin. Useful for big scenes; defer.
-- **Rotate pack-roundtrip closure.** Still deferred (4th slice
-  carrying it now — graduates to highest-priority next-slice
-  candidate).
-- **CM-008 production-side fix.**
-- **Inspector ergonomics for rotation.** Future slice.
+- **Initializer refactor** (Shape A). Shape B is sufficient and
+  smaller.
+- **`applyPendingMaterials` rename or signature change.** The
+  function's name slightly under-sells what it now does, but
+  the contract is unified across load-time + edit-time. Renaming
+  would touch every call site for cosmetic gain. Keep.
+- **Performance optimization** of rotation re-apply for many
+  meshes. v1's small N keeps this trivial.
+- **CM-008 production-side fix** — still deferred (theoretical
+  concern in v1).
 - **Other matrix rows, spec edits.**
 - **Resolving `Q1`, `Q2`, `Q4`, `Q5`, `Q6`, `Q7`.**
 
@@ -288,113 +246,112 @@ clause로 두고, 매트릭스 row 갱신은 안 함 (BDD-017 row가 이 clause�
 
 Ordered. Generator executes top-to-bottom.
 
-1. **Branch hygiene.** Already on `fix/refit-after-edit`'s successor
-   `fix/click-triangle-precision` (the user will branch from main
-   after the refit-after-edit slice merges). Commit prefix: `fix:`.
+1. **Branch hygiene.** Already on `feat/rotate-pack-roundtrip`
+   (off `main` at `d54cb44`). Commit prefix: `add:` (this slice
+   adds the contract change + new pendingRotations write +
+   Block 18). Or `fix:` is also defensible — Generator picks.
 
-2. **Re-read** the diagnosis above and `docs/roles/PLANNER.md`
-   step 7 (stricter-than-spec assertions). Block 17's pass label
-   is intentionally affirmative ("selects nearest triangle, not
-   nearest AABB").
+2. **Re-read the design call** above. The Shape A vs Shape B
+   trade-off is documented; this slice ships Shape B. Don't
+   second-guess unless implementation reveals a blocking
+   subtlety.
 
-3. **Add `rayTriangleIntersect` helper** near `AABB::intersect`
-   (~`src/main.cpp:3014`). Möller–Trumbore. ~20 lines.
+3. **Update `Simulator::rotateObject`** to write
+   `pendingRotations[meshId] = newAbs` after the existing
+   state.x mutation + refit.
 
-4. **Verify `tinym::vec3` exposes `cross` and `dot`.** If not,
-   inline component-wise math in the helper. (Most tinym variants
-   have both; quick grep before writing.)
+4. **Update `Simulator::applyPendingMaterials`** to call
+   `rotateObject(m.id, rit->second)` instead of just setting
+   `m.rotationQuat`. Comment cites D-025.
 
-5. **Add `xPositions` and `facetIndices` members to `TRI_LBVH`.**
-   Both `const PR*` / `const Index*`, default `nullptr`.
+5. **Update `Simulator::initialize`** to call
+   `applyPendingMaterials()` at the end. Document the new
+   contract: any caller that previously relied on the explicit
+   post-`loadScene` call sees no change (the map is empty after
+   the auto-call). Comment cites D-025.
 
-6. **Wire `BVH::build(GeneralMesh&)` to populate the pointers.**
-   `~src/main.cpp:3164`. Two-line addition before delegating to the
-   `build(int oid, ...)` overload.
+6. **Author Block 18** per §2 above. Append after Block 17.
+   Pass label: `FR-004 / rotateObject survives Scene::pack rebuild`.
 
-7. **Replace the leaf branch in `BVH::queryClickRay`.** Per §2
-   above. AABB filter at the top stays; `hit.tmin/tmax` is now
-   used only as a "did the ray reach this AABB?" check, not as
-   the recorded value. Triangle-vs-ray result writes triangle-tmin
-   to the buffer.
+7. **`docs/TEST_MATRIX.md` BDD-017 row** — append the Block 17
+   cross-reference per §3.
 
 8. **Run `./scripts/verify-light.sh`.** Doctest binaries should
    stay 159/159 + 1120/1120.
 
-9. **Run `--self-test` 5+ times.** Expect **34/34 PASS**
-   consistently. Existing Block 14 (BDD-017) and Block 16 (D-023)
-   pass labels stay verbatim — for axis-aligned cubes, the new
-   triangle-tmin ≈ old AABB-tmin within FP tolerance, so existing
-   assertions are unaffected. Block 17 is the new line.
+9. **Run `--self-test` 5+ times.** Expect **35/35 PASS**
+   consistently.
 
-10. **Bug-probe.** Temporarily revert the leaf write to use
-    `hit.tmin/tmax` (the old AABB-only ranking); confirm Block 17
-    FAILs with the diagnostic `tilted ground stole the click;
-    expected cube id=0 got 1`. Restore.
+10. **Bug-probe.** Temporarily skip the
+    `pendingRotations[meshId] = newAbs;` write inside
+    `rotateObject` (or skip the auto-`applyPendingMaterials`
+    call inside `Simulator::initialize`); confirm Block 18
+    FAILs with the diagnostic showing post-repack state.x has
+    drifted from the rotated value. Restore. Same discipline
+    as recent slices.
 
-11. **Add D-024 + CM-010.** Standard format for both. D-024
-    captures the leaf triangle-vs-ray invariant + the TRI_LBVH
-    mesh-pointer lifetime contract. CM-010 captures the trap
-    pattern.
+11. **Add D-025 to `docs/DECISIONS.md`.** Standard format.
 
-12. **Update CURRENT_WORK / RESUME.** Carry forward deferred
-    follow-ups (rotate pack-roundtrip — graduating priority).
+12. **Update CURRENT_WORK / RESUME.** Drop "rotate pack-roundtrip"
+    from RESUME's carry-forward list. Note the `applyPendingMaterials`
+    auto-call contract change as a load-bearing fact for future
+    callers.
 
 13. **Stop and hand off to the Estimator.** No matrix-row
-    promotion, no spec edits, no scope expansion.
+    promotion, no spec edits, no other features.
 
 ## Course corrections
 
-- **Stricter-than-spec assertions** (PLANNER.md step 7).
-  Block 17's "expected cube" form catches AABB-only ranking
-  regressions. The bug-probe (todo 10) verifies the assertion is
-  load-bearing.
+- **Stricter-than-spec assertions** (PLANNER.md step 7). Block
+  18's pass label tests state.x exact equality (within FP
+  tolerance). A weaker assertion that just checks `mesh.rotationQuat`
+  would miss the bug — the rotate effect is on state.x, not
+  the field. The strict form is the right call.
 
-- **Architectural invariants applying here** (PLANNER.md step 8):
-  - **D-013** (xPrev parity) — unchanged; this slice doesn't touch
-    state.x mutation paths.
-  - **D-014 / D-015 / D-021 / D-023** — unchanged; the BVH consumes
-    state.x through the new pointer, refit takes care of value
-    updates.
-  - **D-018** (`mesh.id` seed) — unrelated; this slice doesn't
-    touch initializer randomness.
-  - **D-019 / D-022** (Quat math) — used by `rotateObject` which
-    Block 17 calls; unchanged.
-  - **D-020** (BVH leaf-return) — preserved; new leaf branch still
-    `return`s.
-  - **NEW D-024** — TRI_LBVH stores raw `state.x.ptr` /
-    `facets.ptr`. Lifetime: BVH is reborn on `Scene::pack`, same
-    moment those pointers are reallocated. `refit()` re-reads
-    values through the same pointer; ptr stability holds for the
-    BVH's lifetime.
+- **Architectural invariants applying here:**
+  - **D-013** (xPrev parity) — preserved; rotateObject mirrors
+    state.x mutation to state.xPrev.
+  - **D-014/D-015** (translate semantic + cascade) — unchanged;
+    translate's pack-roundtrip already works via initializer
+    write-back. No conflict with Shape B for rotate.
+  - **D-018** (mesh.id seed) — unchanged.
+  - **D-019/D-022** (Quat math) — used by rotateObject;
+    unchanged.
+  - **D-020** (BVH leaf return) — unchanged.
+  - **D-021** (rotateObject API + pivot semantic) — extended.
+  - **D-023** (refit after edit) — preserved; rotateObject
+    still calls refit().
+  - **D-024** (triangle-precision click-pick) — unchanged.
+  - **NEW D-025** — `Simulator::initialize()` auto-calls
+    `applyPendingMaterials()`; `applyPendingMaterials()` now
+    re-applies rotation via `rotateObject` (not just rotationQuat
+    set). pendingRotations is the canonical post-pack rotation
+    side-table for both load-time (loadScene populates) AND
+    edit-time (rotateObject populates).
 
-- **No two-stage walk needed.** The earlier draft of this plan
-  proposed a `pickClosestTriangleHit` consumer-side helper
-  (Shape B). User pointed out correctly that the BVH should
-  produce triangle hits directly — the helper was redundant.
-  Removed. The mouse callback's existing smallest-tmin walk and
-  Block 14's `pickClosest` lambda both stay verbatim.
+- **`pendingMaterials` path is unchanged.** Materials are CPU-
+  side state that doesn't depend on state.x; just setting
+  `m.material = pendingMaterials[id]` is correct. Only the
+  rotation branch needs the rotateObject upgrade.
 
-- **`hit.tmin/tmax` from `node.aabb.intersect` still used** as the
-  AABB filter (cheap reject for nodes the ray doesn't enter at
-  all). Just not as the recorded leaf value. The dual use is
-  fine and matches how broad/narrow phase already split labor.
+- **`Simulator::initialize` is called by all create flows.**
+  addCube, addSphere, addCloth, importMesh — they all call
+  `initialize()` after `addGeneralMesh`. So pendingRotations
+  gets re-applied automatically on every scene mutation.
 
 ## What to read before writing code
 
-- `src/main.cpp::BVH<...>::queryClickRay` (~line 3833) — the leaf
-  write site to replace.
-- `src/main.cpp::BVH::build` (~line 3164 for `GeneralMesh&`
-  overload) — site to wire mesh-data pointers.
-- `src/main.cpp::AABB::intersect` (~line 3014) — neighborhood for
-  `rayTriangleIntersect`.
-- `src/main.cpp` mouse callback at ~line 6996 — production
-  consumer (unchanged but read to confirm).
-- `src/main.cpp::runSelfTest` Block 14 (`pickClosest` lambda) and
-  Block 16 (refit clauses) — confirm they stay green with the
-  triangle-precision change for axis-aligned cubes.
-- `include/tinym.hpp` — confirm `cross` and `dot` on `vec3`.
-- `docs/DECISIONS.md::D-013, D-014, D-015, D-018, D-019, D-020,
-  D-021, D-022, D-023` — recent invariants that constrain how
-  this slice interacts with state.x, BVH, and rotation.
-- `docs/mistakes/COMMON_MISTAKES.md::CM-009` — neighbor entry
-  for the BVH-walk trap family.
+- `src/main.cpp::Simulator::rotateObject` (~line 4545) — site
+  to add `pendingRotations[id] = newAbs`.
+- `src/main.cpp::Simulator::initialize` (~line 4582) — site
+  to add the auto-`applyPendingMaterials()` call at the end.
+- `src/main.cpp::Simulator::applyPendingMaterials` (~line 5242)
+  — site to swap `m.rotationQuat = ...` for `rotateObject(...)`.
+- `src/main.cpp::runSelfTest` Block 9 (BDD-003 clause d, "translate
+  survives Scene::pack rebuild") — template for Block 18's
+  shape.
+- `docs/DECISIONS.md::D-014, D-015` — translate pack-roundtrip
+  precedent; D-025 is the rotate analog with a different shape
+  (side-table re-apply vs initializer write-back).
+- `.agent/RESUME.md` — the carry-forward list that's about to
+  drop "rotate pack-roundtrip".
