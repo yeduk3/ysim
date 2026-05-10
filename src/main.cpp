@@ -4526,6 +4526,12 @@ struct Simulator {
         } else if (auto* f  = dynamic_cast<MeshFileInitializer  <BE, PR>*>(mesh->initializer)) {
             f->params.offset = newPos;
         }
+        // D-023: refit the BVH so click-pick reads the new pose
+        // immediately, even on a paused sim before the next sim.update().
+        // refit() covers per-mesh tree refit AND the SCENE-level rebuild
+        // (BroadPhase::refit at src/main.cpp:3961 — single call covers both
+        // levels).
+        collisionPipeline.broadPhase.refit();
     }
 
     // FR-004 / D-021: set the named mesh's absolute orientation to newQuat.
@@ -4571,6 +4577,9 @@ struct Simulator {
             }
         }
         mesh->rotationQuat = newAbs;
+        // D-023: refit the BVH so click-pick reads the rotated pose
+        // immediately, even on a paused sim before the next sim.update().
+        collisionPipeline.broadPhase.refit();
     }
 
     void memoryAllocation() {
@@ -6717,6 +6726,104 @@ static int runSelfTest() {
                     pass("FR-004 UI / next sim step preserves rotated state.x");
                 }
             }
+        }
+    }
+
+    // ---- Block 16: D-023 — translateObject / rotateObject refit BVH. ------
+    // Estimator turn-17 WARNING: state.x mutations from the inspector edits
+    // were not refitting the scene-level BVH, so click-pick on a paused
+    // sim hit the old pose. D-023 fixes this with one refit() call at the
+    // end of each function. Block 16 mechanizes the invariant so a
+    // regression that drops the refit() call surfaces as a hard FAIL.
+    {
+        // --- Clause (a): translateObject refits the BVH. ---------------
+        sim.collisionPipeline.broadPhase.objTrees.clear();
+        resetScene();
+        sim.addCube(tinym::vec3(0.0f, 0.0f, 0.0f), /*tess=*/2,
+                    /*size=*/0.5f, /*mass=*/0.1f);
+        sim.initialize();
+        sim.update();  // populate BVH AABBs
+        const Index translateRefitId = 0;
+
+        sim.translateObject(translateRefitId, tinym::vec3(5.0f, 0.0f, 0.0f));
+
+        // Ray at NEW position (5, 0, 0): expect hit.
+        Ray rayNewT;
+        rayNewT.origin = tinym::vec3(5.0f, 0.0f, 10.0f);
+        rayNewT.dir    = tinym::vec3(0.0f, 0.0f, -1.0f);
+        Scene<Backend, Precision>::rayTracedData.numClickRayCollisions[0] = 0;
+        sim.collisionPipeline.broadPhase.queryClickRay(rayNewT);
+        Index hitsNewT =
+            Scene<Backend, Precision>::rayTracedData.numClickRayCollisions[0];
+
+        // Ray at OLD position (0, 0, 0): expect miss.
+        Ray rayOldT;
+        rayOldT.origin = tinym::vec3(0.0f, 0.0f, 10.0f);
+        rayOldT.dir    = tinym::vec3(0.0f, 0.0f, -1.0f);
+        Scene<Backend, Precision>::rayTracedData.numClickRayCollisions[0] = 0;
+        sim.collisionPipeline.broadPhase.queryClickRay(rayOldT);
+        Index hitsOldT =
+            Scene<Backend, Precision>::rayTracedData.numClickRayCollisions[0];
+
+        if (hitsNewT == 0) {
+            fail("FR-003 / translateObject refits BVH so click-pick reads new pose",
+                 "ray at NEW position (5, 0, 0) returned 0 hits — BVH still on old pose");
+        } else if (hitsOldT != 0) {
+            fail("FR-003 / translateObject refits BVH so click-pick reads new pose",
+                 "ray at OLD position (0, 0, 0) returned " +
+                 std::to_string(hitsOldT) + " hits — BVH still includes old pose");
+        } else {
+            pass("FR-003 / translateObject refits BVH so click-pick reads new pose");
+        }
+
+        // --- Clause (b): rotateObject refits the BVH. ------------------
+        // 90deg-Z rotation leaves an axis-aligned cube's AABB unchanged
+        // (rotational symmetry). Use 45deg-Z so the AABB grows from
+        // ±0.25 to ±0.25*sqrt(2) ≈ ±0.354 in xy. Witness ray at x=0.30
+        // is OUTSIDE the original AABB and INSIDE the rotated AABB.
+        sim.collisionPipeline.broadPhase.objTrees.clear();
+        resetScene();
+        sim.addCube(tinym::vec3(0.0f, 0.0f, 0.0f), /*tess=*/2,
+                    /*size=*/0.5f, /*mass=*/0.1f);
+        sim.initialize();
+        sim.update();
+        const Index rotateRefitId = 0;
+
+        Ray rayWitness;
+        rayWitness.origin = tinym::vec3(0.30f, 0.0f, 10.0f);
+        rayWitness.dir    = tinym::vec3(0.0f, 0.0f, -1.0f);
+
+        // Pre-condition: ray at x=0.30 must NOT hit pre-rotate cube.
+        Scene<Backend, Precision>::rayTracedData.numClickRayCollisions[0] = 0;
+        sim.collisionPipeline.broadPhase.queryClickRay(rayWitness);
+        Index hitsPre =
+            Scene<Backend, Precision>::rayTracedData.numClickRayCollisions[0];
+
+        // Apply 45deg-Z rotation.
+        constexpr float kPi16 = 3.14159265358979323846f;
+        auto qAxisAngle16 = [](tinym::vec3 a, float ang) {
+            float h = ang * 0.5f;
+            return ::Quat{std::cos(h), a.x * std::sin(h),
+                          a.y * std::sin(h), a.z * std::sin(h)};
+        };
+        ::Quat newAbsR = qAxisAngle16(tinym::vec3(0, 0, 1), kPi16 / 4.0f);
+        sim.rotateObject(rotateRefitId, newAbsR);
+
+        // Post-rotate: same witness ray must now hit.
+        Scene<Backend, Precision>::rayTracedData.numClickRayCollisions[0] = 0;
+        sim.collisionPipeline.broadPhase.queryClickRay(rayWitness);
+        Index hitsPost =
+            Scene<Backend, Precision>::rayTracedData.numClickRayCollisions[0];
+
+        if (hitsPre != 0) {
+            fail("FR-004 UI / rotateObject refits BVH so click-pick reads new pose",
+                 "pre-rotate witness at x=0.30 unexpectedly hit (hits=" +
+                 std::to_string(hitsPre) + ") — scene setup is wrong");
+        } else if (hitsPost == 0) {
+            fail("FR-004 UI / rotateObject refits BVH so click-pick reads new pose",
+                 "post-rotate witness at x=0.30 returned 0 hits — BVH still on pre-rotate AABB");
+        } else {
+            pass("FR-004 UI / rotateObject refits BVH so click-pick reads new pose");
         }
     }
 

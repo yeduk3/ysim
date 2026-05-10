@@ -1,33 +1,32 @@
-# Resume — FR-004 UI Rotate-Object Slice (D-021 + D-022 land; pack-roundtrip deferred)
+# Resume — Refit-After-Edit Fix-turn (Estimator turn-17 WARNING closed via D-023)
 
 ## Must remember
 
-- **Branch:** `feat/rotate-object` (off `main` at `4217619`).
-- **D-021 — `Simulator::rotateObject(meshId, newQuat)` is absolute-form.** Mirrors `translateObject(newPos)`. Internally computes `delta = newAbs * conjugate(currentQuat)`, applies to state.x AND state.xPrev around `mesh.transformPosition` pivot, writes `mesh.rotationQuat = newAbs`. `state.v` unchanged. Future rotation API extensions (delta-form helper, rotateAroundCustomPivot, etc.) should layer on top of this.
-- **D-022 — `quatConjugate` and `rotateVector(q, v)` join D-019's family.** Both inline free functions; both assume q is unit norm; both reuse D-019's `operator*` so the Hamilton convention (`a * b = apply b first, then a`) stays consistent. Future rotation consumers (FR-008 rigid body, eventual renderer-side rotation) should use these rather than re-inlining the math.
-- **Pack-roundtrip is the open follow-up.** Re-pack rebuilds state.x from the initializer's geometry — rotateObject's effect on state.x is lost on next `Simulator::initialize()`. The clean fix mirrors D-015's translate write-back pattern: `rotateObject` writes `pendingRotations[mesh.id] = newAbs`, AND `applyPendingMaterials()` is called automatically from `Simulator::initialize()` (contract change). The Planner needs to decide whether the auto-call is the right shape — that's the design call. Until then, a `addCube` + `simulator.initialize()` sequence after a rotate silently drops the rotate effect.
-- **Inspector raw-quat input is minimal.** FR-004 Notes line says "UI may expose Euler/axis-angle as input affordances" — that's a future slice. Current UI is `InputFloat4("Quat (w,x,y,z)")`. The user has to know quaternion math (or paste a value).
-- **Block 15 cube witness vertex** lives at `(0.25, -0.25, -0.25)` after `addCube(center=(0,0,0), tess=2, size=0.5)`. Under 90° Z rotation: `(x, y, z) → (-y, x, z) = (0.25, 0.25, -0.25)`. If the cube generator changes (different witness vertex), Block 15's expected coordinates need to change too — the `posTol = 1e-5` is tight.
-- **`state.v` is NOT rotated.** Cloth-mid-flight rotation would physically need v-rotation too; deferred. Block 15 only tests Float so this gap doesn't affect the assertion.
+- **Branch:** `fix/refit-after-edit` (off `main` at `9c8da75`).
+- **D-023 is the canonical invariant.** Direct `state.x` mutations outside the integrator MUST call `collisionPipeline.broadPhase.refit()` so the click-pick BVH reflects the new pose immediately on a paused sim. Currently `translateObject` and `rotateObject` are the only such mutators; future write paths (e.g., a "set absolute position" API, future rigid-body teleport) must follow the same pattern.
+- **`refit()` is the canonical invalidator.** Don't reach for `tree.build()` directly or fiddle with `objTrees`. `BroadPhase::refit()` at `src/main.cpp:3961` covers both per-mesh refit (line 3962-3963) AND SCENE-level rebuild via `tree.build(-1, positions, indices)` (line 3979) in one call.
+- **Block 16's 45°-Z rotation in clause (b) is deliberate.** A 90°-Z rotation leaves an axis-aligned cube's AABB at ±0.25 (rotational symmetry), which would make the assertion fail to distinguish "refit happened" from "refit didn't happen". 45° grows AABB by √2 (to ±0.354), which is observable. Witness ray at x=0.30 is between the two — outside pre-rotate, inside post-rotate.
+- **Block 16 stricter-than-spec assertions.** Clause (a) checks BOTH new-pose-hit AND old-pose-miss; without the both-checks form, a refit that copies state.x but leaves stale leaf AABBs would still pass. Per PLANNER.md step 7's discipline.
+- **Bug-probe-verified during build:** commenting out the `refit()` call in `translateObject` makes clause (a) FAIL with the exact diagnostic the assertion claims; restoring flips back to PASS.
+- **Inspector ergonomics for rotation** still uses raw `InputFloat4("Quat (w,x,y,z)")`. Euler/axis-angle UX deferred (FR-004 Notes territory, future slice).
 
 ## Last decisions + why
 
-- **D-021 absolute-form (not delta-form)** — symmetry with translateObject. Inspector naturally has the absolute current value + user edit; passing the delta would force the inspector to compute it. Rejected per-mesh model matrix in renderer (renderer rework, same reason D-014 baked into state.x). Rejected initializer write-back in this slice (needs Planner design call about applyPendingMaterials auto-call).
-- **D-022 free functions, not Quat members** — D-019's existing decision. Keeps Quat as POD aggregate matching on-disk schema; math lives next to the struct.
+- **D-023 — refit-after-direct-state.x-mutation.** Closes Estimator turn-17 WARNING. Rejected: requiring GUI to call `sim.update()` after edits (heavy + breaks paused-sim semantics); refit-on-click read-side (asymmetric, leaves visualization stale); dirty-flag + lazy refit (state machine adds a third concern for no gain at v1's mesh counts). The write-side refit is the symmetric extension to D-014 / D-015 / D-021's edit-path patterns.
 
 ## Next step you were about to take
 
-Slice complete. Next concrete step is the **Estimator's** turn — `./scripts/verify.sh` should exit 0 with **31/31** self-test PASS lines. Expected verdict: NOTE level.
+Slice complete. Next concrete step is the **Estimator's** turn — `./scripts/verify.sh` should exit 0 with **33/33** self-test PASS lines. Expected verdict: NOTE level.
 
 After this lands, planner-tracked candidates per `PROJECT_STATE.md`:
 
-- **Rotate pack-roundtrip slice (FR-004 follow-up).** Mirror D-015's translate write-back pattern. The Planner design call: should `Simulator::initialize()` auto-call `applyPendingMaterials()`? Today it's only called explicitly from `loadScene` flows. Auto-calling would change the contract for existing call sites; not auto-calling means the user has to remember (or every call site duplicates the call). Pick.
-- **CM-008 production-side fix** — `BroadPhase::build`'s Float-mesh skip robust against scene-swap-at-same-count. Theoretical concern in v1.
+- **Rotate pack-roundtrip slice (FR-004 follow-up).** The rotate analog of D-015's translate write-back. Planner design call about whether `Simulator::initialize()` should auto-call `applyPendingMaterials()` (currently only `loadScene` flow does). RESUME has been carrying this for 2 slices now — promotion candidate next.
+- **CM-008 production-side fix** — `BroadPhase::build`'s Float-mesh skip robust against scene-swap-at-same-count cases. Theoretical concern in v1.
 - **Inspector ergonomics for rotation** — Euler / axis-angle input affordances per FR-004 Notes.
 - **BDD-018 inspector live-edit propagation** — implementation exists; mechanization needs ImGui-side simulation or callable abstraction.
 - **Material editing UI (FR-005 / BDD-005)** — needs PBR preview shader. Large.
 - **Behavior assignment UI (FR-006 / BDD-006)** — Q2 still open.
-- **Rigid body slice (FR-008 / BDD-008)** — blocked on Q4. When this lands: D-015 three-site cascade + D-018 seed + D-019/D-022 Quat math + D-020 BVH leaf-return + D-021 rotate semantics all apply.
+- **Rigid body slice (FR-008 / BDD-008)** — blocked on Q4. When this lands: D-014/D-015 + D-018 + D-019/D-022 + D-020 + D-021 + D-023 all apply.
 - **Alembic export slice (FR-013 / BDD-013)** — blocked on Q5 + Q6.
 
 See `.agent/PLAN.md` and `.agent/CURRENT_WORK.md` for full plan and progress.
