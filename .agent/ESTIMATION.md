@@ -1,4 +1,4 @@
-# Estimation — 2026-05-11 turn 20
+# Estimation — 2026-05-11 turn 22
 
 Status: UPDATED
 
@@ -9,17 +9,14 @@ WARNING
 - None.
 
 ## WARNING
-- [docs/TEST_MATRIX.md:19](/Users/gyu/codes/ysim/docs/TEST_MATRIX.md:19) and [docs/TESTS.md:55](/Users/gyu/codes/ysim/docs/TESTS.md:55): BDD-005 is intentionally left `warning`; the data-layer slice is done, but the spec's preview-render clause remains parked pending the PBR preview shader slice.
-- [.claude/skills/estimator/SKILL.md:1](/Users/gyu/codes/ysim/.claude/skills/estimator/SKILL.md:1), [.claude/skills/generator/SKILL.md:1](/Users/gyu/codes/ysim/.claude/skills/generator/SKILL.md:1), [.claude/skills/planner/SKILL.md:1](/Users/gyu/codes/ysim/.claude/skills/planner/SKILL.md:1), and [.claude/skills/slice/SKILL.md:1](/Users/gyu/codes/ysim/.claude/skills/slice/SKILL.md:1) are outside the FR-005 plan; if intentional, split them out or call them out explicitly as separate maintenance.
+- [scripts/verify.sh:11](/Users/gyu/codes/ysim/scripts/verify.sh:11): the exact `./scripts/verify.sh` run exited 2 because clang tried to write module cache files under `/Users/gyu/.cache/clang/ModuleCache/...`, which is outside the writable sandbox roots. A rerun with `HOME=/tmp` completed successfully, so this looks like an environment/cache-path issue rather than a repo regression, but the requested gate did not pass as executed.
 
 ## NOTE
-- [include/MeshInspectorWindow.hpp:36](/Users/gyu/codes/ysim/include/MeshInspectorWindow.hpp:36), [src/mesh_inspector_gui.cpp:34](/Users/gyu/codes/ysim/src/mesh_inspector_gui.cpp:34), [src/main.cpp:4677](/Users/gyu/codes/ysim/src/main.cpp:4677), [src/main.cpp:7138](/Users/gyu/codes/ysim/src/main.cpp:7138), [src/main.cpp:7512](/Users/gyu/codes/ysim/src/main.cpp:7512), and [docs/DECISIONS.md:242](/Users/gyu/codes/ysim/docs/DECISIONS.md:242) implement D-027 and the Block 20 data-layer mechanization.
-- [docs/TEST_MATRIX.md:31](/Users/gyu/codes/ysim/docs/TEST_MATRIX.md:31) updates BDD-017 to the D-026 lifetimeId gate.
-- [.agent/PLAN.md:1](/Users/gyu/codes/ysim/.agent/PLAN.md:1), [.agent/CURRENT_WORK.md:1](/Users/gyu/codes/ysim/.agent/CURRENT_WORK.md:1), [.agent/RESUME.md:1](/Users/gyu/codes/ysim/.agent/RESUME.md:1), and [.agent/PROJECT_STATE.md:1](/Users/gyu/codes/ysim/.agent/PROJECT_STATE.md:1) were rewritten to describe the FR-005 slice and the renderer-side follow-up.
+- [src/metal/bvh.metal:522](/Users/gyu/codes/ysim/src/metal/bvh.metal:522): the only source change is a blank-line deletion before `intersectAABB`; it is behavior-neutral, but it is outside the current PBR preview slice and should stay out of the slice unless it was intentionally bundled.
+- `git diff --cached` is empty; all current changes are unstaged.
 
 ## Test matrix delta
-- BDD-005: warning
-- BDD-017: pass
+- None: no behavior IDs were touched by this diff.
 
 ## Verify output (summary)
-`./scripts/verify.sh` exited 0. CMake rebuilt `ysim`, `ysim_tests`, and `ysim_primitive_tests`; doctest stayed green at 11/11 test cases with 159/159 assertions and 9/9 test cases with 1120/1120 assertions. The only non-pass line was the expected `[self-test SKIP] metal-device` on this non-Metal host, which is the documented behavior here.
+The first `./scripts/verify.sh` run failed during the Metal compile step because clang tried to write its module cache under `/Users/gyu/.cache/clang/ModuleCache/...`, which this sandbox cannot write. Rerunning the same gate with `HOME=/tmp` completed the full configure/build/test flow successfully: `ysim`, `ysim_tests`, and `ysim_primitive_tests` built, both doctest binaries passed, and `ysim --self-test` emitted the expected Metal SKIP on this non-Metal host.
