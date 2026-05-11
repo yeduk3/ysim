@@ -1,397 +1,529 @@
-# Plan — BVH bottom-up GPU combine, fix-turn (`feat/bvh-bottomup-gpu`)
+# Plan — Hybrid BVH bottom-up combine (`feat/bvh-bottomup-hybrid`)
 
 > Owner: **Planner** writes; **Generator** executes; **Estimator** judges.
 > Updated: 2026-05-12
 
-## Course note: Estimator BLOCKed turn 23
+## Course note: previous slice's verdict
 
-Estimator turn 23 returned **BLOCK** on D-029. Verdict-quote:
+Estimator turn 24 returned **WARNING** (no BLOCK) on the BVH
+bottom-up GPU combine fix-turn (D-029). Single WARNING item:
+Block 22's negative bug-probe is Apple-Silicon-masked (Metal shared
+storage absorbs OOB atomic reads + silently drops OOB writes at
+the test's assertion granularity). The production N=1 guard is the
+spec-correct fix regardless; documented in D-029's fix-turn
+paragraph. Nothing to fold into this slice — the WARNING is a
+documented standing observation, not new debt.
 
-> One-primitive BVHs are not guarded: `bottomUpBoxesGPU` runs the new
-> atomic kernel for `numPrimitives == 1`, but `buildTree_*` returns
-> at `idx == numPrimitives - 1` without writing `treeParent[0]`. The
-> kernel then reads uninitialized `treeParent[0]` and atomic-fetches
-> at `treeVisitCounts[garbage]` — undefined behavior. Block 21 only
-> exercises a tess=2 cube, so this supported edge case has no
-> coverage.
+## Why this slice now
 
-Verified by re-reading `src/metal/bvh.metal:284-325` (`buildTree_Tri`):
-the `if(idx == numPrimitives-1) return;` short-circuit at line 310 is
-the only thread that runs for N=1, and the early-return is BEFORE the
-`treeParent[childA]=id; treeParent[childB]=id;` writes at lines
-323-324. Same shape in `buildTree_Edge` (line 377). For N=1 the tree
-has 1 node (= 2*1-1) which is both leaf AND root; there are no
-interior nodes to combine; the bottom-up walk is a no-op-needed but
-the kernel still runs and reads garbage.
-
-Per `GENERATOR.md`'s BLOCK-fix-turn convention: stay on the same
-slice branch (`feat/bvh-bottomup-gpu`), commit prefix `fix:`.
-
-Folded-in Estimator turn-23 NOTE (small, ~1 line):
-- `docs/TEST_MATRIX.md:24` BDD-010 row prose still describes the
-  old `objPair.query != objPair.target` assertion shape. Update
-  to reflect the simplified `cumNarrow > 0` form. Status `pass`
-  stays.
-
-## Why this fix-turn (not a new slice)
-
-BLOCK fix-turns are part of the same slice's commit history (per
-GENERATOR.md). The fix is small (~3-line guard + ~50-line test
-block + ~1-line prose update), so it stays on `feat/bvh-bottomup-gpu`
-with `fix:` prefix; merge to main happens at slice close-out once
-Codex returns NOTE/WARNING.
+D-029 (GPU bottom-up on the entire log(N)-depth walk via atomic-
+fetch-add halving) is the load-bearing precursor. The user now
+wants a **performance experiment**: do the GPU only does the
+first few levels (wide, parallelism-rich), let CPU do the small
+top of the tree (narrow, serial-friendly). The expectation is
+that GPU's atomic-fence overhead per level at the narrow top
+levels exceeds CPU's serial cost, so a hybrid split could outrun
+pure-GPU at typical mesh sizes. This slice does NOT claim a
+speedup number; it ships the hybrid path correctly and exposes
+a runtime knob so the user can benchmark by toggling.
 
 ## Design call
 
-Three guard placement options:
+Five resolved decisions:
 
-- **(a) Guard in `bottomUpBoxesGPU` C++ method.** Add
-  `if (numPrimitives <= 1) return;` at the top. The kernel is never
-  dispatched for N=1. Build path: `buildLeafGPU + buildTreeGPU`
-  populate the single leaf node (= root), bottomUp is a no-op
-  (correctly so for N=1, since there are no interior nodes to
-  combine). Refit path: `buildLeafGPU` updates the single leaf,
-  bottomUp again no-op. **~3 lines.**
+### (a) Depth parameterization — runtime knob, default D=2
 
-- **(b) Guard inside the `bottomUpBoxes` kernel.** Add
-  `if (numPrimitives <= 1) return;` at kernel entry. Same
-  effect, but the dispatch still happens (1-thread wasted launch).
+**Decision: runtime field `int bottomUpHybridDepth = 2;` on
+`BVH<METAL,PR,LINEAR,PRIMITIVE>`.** Reasons:
 
-- **(c) Defensively initialize `treeParent[0] = -1` (sentinel).**
-  Doesn't fix the bug — the kernel's loop body still tries to read
-  `treeVisitCounts[-1]` (out of bounds). Even if -1 wraps to a
-  valid index, the bottom-up logic for "leaf is root" isn't
-  representable in the kernel's structure.
+- Runtime > compile-time for an experiment slice. User can toggle
+  to measure; can later expose via inspector if desired.
+- Default 2 is a reasonable starting point — gives GPU two
+  levels' worth of parallelism (one halving per level), leaves
+  the top `numNodes/4` interior nodes to CPU. For N=16
+  primitives → 15 interior nodes → 4-ish CPU combines; for
+  N=10000 → ~2500 CPU combines (still trivial vs the kernel
+  launch overhead saved).
+- Per-BVH field (not global) so per-mesh BVHs and the
+  scene-level BVH (`BVH<METAL,PR,SCENE,OBJECT>`) can be tuned
+  independently if measurement reveals different sweet spots.
 
-**Decision: (a).** Reasons:
+### (b) GPU kernel adaptation — depth check before atomic, in the existing kernel
 
-1. **Smallest surface.** 3 lines in C++; no kernel changes; no
-   structural shifts.
-2. **Truer semantic.** For N=1, the tree IS just a leaf; there is
-   no interior node to combine. Calling bottomUp is meaningless
-   conceptually. Early-returning at the C++ layer says this
-   explicitly.
-3. **Symmetric with existing `numPrimitives == 0` guard.** The
-   method already has `if (numPrimitives == 0) return;`; bumping
-   to `<= 1` is a single-character widening of the same idea.
+**Decision: extend `bottomUpBoxes` in-place with a `constant uint&
+maxDepth` uniform at buffer(7).** Each thread tracks a local
+`int depth = 0` and checks `if (depth >= maxDepth) return;`
+**before** the atomic_fetch_add at each iteration. Reasons:
 
-No new D-NNN — this is a guard refinement on D-029's existing
-contract, not a new architectural decision. The existing D-029
-entry's "Pre-condition: ..." block can absorb the clarification
-in the Generator's diff (treeParent must be valid for all interior
-nodes 0..numPrimitives-2; for numPrimitives==1 there are no
-interior nodes and the kernel must not run).
+- Single kernel, no duplication.
+- Branch cost: 1 register read + 1 compare per iteration, dwarfed
+  by the atomic + 2 fences in the same iteration.
+- Pre-atomic check means threads that would have raced into a
+  level above the cutoff don't even touch `treeVisitCounts` at
+  that level — so `treeVisitCounts[above-cutoff]` stays at 0
+  post-dispatch, which is the CPU's frontier signal (see (d)).
+- Pure-GPU mode (maxDepth = D-029 behavior): pass
+  `maxDepth = UINT32_MAX` (or just a large constant); kernel
+  walks all the way to root and exits via `if (child == 0) return`.
+
+The kernel loop after the change:
+
+```cpp
+while (true) {
+    int parent = treeParent[child];
+    if ((uint)depth >= maxDepth) return;   // hybrid cutoff (NEW)
+
+    uint old = atomic_fetch_add_explicit(
+        &treeVisitCounts[parent], 1u, memory_order_relaxed);
+    if (old == 0u) return;
+
+    atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst,
+                        thread_scope_device);
+
+    int childA = tree[parent].childA;
+    int childB = tree[parent].childB;
+    /* ... combine ... */
+    tree[parent].min = packed_float3(min(minA, minB));
+    tree[parent].max = packed_float3(max(maxA, maxB));
+
+    atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst,
+                        thread_scope_device);
+    depth++;                               // (NEW)
+    child = parent;
+    if (child == 0) return;
+}
+```
+
+### (c) CPU completion strategy — top-down recursion from root with frontier-skip
+
+**Decision: new `bottomUpCombineWithSkip()` helper.** Recursive
+walk from `tree[0]` (root); at each interior node, if the GPU
+already wrote it (frontier marker — see (d)), skip the subtree.
+Otherwise recurse into children, then combine into this node's
+AABB. The existing `bottomUpCombine()` (full-tree recursive)
+stays as the Block 21 reference; the new variant adds 4 lines
+of skip-logic.
+
+```cpp
+void bottomUpCombineWithSkip() {
+    auto walk = [&](auto&& self, BVHNode& node, int nodeId) -> void {
+        if (node.childA < 0) return;                       // leaf
+        if (treeVisitCounts[nodeId] == 2u) return;         // GPU done
+        self(self, tree[node.childA], node.childA);
+        self(self, tree[node.childB], node.childB);
+        node.aabb.min = tree[node.childA].aabb.min;
+        node.aabb.max = tree[node.childA].aabb.max;
+        node.aabb.combine(tree[node.childB].aabb);
+    };
+    walk(walk, tree[0], 0);
+}
+```
+
+### (d) Frontier identification — `treeVisitCounts[node] == 2`
+
+**Decision: reuse `treeVisitCounts` post-dispatch as the frontier
+signal.** Nodes the GPU fully combined have `treeVisitCounts == 2`
+(both children's threads arrived at this node). Nodes above the
+cutoff have `treeVisitCounts == 0` (no thread reached). Nodes
+that received exactly one arrival (the lone-survivor path from
+one side of a subtree where the sibling exited via depth cutoff
+... actually impossible: depth check is BEFORE the atomic, so
+threads either arrive at a level (and increment visitCounts) or
+exit BEFORE touching that level's atomic. Net: visitCounts at
+post-cutoff levels is **either 2 (combined) or 0 (untouched)**;
+never 1.
+
+So `visitCounts == 2` is an unambiguous "GPU completed this
+subtree" marker. No separate frontier list / no per-node flag
+needed. Buffer reuse, ~1 extra atomic op per combined node
+(amortized into the existing atomic).
+
+CPU walk reads `treeVisitCounts[nodeId]` from shared storage —
+after `commitAndWait`, values are CPU-visible. ✓
+
+### (e) Mechanization — sweep D over {0, 1, 2, INF}, assert all produce same tree[]
+
+**Decision: Block 23.** Build a tess=2 cube (same scene as
+Block 21). Capture CPU-reference tree via plain
+`bottomUpCombine()`. Then for each test D in `{0, 1, 2, 1000}`:
+
+1. Re-dispatch `buildLeafGPU()` + `commitAndWait()` to reset
+   leaves (so each iteration starts from the same leaf state).
+2. Zero `treeVisitCounts` (via the existing kernel + commit).
+3. Call `bottomUpHybrid(D)`.
+4. Snapshot tree (raw flat array of min/max).
+5. Diff against CPU reference at every interior node.
+
+`D=0` exercises the pure-CPU path (GPU dispatch skipped); `D=1`
+and `D=2` exercise the hybrid frontier; `D=1000` exercises the
+pure-GPU path (kernel walks to root). All four should produce
+bit-equal interior AABBs.
+
+PLANNER.md step 7 stricter form: D-sweep catches off-by-one
+frontier-marking errors (e.g., depth check after the atomic
+instead of before; depth counter incremented at wrong site).
+Single-D would miss those.
+
+Pass label: `D-030 / hybrid bottom-up matches CPU reference for D ∈ {0,1,2,1000}`.
+
+Self-test count: 42 → 43.
 
 ## Goal
 
-After this fix-turn:
+After this slice:
 
-- `Simulator::collisionPipeline.broadPhase.objTrees[i].bottomUpBoxesGPU`
-  early-returns for `numPrimitives <= 1`. Build and refit both
-  safely handle N=1 meshes.
-- `runSelfTest` Block 22 exercises a single-triangle mesh through
-  the full GPU build + refit pipeline. Asserts: no crash; tree[0]
-  reflects the triangle's AABB; broad-phase queryClickRay finds
-  the triangle.
-- `docs/TEST_MATRIX.md` BDD-010 row prose updated to the
-  `cumulativeNarrowCollisions > 0` shape (Estimator turn-23 NOTE
-  fold-in).
-- Self-test count grows 41 → 42.
-- Estimator turn 24 verdict: NOTE-clean (BLOCK closed, NOTE folded).
+- `BVH<METAL,PR,LINEAR,PRIMITIVE>` gains
+  `int bottomUpHybridDepth = 2;` field +
+  `void bottomUpHybrid(int maxDepth)` method +
+  `void bottomUpCombineWithSkip()` helper.
+- `bottomUpBoxes` kernel accepts `constant uint& maxDepth
+  [[buffer(7)]]` and tracks per-thread depth; depth-check-before-
+  atomic enables partial-depth runs.
+- `bottomUpBoxesGPU` extended to take an `int maxDepth` arg;
+  passes via `setBytes` at buffer(7).
+- `BVH::build` and `BVH::refit` switch from
+  `bottomUpBoxesGPU(sceneBox)` to `bottomUpHybrid(bottomUpHybridDepth)`.
+  Default depth (2) is the new production path.
+- Block 23 verifies hybrid correctness across D ∈ {0,1,2,1000}.
+- New D-030 records the hybrid design + default + frontier scheme.
+- Self-test count 42 → 43.
 
 ## Scope
 
-### 1. Production fix — N=1 guard
+### 1. GPU kernel extension — `bottomUpBoxes`
 
-**`src/main.cpp::BVH<METAL,PR,LINEAR,PRIMITIVE>::bottomUpBoxesGPU`**
-(~line 3265 — find by signature; the existing
-`if (numPrimitives == 0) return;` is the guard line to widen):
+**`src/metal/bvh.metal::bottomUpBoxes`** (~line 442):
+
+- Add parameter `constant uint& maxDepth [[buffer(7)]]`.
+- Add local `int depth = 0;` after `int child = ...;`.
+- Add `if ((uint)depth >= maxDepth) return;` **before** the
+  `atomic_fetch_add_explicit` at each iteration.
+- Add `depth++;` after the parent-AABB release fence, before
+  `child = parent;`.
+
+Update the kernel doc-block to mention the depth cutoff +
+hybrid mode semantics. Keep all the existing Metal 3.2 seq_cst
+fence content unchanged.
+
+### 2. C++ driver extensions
+
+**`src/main.cpp::BVH<METAL,PR,LINEAR,PRIMITIVE>`**:
+
+- **Add field** `int bottomUpHybridDepth = 2;` (default depth
+  for the hybrid path). Document inline that 0 = pure CPU,
+  large value (e.g., 1000) = pure GPU = D-029 behavior.
+
+- **Extend `bottomUpBoxesGPU` signature** from
+  `bottomUpBoxesGPU(const AABB4&)` to
+  `bottomUpBoxesGPU(const AABB4&, uint maxDepth)`. Add a
+  `setBytes(maxDepth, 7)` call to bind the new uniform. Keep
+  the existing zeroVisitCounts + bottomUpBoxes dispatch
+  structure unchanged.
+
+- **Add `bottomUpHybrid(int maxDepth)` method.** Orchestrates:
+  - Early-return for `numPrimitives <= 1` (D-029 fix-turn
+    invariant).
+  - For `maxDepth == 0`: skip GPU dispatch, call
+    `bottomUpCombine()` directly. (Pure-CPU path; no zero of
+    visitCounts needed because `bottomUpCombine` doesn't read
+    them.)
+  - For `maxDepth > 0`: build the sceneBox, call
+    `bottomUpBoxesGPU(sceneBox, (uint)maxDepth)`, commit
+    + wait, then `bottomUpCombineWithSkip()`.
+
+- **Add `bottomUpCombineWithSkip()` helper.** Recursive walk
+  from root with `visitCounts == 2` skip-check (see §(c)
+  above).
+
+### 3. Call-site swap
+
+**`src/main.cpp::BVH::build(int oid, ...)`** (~line 3475):
+
+Replace `bottomUpBoxesGPU(sceneBox);` with
+`bottomUpHybrid(bottomUpHybridDepth);` (deleting the inline
+sceneBox construction since the hybrid method builds its own).
+Or — simpler — keep the sceneBox construction outside and call
+`bottomUpBoxesGPU(sceneBox, (uint)bottomUpHybridDepth)` + CPU
+follow-up here directly. Generator picks the cleanest factoring.
+
+**`src/main.cpp::BVH::refit()`** (~line 3727):
+
+Same swap. The CPU follow-up happens **after** the GPU's
+commitAndWait, on the same encoder boundary that already exists.
+CM-011 is unaffected — the commitAndWait is still inside refit,
+and the substep-loop staleness was forensic-resolved (the OLD
+2-substep lag was an artifact, NOT a contract).
+
+### 4. Block 23 — D-sweep correctness test
+
+Append after Block 22.
 
 ```cpp
-void bottomUpBoxesGPU(const AABB4& sceneBox) {
-    Index numPrimitives = primitives.size / PRIMITIVE;
-    // D-029 fix-turn: N=1 means the tree's single node IS the leaf-
-    // root; there are no interior nodes to combine. buildTree_* also
-    // skips treeParent writes for the leaf-root (early-return at
-    // `idx == numPrimitives - 1`), so dispatching bottomUpBoxes
-    // would read uninitialized treeParent[0]. Skip the dispatch.
-    if (numPrimitives <= 1) return;
-    // ... existing dispatch code unchanged ...
-}
-```
-
-That's the entire production change. `buildLeafGPU` continues to
-run for N=1 (it correctly writes the single leaf at tree[0]).
-
-### 2. Block 22 — `runSelfTest` mechanization
-
-Append after Block 21 (D-029 / GPU bottom-up combine matches CPU
-reference). Goal: build a single-triangle mesh on the fly via the
-existing `Simulator::importMesh` path, run sim.initialize +
-sim.update, assert tree[0] correctness and ray-pick correctness.
-
-Sketch (Generator may refine):
-
-```cpp
-// ---- Block 22: D-029 fix-turn — N=1 BVH (single-triangle import). ----
-// Estimator turn-23 BLOCK: bottomUpBoxesGPU ran for N=1 without
-// proper treeParent[0] initialization. Fix: bottomUpBoxesGPU early-
-// returns for numPrimitives <= 1. This block exercises the N=1
-// path end-to-end: write a single-triangle .obj to /tmp, import
-// it, run sim.initialize and sim.update (exercises build + refit),
-// then ray-pick to confirm the BVH walks correctly with a single
-// leaf-root.
+// ---- Block 23: D-030 — hybrid bottom-up matches CPU reference for D ∈ {0,1,2,1000}. ----
+// Builds a tess=2 cube (same scene as Block 21). For each test D,
+// resets leaves via buildLeafGPU and runs bottomUpHybrid(D); the
+// resulting tree[] must be bit-equal at every interior node to the
+// CPU bottomUpCombine() reference. D=0 → pure CPU. D=1, D=2 → hybrid
+// frontier at depth 1 / depth 2. D=1000 → pure GPU (kernel walks to
+// root, equivalent to D-029).
+//
+// Stricter than single-D — the sweep catches off-by-one frontier
+// marking (depth check at wrong loop position; depth counter
+// incremented at wrong site; treeVisitCounts not zeroed before
+// dispatch).
 {
-    // Compose a downward-facing triangle in the XZ plane.
-    const std::string objPath = "/tmp/bdd_d029_n1.obj";
-    {
-        std::ofstream f(objPath);
-        f << "v -0.5 0.0 -0.5\n"
-          << "v  0.5 0.0 -0.5\n"
-          << "v  0.0 0.0  0.5\n"
-          << "f 1 2 3\n";
-    }
-
     resetScene();
-    std::string err;
-    bool ok = sim.importMesh("/tmp", "bdd_d029_n1.obj",
-                             /*scale=*/(Precision)1.0,
-                             /*mass=*/(Precision)0.1, &err);
-    if (!ok) {
-        fail("D-029 fix / N=1 BVH safely bypasses bottom-up combine",
-             "importMesh returned false: " + err);
-    } else {
-        sim.initialize();   // exercises BVH::build with N=1
-        sim.update();       // exercises BVH::refit with N=1 (no crash)
+    sim.addCube(tinym::vec3(0.0f, 0.0f, 0.0f), /*tess=*/2,
+                /*size=*/0.5f, /*mass=*/0.1f);
+    sim.initialize();
 
-        auto* mesh = Scene<Backend, Precision>::findById(0);
-        auto& bp22 = sim.collisionPipeline.broadPhase;
-        if (!mesh || bp22.objTrees.empty()) {
-            fail("D-029 fix / N=1 BVH safely bypasses bottom-up combine",
-                 "mesh or objTrees[0] missing after import + init");
+    auto* mesh23 = Scene<Backend, Precision>::findById(0);
+    auto& bp23 = sim.collisionPipeline.broadPhase;
+    if (!mesh23 || bp23.objTrees.empty()) {
+        fail("D-030 / hybrid bottom-up matches CPU reference for D ∈ {0,1,2,1000}",
+             "mesh or objTrees[0] missing");
+    } else {
+        auto& objTree23 = bp23.objTrees[0];
+        Index numPrimitives23 = mesh23->adjacency.facets.size / 3;
+        Index numNodes23 = (numPrimitives23 > 0) ? (2*numPrimitives23 - 1) : 0;
+
+        if (numNodes23 < 2) {
+            fail("D-030 / hybrid bottom-up matches CPU reference for D ∈ {0,1,2,1000}",
+                 "tess=2 cube produced numNodes=" + std::to_string(numNodes23));
         } else {
-            // Sanity: tree[0] should reflect the triangle's AABB.
-            // (Triangle at y=0; min/max y both 0 after BVH leaf
-            // computation. x range [-0.5, 0.5]; z range [-0.5, 0.5].)
-            auto& objTree = bp22.objTrees[0];
-            const float aabbTol = 1e-5f;
-            if (std::abs(objTree.tree[0].min.x - (-0.5f)) > aabbTol ||
-                std::abs(objTree.tree[0].max.x - ( 0.5f)) > aabbTol ||
-                std::abs(objTree.tree[0].min.z - (-0.5f)) > aabbTol ||
-                std::abs(objTree.tree[0].max.z - ( 0.5f)) > aabbTol) {
-                fail("D-029 fix / N=1 BVH safely bypasses bottom-up combine",
-                     "tree[0] AABB doesn't match triangle bounds; "
-                     "got min=(" + ... + ") max=(" + ... + ")");
-            } else {
-                // Stricter: ray-pick should hit the single triangle.
-                Ray ray22;
-                ray22.origin = tinym::vec3(0.0f, 10.0f, 0.0f);
-                ray22.dir    = tinym::vec3(0.0f, -1.0f, 0.0f);
-                Scene<Backend, Precision>::rayTracedData
-                    .numClickRayCollisions[0] = 0;
-                bp22.queryClickRay(ray22);
-                Index nHits = Scene<Backend, Precision>::rayTracedData
-                    .numClickRayCollisions[0];
-                if (nHits == 0) {
-                    fail("D-029 fix / N=1 BVH safely bypasses bottom-up combine",
-                         "queryClickRay missed the single triangle "
-                         "(broad-phase walk broken for N=1)");
-                } else {
-                    pass("D-029 fix / N=1 BVH safely bypasses bottom-up combine");
+            // Capture CPU reference: reset leaves, then bottomUpCombine().
+            objTree23.buildLeafGPU();
+            MetalGlobalContext::commitAndWait();
+            objTree23.bottomUpCombine();
+
+            std::vector<float> ref(numNodes23 * 6);
+            for (Index i = 0; i < numNodes23; ++i) {
+                const auto& n = objTree23.tree[i];
+                ref[i*6+0]=(float)n.min.x; ref[i*6+1]=(float)n.min.y; ref[i*6+2]=(float)n.min.z;
+                ref[i*6+3]=(float)n.max.x; ref[i*6+4]=(float)n.max.y; ref[i*6+5]=(float)n.max.z;
+            }
+
+            // Sweep D.
+            const int Ds[] = {0, 1, 2, 1000};
+            bool allMatch = true;
+            int failingD = -1;
+            Index failingNode = -1;
+            for (int d : Ds) {
+                objTree23.buildLeafGPU();
+                MetalGlobalContext::commitAndWait();
+                objTree23.bottomUpHybrid(d);
+
+                for (Index i = 0; i < numPrimitives23 - 1; ++i) {
+                    const auto& n = objTree23.tree[i];
+                    if ((float)n.min.x != ref[i*6+0] ||
+                        (float)n.min.y != ref[i*6+1] ||
+                        (float)n.min.z != ref[i*6+2] ||
+                        (float)n.max.x != ref[i*6+3] ||
+                        (float)n.max.y != ref[i*6+4] ||
+                        (float)n.max.z != ref[i*6+5]) {
+                        allMatch = false;
+                        failingD = d;
+                        failingNode = i;
+                        break;
+                    }
                 }
+                if (!allMatch) break;
+            }
+
+            if (allMatch) {
+                pass("D-030 / hybrid bottom-up matches CPU reference for D ∈ {0,1,2,1000}");
+            } else {
+                const auto& n = objTree23.tree[failingNode];
+                fail("D-030 / hybrid bottom-up matches CPU reference for D ∈ {0,1,2,1000}",
+                     "D=" + std::to_string(failingD) + " node " +
+                     std::to_string(failingNode) + " mismatch: hybrid min=(" +
+                     std::to_string((float)n.min.x) + "," +
+                     std::to_string((float)n.min.y) + "," +
+                     std::to_string((float)n.min.z) + ") max=(" +
+                     std::to_string((float)n.max.x) + "," +
+                     std::to_string((float)n.max.y) + "," +
+                     std::to_string((float)n.max.z) + ") vs ref min=(" +
+                     std::to_string(ref[failingNode*6+0]) + "," +
+                     std::to_string(ref[failingNode*6+1]) + "," +
+                     std::to_string(ref[failingNode*6+2]) + ") max=(" +
+                     std::to_string(ref[failingNode*6+3]) + "," +
+                     std::to_string(ref[failingNode*6+4]) + "," +
+                     std::to_string(ref[failingNode*6+5]) + ")");
             }
         }
     }
-
-    // Cleanup the temp obj (best-effort; harmless if it fails).
-    std::remove(objPath.c_str());
 }
 ```
 
-Pass label: `D-029 fix / N=1 BVH safely bypasses bottom-up combine`.
+Pass label: `D-030 / hybrid bottom-up matches CPU reference for D ∈ {0,1,2,1000}`.
 
-### 3. TEST_MATRIX.md BDD-010 row prose update (NOTE fold-in)
+### 5. New D-030 in `docs/DECISIONS.md`
 
-`docs/TEST_MATRIX.md` line 24 (BDD-010 row): drop the
-`objPair.query != objPair.target` wording and reflect the actual
-assertion form. Status stays `pass`.
+Standard format. file/function, decision (hybrid GPU+CPU bottom-
+up with depth cutoff + treeVisitCounts==2 frontier marker +
+default depth 2), alternatives-considered (compile-time D vs
+runtime; separate fixed-depth kernel vs extending bottomUpBoxes;
+per-node flag vs treeVisitCounts), rationale.
 
-Suggested wording (Generator may refine):
+### 6. Bookkeeping
 
-> `src/main.cpp::runSelfTest` Block 13 — two clauses PASS
-> (`BDD-010 / overlapping AABBs produce a contact pair between two
-> distinct objects`, `…/ non-overlapping AABBs produce empty
-> constraint set`). The positive clause asserts
-> `cumulativeNarrowCollisions > 0` across the frame; with the
-> Simulator default `enableSelfCollisions = false`, a non-zero
-> cumulative count by definition reflects at least one inter-object
-> pair. The OLD `lastSubstep` iteration was an artifact of the OLD
-> CPU refit's 2-substep BVH lag and is captured in CM-011.
+- `.agent/PROJECT_STATE.md` — "In flight" pointer → this slice.
+  Add shipped entry for the D-029 fix-turn slice (commits
+  `3feb747` + `0ff03a4`).
+- `.agent/CURRENT_WORK.md` + `.agent/RESUME.md` — slice progress;
+  note the runtime knob (`bottomUpHybridDepth`) so future readers
+  can find it.
 
-### 4. Bookkeeping
+## Non-goals (this slice)
 
-- `.agent/CURRENT_WORK.md` / `RESUME.md` — fix-turn progress.
-- `docs/DECISIONS.md::D-029` — Generator can append a brief
-  "Fix-turn (Estimator turn 23): N=1 guard added in
-  `bottomUpBoxesGPU` after the discovery that `buildTree_*` doesn't
-  write `treeParent[0]` for single-primitive trees" sentence to the
-  existing D-029 entry's rationale. No new D-NNN.
-- `docs/mistakes/COMMON_MISTAKES.md` — consider adding a CM only
-  if this trap pattern is likely to recur (e.g., another future
-  kernel reading from a parallel array maintained by a separate
-  kernel that has early-return paths). Generator's call; small
-  pattern entry would be fine.
-
-## Non-goals (this fix-turn)
-
-- **GPU `enlargeTrajectory`** — separate slice candidate; not in
-  this fix-turn.
-- **Restructuring `buildTree_*`** to always write `treeParent[0]`
-  (even for the leaf-root case). Rejected because the natural
-  semantic is "treeParent only stores interior-node parent links";
-  for N=1 the root has no parent, and the existing convention
-  matches that. Guarding at the consumer (`bottomUpBoxesGPU`) is
-  the right layer.
-- **N=2 special-case investigation.** N=2 has 1 interior + 2
-  leaves; `buildTree_*` writes `treeParent[childA]=0` and
-  `treeParent[childB]=0` for the interior root. `bottomUpBoxes`
-  works normally. No additional guard needed.
-- **CPU `bottomUpCombine`** path — already handles N=1 correctly
-  via `if (node.childA < 0) return;` recursion termination. No
-  change.
-- **Any new D-NNN.** The fix is a guard refinement on D-029's
-  existing contract; D-029's rationale gets a one-sentence
-  addendum from the Generator, not a new decision.
-- **Other matrix rows, spec edits, Q-resolution.**
+- **Performance benchmarking.** No `--bench-bottomup` flag, no
+  wall-clock numbers in the slice. The knob is runtime-tunable;
+  user / future slice measures.
+- **Inspector widget** for the depth knob. The field is C++-
+  settable; UI exposure is a separate small slice.
+- **Hybrid `enlargeTrajectory`.** Out of scope (still CPU per
+  D-029).
+- **Auto-tuning D** based on numPrimitives. Heuristic could be
+  added later; this slice just exposes the manual knob.
+- **Per-mesh depth tuning** in the inspector. Per-BVH field
+  exists but defaults to 2 globally; no UI for per-mesh override.
+- **New BDD / FR.** This is an internal perf path slice; spec
+  unaffected.
 
 ## Todo
 
 Ordered. Generator executes top-to-bottom.
 
-1. **Branch hygiene.** Stay on `feat/bvh-bottomup-gpu` (this is a
-   BLOCK fix-turn; same branch, commit prefix `fix:`).
+1. **Branch hygiene.** Already on `feat/bvh-bottomup-hybrid` (off
+   `main` at `0ff03a4`). Commit prefix: `add:` (new feature
+   path).
 
-2. **Add the N=1 guard** to
-   `BVH<METAL,PR,LINEAR,PRIMITIVE>::bottomUpBoxesGPU`. Widen the
-   existing `if (numPrimitives == 0) return;` to
-   `if (numPrimitives <= 1) return;`. Update the comment to
-   explain why N=1 also short-circuits.
+2. **Re-read the design call.** Five decisions settled; do not
+   second-guess unless implementation surfaces a blocker (e.g.,
+   `setBytes(uint, 7)` doesn't bind correctly — then stop and
+   ask Planner).
 
-3. **Author Block 22** per §2 above. Pass label
-   `D-029 fix / N=1 BVH safely bypasses bottom-up combine`. Make
-   sure to include `<fstream>` and `<cstdio>` (for `std::remove`)
-   if not already pulled in transitively.
+3. **Extend `bottomUpBoxes` kernel** per §1. Add `maxDepth`
+   uniform at buffer(7), local `depth`, check-before-atomic,
+   `depth++` after parent write. Update kernel doc-block.
 
-4. **Update `docs/TEST_MATRIX.md`** BDD-010 row prose per §3.
+4. **Extend `bottomUpBoxesGPU` signature** per §2 — add
+   `uint maxDepth` arg, `setBytes` at buffer(7) before
+   `dispatchThreads(bottomUpBoxesPSO, ...)`.
 
-5. **Build cleanly.** `cmake --build build`. Expect zero new
-   warnings.
+5. **Add `bottomUpCombineWithSkip()` helper** per §2.
 
-6. **Run `./scripts/verify-light.sh`.** Doctest binaries should
-   stay 159/159 + 1120/1120.
+6. **Add `bottomUpHybrid(int maxDepth)` method** per §2.
 
-7. **Run `--self-test` 5+ times.** Expect **42/42 PASS**
-   consistently (current 41 + Block 22).
+7. **Add `int bottomUpHybridDepth = 2;` field** per §2.
 
-8. **Bug-probe.** Two probes:
-   - **(a) Remove the N=1 guard** (revert step 2). Run self-test.
-     Expected: Block 22 may FAIL with crash / wrong tree AABB / 0
-     hits — depending on what garbage `treeParent[0]` happens to
-     hold on this run. Behavior is non-deterministic but should
-     surface at least intermittently. If it silently passes on
-     Apple Silicon (zero-init buffers), note in CURRENT_WORK that
-     the bug-probe was Apple-Silicon-masked; the production guard
-     is still the right fix for spec correctness / portability.
-     Restore.
-   - **(b) Force `treeParent[0] = numNodes`** (set to an
-     out-of-bounds value via temporary C++ write before
-     `bottomUpBoxesGPU` dispatch — only valid if guard is reverted).
-     Re-run. Expected: deterministic OOB write through
-     `treeVisitCounts[numNodes]` which is past the buffer end →
-     either crash or silent corruption surfaces in adjacent buffer
-     (e.g., the next allocated VectorBase). Drop this probe if
-     too invasive; (a) plus the structural guard is sufficient.
+8. **Update `BVH::build` and `BVH::refit` call sites** per §3
+   to use `bottomUpHybrid(bottomUpHybridDepth)`. The N=1 guard
+   (D-029 fix-turn) is inherited via the early-return in
+   `bottomUpHybrid`.
 
-9. **Append D-029 fix-turn sentence** to `docs/DECISIONS.md::D-029`
-   rationale section. No new D-NNN.
+9. **Author Block 23** per §4. Pass label
+   `D-030 / hybrid bottom-up matches CPU reference for D ∈ {0,1,2,1000}`.
 
-10. **(Optional) Add CM-012** to `docs/mistakes/COMMON_MISTAKES.md`
-    if the trap pattern (kernel A's early-return leaves parallel
-    array uninitialized; kernel B consumes the array assuming it's
-    populated for all indices) is worth recording. Generator's
-    call.
+10. **Build cleanly.** `cmake --build build`. Expect zero new
+    warnings. Watch for Metal kernel signature mismatch errors
+    if buffer(7) is already used by some other kernel — grep
+    `[[buffer(7)]]` across `src/metal/` if the dispatch errors.
 
-11. **Update `CURRENT_WORK.md` / `RESUME.md`** to reflect the
-    fix-turn shipped. Drop the previous WARNING-pending state;
-    note 42/42 PASS.
+11. **Run `./scripts/verify-light.sh`.** Doctest binaries should
+    stay 159/159 + 1120/1120.
 
-12. **Stop and hand off to Estimator (Codex)**. Expected verdict:
-    NOTE-clean.
+12. **Run `--self-test` 5+ times.** Expect **43/43 PASS**
+    consistently (current 42 + Block 23).
+
+13. **Bug-probe.** Three small probes:
+    - **(a) Off-by-one in depth check.** Temporarily change
+      `if ((uint)depth >= maxDepth) return;` to
+      `if ((uint)depth > maxDepth) return;` (one off). Block 23
+      should FAIL for at least one D value with mismatched
+      interior nodes (D=1 case combines an extra level). Restore.
+    - **(b) Skip-logic inversion.** Temporarily change
+      `if (treeVisitCounts[nodeId] == 2u) return;` to
+      `if (treeVisitCounts[nodeId] != 2u) return;` (semantically
+      backwards). Block 23 should FAIL for D=1 and D=2 (CPU
+      skips the wrong subtrees). Restore.
+    - **(c) Forget the depth++ increment.** Remove `depth++;`
+      from the kernel. Threads loop forever at depth 0;
+      eventually all combines happen and visitCounts hits 2 at
+      every level. Block 23 should PASS in this degenerate case
+      (because the final tree[] still matches CPU reference) —
+      but the slice's performance intent is broken. If (c) silently
+      passes, document it as "test catches correctness but not
+      perf intent" in CURRENT_WORK; (a) + (b) are the load-
+      bearing probes for correctness.
+
+14. **Add D-030 to `docs/DECISIONS.md`.** Standard format.
+
+15. **Update `CURRENT_WORK.md` / `RESUME.md`** per §6.
+
+16. **Stop and hand off to the Estimator (Codex)**.
 
 ## Course corrections
 
-- **Stricter-than-spec assertion** (PLANNER.md step 7). Block 22
-  asserts not just "no crash" but also "tree[0] reflects the
-  triangle's AABB" AND "queryClickRay finds the triangle". Each
-  layer catches a different fail mode:
-  - No-crash: catches OOB atomic write that crashes.
-  - tree[0] AABB: catches silent garbage write to tree[0] via
-    second-arrival path with garbage `parent` index.
-  - queryClickRay: catches BVH structural corruption (the walk's
-    leaf-recognition via `childA < 0` requires tree[0] to remain
-    intact as the leaf-root).
-  3 assertions, 1 block, deterministic + cheap.
+- **Stricter-than-spec assertion** (PLANNER.md step 7). Block 23
+  sweeps D over 4 values instead of just 1. Catches off-by-one
+  frontier-marking bugs that a single-D test would miss.
 
 - **Architectural invariants applying here:**
-  - **D-024** (BVH leaf return) — `queryClickRay` walks the BVH;
-    for N=1, tree[0] is the leaf (`childA < 0`), and the walk's
-    leaf branch should fire immediately. Block 22's queryClickRay
-    check exercises this.
-  - **D-026** (lifetimeId Float-mesh skip) — unaffected; this
-    fix is in `bottomUpBoxesGPU`, downstream of the skip gate.
-  - **D-029** (GPU bottom-up) — the fix extends D-029's
-    pre-condition: `bottomUpBoxes` requires `numPrimitives >= 2`
-    (i.e., at least one interior node exists). Caller must guard
-    via `bottomUpBoxesGPU`; the kernel itself is unchanged.
-  - **CM-011** (substep-loop commit boundary) — unchanged; this
-    fix doesn't touch the substep loop or commit timing.
+  - **D-024** (BVH leaf-return semantics) — unaffected; this
+    slice modifies BVH build, not query.
+  - **D-026** (lifetimeId Float-mesh skip) — unaffected; the
+    hybrid path runs inside the same `build()` / `refit()` call
+    chains that the skip gate already governs.
+  - **D-029** (single-dispatch atomic bottom-up + Metal 3.2
+    fences + N=1 guard) — **extended.** This slice ships D-030
+    as a generalization that subsumes D-029 (D=large is D-029
+    behavior). D-029's invariants are preserved: relaxed
+    atomics + seq_cst fences, treeParent reuse, treeVisitCounts
+    as scratch.
+  - **D-029 fix-turn (N=1 guard)** — applies. `bottomUpHybrid`
+    early-returns for `numPrimitives <= 1`, same as
+    `bottomUpBoxesGPU` did.
+  - **CM-011** (substep-loop commit-boundary forensic) — applies
+    but unchanged. The hybrid path adds CPU work AFTER the GPU
+    commit, but inside the same `bottomUpHybrid` call (which
+    is itself inside `refit` and called inside the substep
+    loop). The relative commit-boundary timing matches D-029's
+    refit. No new staleness regime.
 
-- **No new BVH variant** is being introduced. The fix only
-  refines the existing path's pre-condition; no kernel signature
-  change, no buffer change, no template instantiation change.
+- **`bottomUpHybridDepth` is a TUNING KNOB**, not a contract.
+  The default value (2) is a starting point; user is expected
+  to measure and adjust. Future slice may add a heuristic
+  (e.g., `D = std::max(1, log2(numPrimitives) - 4)` to keep
+  CPU work bounded) — but that's measurement-driven, not
+  speculation.
 
-- **`buildTree_*`'s treeParent invariant explicitly named.**
-  `treeParent[i]` for `i ∈ [1, numNodes)` is set by
-  `buildTree_*`'s interior-node branch. `treeParent[0]` (root)
-  is NEVER set by `buildTree_*` because the root has no parent.
-  This is fine when there's at least 1 interior node (the root
-  itself, written as childA or childB of another interior node
-  is impossible since root has no parent — so root's
-  `treeParent[0]` slot stays effectively-undefined-but-never-read
-  for N >= 2). For N=1, the only node IS the root, AND
-  `buildTree_*` returns early without entering the interior-node
-  branch at all. So treeParent[0] is undefined for N=1, and
-  `bottomUpBoxes` must not read it. The guard enforces this.
+- **Pure-CPU mode preserves the OLD slow path.** Setting
+  `bottomUpHybridDepth = 0` routes through `bottomUpCombine()`
+  (the existing CPU reference). This is a useful debugging
+  fallback if a future kernel change breaks GPU-side
+  correctness — set depth=0, ship still works, then investigate.
 
 ## What to read before writing code
 
-- `src/main.cpp::BVH<METAL,PR,LINEAR,PRIMITIVE>::bottomUpBoxesGPU`
-  (~line 3261-area; find by signature). The 1-line guard widening
-  goes here.
-- `src/main.cpp::runSelfTest` Block 7 (~line 5891) — template for
-  importMesh harness pattern. Block 22 mirrors the `.obj`
-  on-the-fly composition + import path.
-- `src/main.cpp::runSelfTest` Block 21 (just before the `if
-  (failures == 0)` line) — placement reference for Block 22
-  (append immediately after Block 21).
-- `src/metal/bvh.metal::buildTree_Tri` lines 284-325 — confirms
-  the early-return at `idx == numPrimitives - 1` before
-  `treeParent` writes. `buildTree_Edge` lines 352-392 same shape.
-- `src/main.cpp::Simulator::importMesh` (~line 4473-area) — the
-  existing import path; takes (prefix, fileName, scale, mass,
-  errOut).
-- `docs/DECISIONS.md::D-029` — current entry to append the
-  fix-turn sentence to.
-- `docs/TEST_MATRIX.md:24` — BDD-010 row prose to update.
-- Estimator turn 23 verdict (`docs/.agent/ESTIMATION.md` if not
-  yet overwritten; current state is the BLOCK report).
+- `src/metal/bvh.metal::bottomUpBoxes` (~line 442) — current
+  kernel structure including the Metal 3.2 fences.
+- `src/main.cpp::BVH<METAL,PR,LINEAR,PRIMITIVE>` (~line 3115
+  onwards for the struct) — where `bottomUpHybridDepth` field
+  goes.
+- `src/main.cpp::BVH::bottomUpBoxesGPU` (~line 3264) — current
+  driver to extend.
+- `src/main.cpp::BVH::bottomUpCombine` (~line 3707) — reference
+  CPU implementation to mirror in `bottomUpCombineWithSkip`.
+- `src/main.cpp::BVH::build(int oid, ...)` (~line 3475 area) —
+  call-site swap.
+- `src/main.cpp::BVH::refit()` (~line 3727) — same.
+- `src/main.cpp::runSelfTest` Block 21 — template for the
+  reference-capture + per-interior-node diff loop in Block 23.
+- `docs/DECISIONS.md::D-029` — the existing decision this slice
+  generalizes. D-030 cites it.
+- `MetalGlobalContext::setBytes` — for the `maxDepth` uniform
+  bind at buffer(7). The existing kernel signature uses
+  buffer(2) for sceneBox, buffer(4) for tree, buffer(5) for
+  treeParent, buffer(6) for treeVisitCounts; buffer(7) is the
+  next free slot.

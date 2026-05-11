@@ -1,32 +1,38 @@
-# Resume — BVH bottom-up GPU combine (D-029 + fix-turn; FULL scope shipped)
+# Resume — Hybrid BVH bottom-up combine (D-030; runtime depth knob; build + refit)
 
 ## Must remember
 
-- **Branch:** `feat/bvh-bottomup-gpu` (off `main` at `eb1413e`). Two phases on this branch:
-  1. Original Generator turn: build + refit GPU port (+ CM-011 forensic resolved).
-  2. Fix-turn (this turn, Estimator turn 23 BLOCK absorbed): N=1 guard in `bottomUpBoxesGPU`.
-  Commit prefix `fix:` (BLOCK fix-turns stay on slice branch per GENERATOR.md).
-- **D-029 ships build AND refit on GPU**, with the N=1 guard. `bottomUpBoxesGPU` short-circuits when `numPrimitives <= 1`. For N=1, the tree's single node IS the leaf-root (no interior nodes to combine), and `buildTree_*` doesn't write `treeParent[0]` for that case — dispatching the kernel would read uninitialized parent and produce UB. `buildLeafGPU` still runs for N=1 (correctly writes the single leaf at tree[0]).
-- **`enlargeTrajectory` stays CPU.** Separate slice candidate; same per-substep-loop GPU port pattern as refit. CM-011 forensic confirmed the OLD "2-substep BVH lag" was an artifact, so future GPU enlargeTrajectory port is unblocked.
-- **Bug-probe is Apple-Silicon-masked**, documented in D-029 + CURRENT_WORK. The N=1 UB is real (spec-incorrect, would manifest on weaker memory models / non-zero-init buffers / strict OOB-trap GPUs), just invisible to this harness on Apple Silicon. The production guard is the spec-correct fix regardless.
-- **Block 22 is the N=1 path canary.** Single-triangle .obj imported from `/tmp/bdd_d029_n1.obj`, sim.initialize + sim.update, assert tree[0] AABB + queryClickRay hit. Pass label `D-029 fix / N=1 BVH safely bypasses bottom-up combine`.
-- **Metal 3.2 seq_cst fences in `bottomUpBoxes`.** MSL atomics are relaxed-only; fences carry ordering. Kernel is spec-correct, not TSO-dependent. Two fence sites bracket the publication boundary.
-- **CM-011 reframed as forensic.** OLD CPU refit's 2-substep BVH lag was a deferred-commit artifact, not a contract. NEW GPU refit has the standard 1-substep lag. BDD-010's OLD `lastSubstep`-iteration assertion was satisfied only by the artifact; the simplified `cumulativeNarrowCollisions > 0` form (with `enableSelfCollisions = false` default) honestly satisfies the spec.
+- **Branch:** `feat/bvh-bottomup-hybrid` (off `main` at `0ff03a4`).
+- **D-030 is parallel-symbol, not modify-in-place**: D-029's `bottomUpBoxes` kernel + `bottomUpBoxesGPU` method stay UNCHANGED. A new `bottomUpBoxesPartial` kernel + `bottomUpBoxesPartialGPU` method live alongside them with the `maxDepth` cutoff. The hybrid driver `bottomUpHybrid` picks between them. This shape is mandated by the user's make-means-add-new rule (see `.claude/skills/slice/SKILL.md` "Interpreting the user's slice request" and the `feedback_make_means_add_new` memory entry) — future modifications must NOT collapse the parallel pair back into one symbol.
+- **Three modes via `bottomUpHybrid`:**
+  - `maxDepth == 0` → pure CPU `bottomUpCombine()`.
+  - `1 <= maxDepth < log2(N)` → hybrid: GPU first `maxDepth` levels via `bottomUpBoxesPartialGPU`, CPU finishes via `bottomUpCombineWithSkip()`.
+  - `maxDepth >= log2(N)` → still routes through `bottomUpBoxesPartialGPU` (kernel walks to root because the depth check never fires); functionally equivalent to D-029's `bottomUpBoxesGPU`. The original `bottomUpBoxesGPU` is still callable directly for callers that want pure-GPU walk-to-root without the redundant depth counter.
+  Default `bottomUpHybridDepth = 2` (starting point, not measurement-validated).
+- **`treeVisitCounts == 2` is the GPU-completed-frontier marker.** Load-bearing invariant: depends on the `bottomUpBoxesPartial` kernel's CHECK-BEFORE-ATOMIC placement. If a future edit moves the depth check after the atomic, the marker becomes ambiguous (could be 1 from a depth-cutoff thread) and `bottomUpCombineWithSkip` produces wrong results. Don't reorder without thinking.
+- **`bottomUpHybrid` is the canonical entry point** for BVH bottom-up combine; callers (`build` and `refit`) MUST go through it rather than calling `bottomUpBoxesGPU` or `bottomUpBoxesPartialGPU` directly. `bottomUpHybrid` handles N=1, pure-CPU, partial-GPU+CPU, and pure-GPU modes uniformly AND commits the encoder on all paths.
+- **`MetalGlobalContext::commitAndWait` is now null-encoder-safe.** One-line guard at the top (`if (!computeCommandEncoder) return;`). This was load-bearing for `bottomUpHybrid`'s N<=1 / maxDepth=0 branches that need to flush prior dispatches but may have no encoder of their own.
+- **Bug-probe (a) — off-by-one in depth check — passes silently.** Because the CPU completion's frontier-skip correctly handles "GPU did more work than expected", a wrong `>` vs `>=` makes GPU combine 1 extra level but the final tree result is identical. The D-sweep doesn't discriminate. Off-by-one is a perf-only bug, not a correctness bug, and the slice doesn't claim perf bounds. Documented in D-030's "alternatives considered" + CURRENT_WORK.
+- **Bug-probe (b) — skip-logic inversion — caught loudly.** `!= 2u` instead of `== 2u` makes CPU return at root, leaving tree[0] uninitialized. FR-003 + FR-004 + Block 21 (D-029) all FAIL together. The frontier-skip semantic IS load-bearing for correctness.
 
 ## Last decisions + why
 
-- **D-029 fix-turn — N=1 guard at the C++ layer** (`bottomUpBoxesGPU`) over kernel-internal guard or sentinel-init. Smallest surface (3 lines), truer semantic ("N=1 has no interior nodes to combine"), symmetric with the existing N=0 guard.
-- **Block 22 stricter than minimum.** Three layered assertions: no-crash + tree[0] AABB + queryClickRay hit. Catches different fail modes (UB-crash, silent garbage write, BVH structural corruption). PLANNER.md step 7 stricter-when-cheap.
-- **No new D-NNN; D-029 rationale gets a fix-turn paragraph.** The fix is a guard refinement on the existing decision's pre-condition, not a new architectural call.
-- **No CM-012.** The trap pattern (kernel A's early-return leaves parallel array uninitialized; kernel B consumes assuming full coverage) is captured directly in D-029's fix-turn paragraph; not generic enough for its own CM yet.
+- **D-030 — runtime depth knob + check-before-atomic + treeVisitCounts==2 frontier.**
+  - Runtime over compile-time: experiment slice needs runtime A/B without rebuild.
+  - Check-before-atomic over check-after: keeps `treeVisitCounts` unambiguous at the frontier (always 0 or 2, never 1).
+  - `treeVisitCounts == 2` over per-node flag: no new state; reuses existing scratch buffer.
+  - Default D=2: starting point; future slice can measure and tune (or add auto-heuristic).
+- **`commitAndWait` null-encoder guard** added at the MetalGlobalContext layer. Caller-side guards would be more verbose; making the API forgiving is the cleaner contract change.
+- **bottomUpHybrid commits on all paths** (not caller-side). N<=1 + maxDepth=0 branches still need to flush prior dispatches (buildLeafGPU, buildTreeGPU, etc.) so CPU reads of tree.ptr are up-to-date.
 
 ## Next step you were about to take
 
-Fix-turn complete. Next concrete step is the **Estimator's** turn — `./scripts/verify.sh` should exit 0 with **42/42** self-test PASS lines (Block 22 added; previous was 41). Expected verdict: **NOTE-clean** (BLOCK closed; turn-23 NOTE folded into TEST_MATRIX; bug-probe Apple-Silicon-mask documented).
+Slice complete after parallel-symbol restructure. Next concrete step is to **re-run the Estimator** (Codex) on the restructured diff — `./scripts/verify.sh` should exit 0 with **43/43** self-test PASS lines (Block 23 added; previous was 42), and the Estimator should see that `bottomUpBoxes`/`bottomUpBoxesGPU` are back to their D-029 single-arg form with the partial-depth path living as the new `bottomUpBoxesPartial`/`bottomUpBoxesPartialGPU` parallel pair. Expected verdict: NOTE or WARNING. Possible items: (i) probe (a)'s silent pass + the D-sweep's lack of perf discrimination; (ii) default `bottomUpHybridDepth = 2` being unsupported by measurement; (iii) maintenance hazard from the two parallel kernels sharing most of their body (acceptable trade for keeping D-029 callable).
 
 After this lands, planner-tracked candidates per `PROJECT_STATE.md`:
 
-- **GPU port of `enlargeTrajectory`** — same per-substep-loop pattern, now unblocked since CM-011 was resolved as forensic.
+- **GPU port of `enlargeTrajectory`** — same per-substep-loop pattern (now well-trodden via D-029 + D-030).
+- **BVH bottom-up perf benchmark slice** — add a `--bench-bottomup` flag, build a large mesh, time build() across D values. Closes the question D-030 leaves open.
 - **FBO-based render harness slice** — for BDD-005's render-side clause.
 - **Inspector ergonomics for rotation** — Euler / axis-angle input.
 - **BDD-018 inspector live-edit propagation** — needs ImGui-side simulation.

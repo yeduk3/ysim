@@ -497,6 +497,79 @@ kernel void bottomUpBoxes(
     }
 }
 
+// D-030: partial-depth variant of `bottomUpBoxes`. Each thread walks
+// up via treeParent and combines AABBs identically to bottomUpBoxes,
+// but stops after writing `maxDepth` levels from the leaf side. The
+// CPU follow-up (`bottomUpCombineWithSkip` in main.cpp) finishes the
+// remaining top-of-tree.
+//
+// Kept as a SEPARATE kernel (not a depth-parameterized extension of
+// bottomUpBoxes) so D-029's pure-GPU walk-to-root path remains
+// callable and benchmarkable unchanged. The two kernels share the
+// same Metal 3.2 seq_cst fence shape; only the loop's depth check
+// + per-thread depth counter differ.
+//
+// **Frontier invariant**: the depth check is BEFORE the atomic so
+// threads exiting at the cutoff never increment `treeVisitCounts` at
+// the post-cutoff level. Post-dispatch, every node at the GPU
+// frontier has `treeVisitCounts == 2` and every node above the
+// frontier has `treeVisitCounts == 0` — never 1. The CPU completion
+// uses that as an unambiguous "GPU completed this subtree" marker.
+kernel void bottomUpBoxesPartial(
+    constant AABB4& sceneBox [[buffer(2)]],
+    device BVHNode* tree [[buffer(4)]],
+    device const int* treeParent [[buffer(5)]],
+    device atomic_uint* treeVisitCounts [[buffer(6)]],
+    constant uint& maxDepth [[buffer(7)]],
+    uint id [[thread_position_in_grid]]
+) {
+    uint numPrimitives = (uint)sceneBox._pad0;
+    if (id >= numPrimitives) return;
+
+    int child = int(id + numPrimitives - 1); // leaf node index
+    uint depth = 0u;
+
+    while (true) {
+        int parent = treeParent[child];
+
+        // Hybrid cutoff — check BEFORE the atomic so threads exiting
+        // here don't touch treeVisitCounts at this level (preserves
+        // the frontier invariant above).
+        if (depth >= maxDepth) return;
+
+        uint old = atomic_fetch_add_explicit(
+            &treeVisitCounts[parent],
+            1u,
+            memory_order_relaxed
+        );
+
+        if (old == 0u) return;
+
+        atomic_thread_fence(mem_flags::mem_device,
+                            memory_order_seq_cst,
+                            thread_scope_device);
+
+        int childA = tree[parent].childA;
+        int childB = tree[parent].childB;
+
+        float3 minA = float3(tree[childA].min);
+        float3 maxA = float3(tree[childA].max);
+        float3 minB = float3(tree[childB].min);
+        float3 maxB = float3(tree[childB].max);
+
+        tree[parent].min = packed_float3(min(minA, minB));
+        tree[parent].max = packed_float3(max(maxA, maxB));
+
+        atomic_thread_fence(mem_flags::mem_device,
+                            memory_order_seq_cst,
+                            thread_scope_device);
+
+        depth++;                 // just combined a level
+        child = parent;
+        if (child == 0) return;  // wrote root, done
+    }
+}
+
 
 
 

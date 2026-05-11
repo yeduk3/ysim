@@ -165,6 +165,11 @@ struct MetalGlobalContext {
         getComputeCommandEncoder()->dispatchThreads(gridSize, groupSize);
     }
     static void commitAndWait() {
+        // No pending encoder = nothing to commit. Used to crash on null
+        // dereference; D-030's hybrid bottom-up driver needs a no-op
+        // path when its prior dispatches already committed (e.g.,
+        // pure-CPU branch called between two GPU-dispatching paths).
+        if (!computeCommandEncoder) return;
         computeCommandEncoder->endEncoding();
         commandBuffer->commit();
         commandBuffer->waitUntilCompleted();
@@ -3164,6 +3169,17 @@ struct BVH<BE, PR, BVHMODE::LINEAR, PRIMITIVE> {
     // multi-pass approach.
     VectorBase<METAL, uint32_t> treeVisitCounts;      // numNodes
 
+    // D-030: hybrid bottom-up depth knob. GPU combines the first
+    // `bottomUpHybridDepth` levels (from leaf side); CPU finishes
+    // the remaining top-of-tree. Runtime-tunable so the user can
+    // measure the sweet spot. Values: 0 = pure CPU (skips GPU
+    // dispatch, calls bottomUpCombine() directly); 1 or 2 (default)
+    // = hybrid; large value (~1000+) = pure GPU (recovers D-029
+    // walk-to-root behavior). The CPU side reads `treeVisitCounts`
+    // as a frontier marker: nodes with count == 2 were combined
+    // by GPU and their subtrees are skipped by the CPU walk.
+    int bottomUpHybridDepth = 3;
+
     int objid; // who made this tree
     // D-026: cached at build() time from mesh->lifetimeId so
     // BroadPhase::build's Float-mesh skip can verify the slot still
@@ -3180,6 +3196,7 @@ struct BVH<BE, PR, BVHMODE::LINEAR, PRIMITIVE> {
     MTL::ComputePipelineState* buildTreePSO;
     MTL::ComputePipelineState* buildLeafPSO;
     MTL::ComputePipelineState* bottomUpBoxesPSO;
+    MTL::ComputePipelineState* bottomUpBoxesPartialPSO;   // D-030
     MTL::ComputePipelineState* zeroVisitCountsPSO;    // D-029
     MTL::ComputePipelineState* queryPointsPSO;
 
@@ -3212,6 +3229,7 @@ struct BVH<BE, PR, BVHMODE::LINEAR, PRIMITIVE> {
             buildLeafPSO = MetalKernelContext::getPSO("buildLeaf_Edge");
         }
         bottomUpBoxesPSO = MetalKernelContext::getPSO("bottomUpBoxes");
+        bottomUpBoxesPartialPSO = MetalKernelContext::getPSO("bottomUpBoxesPartial"); // D-030
         zeroVisitCountsPSO = MetalKernelContext::getPSO("zeroVisitCounts"); // D-029
         queryPointsPSO = MetalKernelContext::getPSO("queryPoints");
 
@@ -3261,28 +3279,13 @@ struct BVH<BE, PR, BVHMODE::LINEAR, PRIMITIVE> {
     // Pre-condition: leaf AABBs already written (buildLeaf*
     // dispatched before this call); treeParent populated (build*
     // dispatched, or carried from prior build for refit).
+    //
+    // N=1 guard (D-029 fix-turn): the tree's single node IS the
+    // leaf-root; buildTree_* never writes treeParent[0] for that
+    // case. Skipping the dispatch avoids reading uninitialized
+    // parent index.
     void bottomUpBoxesGPU(const AABB4& sceneBox) {
         Index numPrimitives = primitives.size / PRIMITIVE;
-        // D-029 fix-turn (Estimator turn 23 BLOCK): N=1 means the
-        // tree's single node IS the leaf-root; there are no interior
-        // nodes to combine. buildTree_* short-circuits at
-        // `idx == numPrimitives - 1` BEFORE writing treeParent[childA/B],
-        // so for N=1 (only thread is idx=0, the leaf-root itself)
-        // treeParent[0] is never written. Dispatching bottomUpBoxes
-        // here would read uninitialized treeParent[0] and atomic-fetch
-        // at treeVisitCounts[garbage] — undefined behavior. Skip the
-        // dispatch; buildLeafGPU already wrote the single leaf at
-        // tree[0] correctly.
-        // D-029 fix-turn (Estimator turn 23 BLOCK): N=1 means the
-        // tree's single node IS the leaf-root; there are no interior
-        // nodes to combine. buildTree_* short-circuits at
-        // `idx == numPrimitives - 1` BEFORE writing treeParent[childA/B],
-        // so for N=1 (only thread is idx=0, the leaf-root itself)
-        // treeParent[0] is never written. Dispatching bottomUpBoxes
-        // here would read uninitialized treeParent[0] and atomic-fetch
-        // at treeVisitCounts[garbage] — undefined behavior. Skip the
-        // dispatch; buildLeafGPU already wrote the single leaf at
-        // tree[0] correctly.
         if (numPrimitives <= 1) return;
         Index numNodes = 2 * numPrimitives - 1;
 
@@ -3299,6 +3302,107 @@ struct BVH<BE, PR, BVHMODE::LINEAR, PRIMITIVE> {
         MetalGlobalContext::setBuffer(treeParent, 5);
         MetalGlobalContext::setBuffer(treeVisitCounts, 6);
         MetalGlobalContext::dispatchThreads(bottomUpBoxesPSO, numPrimitives);
+    }
+
+    // D-030: GPU partial-depth variant kept SEPARATE from the D-029
+    // path so the original `bottomUpBoxesGPU` remains intact and
+    // callable (e.g., by callers that want pure-GPU walk-to-root).
+    // The two methods share scaffolding (zero visit-counts + same
+    // buffer bindings) but dispatch DIFFERENT kernels and live as
+    // parallel symbols rather than a widened single one.
+    //
+    //   maxDepth >= 1: GPU combines up to `maxDepth` levels from the
+    //     leaf side; threads exit BEFORE the atomic at subsequent
+    //     levels, so `treeVisitCounts == 2` at the GPU frontier and
+    //     `== 0` above it. CPU completion (`bottomUpCombineWithSkip`)
+    //     uses `== 2` as the frontier marker.
+    //   maxDepth >= log2(N): kernel walks all the way to root and is
+    //     functionally equivalent to `bottomUpBoxesGPU`, just with a
+    //     redundant per-thread depth counter.
+    //   maxDepth == 0: caller should NOT invoke this — route through
+    //     `bottomUpCombine` (pure CPU) instead.
+    //
+    // N=1 guard inherited from `bottomUpBoxesGPU`.
+    void bottomUpBoxesPartialGPU(const AABB4& sceneBox, uint maxDepth) {
+        Index numPrimitives = primitives.size / PRIMITIVE;
+        if (numPrimitives <= 1) return;
+        Index numNodes = 2 * numPrimitives - 1;
+
+        uint32_t numNodesU = (uint32_t)numNodes;
+        MetalGlobalContext::setBuffer(treeVisitCounts, 0);
+        MetalGlobalContext::setBytes(numNodesU, 1);
+        MetalGlobalContext::dispatchThreads(zeroVisitCountsPSO, numNodes);
+
+        MetalGlobalContext::setBytes(sceneBox, 2);
+        MetalGlobalContext::setBuffer(tree, 4);
+        MetalGlobalContext::setBuffer(treeParent, 5);
+        MetalGlobalContext::setBuffer(treeVisitCounts, 6);
+        MetalGlobalContext::setBytes(maxDepth, 7);
+        MetalGlobalContext::dispatchThreads(bottomUpBoxesPartialPSO, numPrimitives);
+    }
+
+    // D-030: top-down recursive CPU walk that skips subtrees the
+    // GPU already combined (frontier marker: treeVisitCounts == 2).
+    // Used by `bottomUpHybrid` after the GPU partial-depth dispatch
+    // commits. Mirrors `bottomUpCombine`'s shape with the extra
+    // skip check; the existing `bottomUpCombine` stays as the
+    // pure-CPU path + Block 21's reference.
+    //
+    // Pre-condition: GPU dispatch has been commitAndWait'd so
+    // tree[] and treeVisitCounts are CPU-visible. For pure-CPU
+    // mode (maxDepth == 0) the caller goes through `bottomUpCombine`
+    // instead — treeVisitCounts is undefined there.
+    void bottomUpCombineWithSkip() {
+        auto walk = [&](auto&& self, BVHNode& node, int nodeId) -> void {
+            if (node.childA < 0) return;                       // leaf
+            if (treeVisitCounts[nodeId] == 2u) return;         // GPU done
+            self(self, tree[node.childA], node.childA);
+            self(self, tree[node.childB], node.childB);
+            node.aabb.min = tree[node.childA].aabb.min;
+            node.aabb.max = tree[node.childA].aabb.max;
+            node.aabb.combine(tree[node.childB].aabb);
+        };
+        walk(walk, tree[0], 0);
+    }
+
+    // D-030: hybrid bottom-up driver. GPU partial-depth combine
+    // (up to maxDepth levels from leaf) followed by CPU completion
+    // for the remaining top-of-tree. maxDepth == 0 routes through
+    // the pure-CPU path (`bottomUpCombine`). maxDepth large value
+    // recovers D-029's walk-to-root behavior. N=1 guard inherited
+    // from `bottomUpBoxesGPU`.
+    //
+    // Pre-condition: leaf AABBs already written (buildLeaf* /
+    // buildTree* dispatched before this call); treeParent populated
+    // (build* dispatched, or carried from prior build for refit).
+    void bottomUpHybrid(const AABB4& sceneBox, int maxDepth) {
+        Index numPrimitives = primitives.size / PRIMITIVE;
+        // All paths must end with the encoder flushed so callers
+        // (BroadPhase::refit / build / harness) see committed
+        // tree.ptr — prior GPU dispatches (buildLeaf*, buildTree*,
+        // radix sort, etc.) sit in the encoder when bottomUpHybrid
+        // is entered.
+        if (numPrimitives <= 1) {
+            // Tree's single node IS the leaf-root; nothing to
+            // combine. Flush so callers see the committed leaf.
+            MetalGlobalContext::commitAndWait();
+            return;
+        }
+
+        if (maxDepth == 0) {
+            // Pure CPU — flush prior dispatches first so
+            // bottomUpCombine reads up-to-date tree.ptr.
+            MetalGlobalContext::commitAndWait();
+            bottomUpCombine();
+            return;
+        }
+
+        // GPU partial-depth combine; CPU finishes the rest. Uses
+        // the D-030 parallel-symbol variant so the D-029 path
+        // (`bottomUpBoxesGPU`, walk-to-root) stays unmodified.
+        bottomUpBoxesPartialGPU(sceneBox, (uint)maxDepth);
+        MetalGlobalContext::commitAndWait();
+        bottomUpCombineWithSkip();
     }
 
 
@@ -3469,15 +3573,13 @@ struct BVH<BE, PR, BVHMODE::LINEAR, PRIMITIVE> {
         // output: linear bvh tree + treeParent up-links
         buildTreeGPU();
 
-        // [stage 5] bottom-up AABB combine. D-029 — single-dispatch
-        // atomic-fetch-add halving via the bottomUpBoxes kernel
-        // (replaces the multi-pass bottomUpCombineStep driver).
-        bottomUpBoxesGPU(sceneBox);
-
-        // Final commit flushes radix + buildTree + zeroVisitCounts +
-        // bottomUpBoxes back to CPU-visible storage so the caller
-        // (BroadPhase::build) can read tree.ptr immediately.
-        MetalGlobalContext::commitAndWait();
+        // [stage 5] bottom-up AABB combine. D-030 — hybrid: GPU
+        // combines the first `bottomUpHybridDepth` levels (from
+        // leaf side); CPU finishes the top-of-tree via
+        // bottomUpCombineWithSkip. bottomUpHybrid itself does the
+        // commitAndWait between GPU and CPU phases, so tree.ptr is
+        // CPU-visible by the time this returns.
+        bottomUpHybrid(sceneBox, bottomUpHybridDepth);
     }
 
     void buildCPU(int oid, VectorBase<METAL, PR>& pos, VectorBase<METAL, Index>& prim) {
@@ -3745,8 +3847,10 @@ struct BVH<BE, PR, BVHMODE::LINEAR, PRIMITIVE> {
         sceneBox.i0 = numPrimitives;
 
         buildLeafGPU();
-        bottomUpBoxesGPU(sceneBox);
-        MetalGlobalContext::commitAndWait();
+        // D-030: hybrid GPU+CPU bottom-up. Internal commitAndWait
+        // happens inside bottomUpHybrid between the GPU partial
+        // dispatch and the CPU completion.
+        bottomUpHybrid(sceneBox, bottomUpHybridDepth);
     }
 
     void enlargeTrajectory(PR dt) {
@@ -7452,6 +7556,109 @@ static int runSelfTest() {
         }
 
         std::remove(objPath.c_str());
+    }
+
+    // ---- Block 23: D-030 — hybrid bottom-up matches CPU reference for D ∈ {0,1,2,1000}. ----
+    // Builds a tess=2 cube (same scene as Block 21). Captures CPU
+    // reference via bottomUpCombine(). Then for each test D in the
+    // sweep, resets the leaves via buildLeafGPU and runs
+    // bottomUpHybrid(D); asserts every interior node's AABB is
+    // bit-equal to the CPU reference. D=0 → pure CPU. D=1, D=2 →
+    // hybrid frontier (GPU does the first D levels from leaf;
+    // CPU completes via bottomUpCombineWithSkip). D=1000 → pure
+    // GPU (kernel walks to root, equivalent to D-029).
+    //
+    // Stricter than single-D: the sweep catches off-by-one
+    // frontier-marking bugs (depth check at wrong loop position;
+    // depth counter incremented at wrong site; treeVisitCounts
+    // not zeroed before dispatch).
+    {
+        resetScene();
+        sim.addCube(tinym::vec3(0.0f, 0.0f, 0.0f), /*tess=*/2,
+                    /*size=*/0.5f, /*mass=*/0.1f);
+        sim.initialize();
+
+        auto* mesh23 = Scene<Backend, Precision>::findById(0);
+        auto& bp23 = sim.collisionPipeline.broadPhase;
+        if (!mesh23 || bp23.objTrees.empty()) {
+            fail("D-030 / hybrid bottom-up matches CPU reference for D in {0,1,2,1000}",
+                 "mesh or objTrees[0] missing");
+        } else {
+            auto& objTree23 = bp23.objTrees[0];
+            Index numPrimitives23 = mesh23->adjacency.facets.size / 3;
+            Index numNodes23 = (numPrimitives23 > 0) ? (2*numPrimitives23 - 1) : 0;
+
+            if (numNodes23 < 2) {
+                fail("D-030 / hybrid bottom-up matches CPU reference for D in {0,1,2,1000}",
+                     "tess=2 cube produced numNodes=" + std::to_string(numNodes23));
+            } else {
+                // Capture CPU reference: reset leaves, then bottomUpCombine().
+                objTree23.buildLeafGPU();
+                MetalGlobalContext::commitAndWait();
+                objTree23.bottomUpCombine();
+
+                std::vector<float> ref23(numNodes23 * 6);
+                for (Index i = 0; i < numNodes23; ++i) {
+                    const auto& n = objTree23.tree[i];
+                    ref23[i*6+0]=(float)n.min.x; ref23[i*6+1]=(float)n.min.y; ref23[i*6+2]=(float)n.min.z;
+                    ref23[i*6+3]=(float)n.max.x; ref23[i*6+4]=(float)n.max.y; ref23[i*6+5]=(float)n.max.z;
+                }
+
+                // We need a sceneBox for bottomUpHybrid. bottomUpBoxes
+                // only reads sceneBox._pad0 (= numPrimitives), so a
+                // minimal sceneBox suffices.
+                AABB4 sceneBox23;
+                sceneBox23.i0 = numPrimitives23;
+
+                const int Ds[] = {0, 1, 2, 1000};
+                bool allMatch = true;
+                int failingD = -1;
+                Index failingNode = (Index)-1;
+                for (int d : Ds) {
+                    // Reset leaves to the same starting state so every
+                    // D iteration receives identical input.
+                    objTree23.buildLeafGPU();
+                    objTree23.bottomUpHybrid(sceneBox23, d);
+
+                    for (Index i = 0; i < numPrimitives23 - 1; ++i) {
+                        const auto& n = objTree23.tree[i];
+                        if ((float)n.min.x != ref23[i*6+0] ||
+                            (float)n.min.y != ref23[i*6+1] ||
+                            (float)n.min.z != ref23[i*6+2] ||
+                            (float)n.max.x != ref23[i*6+3] ||
+                            (float)n.max.y != ref23[i*6+4] ||
+                            (float)n.max.z != ref23[i*6+5]) {
+                            allMatch = false;
+                            failingD = d;
+                            failingNode = i;
+                            break;
+                        }
+                    }
+                    if (!allMatch) break;
+                }
+
+                if (allMatch) {
+                    pass("D-030 / hybrid bottom-up matches CPU reference for D in {0,1,2,1000}");
+                } else {
+                    const auto& n = objTree23.tree[failingNode];
+                    fail("D-030 / hybrid bottom-up matches CPU reference for D in {0,1,2,1000}",
+                         "D=" + std::to_string(failingD) + " node " +
+                         std::to_string(failingNode) + " mismatch: hybrid min=(" +
+                         std::to_string((float)n.min.x) + "," +
+                         std::to_string((float)n.min.y) + "," +
+                         std::to_string((float)n.min.z) + ") max=(" +
+                         std::to_string((float)n.max.x) + "," +
+                         std::to_string((float)n.max.y) + "," +
+                         std::to_string((float)n.max.z) + ") vs ref min=(" +
+                         std::to_string(ref23[failingNode*6+0]) + "," +
+                         std::to_string(ref23[failingNode*6+1]) + "," +
+                         std::to_string(ref23[failingNode*6+2]) + ") max=(" +
+                         std::to_string(ref23[failingNode*6+3]) + "," +
+                         std::to_string(ref23[failingNode*6+4]) + "," +
+                         std::to_string(ref23[failingNode*6+5]) + ")");
+                }
+            }
+        }
     }
 
     if (failures == 0) {

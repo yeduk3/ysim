@@ -5,12 +5,27 @@ description: Run a full Planner → Generator → Estimator slice cycle for the 
 
 You are orchestrating one full slice cycle for the ysim 3-role workflow (Planner → Generator → Estimator). Follow these steps strictly and in order. Do not skip steps. Do not invent steps.
 
+**A single `/slice` invocation runs ALL of Steps 1 through 8 in one response.** This is the most-violated rule. When `Skill(planner)` or `Skill(generator)` returns, you are STILL the slice orchestrator — do NOT stop, do NOT wait for user input, do NOT summarize the sub-skill's output as a final answer. Continue immediately to the next step in the same response. The only places `/slice` stops mid-cycle are: Step 1's halt-on-bad-state branches (C/D/E), Step 5/6 explicit hand-back from the sub-skill (Planner found a spec contradiction, Generator hit a build-time discovery requiring re-plan), self-test FAILs in Step 6, or Codex auth failure in Step 7. **The report at Step 8 is the SOLE end-of-cycle output to the user.** Plan summaries from the Planner skill and progress reports from the Generator skill are intermediate work, not the user-facing final report.
+
+## Interpreting the user's slice request
+
+When the user's `/slice` args use **creation-verb language** ("만들어보자", "만들어달라", "만들어줘", "make X", "create X", "add X", "build X"), interpret it as **ADD A NEW PARALLEL SYMBOL alongside the existing one**, NOT as a modification of the existing path. Both versions must remain callable after the slice ships.
+
+- Planner: the Plan's "Scope" section must explicitly enumerate NEW symbols (new function/kernel/method/field names) and PRESERVED symbols (existing names that stay unchanged). Don't widen existing signatures, don't add cutoff parameters to existing kernels — copy-and-edit into a new symbol with a new name.
+- Generator: write new functions next to old ones; the call site picks which to use. Existing tests that exercise the old path stay green; new tests cover the new path.
+- Estimator: a Generator turn that modifies an existing path when the user asked for "make X" is a process violation worth flagging as WARNING (silent scope contraction).
+
+Exception: if the user explicitly says "기존걸 수정해서 / modify the existing / extend X to do Y / rewrite X", then in-place modification is correct. The rule applies only to neutral creation verbs.
+
+Bitten on D-030 (BVH hybrid bottom-up) — user asked "hybrid bottom-up combine 만들어보자", Generator extended `bottomUpBoxes` kernel + `bottomUpBoxesGPU` C++ method in place; user flagged the violation and asked for the original to be restored + new parallel symbols added.
+
 ## Conventions you must respect
 
 - The Estimator (`Agent(codex:codex-rescue)`) MUST run via Codex, not via the local `estimator` skill — independence between Generator's model and Estimator's model is load-bearing per `docs/roles/ESTIMATOR.md`. Never call `Skill(estimator)` inside this cycle.
 - The Estimator's ESTIMATION.md output is committed at the **start** of the **next** cycle (Step 2 below), not at the end of the current cycle. This matches the existing pattern in git log: `chore: estimator turn N` commits sit beside the slice commit they review.
 - Do not auto-trigger a follow-up `/slice` cycle. After Step 8 (Report), stop and let the user decide whether to run `/slice` again.
 - If at any step the working tree is in an unexpected state, stop and report — do not improvise destructive recovery.
+- **Continuation between steps is implicit, not explicit.** After `Skill(planner)` returns, immediately invoke `Skill(generator)` in the same response. After `Skill(generator)` returns, immediately invoke `Agent(codex:codex-rescue)` in the same response. After Codex returns, immediately read ESTIMATION.md and write the Step 8 report. The user does NOT need to type "continue" between steps — that's the bug the explicit continuation rule above closes.
 
 ## Step 1: Inspect state
 

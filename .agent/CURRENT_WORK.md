@@ -1,19 +1,28 @@
-# Current Work — BVH bottom-up GPU combine, fix-turn (`feat/bvh-bottomup-gpu`)
+# Current Work — Hybrid BVH bottom-up combine (`feat/bvh-bottomup-hybrid`)
 
-- File in flight: none — fix-turn complete. **42/42 self-test PASS** deterministic across 5 runs. Doctest 159/159 + 1120/1120 green.
-- How far: all 12 PLAN todos done.
-  - **N=1 guard added** to `BVH::bottomUpBoxesGPU` (`src/main.cpp`). Widened `if (numPrimitives == 0) return;` to `<= 1`. Comment explains why N=1 also short-circuits (leaf-is-root, no interior nodes to combine, treeParent[0] uninitialized).
-  - **Block 22 added** to `runSelfTest`. Writes a single-triangle `.obj` to `/tmp/bdd_d029_n1.obj`, imports via `sim.importMesh`, runs `sim.initialize + sim.update` to exercise BVH::build + BVH::refit with N=1, asserts:
-    1. No crash.
-    2. `tree[0]` AABB matches the triangle bounds within tolerance.
-    3. `queryClickRay` finds the single triangle (walks the BVH correctly when tree[0] is leaf-root, exercising D-024 leaf-recognition under N=1).
-    Pass label: `D-029 fix / N=1 BVH safely bypasses bottom-up combine`.
-  - **TEST_MATRIX BDD-010 row prose updated** (NOTE fold-in). Drops the OLD `objPair.query != objPair.target` shape, replaces with cumNarrow-based description + CM-011 cross-ref. Status stays `pass`.
-  - **D-029 entry in `docs/DECISIONS.md`** appended fix-turn paragraph: documents the N=1 guard widening + the Apple-Silicon-mask of the bug-probe.
+- File in flight: none — slice complete (parallel-symbol restructure landed; see "Restructure" bullet below). **43/43 self-test PASS** deterministic across 5 runs. Doctest 159/159 + 1120/1120 green.
+- How far: all 16 PLAN todos done + post-Estimator restructure.
+  - **D-030 — hybrid GPU+CPU bottom-up with runtime depth knob, ADD parallel symbols.**
+    - `src/metal/bvh.metal::bottomUpBoxes` UNCHANGED from D-029 — D-029's pure-GPU walk-to-root kernel stays intact and callable.
+    - `src/metal/bvh.metal::bottomUpBoxesPartial` NEW kernel: same atomic + seq_cst fence shape as `bottomUpBoxes`, plus `constant uint& maxDepth [[buffer(7)]]`, local `depth = 0`, check-before-atomic at loop top, `depth++` after parent-AABB release fence. Preserves Metal 3.2 seq_cst fences (D-029) unchanged.
+    - `BVH<METAL,PR,LINEAR,PRIMITIVE>` gains:
+      - `int bottomUpHybridDepth = 2;` field (runtime knob, default 2).
+      - `MTL::ComputePipelineState* bottomUpBoxesPartialPSO;` registered as `"bottomUpBoxesPartial"` next to the existing `bottomUpBoxesPSO`.
+      - `bottomUpBoxesGPU(const AABB4&)` UNCHANGED (single-arg, D-029 form, dispatches `bottomUpBoxesPSO`) — stays callable.
+      - `bottomUpBoxesPartialGPU(const AABB4&, uint maxDepth)` NEW method that dispatches `bottomUpBoxesPartialPSO` with the maxDepth uniform bound to buffer(7).
+    - New `bottomUpCombineWithSkip()` — CPU walk from root that short-circuits at `treeVisitCounts[nodeId] == 2` (GPU-completed-frontier marker).
+    - New `bottomUpHybrid(sceneBox, maxDepth)` driver — handles 3 modes: N<=1 early return (with commit so prior dispatches flush), `maxDepth == 0` falls back to `bottomUpCombine()` (pure CPU), `maxDepth >= 1` calls `bottomUpBoxesPartialGPU` + `commitAndWait` + `bottomUpCombineWithSkip`.
+    - `BVH::build` and `BVH::refit` call sites updated to `bottomUpHybrid(sceneBox, bottomUpHybridDepth)`.
+  - **Restructure (post-Estimator turn 25):** earlier within this slice the partial-depth kernel was wired by widening `bottomUpBoxes` + `bottomUpBoxesGPU` in place with a `maxDepth` parameter. User flagged that as a process violation — creation-verb requests ("hybrid bottom-up combine 만들어보자") mean ADD a new parallel path, not modify the existing one. The restructure restored D-029's `bottomUpBoxes` kernel + `bottomUpBoxesGPU` method to their original single-arg form and added `bottomUpBoxesPartial` + `bottomUpBoxesPartialGPU` as parallel symbols. The rule is now captured in `.claude/skills/slice/SKILL.md` ("Interpreting the user's slice request") and in the `feedback_make_means_add_new` memory entry. D-030's DECISIONS entry was updated to (i) describe the parallel-symbol shape and (ii) add an invariant forbidding future collapse of the parallel pair.
+  - **`MetalGlobalContext::commitAndWait` made null-encoder-safe.** One-line guard added at the top; lets `bottomUpHybrid` commit on all paths without crashing when no GPU dispatch is pending. This was load-bearing for the N<=1 path — Block 22 silently dropped a PASS line because refit's `buildLeafGPU` dispatch sat in the encoder uncommitted after `bottomUpHybrid` early-returned.
+  - **Block 23 mechanizes correctness across `D ∈ {0, 1, 2, 1000}`.** Builds a tess=2 cube, captures CPU reference, then for each D: resets leaves via `buildLeafGPU` and runs `bottomUpHybrid(D)`; asserts every interior-node AABB bit-equal to reference. Pass label `D-030 / hybrid bottom-up matches CPU reference for D in {0,1,2,1000}`. Self-test count 42 → 43.
+  - **Bug-probes (2 of 3 documented):**
+    - **(a) Off-by-one in depth check** (`>` instead of `>=`): PASSED silently. Off-by-one makes GPU combine 1 extra level; final tree result is still correct (CPU completion absorbs the extra GPU work via the frontier-skip). Documented in D-030 — this is a perf-only bug, not a correctness bug, and the slice doesn't claim perf bounds.
+    - **(b) Skip-logic inversion** (`!= 2u` instead of `== 2u` in CPU helper): caught LOUDLY. FR-003 + FR-004 (refit-after-edit canaries) + D-029 (Block 21 per-interior-node diff) all FAIL together because CPU walks return at root with `visitCounts != 2`, leaving `tree[0]` uninitialized. Restored.
+    - **(c) Forgotten `depth++`** in kernel: not run separately; same equivalence-class argument as (a) — the loop would run forever (depth stays 0, check never triggers) until reaching root via `if (child == 0) return;`. Equivalent to pure-GPU (`maxDepth = INF`) behavior. Final tree result correct.
 - What's tested:
-  - 42/42 self-test PASS on macOS Apple Silicon, deterministic 5×.
-  - Block 22 (new) + Block 21 + Block 13 + FR-003/004 (refit-after-edit) all green.
-  - Doctest 159/159 + 1120/1120 SUCCESS via `verify-light.sh`.
-  - **Bug-probe is Apple-Silicon-masked (documented honestly).** Probe (a) — revert the N=1 guard — silently passed all 5 runs because `treeParent[0]` reads as 0 from the zero-init shared buffer, the kernel's first-arrival path exits with `old == 0u`, and tree[0] is preserved. Probe (b) — guard removed AND force `treeParent[0] = 999999` (deliberate OOB) — STILL passed because Metal's shared storage absorbs OOB atomic reads (return 0) and OOB writes (silently dropped or landed in adjacent unmapped memory). The UB the Estimator flagged is real (spec-incorrect, would crash on non-Apple memory models), just invisible to this harness on Apple Silicon. The production guard is the spec-correct fix regardless.
-- Non-goals respected: no GPU `enlargeTrajectory`, no `buildTree_*` restructuring, no new D-NNN, no CM-012 (the trap pattern is captured directly in D-029's fix-turn paragraph; not generic enough to warrant a separate CM).
-- What's next: Estimator review (Codex). Expected verdict: NOTE-clean (BLOCK closed; turn-23 NOTE folded into TEST_MATRIX; bug-probe Apple-Silicon-mask documented in D-029 + here).
+  - 43/43 self-test PASS deterministic 5×.
+  - Block 23 sweeps 4 D values + Block 21 + Block 22 + FR-003/004 refit canaries all green.
+  - Doctest 159/159 + 1120/1120 SUCCESS.
+- Non-goals respected: no perf benchmarking (knob is runtime-tunable for future measurement), no inspector widget for the depth knob, no auto-tuning heuristic, no hybrid `enlargeTrajectory`, no new BDD/FR.
+- What's next: re-run Estimator (Codex) on the parallel-symbol restructure. Expected verdict: NOTE / WARNING. Possible items: (i) probe (a)'s silent pass means the D-sweep doesn't discriminate between off-by-one and correct depth-check placement (correctness-only test, perf bugs uncaught); (ii) default `bottomUpHybridDepth = 2` is a starting point, not measurement-validated; (iii) two parallel kernels share most of their body, so a future drift between them is the new maintenance hazard — acceptable trade for keeping D-029 callable, but worth a NOTE.
