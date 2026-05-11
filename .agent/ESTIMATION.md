@@ -1,4 +1,4 @@
-# Estimation — 2026-05-12 turn 25
+# Estimation — 2026-05-12 turn 26
 
 Status: UPDATED
 
@@ -6,16 +6,16 @@ Status: UPDATED
 WARNING
 
 ## BLOCK
-- none
+(none)
 
 ## WARNING
-- Hybrid default depth is unmeasured: [src/main.cpp](/Users/gyu/codes/ysim/src/main.cpp):3181 - `bottomUpHybridDepth = 2` is now the default path for build/refit, but the slice explicitly treats 2 as a starting point and does not benchmark or tune it. That can silently pick the wrong D for real scenes, so performance risk remains.
+- `docs/DECISIONS.md:281`, `.agent/CURRENT_WORK.md:21`, `.agent/PROJECT_STATE.md:47`, `profiles/experiment/bvh-refit-2026-05-12/refit_bench.csv:112` — the written takeaway says Hybrid D=1/D=2 never beat FullCPU, but the committed CSV contradicts that at 499,849 vertices: the HybridD2 sweep is faster than the matching FullCPU sweep. The downstream tuning recommendation is still plausible, but this specific conclusion is wrong and needs to be rewritten before the follow-up slice uses it.
 
 ## NOTE
-- none
+- `profiles/experiment/bvh-refit-2026-05-12/README.ko.md:110` — the artifact section still describes `refit_bench.csv` as a header-only placeholder, but the committed CSV already contains the populated 160-row sweep. Align the prose with the shipped artifact.
 
 ## Test matrix delta
-- none
+(none)
 
 ## Verify output (summary)
-`./scripts/verify.sh` exited 0. The build completed, both doctest binaries passed (159/159 and 1120/1120 assertions), and the main executable reported `[self-test SKIP] metal-device: MTL::CreateSystemDefaultDevice() returned null`, which is the expected non-Metal-host skip rather than a failure.
+`./scripts/verify.sh` configured and built successfully; both doctest suites passed (`159/159` and `1120/1120`). On this host, `src/ysim --self-test` took the expected Metal-less skip path (`MTL::CreateSystemDefaultDevice() returned null`), so the new bench smoke path was not re-exercised here. The committed benchmark artifacts are present: `refit_bench.csv` has 160 data rows and the two PNG charts are included.
