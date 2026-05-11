@@ -1,4 +1,4 @@
-# Estimation — 2026-05-12 turn 24
+# Estimation — 2026-05-12 turn 25
 
 Status: UPDATED
 
@@ -9,13 +9,13 @@ WARNING
 - none
 
 ## WARNING
-- `src/main.cpp:7374` and `docs/DECISIONS.md:264` - Block 22 proves the N=1 happy path, but the negative probe is Apple-Silicon-masked; removing the guard and forcing `treeParent[0]` did not fail on this host, so the canary does not currently catch the regression it documents.
+- Hybrid default depth is unmeasured: [src/main.cpp](/Users/gyu/codes/ysim/src/main.cpp):3181 - `bottomUpHybridDepth = 2` is now the default path for build/refit, but the slice explicitly treats 2 as a starting point and does not benchmark or tune it. That can silently pick the wrong D for real scenes, so performance risk remains.
 
 ## NOTE
 - none
 
 ## Test matrix delta
-- BDD-010: pass
+- none
 
 ## Verify output (summary)
-`./scripts/verify.sh` completed successfully in this container: the build succeeded, both doctest binaries passed, and the self-test took the expected Metal SKIP path (`[self-test SKIP] metal-device: ...`) because this host does not expose a Metal device. I did not see a spec mismatch in the D-029 guard, the new Block 22 mechanization, or the BDD-010 matrix wording update.
+`./scripts/verify.sh` exited 0. The build completed, both doctest binaries passed (159/159 and 1120/1120 assertions), and the main executable reported `[self-test SKIP] metal-device: MTL::CreateSystemDefaultDevice() returned null`, which is the expected non-Metal-host skip rather than a failure.
