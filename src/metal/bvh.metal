@@ -391,10 +391,58 @@ kernel void buildTree_Edge(
     treeParent[childB] = id;
 }
 
+// D-029: zero treeVisitCounts before each bottomUpBoxes dispatch.
+// Each thread writes one slot; dispatched over numNodes threads.
+kernel void zeroVisitCounts(
+    device uint* counts [[buffer(0)]],
+    constant uint& numNodes [[buffer(1)]],
+    uint id [[thread_position_in_grid]]
+) {
+    if (id < numNodes) counts[id] = 0u;
+}
+
+// D-029: lock-free single-dispatch bottom-up AABB combine.
+//
+// Each leaf thread walks up to the root via `treeParent`. At each
+// parent it does atomic_fetch_add(readyCount[parent], 1):
+//   - old == 0: first child to arrive — exit (the second arrival
+//     will do the combine, which halves the surviving threads at
+//     each level → log(N) work depth).
+//   - old == 1: second child has arrived — both children's AABBs
+//     are now writeable; this thread reads them, computes the
+//     parent AABB, writes it, then continues up to grandparent.
+//
+// **Memory ordering (Metal 3.2+).** MSL's atomic operations are
+// restricted to `memory_order_relaxed`, but `atomic_thread_fence`
+// supports `memory_order_seq_cst` with explicit `mem_flags` and
+// `thread_scope` (MSL Spec §6.15.1–§6.15.3). The seq_cst fence is
+// a sequentially-consistent acquire-AND-release barrier within
+// `thread_scope_device`, scoped to `mem_flags::mem_device`. Two
+// fence sites bracket the atomic publication boundary:
+//   (a) after the second-arrival's `atomic_fetch_add` returns 1,
+//       before reading `tree[childA/B]` — acquires the sibling
+//       (first-arrival) thread's child-AABB writes.
+//   (b) after this thread writes `tree[parent].min/max`, before
+//       the next loop iteration's `atomic_fetch_add` at the
+//       grandparent — releases this thread's parent-AABB writes
+//       to the sibling thread that will later acquire them.
+// No fence is needed at kernel entry: leaf AABBs are written by
+// the prior `buildLeaf*` dispatch in the same command queue, and
+// Metal guarantees cross-dispatch visibility at the command
+// boundary.
+//
+// Pre-condition: `treeVisitCounts[]` must be zero on entry — use
+// `zeroVisitCounts` immediately before dispatching this kernel.
+// Pre-condition: `treeParent[]` must already be populated by
+// `buildTree_*` (build) OR carried from the prior build (refit;
+// topology unchanged across refits).
+//
+// Replaces the multi-pass `bottomUpCombineStep` driver (removed
+// in the same slice).
 kernel void bottomUpBoxes(
     constant AABB4& sceneBox [[buffer(2)]],
     device BVHNode* tree [[buffer(4)]],
-    device int* treeParent [[buffer(5)]],
+    device const int* treeParent [[buffer(5)]],
     device atomic_uint* treeVisitCounts [[buffer(6)]],
     uint id [[thread_position_in_grid]]
 ) {
@@ -406,20 +454,25 @@ kernel void bottomUpBoxes(
     while (true) {
         int parent = treeParent[child];
 
-        // old == 0 : first child arrives
-        // old == 1 : second child arrives
+        // Atomics are relaxed-only in MSL; fences carry the
+        // memory ordering — see kernel doc-block above.
         uint old = atomic_fetch_add_explicit(
             &treeVisitCounts[parent],
             1u,
-            memory_order_relaxed // this is problematic. No guarantee for the saving childA, B
+            memory_order_relaxed
         );
 
         if (old == 0u) {
-            // first child: do nothing more
+            // First arrival — exit; second arrival will combine.
             return;
         }
 
-        // second child: both children are now ready
+        // (a) Acquire the first arrival's child-AABB writes
+        // before reading children's bounds.
+        atomic_thread_fence(mem_flags::mem_device,
+                            memory_order_seq_cst,
+                            thread_scope_device);
+
         int childA = tree[parent].childA;
         int childB = tree[parent].childB;
 
@@ -431,88 +484,18 @@ kernel void bottomUpBoxes(
         tree[parent].min = packed_float3(min(minA, minB));
         tree[parent].max = packed_float3(max(maxA, maxB));
 
-        // now parent is finished, continue upward
+        // (b) Release this thread's parent-AABB write before the
+        // next iteration's atomic at the grandparent — so the
+        // sibling thread (which will acquire via fence (a) after
+        // its own fetch_add) sees our write.
+        atomic_thread_fence(mem_flags::mem_device,
+                            memory_order_seq_cst,
+                            thread_scope_device);
+
         child = parent;
-        if (child == 0) return; // root reached
+        if (child == 0) return; // wrote root, done
     }
 }
-
-
-struct BottomUpParams {
-    uint numPrimitives;  // leaf count
-    uint numNodes;       // 2*numPrimitives - 1
-};
-
-kernel void initBottomUpReady(
-    constant BottomUpParams& params [[buffer(0)]],
-    device uint* readyCur [[buffer(1)]],
-    device uint* readyNext [[buffer(2)]],
-    uint id [[thread_position_in_grid]]
-) {
-    if (id >= params.numNodes) return;
-
-    uint leafBegin = params.numPrimitives - 1;
-    uint r = (id >= leafBegin) ? 1u : 0u;
-
-    readyCur[id] = r;
-    readyNext[id] = r;
-}
-
-kernel void clearBottomUpProgress(
-    device uint* progress [[buffer(0)]],
-    uint tid [[thread_position_in_grid]]
-) {
-    if (tid == 0) progress[0] = 0u;
-}
-
-kernel void bottomUpCombineStep(
-    constant BottomUpParams& params [[buffer(0)]],
-    device BVHNode* tree [[buffer(1)]],
-    device const uint* readyCur [[buffer(2)]],
-    device uint* readyNext [[buffer(3)]],
-    device uint* progress [[buffer(4)]],
-    uint id [[thread_position_in_grid]]
-) {
-    if (id >= params.numNodes) return;
-
-    uint leafBegin = params.numPrimitives - 1;
-
-    // leaf stays ready
-    if (id >= leafBegin) {
-        readyNext[id] = 1u;
-        return;
-    }
-
-    // already ready -> keep ready
-    if (readyCur[id]) {
-        readyNext[id] = 1u;
-        return;
-    }
-
-    int childA = tree[id].childA;
-    int childB = tree[id].childB;
-
-    if (childA < 0 || childB < 0) {
-        readyNext[id] = 0u;
-        return;
-    }
-
-    if (readyCur[childA] && readyCur[childB]) {
-        float3 minA = float3(tree[childA].min);
-        float3 maxA = float3(tree[childA].max);
-        float3 minB = float3(tree[childB].min);
-        float3 maxB = float3(tree[childB].max);
-
-        tree[id].min = packed_float3(min(minA, minB));
-        tree[id].max = packed_float3(max(maxA, maxB));
-
-        readyNext[id] = 1u;
-        progress[0] = 1u;
-    } else {
-        readyNext[id] = 0u;
-    }
-}
-
 
 
 

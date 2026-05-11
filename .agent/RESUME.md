@@ -1,34 +1,38 @@
-# Resume — PBR Preview Shader Slice (D-028 lands; BDD-005 render path closed, render clause manual-test-only)
+# Resume — BVH bottom-up GPU combine (D-029 + fix-turn; FULL scope shipped)
 
 ## Must remember
 
-- **Branch:** `feat/pbr-preview-shader` (off `main` at `9b76f7b`).
-- **D-028 is the canonical preview-shader semantic.** GGX-Smith microfacet + single directional light + small ambient term + 5 individual uniforms matching D-005's v1 OpenPBR subset. Implemented in `src/shader/shader.frag::pbrPreview()`; consumed via `MeshGL::draw`'s extended signature; called from `src/main.cpp:4914`. Anchors to OpenPBR — Cook-Torrance Beckmann and Lambert+specular were rejected for that reason.
-- **Manual visual gate IS the slice's load-bearing assertion.** The harness has no GL context (D-011 decoupled MeshGL specifically to make `--self-test` headless), so render-clause correctness cannot be mechanized in this slice. CURRENT_WORK.md has the explicit user-facing gate instructions at the top.
-- **BDD-005 row stays `warning`** in the matrix until the FBO render harness slice ships (separate slice candidate). This is a **standing structural WARNING** parallel to BDD-102's Alembic-bytes substitution — PROJECT_STATE.md records it under "What the Estimator should know" so future Estimator turns don't re-flag it as new debt.
-- **Uniform name <-> Material field name parity is load-bearing.** The shader's `uniform vec3 baseColor`, `uniform float metallic`, `uniform float roughness`, `uniform float specularWeight`, `uniform vec3 emissionColor` mirror `Material::{baseColor, metallic, roughness, specularWeight, emissionColor}` exactly. Grep is the cross-reference tool. Any future Material schema change (D-005 amendment) updates BOTH ends in lockstep.
-- **The `MeshGL::draw` signature change is compile-time call-site safe.** Forgetting a material field at the call site is a build error, not a silent zero — this was the load-bearing reason individual uniforms beat UBO (the UBO would have silently zero-filled missing fields).
-- **`Program::setUniform` has the needed overloads** at `include/program.hpp:208` (vec3) and `:241` (float). No scope expansion was needed here, but flag for future shader slices: confirm the overload set before introducing exotic uniform types.
+- **Branch:** `feat/bvh-bottomup-gpu` (off `main` at `eb1413e`). Two phases on this branch:
+  1. Original Generator turn: build + refit GPU port (+ CM-011 forensic resolved).
+  2. Fix-turn (this turn, Estimator turn 23 BLOCK absorbed): N=1 guard in `bottomUpBoxesGPU`.
+  Commit prefix `fix:` (BLOCK fix-turns stay on slice branch per GENERATOR.md).
+- **D-029 ships build AND refit on GPU**, with the N=1 guard. `bottomUpBoxesGPU` short-circuits when `numPrimitives <= 1`. For N=1, the tree's single node IS the leaf-root (no interior nodes to combine), and `buildTree_*` doesn't write `treeParent[0]` for that case — dispatching the kernel would read uninitialized parent and produce UB. `buildLeafGPU` still runs for N=1 (correctly writes the single leaf at tree[0]).
+- **`enlargeTrajectory` stays CPU.** Separate slice candidate; same per-substep-loop GPU port pattern as refit. CM-011 forensic confirmed the OLD "2-substep BVH lag" was an artifact, so future GPU enlargeTrajectory port is unblocked.
+- **Bug-probe is Apple-Silicon-masked**, documented in D-029 + CURRENT_WORK. The N=1 UB is real (spec-incorrect, would manifest on weaker memory models / non-zero-init buffers / strict OOB-trap GPUs), just invisible to this harness on Apple Silicon. The production guard is the spec-correct fix regardless.
+- **Block 22 is the N=1 path canary.** Single-triangle .obj imported from `/tmp/bdd_d029_n1.obj`, sim.initialize + sim.update, assert tree[0] AABB + queryClickRay hit. Pass label `D-029 fix / N=1 BVH safely bypasses bottom-up combine`.
+- **Metal 3.2 seq_cst fences in `bottomUpBoxes`.** MSL atomics are relaxed-only; fences carry ordering. Kernel is spec-correct, not TSO-dependent. Two fence sites bracket the publication boundary.
+- **CM-011 reframed as forensic.** OLD CPU refit's 2-substep BVH lag was a deferred-commit artifact, not a contract. NEW GPU refit has the standard 1-substep lag. BDD-010's OLD `lastSubstep`-iteration assertion was satisfied only by the artifact; the simplified `cumulativeNarrowCollisions > 0` form (with `enableSelfCollisions = false` default) honestly satisfies the spec.
 
 ## Last decisions + why
 
-- **D-028 — GGX-Smith over Cook-Torrance / Lambert+specular** (anchors to OpenPBR; only GGX provides visible roughness change). **Single directional light over point light** (DCC default; no falloff confound for a comparison preview). **Individual uniforms over UBO** (5-field count stable; compile-time call-site safety). **Manual-test mechanization over FBO pixel-diff / CPU reference BRDF** (harness has no GL context; FBO harness is its own ~150-line slice and is now tracked as a candidate; CPU reference BRDF has code-clone maintenance cost without catching real shader-side failure modes).
+- **D-029 fix-turn — N=1 guard at the C++ layer** (`bottomUpBoxesGPU`) over kernel-internal guard or sentinel-init. Smallest surface (3 lines), truer semantic ("N=1 has no interior nodes to combine"), symmetric with the existing N=0 guard.
+- **Block 22 stricter than minimum.** Three layered assertions: no-crash + tree[0] AABB + queryClickRay hit. Catches different fail modes (UB-crash, silent garbage write, BVH structural corruption). PLANNER.md step 7 stricter-when-cheap.
+- **No new D-NNN; D-029 rationale gets a fix-turn paragraph.** The fix is a guard refinement on the existing decision's pre-condition, not a new architectural call.
+- **No CM-012.** The trap pattern (kernel A's early-return leaves parallel array uninitialized; kernel B consumes assuming full coverage) is captured directly in D-029's fix-turn paragraph; not generic enough for its own CM yet.
 
 ## Next step you were about to take
 
-Slice implementation complete. **User must run the manual visual gate** described in CURRENT_WORK.md's top section before `/codex:rescue` is appropriate. The visual gate is the slice's load-bearing assertion; skipping it ships a shader nobody verified.
+Fix-turn complete. Next concrete step is the **Estimator's** turn — `./scripts/verify.sh` should exit 0 with **42/42** self-test PASS lines (Block 22 added; previous was 41). Expected verdict: **NOTE-clean** (BLOCK closed; turn-23 NOTE folded into TEST_MATRIX; bug-probe Apple-Silicon-mask documented).
 
-After visual gate passes:
-- `/codex:rescue` for Estimator turn 22. Expected verdict: NOTE level. The Estimator should acknowledge the standing structural WARNING (BDD-005 render clause is manual-test-only) as documented gap, not new debt — PROJECT_STATE.md records this explicitly.
+After this lands, planner-tracked candidates per `PROJECT_STATE.md`:
 
-Standing feature candidates after this slice (per `PROJECT_STATE.md`):
-
-- **FBO-based render harness slice** — gives `--self-test` a hidden GLFW window + offscreen framebuffer + `glReadPixels` sampling. Promotes BDD-005 row `warning → pass`. ~150–200 lines harness GL plumbing. The natural pixel-diff witness for BDD-005 is "select mesh; set material A (roughness 0.1) → sample center pixel → set material B (roughness 0.9) → sample center pixel → assert RGB differs above tolerance." With this slice's shader in place, the FBO harness has a real target.
-- **Inspector ergonomics for rotation** — Euler / axis-angle input affordances per FR-004 Notes. Manual-test-only mechanization.
-- **BDD-018 inspector live-edit propagation** — needs ImGui-side simulation or callable abstraction.
-- **Behavior assignment UI (FR-006 / BDD-006)** — Q2 still open.
-- **Rigid body slice (FR-008 / BDD-008)** — blocked on Q4. When this lands: D-014/D-015 + D-018 + D-019/D-022 + D-020 + D-021 + D-023 + D-024 + D-025 + D-026 + D-027 + D-028 all apply.
-- **Alembic export slice (FR-013 / BDD-013)** — blocked on Q5 + Q6.
-- **Role-doc maintenance pass** — `docs/roles/GENERATOR.md` still has stale `objTrees.clear()` gotcha entry (CM-008 graduated).
+- **GPU port of `enlargeTrajectory`** — same per-substep-loop pattern, now unblocked since CM-011 was resolved as forensic.
+- **FBO-based render harness slice** — for BDD-005's render-side clause.
+- **Inspector ergonomics for rotation** — Euler / axis-angle input.
+- **BDD-018 inspector live-edit propagation** — needs ImGui-side simulation.
+- **Behavior assignment UI (FR-006 / BDD-006)** — Q2 open.
+- **Rigid body (FR-008)** — Q4 blocked.
+- **Alembic export (FR-013)** — Q5+Q6 blocked.
+- **Role-doc maintenance pass**.
 
 See `.agent/PLAN.md` and `.agent/CURRENT_WORK.md` for full plan and progress.
