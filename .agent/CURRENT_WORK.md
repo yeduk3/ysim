@@ -1,28 +1,31 @@
-# Current Work — Hybrid BVH bottom-up combine (`feat/bvh-bottomup-hybrid`)
+# Current Work — BVH refit benchmarking harness (`feat/bvh-refit-bench`)
 
-- File in flight: none — slice complete (parallel-symbol restructure landed; see "Restructure" bullet below). **43/43 self-test PASS** deterministic across 5 runs. Doctest 159/159 + 1120/1120 green.
-- How far: all 16 PLAN todos done + post-Estimator restructure.
-  - **D-030 — hybrid GPU+CPU bottom-up with runtime depth knob, ADD parallel symbols.**
-    - `src/metal/bvh.metal::bottomUpBoxes` UNCHANGED from D-029 — D-029's pure-GPU walk-to-root kernel stays intact and callable.
-    - `src/metal/bvh.metal::bottomUpBoxesPartial` NEW kernel: same atomic + seq_cst fence shape as `bottomUpBoxes`, plus `constant uint& maxDepth [[buffer(7)]]`, local `depth = 0`, check-before-atomic at loop top, `depth++` after parent-AABB release fence. Preserves Metal 3.2 seq_cst fences (D-029) unchanged.
-    - `BVH<METAL,PR,LINEAR,PRIMITIVE>` gains:
-      - `int bottomUpHybridDepth = 2;` field (runtime knob, default 2).
-      - `MTL::ComputePipelineState* bottomUpBoxesPartialPSO;` registered as `"bottomUpBoxesPartial"` next to the existing `bottomUpBoxesPSO`.
-      - `bottomUpBoxesGPU(const AABB4&)` UNCHANGED (single-arg, D-029 form, dispatches `bottomUpBoxesPSO`) — stays callable.
-      - `bottomUpBoxesPartialGPU(const AABB4&, uint maxDepth)` NEW method that dispatches `bottomUpBoxesPartialPSO` with the maxDepth uniform bound to buffer(7).
-    - New `bottomUpCombineWithSkip()` — CPU walk from root that short-circuits at `treeVisitCounts[nodeId] == 2` (GPU-completed-frontier marker).
-    - New `bottomUpHybrid(sceneBox, maxDepth)` driver — handles 3 modes: N<=1 early return (with commit so prior dispatches flush), `maxDepth == 0` falls back to `bottomUpCombine()` (pure CPU), `maxDepth >= 1` calls `bottomUpBoxesPartialGPU` + `commitAndWait` + `bottomUpCombineWithSkip`.
-    - `BVH::build` and `BVH::refit` call sites updated to `bottomUpHybrid(sceneBox, bottomUpHybridDepth)`.
-  - **Restructure (post-Estimator turn 25):** earlier within this slice the partial-depth kernel was wired by widening `bottomUpBoxes` + `bottomUpBoxesGPU` in place with a `maxDepth` parameter. User flagged that as a process violation — creation-verb requests ("hybrid bottom-up combine 만들어보자") mean ADD a new parallel path, not modify the existing one. The restructure restored D-029's `bottomUpBoxes` kernel + `bottomUpBoxesGPU` method to their original single-arg form and added `bottomUpBoxesPartial` + `bottomUpBoxesPartialGPU` as parallel symbols. The rule is now captured in `.claude/skills/slice/SKILL.md` ("Interpreting the user's slice request") and in the `feedback_make_means_add_new` memory entry. D-030's DECISIONS entry was updated to (i) describe the parallel-symbol shape and (ii) add an invariant forbidding future collapse of the parallel pair.
-  - **`MetalGlobalContext::commitAndWait` made null-encoder-safe.** One-line guard added at the top; lets `bottomUpHybrid` commit on all paths without crashing when no GPU dispatch is pending. This was load-bearing for the N<=1 path — Block 22 silently dropped a PASS line because refit's `buildLeafGPU` dispatch sat in the encoder uncommitted after `bottomUpHybrid` early-returned.
-  - **Block 23 mechanizes correctness across `D ∈ {0, 1, 2, 1000}`.** Builds a tess=2 cube, captures CPU reference, then for each D: resets leaves via `buildLeafGPU` and runs `bottomUpHybrid(D)`; asserts every interior-node AABB bit-equal to reference. Pass label `D-030 / hybrid bottom-up matches CPU reference for D in {0,1,2,1000}`. Self-test count 42 → 43.
-  - **Bug-probes (2 of 3 documented):**
-    - **(a) Off-by-one in depth check** (`>` instead of `>=`): PASSED silently. Off-by-one makes GPU combine 1 extra level; final tree result is still correct (CPU completion absorbs the extra GPU work via the frontier-skip). Documented in D-030 — this is a perf-only bug, not a correctness bug, and the slice doesn't claim perf bounds.
-    - **(b) Skip-logic inversion** (`!= 2u` instead of `== 2u` in CPU helper): caught LOUDLY. FR-003 + FR-004 (refit-after-edit canaries) + D-029 (Block 21 per-interior-node diff) all FAIL together because CPU walks return at root with `visitCounts != 2`, leaving `tree[0]` uninitialized. Restored.
-    - **(c) Forgotten `depth++`** in kernel: not run separately; same equivalence-class argument as (a) — the loop would run forever (depth stays 0, check never triggers) until reaching root via `if (child == 0) return;`. Equivalent to pure-GPU (`maxDepth = INF`) behavior. Final tree result correct.
+- File in flight: none — slice complete. **44/44 self-test PASS** deterministic across 5 runs. Doctest 159/159 + 1120/1120 green. Full bench ran in ~109s and produced 160-row CSV + 2 PNG charts.
+- How far: all 18 PLAN todos done.
+  - **D-031 — BVH refit benchmarking harness.**
+    - NEW enum `BVHRefitMethod { FullCPU, HybridD1, HybridD2, FullGPU }` + free helpers `depthForBVHRefitMethod` / `labelForBVHRefitMethod` in `src/main.cpp` just before `runSelfTest`.
+    - NEW `struct BenchConfig` (methods, particleNum1Ds, warmupFrames, measuredFrames, outCsvPath).
+    - NEW `static int runRefitBench(const BenchConfig&)` function — mirrors `runSelfTest`'s Metal-availability gate (SKIP if no device / no metallib), iterates `(method, particleNum1D)`, constructs a fresh `Simulator` per config, toggles `bottomUpHybridDepth` on every `objTrees[i]` + `broadPhase.tree`, wires a local `FrameProfiler`, runs 1 warmup + 10 measured frames per (method, size), reads `broad_refit` section_ms via `history().sectionIndex("broad_refit")` + `latestFrame()`, writes CSV row per measured frame.
+    - NEW `--bench-bvh-refit` argv branch in `main()` constructs the full 4×4×10 config with `YSIM_PROJECT_ROOT`/profiles/experiment/bvh-refit-2026-05-12/refit_bench.csv as outCsvPath.
+    - NEW Block 24 in `runSelfTest`: smoke test invoking `runRefitBench` with `{HybridD2} × {16} × 1 measured frame` writing to `/tmp/ysim_refit_bench_smoke.csv`; asserts CSV header + exactly 1 data row + parseable non-negative refit_time_ms.
+    - NEW `profiles/experiment/bvh-refit-2026-05-12/` folder:
+      - `README.ko.md` — Korean experiment description with 4-methods/4-resolutions tables, the "FullGPU is bottomUpBoxesPartialGPU(30) not strict D-029" honest note, run instructions, caveats around warmup/instability/hardware.
+      - `chart.py` — self-contained matplotlib + csv stdlib script (no pandas). Reads `refit_bench.csv` from script-relative path, writes `refit_chart_line.png` (log-log line, error bars) + `refit_chart_bar.png` (grouped bars per particle count, error bars).
+      - `refit_bench.csv` — populated by `--bench-bvh-refit` run; 160 data rows.
+      - `refit_chart_line.png` + `refit_chart_bar.png` — generated by `chart.py`.
+  - **Production paths preserved (parallel-symbol rule respected):** `BVH::refit`, `BroadPhase::refit`, `bottomUpHybrid`, `bottomUpCombine`, `bottomUpBoxesGPU`, `bottomUpBoxesPartialGPU`, `bottomUpCombineWithSkip`, and all prior Blocks 1–23 are UNCHANGED. The bench only reads `bottomUpHybridDepth` (existing field) and writes to it between runs.
+  - **Measured findings (this slice's data):**
+    - 1k (1024 vert) / 10k (10000 vert): all four methods cluster in a ~25–60 ms band per frame. Noise-dominated; no clear winner.
+    - 100k (99,856 vert): FullGPU ≈ 97 ms, others ≈ 175–195 ms. **~1.8× FullGPU speedup.**
+    - 500k (499,849 vert): FullGPU ≈ 353 ms, others ≈ 673–790 ms. **~2.0× FullGPU speedup.**
+    - Hybrid D=1 / D=2 do NOT outperform FullCPU at any measured size. HybridD1 at 500k is slightly worse than FullCPU (~788 vs ~731 ms).
+    - **Implication:** D-030's hypothesis (hybrid sweet spot because GPU is wasteful at narrow tree top) is NOT supported by this measurement on Apple Silicon. The current production default `bottomUpHybridDepth = 3` is dominated by `30` at every measured size; the tune-default follow-up slice should consider raising it toward FullGPU.
+  - **Bug-probe (a) — disable CSV row write (`csv << row` line commented out):** Block 24 FAILS with `"no data row written"`. Restored.
+  - **Bug-probe (b) — method-identity mismatch (e.g., `depthForBVHRefitMethod` returning wrong values):** Block 24 still PASSES because smoke is mechanism-only, NOT method-identity. Documented in the block's comment + in PLAN's "Course corrections" + in D-031 rationale. The full-bench output is the user's gate for method-identity; the smoke is regression net for the harness mechanism only.
 - What's tested:
-  - 43/43 self-test PASS deterministic 5×.
-  - Block 23 sweeps 4 D values + Block 21 + Block 22 + FR-003/004 refit canaries all green.
-  - Doctest 159/159 + 1120/1120 SUCCESS.
-- Non-goals respected: no perf benchmarking (knob is runtime-tunable for future measurement), no inspector widget for the depth knob, no auto-tuning heuristic, no hybrid `enlargeTrajectory`, no new BDD/FR.
-- What's next: re-run Estimator (Codex) on the parallel-symbol restructure. Expected verdict: NOTE / WARNING. Possible items: (i) probe (a)'s silent pass means the D-sweep doesn't discriminate between off-by-one and correct depth-check placement (correctness-only test, perf bugs uncaught); (ii) default `bottomUpHybridDepth = 2` is a starting point, not measurement-validated; (iii) two parallel kernels share most of their body, so a future drift between them is the new maintenance hazard — acceptable trade for keeping D-029 callable, but worth a NOTE.
+  - 44/44 self-test PASS deterministic 5×.
+  - Block 24 smoke + Blocks 1–23 all green.
+  - Doctest 159/159 + 1120/1120 SUCCESS via `verify-light.sh`.
+  - `--bench-bvh-refit` full sweep completed in ~109 seconds; 160 rows written; both charts rendered without error.
+- Non-goals respected: no perf-correctness assertion in Block 24 (intentionally mechanism-only); no production `bottomUpHybridDepth` default change (deferred to tune-default follow-up); no strict-D-029 column; no cross-scene benchmarks; no GPU profiling primitives; no Metal-kernel changes; no `BVH::refit` / `bottomUpHybrid` modifications; no inspector widget; no source-file split (deferred per user note).
+- What's next: Estimator review (Codex). Expected verdict: NOTE or WARNING. Possible items: (i) `[Pool] Tried to allocate more than the capacity` warning lines emitted during the 500k bench run — non-fatal but worth noting in case it indicates a soft cap; (ii) the bench's "FullGPU = bottomUpBoxesPartialGPU(30)" approximation is documented but is a minor deviation from a strict-D-029 measurement; (iii) the measured-result paragraph in D-031 makes a recommendation ("raise production default toward FullGPU") that arguably belongs in a follow-up slice's plan, not in DECISIONS.md — informational but not actionable here.

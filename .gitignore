@@ -7,7 +7,9 @@ compile_commands.json
 .DS_Store
 
 codex/
-profiles/
+profiles/*
+!profiles/experiment/
+!profiles/experiment/**
 
 .claude/settings.local.json
 CLAUDE.md

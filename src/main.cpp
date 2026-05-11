@@ -5717,6 +5717,189 @@ struct ExplicitSystem<METAL, PR> {
 //
 // Pass/fail via stderr lines + exit code (0 == all-pass). The Estimator's
 // scripts/verify.sh runs this from cwd=build/ so default.metallib is found.
+// D-031: BVH refit benchmarking harness. Times `broad_refit` across four
+// refit methods x four cloth resolutions x ten frames on a cloth-only
+// FastGridCloth scene, writes per-frame CSV rows. Method labels map to
+// values of D-030's runtime `bottomUpHybridDepth` knob; "FullGPU" routes
+// through `bottomUpBoxesPartialGPU(30)` (kernel walks to root because the
+// depth check never fires at the cutoff) rather than the strict D-029
+// `bottomUpBoxesGPU` direct dispatch — the depth-counter overhead is one
+// register-read + one compare per iteration, dwarfed by the atomic + 2
+// seq_cst fences in the same iteration; treated as sub-noise. A future
+// follow-up slice can add a strict-D-029 column if measurement-vs-noise
+// becomes a question (recorded as a candidate in PROJECT_STATE).
+//
+// Production paths untouched: this is all NEW symbols per the
+// make-means-add-new rule baked into `.claude/skills/slice/SKILL.md`.
+//
+// Lives next to `runSelfTest` for now per the user's "tests-in-main"
+// convention; a future source-file split slice will move both out.
+enum class BVHRefitMethod {
+    FullCPU,
+    HybridD1,
+    HybridD2,
+    FullGPU,
+};
+
+inline int depthForBVHRefitMethod(BVHRefitMethod m) {
+    switch (m) {
+        case BVHRefitMethod::FullCPU:   return 0;
+        case BVHRefitMethod::HybridD1:  return 1;
+        case BVHRefitMethod::HybridD2:  return 2;
+        // 30 > log2(largest tree depth in this slice's sweep): a 707x707
+        // cloth has ~2N-1 ~= 2M nodes, log2 ~= 21. Anything >= 21 makes
+        // the kernel walk to root; 30 leaves headroom for larger future
+        // configs without re-tuning.
+        case BVHRefitMethod::FullGPU:   return 30;
+    }
+    return 0;
+}
+
+inline const char* labelForBVHRefitMethod(BVHRefitMethod m) {
+    switch (m) {
+        case BVHRefitMethod::FullCPU:   return "FullCPU";
+        case BVHRefitMethod::HybridD1:  return "HybridD1";
+        case BVHRefitMethod::HybridD2:  return "HybridD2";
+        case BVHRefitMethod::FullGPU:   return "FullGPU";
+    }
+    return "Unknown";
+}
+
+struct BenchConfig {
+    std::vector<BVHRefitMethod> methods;    // default: all 4
+    std::vector<int> particleNum1Ds;        // grid edge sizes; vertices = N*N
+    int warmupFrames = 1;                   // discarded (cold-start absorbed)
+    int measuredFrames = 10;                // recorded per (method, size)
+    std::string outCsvPath;                 // absolute or build-cwd relative
+};
+
+// Smoke-config used by Block 24 + filled-out full-sweep config used by
+// the `--bench-bvh-refit` CLI flag. Self-contained helper, NO modification
+// to BVH::refit / bottomUpHybrid / any existing production path.
+static int runRefitBench(const BenchConfig& cfg) {
+    using Backend = METAL;
+    using SystemT = ExplicitSystem<Backend, Precision>;
+
+    // Mirror runSelfTest's Metal-availability gate. SKIP on non-Metal
+    // hosts so a Linux container that wires this harness wouldn't gate-fail.
+    auto* device = MetalGlobalContext::getDevice();
+    if (!device) {
+        std::cerr << "[refit-bench SKIP] metal-device: "
+                     "MTL::CreateSystemDefaultDevice() returned null\n";
+        return 0;
+    }
+    auto* lib = MetalKernelContext::getLibrary();
+    if (!lib) {
+        std::cerr << "[refit-bench SKIP] metal-library: "
+                     "default.metallib not loadable from cwd\n";
+        return 0;
+    }
+
+    // Create parent dir + open CSV.
+    namespace fs = std::filesystem;
+    fs::path csvPath(cfg.outCsvPath);
+    if (csvPath.has_parent_path()) {
+        std::error_code ec;
+        fs::create_directories(csvPath.parent_path(), ec);
+        if (ec) {
+            std::cerr << "[refit-bench FAIL] mkdir " << csvPath.parent_path()
+                      << ": " << ec.message() << "\n";
+            return 1;
+        }
+    }
+    std::ofstream csv(csvPath);
+    if (!csv) {
+        std::cerr << "[refit-bench FAIL] open " << cfg.outCsvPath << "\n";
+        return 1;
+    }
+    csv << "method,particle_count,frame_index,refit_time_ms\n";
+
+    // Local scene reset (duplicated from runSelfTest's lambda — see
+    // PLAN.md's "course corrections" + the future source-file split
+    // candidate; keeping the duplication local rather than refactoring
+    // runSelfTest to avoid scope expansion).
+    auto resetScene = []() {
+        for (auto& m : Scene<Backend, Precision>::meshes) m.initializer = nullptr;
+        Scene<Backend, Precision>::meshes.clear();
+        for (auto& r : Scene<Backend, Precision>::requestsGeneralMeshes)
+            delete r.initializer;
+        Scene<Backend, Precision>::requestsGeneralMeshes.clear();
+        Scene<Backend, Precision>::numMeshes = 0;
+        Scene<Backend, Precision>::dirty = true;
+        Scene<Backend, Precision>::environment = SceneEnvironment{};
+    };
+
+    for (auto method : cfg.methods) {
+        for (int particleNum1D : cfg.particleNum1Ds) {
+            int64_t particleCount = (int64_t)particleNum1D * particleNum1D;
+
+            resetScene();
+            Precision h = Precision(1) / Precision(60);
+            Index subSteps = 60;  // per PLAN: 60 substeps per frame, locked.
+            SystemT system(h, subSteps);
+            Simulator<Backend, Precision, SystemT> sim(system);
+            sim.pause = false;
+
+            // Cloth-only scene; defaults per addClothGridFast — instability
+            // at 500k is acceptable for refit-time measurement (PLAN §c).
+            sim.addClothGridFast(particleNum1D, /*size1D=*/Precision(1.0));
+            sim.initialize();
+
+            // Toggle the D-030 runtime knob on the per-mesh BVH(s).
+            // bottomUpHybrid dispatches based on this value:
+            //   0  -> bottomUpCombine (pure CPU)
+            //   1..log2(N)-1 -> bottomUpBoxesPartialGPU + skip-CPU
+            //   >= log2(N) -> kernel walks to root; skip-CPU short-circuits.
+            int depth = depthForBVHRefitMethod(method);
+            for (auto& objTree : sim.collisionPipeline.broadPhase.objTrees) {
+                objTree.bottomUpHybridDepth = depth;
+            }
+            // Scene-level BVH (EDGE_LBVH over per-mesh AABBs) has its own
+            // bottomUpHybridDepth field; for a cloth-only scene it has 1
+            // leaf so bottomUpHybrid early-returns regardless, but set for
+            // cross-method consistency.
+            sim.collisionPipeline.broadPhase.tree.bottomUpHybridDepth = depth;
+
+            // Wire a local FrameProfiler so we can read per-frame
+            // `broad_refit` totals via the existing instrumentation
+            // (src/main.cpp:4927). 64 frames of ring buffer is plenty
+            // for warmup + measured.
+            profiler::FrameProfiler localProfiler(
+                static_cast<std::size_t>(cfg.warmupFrames + cfg.measuredFrames + 4));
+            sim.profiler = &localProfiler;
+
+            int totalFrames = cfg.warmupFrames + cfg.measuredFrames;
+            for (int f = 0; f < totalFrames; ++f) {
+                localProfiler.beginFrame(static_cast<uint64_t>(f),
+                                         static_cast<double>(f) * (double)h);
+                sim.update();
+                localProfiler.endFrame();
+
+                if (f >= cfg.warmupFrames) {
+                    int frameIdx = f - cfg.warmupFrames;
+                    int sidx = localProfiler.history().sectionIndex("broad_refit");
+                    double refitMs = -1.0;
+                    const auto* snap = localProfiler.history().latestFrame();
+                    if (snap && sidx >= 0
+                        && static_cast<std::size_t>(sidx) < snap->section_ms.size()) {
+                        refitMs = snap->section_ms[sidx];
+                    }
+                    csv << labelForBVHRefitMethod(method) << ','
+                        << particleCount << ','
+                        << frameIdx << ','
+                        << refitMs << '\n';
+                }
+            }
+            sim.profiler = nullptr;
+        }
+    }
+
+    csv.flush();
+    csv.close();
+    std::cerr << "[refit-bench DONE] wrote " << cfg.outCsvPath << "\n";
+    return 0;
+}
+
 static int runSelfTest() {
     using Backend = METAL;
     int failures = 0;
@@ -7661,6 +7844,73 @@ static int runSelfTest() {
         }
     }
 
+    // ---- Block 24: D-031 — refit bench harness writes one row for one frame. ----
+    // Thin smoke test: invokes runRefitBench(smokeCfg) with a 1-method x
+    // 1-size x 1-frame micro-config; asserts the CSV header is correct,
+    // exactly one data row was written, and refit_time_ms parses as a
+    // non-negative double. This is mechanism-only — NOT a perf assertion
+    // (perf numbers are noisy / non-deterministic / not PASS/FAIL'able).
+    //
+    // Bug-probe (a) — commenting out the `csv << row` line in
+    // runRefitBench should make this block FAIL with "no data row written".
+    // Bug-probe (b) — toggling depthForBVHRefitMethod's return values does
+    // NOT make this block FAIL: smoke is mechanism-only, method-identity
+    // correctness is the full-bench output's user gate (documented).
+    {
+        BenchConfig smokeCfg;
+        smokeCfg.methods         = {BVHRefitMethod::HybridD2};
+        smokeCfg.particleNum1Ds  = {16};    // 16x16 = 256 particles
+        smokeCfg.warmupFrames    = 0;
+        smokeCfg.measuredFrames  = 1;
+        smokeCfg.outCsvPath      = "/tmp/ysim_refit_bench_smoke.csv";
+
+        int rc = runRefitBench(smokeCfg);
+        if (rc != 0) {
+            fail("D-031 / refit bench harness writes one row for one frame",
+                 "runRefitBench returned " + std::to_string(rc));
+        } else {
+            std::ifstream in("/tmp/ysim_refit_bench_smoke.csv");
+            if (!in) {
+                fail("D-031 / refit bench harness writes one row for one frame",
+                     "CSV not written at /tmp/ysim_refit_bench_smoke.csv");
+            } else {
+                std::string header, row, extra;
+                std::getline(in, header);
+                bool hasRow = (bool)std::getline(in, row);
+                bool hasExtra = (bool)std::getline(in, extra);
+                const std::string expectedHeader =
+                    "method,particle_count,frame_index,refit_time_ms";
+                if (header != expectedHeader) {
+                    fail("D-031 / refit bench harness writes one row for one frame",
+                         "header mismatch: got '" + header + "'");
+                } else if (!hasRow || row.empty()) {
+                    fail("D-031 / refit bench harness writes one row for one frame",
+                         "no data row written");
+                } else if (hasExtra && !extra.empty()) {
+                    fail("D-031 / refit bench harness writes one row for one frame",
+                         "expected 1 data row, got more: '" + extra + "'");
+                } else {
+                    // Parse trailing refit_time_ms (4th field) and assert >= 0.
+                    auto lastComma = row.rfind(',');
+                    bool parsed = false;
+                    double t = -1.0;
+                    if (lastComma != std::string::npos) {
+                        try {
+                            t = std::stod(row.substr(lastComma + 1));
+                            if (t >= 0.0) parsed = true;
+                        } catch (...) {}
+                    }
+                    if (parsed) {
+                        pass("D-031 / refit bench harness writes one row for one frame");
+                    } else {
+                        fail("D-031 / refit bench harness writes one row for one frame",
+                             "refit_time_ms unparseable / negative in row: '" + row + "'");
+                    }
+                }
+            }
+        }
+    }
+
     if (failures == 0) {
         std::cerr << "[self-test] all checks passed\n";
         return 0;
@@ -7672,6 +7922,27 @@ static int runSelfTest() {
 int main(int argc, char** argv) {
     if (argc > 1 && std::string(argv[1]) == "--self-test") {
         return runSelfTest();
+    }
+    if (argc > 1 && std::string(argv[1]) == "--bench-bvh-refit") {
+        // Full 4 x 4 x 10 sweep. Output lands under profiles/experiment/
+        // alongside README.ko.md + chart.py for the reader.
+        BenchConfig cfg;
+        cfg.methods         = {BVHRefitMethod::FullCPU,
+                               BVHRefitMethod::HybridD1,
+                               BVHRefitMethod::HybridD2,
+                               BVHRefitMethod::FullGPU};
+        // Vertex counts ~ {1k, 10k, 100k, 500k}. Triangle counts are
+        // 2*(N-1)^2 (see README.ko.md "방법론").
+        cfg.particleNum1Ds  = {32, 100, 316, 707};
+        cfg.warmupFrames    = 1;
+        cfg.measuredFrames  = 10;
+#ifdef YSIM_PROJECT_ROOT
+        cfg.outCsvPath = std::string(YSIM_PROJECT_ROOT)
+                       + "/profiles/experiment/bvh-refit-2026-05-12/refit_bench.csv";
+#else
+        cfg.outCsvPath = "profiles/experiment/bvh-refit-2026-05-12/refit_bench.csv";
+#endif
+        return runRefitBench(cfg);
     }
 
     std::cout << "Run simulator" << std::endl;
