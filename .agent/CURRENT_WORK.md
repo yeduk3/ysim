@@ -1,18 +1,23 @@
-# Current Work — Rotate pack-roundtrip Slice (`feat/rotate-pack-roundtrip`)
+# Current Work — CM-008 production-side fix Slice (`fix/cm-008-broadphase-skip`)
 
-- File in flight: none — slice complete; ready for Estimator. **35/35 self-test PASS** deterministic across 5 runs. Doctest 159/159 + 1120/1120 green.
-- How far: all 13 PLAN todos done.
-  - **D-025 — Shape B over Shape A.** Picked the side-table re-apply path (rotateObject writes to `pendingRotations[id]`; `Simulator::initialize` auto-calls `applyPendingMaterials`; `applyPendingMaterials` rotation branch now calls `rotateObject(id, q)` to actually rotate fresh state.x). Rejected Shape A (initializer carries rotation, mirroring D-015 for translate) because Shape B is 5 lines vs Shape A's 4-class refactor.
-  - **`Simulator::rotateObject`** writes `pendingRotations[meshId] = newAbs` at the end (after state.x mutation + broadPhase.refit).
-  - **`Simulator::initialize`** auto-calls `applyPendingMaterials()` at the end. Existing explicit calls (after loadScene in main.cpp / runSelfTest) stay correct — they become no-ops because the maps are already cleared.
-  - **`Simulator::applyPendingMaterials`** snapshots pendingRotations before the loop (rotateObject re-populates during its call, so iterating the map directly would mutate the container under the iterator), then calls `rotateObject(id, savedQuat)` for each entry. Material branch unchanged.
-  - **Block 18** mechanizes the round-trip: 90deg-Z rotate cube at origin → addCube (forces re-pack) → assert state.x[0] still reflects the rotation. Pass label: `FR-004 / rotateObject survives Scene::pack rebuild`.
-  - **Bug-probe verified** — skipping the `pendingRotations[meshId] = newAbs` write makes Block 18 FAIL with `post-repack state.x[0] drifted from rotated value: expected (0.25, 0.25, -0.25) got (0.25, -0.25, -0.25)` (the un-rotated witness). Restored.
-  - **Estimator turn-18 WARNING fold-in** — `docs/TEST_MATRIX.md` BDD-017 row's test address gained a Block 17 cross-reference for the triangle-precision sister mechanization.
+- File in flight: none — slice complete; ready for Estimator. **36/36 self-test PASS** deterministic across 5 runs. Doctest 159/159 + 1120/1120 still green (verified earlier; will re-run via verify-light at the very end).
+- How far: all 17 PLAN todos done.
+  - **D-026 — Shape A over Shape B.** Picked the lifetime-id field path (never-resetting monotone counter on Scene; `mesh.lifetimeId` separate from `mesh.id` to preserve D-018 RNG seed semantic; `TRI_LBVH::builtForLifetimeId` cached at build; `BroadPhase::build`'s Float-mesh skip gains the lifetimeId match conjunct). Rejected Shape B (explicit `BroadPhase::invalidate()` API) — foolproof beats explicit for an internal optimization.
+  - **`Scene<BE,PR>`** gains `inline static int lifetimeMeshCount = 0;` (never resets).
+  - **`Scene<BE,PR>::RequestGeneralMesh`** gains `int lifetimeId;` field + constructor param.
+  - **`Scene<BE,PR>::addGeneralMesh`** passes `lifetimeMeshCount++` to the request, symmetric with `numMeshes++`.
+  - **`GeneralMesh<BE,PR>`** gains `int lifetimeId = -1;` field; mirrored in the move constructor (without it, every move-realized mesh would default to `-1` and force unnecessary rebuilds).
+  - **`Scene<BE,PR>::pack` realization** sets `meshes[i].lifetimeId = req.lifetimeId;` adjacent to the existing `meshes[i].id = req.id;` line.
+  - **`BVH<METAL,PR,LINEAR,PRIMITIVE>`** gains `int builtForLifetimeId = -1;` field on the per-mesh TRI_LBVH.
+  - **`BVH::build(int oid, ...)`** caches `builtForLifetimeId = mesh->lifetimeId` alongside the existing `objBehavior` cache. The `build(GeneralMesh&)` overload delegates here, so both call paths route through the cache.
+  - **`BroadPhase::build` skip clause** gains `objTrees[i].builtForLifetimeId == scene.meshes[i].lifetimeId` as a third conjunct.
+  - **Block 19** mechanizes the scene-swap-at-same-count round-trip WITHOUT `objTrees.clear()`: addCube at (-3,0,0) → init → update → resetScene → addCube at (+3,0,0) → init → update → ray at x=+3 z=10. Pass label `CM-008 / scene-swap-at-same-count rebuilds Float-mesh BVH`. Bug-probe verified — reverting the lifetimeId clause makes Block 19 FAIL with the expected diagnostic AND simultaneously makes Blocks 14a/14b/16a/16b/17/18 FAIL because their workarounds are now removed and they legitimately depend on the production fix (5 FAILs total in the bug-probe, 36/36 PASS when restored).
+  - **7 harness workaround sites removed**: lines that previously held `sim.collisionPipeline.broadPhase.objTrees.clear();` (Blocks 14a/14b/15/16a/16b/17/18). The first site also had a 5-line CM-008 explanation comment which was removed too.
+  - **CM-008 graduated** to `docs/mistakes/OLD_MISTAKES.md` under a new high-level cause: "skip optimizations silently inherit prior-iteration identity when slot indices align."
 - What's tested:
-  - **35/35 self-test PASS** on macOS Apple Silicon, deterministic across 5 runs.
-  - Doctest binaries unchanged.
-  - **No matrix-row promotion** — Block 18 covers FR-004 cross-cutting (rotate persistence across re-pack), not a specific BDD row.
-- Non-goals respected: no initializer refactor, no `applyPendingMaterials` rename, no performance optimization, no CM-008 production-side fix, no other matrix rows.
-- The "rotate pack-roundtrip" item is now **dropped from RESUME's carry-forward list** (5-slice deferral chain ended).
-- What's next: Estimator review. Expect verdict at NOTE level — D-025 closes the long-deferred gap with bug-probe-verified Block 18 + matrix cross-reference fold-in.
+  - **36/36 self-test PASS** on macOS Apple Silicon, deterministic across 5 runs.
+  - Doctest binaries unchanged (verified mid-slice; will re-run verify-light before stop).
+  - **No matrix-row promotion** — Block 19 covers a CM, not a BDD row.
+- Non-goals respected: no Shape B invalidate API, no `lifetimeId` persistence in scene format, no inspector ergonomics, no other matrix rows.
+- The "CM-008 production-side fix" item is now **dropped from RESUME's carry-forward list**.
+- What's next: Estimator review. Expect verdict at NOTE level — D-026 closes a tracked CM with bug-probe-verified mechanization + harness cleanup.

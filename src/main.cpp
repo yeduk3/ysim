@@ -1599,6 +1599,11 @@ inline tinym::vec3 rotateVector(const Quat& q, const tinym::vec3& v) {
 template <typename BE, typename PR>
 struct GeneralMesh {
     int id;
+    // D-026: never-reused identity for BVH skip-cache invalidation. Set
+    // at Scene::pack realization from RequestGeneralMesh::lifetimeId.
+    // Distinct from `id` (which is numMeshes-derived and resets on
+    // resetScene; D-018 RNG seed). See CM-008 (graduated).
+    int lifetimeId = -1;
 
 
     MeshState<BE, PR> state;
@@ -1626,6 +1631,7 @@ struct GeneralMesh {
     : initializer(initializer), behaviorType(behaviorType), behaviorParams(behaviorParams) {}
     GeneralMesh(GeneralMesh&& other) noexcept
         : id(other.id),
+          lifetimeId(other.lifetimeId),
           state(std::move(other.state)),
           adjacency(std::move(other.adjacency)),
           initializer(other.initializer),
@@ -1679,20 +1685,28 @@ struct SceneEnvironment {
 template <typename BE, typename PR>
 struct Scene {
     inline static int numMeshes = 0;
+    // D-026: never-resetting monotone counter for per-mesh lifetime
+    // identity. Distinct from numMeshes (which resets on resetScene
+    // and is the D-018 RNG seed). Used by BroadPhase::build to gate
+    // the Float-mesh skip — see CM-008 (graduated).
+    inline static int lifetimeMeshCount = 0;
 
     inline static std::vector<GeneralMesh<BE, PR>> meshes;
     inline static SceneEnvironment environment;
 
     struct RequestGeneralMesh {
         int id;
+        int lifetimeId;
         GeneralMeshInitializer<BE, PR>* initializer;
         BehaviorType behaviorType;
         BehaviorParams<PR> behaviorParams;
 
-        RequestGeneralMesh(int id, GeneralMeshInitializer<BE, PR> *initializer,
+        RequestGeneralMesh(int id, int lifetimeId,
+                           GeneralMeshInitializer<BE, PR> *initializer,
                            BehaviorType behaviorType,
                            BehaviorParams<PR> behaviorParams)
-            : id(id), initializer(initializer), behaviorType(behaviorType),
+            : id(id), lifetimeId(lifetimeId), initializer(initializer),
+              behaviorType(behaviorType),
               behaviorParams(std::move(behaviorParams)) {}
     };
 
@@ -1703,7 +1717,8 @@ struct Scene {
         //meshes.emplace_back(initializer, behaviorType, behaviorParams);
         //meshes.back().id = numMeshes++;
 
-        requestsGeneralMeshes.emplace_back(numMeshes++, initializer, behaviorType, behaviorParams);
+        requestsGeneralMeshes.emplace_back(numMeshes++, lifetimeMeshCount++,
+                                           initializer, behaviorType, behaviorParams);
 
         dirty = true;
 
@@ -1828,6 +1843,7 @@ struct Scene {
             RequestGeneralMesh& req = requestsGeneralMeshes[i];
             meshes.emplace_back(req.initializer, req.behaviorType, req.behaviorParams);
             meshes[i].id = req.id;
+            meshes[i].lifetimeId = req.lifetimeId;  // D-026
             // Seed transformPosition from the initializer's center/offset so
             // BDD-003's translate path computes deltas against the author
             // intent, not against (0,0,0). Mirrors the dynamic_cast cascade
@@ -3137,6 +3153,11 @@ struct BVH<BE, PR, BVHMODE::LINEAR, PRIMITIVE> {
     VectorBase<METAL, uint32_t> bottomUpProgress;     // 1
 
     int objid; // who made this tree
+    // D-026: cached at build() time from mesh->lifetimeId so
+    // BroadPhase::build's Float-mesh skip can verify the slot still
+    // refers to the same mesh. Distinct from objid (which is mesh.id
+    // and resets on resetScene). See CM-008 (graduated).
+    int builtForLifetimeId = -1;
     VectorBase<METAL, int> objIds;
     BehaviorType objBehavior;
     VectorBase<METAL, BehaviorType> objBehaviors;
@@ -3403,6 +3424,7 @@ struct BVH<BE, PR, BVHMODE::LINEAR, PRIMITIVE> {
         if(mesh) {
             velocities = mesh->state.v;
             objBehavior = mesh->behaviorType;
+            builtForLifetimeId = mesh->lifetimeId;  // D-026
         }
         objShape = ShapeType::Mesh;
         //std::cout << "[BVH Build] positions and primitives are assigned" << std::endl;
@@ -3986,7 +4008,14 @@ struct BVH<BE, PR, BVHMODE::SCENE, BVHPRIMITIVE::OBJECT> {
         }
 
         for(Index i = 0; i < scene.numMeshes; ++i) {
-            if(objTrees[i].tree.ptr && objTrees[i].objBehavior == BehaviorType::Float) continue;
+            // D-026: gate the Float-mesh skip on lifetime identity in
+            // addition to behavior. Without the lifetimeId clause, a
+            // resetScene + new addCube×N at the same numMeshes count
+            // silently reuses the prior block's stale tree because
+            // both old and new are Float — see CM-008 (graduated).
+            if(objTrees[i].tree.ptr
+               && objTrees[i].objBehavior == BehaviorType::Float
+               && objTrees[i].builtForLifetimeId == scene.meshes[i].lifetimeId) continue;
             objTrees[i].build(scene.meshes[i]);
             Index pbase = i*6;
             positions[pbase  ] = objTrees[i].tree[0].min.x;
@@ -6621,13 +6650,6 @@ static int runSelfTest() {
         // cubeA at x=-1.5, cubeB at x=+1.5 (both y=0, z=0, size=0.5). Their
         // AABBs are disjoint along x; rays cast straight down -z through
         // each cube's x line miss the other.
-        //
-        // Force per-mesh BVHs to rebuild from scratch — broadPhase.build
-        // (src/main.cpp:3907) skips re-allocating Float-tagged trees when
-        // the slot is already populated, which is correct for production
-        // (Float meshes don't change shape) but breaks the harness pattern
-        // of consecutive distinct scenes reusing the same mesh indices.
-        sim.collisionPipeline.broadPhase.objTrees.clear();
         resetScene();
         sim.addCube(tinym::vec3(-1.5f, 0.0f, 0.0f), /*tess=*/2,
                     /*size=*/0.5f, /*mass=*/0.1f);
@@ -6680,7 +6702,6 @@ static int runSelfTest() {
         // --- Clause (b): overlapping case, front-most (smallest tmin). -
         // cubeFront at z=+2 (closer to ray origin at z=+10), cubeBack at
         // z=-2. Both share x=0; ray straight down -z passes through both.
-        sim.collisionPipeline.broadPhase.objTrees.clear();
         resetScene();
         sim.addCube(tinym::vec3(0.0f, 0.0f,  2.0f), /*tess=*/2,
                     /*size=*/0.5f, /*mass=*/0.1f);
@@ -6751,7 +6772,6 @@ static int runSelfTest() {
             return ::Quat{std::cos(half), axis.x * s, axis.y * s, axis.z * s};
         };
 
-        sim.collisionPipeline.broadPhase.objTrees.clear();
         resetScene();
         sim.addCube(tinym::vec3(0.0f, 0.0f, 0.0f), /*tess=*/2,
                     /*size=*/0.5f, /*mass=*/0.1f);
@@ -6820,7 +6840,6 @@ static int runSelfTest() {
     // regression that drops the refit() call surfaces as a hard FAIL.
     {
         // --- Clause (a): translateObject refits the BVH. ---------------
-        sim.collisionPipeline.broadPhase.objTrees.clear();
         resetScene();
         sim.addCube(tinym::vec3(0.0f, 0.0f, 0.0f), /*tess=*/2,
                     /*size=*/0.5f, /*mass=*/0.1f);
@@ -6864,7 +6883,6 @@ static int runSelfTest() {
         // (rotational symmetry). Use 45deg-Z so the AABB grows from
         // ±0.25 to ±0.25*sqrt(2) ≈ ±0.354 in xy. Witness ray at x=0.30
         // is OUTSIDE the original AABB and INSIDE the rotated AABB.
-        sim.collisionPipeline.broadPhase.objTrees.clear();
         resetScene();
         sim.addCube(tinym::vec3(0.0f, 0.0f, 0.0f), /*tess=*/2,
                     /*size=*/0.5f, /*mass=*/0.1f);
@@ -6932,7 +6950,6 @@ static int runSelfTest() {
     // AABB tmin = 2.5 (much smaller than cube's 9.75) — old AABB-only
     // logic would have picked Plane.
     {
-        sim.collisionPipeline.broadPhase.objTrees.clear();
         resetScene();
         sim.addCube(tinym::vec3(0.0f, 0.0f, 0.0f), /*tess=*/2,
                     /*size=*/0.5f, /*mass=*/0.1f);
@@ -6987,7 +7004,6 @@ static int runSelfTest() {
     // by writing pendingRotations[id] inside rotateObject AND auto-
     // calling applyPendingMaterials() from Simulator::initialize().
     {
-        sim.collisionPipeline.broadPhase.objTrees.clear();
         resetScene();
         sim.addCube(tinym::vec3(0.0f, 0.0f, 0.0f), /*tess=*/2,
                     /*size=*/0.5f, /*mass=*/0.1f);
@@ -7037,6 +7053,73 @@ static int runSelfTest() {
                     pass("FR-004 / rotateObject survives Scene::pack rebuild");
                 }
             }
+        }
+    }
+
+    // ---- Block 19: D-026 / CM-008 — scene-swap-at-same-count rebuilds Float-mesh BVH. ----
+    // Reproduces the harness pattern that motivated CM-008's workaround
+    // (objTrees.clear() between scenes) WITHOUT calling clear(). The
+    // production fix (D-026 — lifetimeId gate on BroadPhase::build's
+    // Float-mesh skip) makes the workaround unnecessary. Bug-probe
+    // condition: revert the lifetimeId clause in the skip → expect
+    // FAIL with "ray hit nothing" diagnostic (stale slot-0 leaf AABB
+    // at x=-3 is missed by the ray cast at x=+3).
+    {
+        const Index kNoHit19 = static_cast<Index>(-1);
+        auto pickClosest19 = [&]() -> Index {
+            auto& rt = Scene<Backend, Precision>::rayTracedData;
+            Index n = rt.numClickRayCollisions[0];
+            if (n == 0) return kNoHit19;
+            Index closest = rt.clickRayCollisions[0].obj;
+            float tmin = rt.clickRayCollisions[0].tmin;
+            for (Index i = 1; i < n; ++i) {
+                if (rt.clickRayCollisions[i].tmin < tmin) {
+                    tmin = rt.clickRayCollisions[i].tmin;
+                    closest = rt.clickRayCollisions[i].obj;
+                }
+            }
+            return closest;
+        };
+
+        // Phase 1: build a tree for cube at x=-3. Populates objTrees[0]
+        // with builtForLifetimeId set to whatever lifetimeMeshCount was
+        // here. Crucially: NO objTrees.clear() before this — we rely on
+        // the production fix (D-026) to skip-correctly across scenes.
+        resetScene();
+        sim.addCube(tinym::vec3(-3.0f, 0.0f, 0.0f), /*tess=*/2,
+                    /*size=*/0.5f, /*mass=*/0.1f);
+        sim.initialize();
+        sim.update();
+
+        // Phase 2: resetScene WITHOUT manual objTrees.clear(); add a new
+        // cube at +3. The new mesh has a different lifetimeId, so the
+        // Float-mesh skip in BroadPhase::build must NOT fire for slot 0.
+        // Without D-026, slot 0's stale leaf AABB at x=-3 persists and
+        // the ray cast at x=+3 hits nothing.
+        resetScene();
+        sim.addCube(tinym::vec3(3.0f, 0.0f, 0.0f), /*tess=*/2,
+                    /*size=*/0.5f, /*mass=*/0.1f);
+        sim.initialize();
+        sim.update();
+        const Index newCubeId = 0;
+
+        Ray ray19;
+        ray19.origin = tinym::vec3(3.0f, 0.0f, 10.0f);
+        ray19.dir    = tinym::vec3(0.0f, 0.0f, -1.0f);
+        Scene<Backend, Precision>::rayTracedData.numClickRayCollisions[0] = 0;
+        sim.collisionPipeline.broadPhase.queryClickRay(ray19);
+        Index picked19 = pickClosest19();
+
+        if (picked19 == kNoHit19) {
+            fail("CM-008 / scene-swap-at-same-count rebuilds Float-mesh BVH",
+                 "ray at x=+3 hit nothing — stale tree slot 0 still has "
+                 "AABB at x=-3 (production fix D-026 reverted/missing?)");
+        } else if (picked19 != static_cast<Index>(newCubeId)) {
+            fail("CM-008 / scene-swap-at-same-count rebuilds Float-mesh BVH",
+                 "expected pickClosest id " + std::to_string(newCubeId) +
+                 " (new cube at +3), got " + std::to_string(picked19));
+        } else {
+            pass("CM-008 / scene-swap-at-same-count rebuilds Float-mesh BVH");
         }
     }
 
