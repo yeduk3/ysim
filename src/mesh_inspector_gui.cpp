@@ -32,14 +32,38 @@ void drawMeshInspectorWindow(
     if (target.shape_label) ImGui::Text("Shape: %s", target.shape_label);
 
     if (ImGui::CollapsingHeader("Appearance", ImGuiTreeNodeFlags_DefaultOpen)) {
-        ImGui::ColorEdit3("Base Color", target.base_color->v);
+        // D-027: material edits write through *target.base_color / metallic /
+        // ... in place for live preview (renderer reads mesh.material.*
+        // every frame), then fire on_material_edit so Simulator::setMaterial
+        // also writes pendingMaterials[id] for re-pack survival via D-025.
+        bool haveMaterial = target.metallic && target.roughness
+                         && target.specular_weight && target.emission_color
+                         && target.on_material_edit;
+
+        auto fireMaterialEdit = [&]() {
+            if (!haveMaterial) return;
+            target.on_material_edit(target.mesh_id,
+                                    *target.base_color,
+                                    *target.metallic,
+                                    *target.roughness,
+                                    *target.specular_weight,
+                                    *target.emission_color);
+        };
+
+        if (ImGui::ColorEdit3("Base Color", target.base_color->v)) fireMaterialEdit();
+
+        if (haveMaterial) {
+            if (ImGui::SliderFloat("Metallic", target.metallic, 0.0f, 1.0f))         fireMaterialEdit();
+            if (ImGui::SliderFloat("Roughness", target.roughness, 0.0f, 1.0f))       fireMaterialEdit();
+            if (ImGui::SliderFloat("Specular Weight", target.specular_weight, 0.0f, 1.0f)) fireMaterialEdit();
+            if (ImGui::ColorEdit3("Emission", target.emission_color->v))             fireMaterialEdit();
+        }
 
         if (ImGui::Button("Reset Color")) {
             *target.base_color = tinym::vec3(1.0f);
+            fireMaterialEdit();
             state.status_message = "Base color reset to white.";
         }
-        ImGui::SameLine();
-        ImGui::TextDisabled("More parameters can be added here later.");
     }
 
     if (target.transform_position && target.on_translate) {

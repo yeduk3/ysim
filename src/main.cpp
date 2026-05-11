@@ -4674,6 +4674,18 @@ struct Simulator {
         pendingRotations[meshId] = newAbs;
     }
 
+    // D-027: edit-time material mutator. Mirrors translateObject (D-014) and
+    // rotateObject (D-021). Writes mesh->material AND pendingMaterials[id]
+    // so the edit survives Scene::pack rebuild via D-025's auto-call from
+    // Simulator::initialize(). No broadPhase.refit() needed — material does
+    // not affect AABBs.
+    void setMaterial(int meshId, const Material& mat) {
+        auto* mesh = Scene<BE,PR>::findById(meshId);
+        if (!mesh) return;
+        mesh->material = mat;
+        pendingMaterials[meshId] = mat;
+    }
+
     void memoryAllocation() {
         //for(auto& plane : sceneObjects.planes) plane.memoryAllocation(pool);
         for(auto& mesh : scene.meshes) mesh.memoryAllocation();
@@ -7123,6 +7135,130 @@ static int runSelfTest() {
         }
     }
 
+    // ---- Block 20: D-027 — setMaterial closes BDD-005's data-layer clauses. ----
+    // Renderer-side clause ("preview render reflects the lower roughness")
+    // is parked under the PBR-preview-shader slice; this block mechanizes
+    // the data-layer subset: setMaterial writes all 5 fields to mesh.material;
+    // a sim step preserves them (BDD-103 backend-boundary); save/load
+    // round-trips them; addCube re-pack preserves them (D-025 sister
+    // mechanization).
+    {
+        resetScene();
+        sim.addCube(tinym::vec3(0.0f, 0.0f, 0.0f), /*tess=*/2,
+                    /*size=*/0.5f, /*mass=*/0.1f);
+        sim.initialize();
+        const int matMeshId = 0;
+
+        auto* m0 = Scene<Backend, Precision>::findById(matMeshId);
+        if (!m0) {
+            fail("BDD-005 / setMaterial writes all 5 fields to mesh.material",
+                 "cube id=" + std::to_string(matMeshId) + " not found");
+        } else {
+            ::Material edited;
+            edited.baseColor = tinym::vec3(0.2f, 0.3f, 0.4f);
+            edited.metallic = 0.7f;
+            edited.roughness = 0.1f;
+            edited.specularWeight = 0.8f;
+            edited.emissionColor = tinym::vec3(0.05f, 0.10f, 0.15f);
+
+            const float matTol = 1e-6f;
+            auto matEqual = [&](const ::Material& a, const ::Material& b) {
+                return std::abs(a.baseColor.x - b.baseColor.x) < matTol
+                    && std::abs(a.baseColor.y - b.baseColor.y) < matTol
+                    && std::abs(a.baseColor.z - b.baseColor.z) < matTol
+                    && std::abs(a.metallic - b.metallic) < matTol
+                    && std::abs(a.roughness - b.roughness) < matTol
+                    && std::abs(a.specularWeight - b.specularWeight) < matTol
+                    && std::abs(a.emissionColor.x - b.emissionColor.x) < matTol
+                    && std::abs(a.emissionColor.y - b.emissionColor.y) < matTol
+                    && std::abs(a.emissionColor.z - b.emissionColor.z) < matTol;
+            };
+
+            // Phase 1: setMaterial writes all 5 fields.
+            sim.setMaterial(matMeshId, edited);
+            if (!matEqual(m0->material, edited)) {
+                fail("BDD-005 / setMaterial writes all 5 fields to mesh.material",
+                     "mesh.material differs from edited after setMaterial: "
+                     "got baseColor=(" + std::to_string(m0->material.baseColor.x) + ", " +
+                     std::to_string(m0->material.baseColor.y) + ", " +
+                     std::to_string(m0->material.baseColor.z) + ") metallic=" +
+                     std::to_string(m0->material.metallic) + " roughness=" +
+                     std::to_string(m0->material.roughness) + " specWeight=" +
+                     std::to_string(m0->material.specularWeight) + " emission=(" +
+                     std::to_string(m0->material.emissionColor.x) + ", " +
+                     std::to_string(m0->material.emissionColor.y) + ", " +
+                     std::to_string(m0->material.emissionColor.z) + ")");
+            } else {
+                pass("BDD-005 / setMaterial writes all 5 fields to mesh.material");
+            }
+
+            // Phase 2: a sim step preserves material (BDD-103 backend-boundary —
+            // the simulation kernels must not clobber material fields).
+            sim.update();
+            auto* m0_postStep = Scene<Backend, Precision>::findById(matMeshId);
+            if (!m0_postStep || !matEqual(m0_postStep->material, edited)) {
+                fail("BDD-005 / material survives one sim step",
+                     "material drifted after sim.update() — kernel clobber?");
+            } else {
+                pass("BDD-005 / material survives one sim step");
+            }
+
+            // Phase 3: save → reset → load → init round-trip.
+            const std::string matSavePath = "/tmp/bdd005_material_roundtrip.ysim.json";
+            std::string saveErr;
+            if (!sim.saveScene(matSavePath, &saveErr)) {
+                fail("BDD-005 / material round-trips through saveScene/loadScene",
+                     "saveScene failed: " + saveErr);
+            } else {
+                resetScene();
+                auto lr20 = sim.loadScene(matSavePath);
+                if (!lr20.ok) {
+                    fail("BDD-005 / material round-trips through saveScene/loadScene",
+                         "loadScene failed: " + lr20.error.message);
+                } else {
+                    sim.initialize();  // auto-applyPendingMaterials writes mesh.material (D-025)
+                    auto* m0_postLoad = Scene<Backend, Precision>::findById(matMeshId);
+                    if (!m0_postLoad) {
+                        fail("BDD-005 / material round-trips through saveScene/loadScene",
+                             "cube id=0 disappeared after load");
+                    } else if (!matEqual(m0_postLoad->material, edited)) {
+                        fail("BDD-005 / material round-trips through saveScene/loadScene",
+                             "post-load material differs from saved edit: "
+                             "got roughness=" + std::to_string(m0_postLoad->material.roughness) +
+                             " (expected " + std::to_string(edited.roughness) + ")");
+                    } else {
+                        pass("BDD-005 / material round-trips through saveScene/loadScene");
+                    }
+                }
+            }
+
+            // Phase 4: addCube + sim.initialize() forces re-pack; setMaterial
+            // edit must survive (D-025 sister mechanization for material).
+            // The Phase 3 load already populated pendingMaterials[0] for the
+            // same edit; we re-apply via setMaterial to exercise the edit-time
+            // path explicitly (rather than relying on the load-time path).
+            auto* m0_preRepack = Scene<Backend, Precision>::findById(matMeshId);
+            if (m0_preRepack) {
+                sim.setMaterial(matMeshId, edited);  // ensures pendingMaterials[0] is set
+            }
+            sim.addCube(tinym::vec3(5.0f, 0.0f, 0.0f), /*tess=*/2,
+                        /*size=*/0.5f, /*mass=*/0.1f);
+            sim.initialize();
+            auto* m0_postRepack = Scene<Backend, Precision>::findById(matMeshId);
+            if (!m0_postRepack) {
+                fail("BDD-005 / material survives Scene::pack rebuild",
+                     "cube id=0 disappeared after re-pack");
+            } else if (!matEqual(m0_postRepack->material, edited)) {
+                fail("BDD-005 / material survives Scene::pack rebuild",
+                     "post-repack material differs — pendingMaterials write-back broken? "
+                     "got roughness=" + std::to_string(m0_postRepack->material.roughness) +
+                     " (expected " + std::to_string(edited.roughness) + ")");
+            } else {
+                pass("BDD-005 / material survives Scene::pack rebuild");
+            }
+        }
+    }
+
     if (failures == 0) {
         std::cerr << "[self-test] all checks passed\n";
         return 0;
@@ -7372,6 +7508,27 @@ int main(int argc, char** argv) {
                 target.rotation_wxyz = &selectedMesh->rotationQuat.w;
                 target.on_rotate = [&simulator](int id, float w, float x, float y, float z) {
                     simulator.rotateObject(id, ::Quat{w, x, y, z});
+                };
+                // D-027: material inspector path. base_color is set above;
+                // wire the other 4 material fields + the commit callback so
+                // each widget change routes through Simulator::setMaterial
+                // (which writes both mesh->material and pendingMaterials[id]).
+                target.metallic = &selectedMesh->material.metallic;
+                target.roughness = &selectedMesh->material.roughness;
+                target.specular_weight = &selectedMesh->material.specularWeight;
+                target.emission_color = &selectedMesh->material.emissionColor;
+                target.on_material_edit = [&simulator](int id,
+                                                       tinym::vec3 baseColor,
+                                                       float metallic, float roughness,
+                                                       float specularWeight,
+                                                       tinym::vec3 emissionColor) {
+                    ::Material m;
+                    m.baseColor = baseColor;
+                    m.metallic = metallic;
+                    m.roughness = roughness;
+                    m.specularWeight = specularWeight;
+                    m.emissionColor = emissionColor;
+                    simulator.setMaterial(id, m);
                 };
             }
             return target;

@@ -1,23 +1,24 @@
-# Current Work — CM-008 production-side fix Slice (`fix/cm-008-broadphase-skip`)
+# Current Work — FR-005 Material-edit Data-layer Slice (`feat/material-inspector-data-layer`)
 
-- File in flight: none — slice complete; ready for Estimator. **36/36 self-test PASS** deterministic across 5 runs. Doctest 159/159 + 1120/1120 still green (verified earlier; will re-run via verify-light at the very end).
-- How far: all 17 PLAN todos done.
-  - **D-026 — Shape A over Shape B.** Picked the lifetime-id field path (never-resetting monotone counter on Scene; `mesh.lifetimeId` separate from `mesh.id` to preserve D-018 RNG seed semantic; `TRI_LBVH::builtForLifetimeId` cached at build; `BroadPhase::build`'s Float-mesh skip gains the lifetimeId match conjunct). Rejected Shape B (explicit `BroadPhase::invalidate()` API) — foolproof beats explicit for an internal optimization.
-  - **`Scene<BE,PR>`** gains `inline static int lifetimeMeshCount = 0;` (never resets).
-  - **`Scene<BE,PR>::RequestGeneralMesh`** gains `int lifetimeId;` field + constructor param.
-  - **`Scene<BE,PR>::addGeneralMesh`** passes `lifetimeMeshCount++` to the request, symmetric with `numMeshes++`.
-  - **`GeneralMesh<BE,PR>`** gains `int lifetimeId = -1;` field; mirrored in the move constructor (without it, every move-realized mesh would default to `-1` and force unnecessary rebuilds).
-  - **`Scene<BE,PR>::pack` realization** sets `meshes[i].lifetimeId = req.lifetimeId;` adjacent to the existing `meshes[i].id = req.id;` line.
-  - **`BVH<METAL,PR,LINEAR,PRIMITIVE>`** gains `int builtForLifetimeId = -1;` field on the per-mesh TRI_LBVH.
-  - **`BVH::build(int oid, ...)`** caches `builtForLifetimeId = mesh->lifetimeId` alongside the existing `objBehavior` cache. The `build(GeneralMesh&)` overload delegates here, so both call paths route through the cache.
-  - **`BroadPhase::build` skip clause** gains `objTrees[i].builtForLifetimeId == scene.meshes[i].lifetimeId` as a third conjunct.
-  - **Block 19** mechanizes the scene-swap-at-same-count round-trip WITHOUT `objTrees.clear()`: addCube at (-3,0,0) → init → update → resetScene → addCube at (+3,0,0) → init → update → ray at x=+3 z=10. Pass label `CM-008 / scene-swap-at-same-count rebuilds Float-mesh BVH`. Bug-probe verified — reverting the lifetimeId clause makes Block 19 FAIL with the expected diagnostic AND simultaneously makes Blocks 14a/14b/16a/16b/17/18 FAIL because their workarounds are now removed and they legitimately depend on the production fix (5 FAILs total in the bug-probe, 36/36 PASS when restored).
-  - **7 harness workaround sites removed**: lines that previously held `sim.collisionPipeline.broadPhase.objTrees.clear();` (Blocks 14a/14b/15/16a/16b/17/18). The first site also had a 5-line CM-008 explanation comment which was removed too.
-  - **CM-008 graduated** to `docs/mistakes/OLD_MISTAKES.md` under a new high-level cause: "skip optimizations silently inherit prior-iteration identity when slot indices align."
+- File in flight: none — slice complete; ready for Estimator. **40/40 self-test PASS** deterministic across 5 runs. Doctest 159/159 + 1120/1120 still green (verified mid-slice; will re-run via verify-light at the very end).
+- How far: all 14 PLAN todos done.
+  - **D-027 — Shape B (mutator) over Shape A (direct mutation).** New `Simulator::setMaterial(meshId, Material)` in `src/main.cpp` adjacent to `translateObject` / `rotateObject`. Writes `mesh->material = mat` AND `pendingMaterials[meshId] = mat`. No `broadPhase.refit()` (material doesn't affect AABBs). ~5 lines.
+  - **`MeshInspectorTarget`** (in `include/MeshInspectorWindow.hpp`) gains 4 new pointer fields (`metallic`, `roughness`, `specular_weight`, `emission_color`) + `on_material_edit` callback (5-arg primitives form, matching `on_rotate` convention to avoid coupling the header to main.cpp's `Material` type).
+  - **`src/mesh_inspector_gui.cpp`** Appearance section renders 2 ColorEdit3 + 3 SliderFloat (0..1) widgets. A `fireMaterialEdit` lambda gathers the 5 current pointer reads and calls `target.on_material_edit(...)` on every change. The existing `Reset Color` button now also fires the callback (previously it only mutated `*target.base_color` directly, which lost on re-pack).
+  - **`buildSelectedMeshTarget`** at `src/main.cpp:7361` wires the 4 new pointer fields to `selectedMesh->material.*` and the callback to `simulator.setMaterial(id, m)` (constructs a `::Material` from the 5 callback args).
+  - **Block 20** mechanizes BDD-005's data-layer clauses across 4 phases:
+    - Phase 1: `sim.setMaterial(0, edited)` → assert all 5 fields written via `matEqual` lambda.
+    - Phase 2: `sim.update()` → assert material unchanged (BDD-103 backend-boundary; kernels must not clobber material fields).
+    - Phase 3: save to `/tmp/bdd005_material_roundtrip.ysim.json` → resetScene → load → init → assert all 5 fields restored (D-025's auto-applyPendingMaterials does the work).
+    - Phase 4: `setMaterial(0, edited)` again (to populate pendingMaterials for the edit-time path explicitly) → addCube + initialize (forces re-pack) → assert all 5 fields survived.
+  - **Bug-probe 1 verified**: removing the `pendingMaterials[meshId] = mat` write makes Phase 4 FAIL with `post-repack material differs — pendingMaterials write-back broken? got roughness=0.500000 (expected 0.100000)`. Restored.
+  - **Bug-probe 2 verified**: skipping the Phase 1 `setMaterial` call makes Phases 1/2/3 FAIL (mesh.material stays at defaults; saved file holds defaults), proving the matEqual lambda actually compares fields. Phase 4 PASSes because it re-calls `setMaterial` explicitly (intentional in the Block design). Restored.
+  - **`docs/TEST_MATRIX.md` updates**: BDD-005 row promoted `pending → warning` with full test address pointing at Block 20's 4 clauses + parked-clause note for the PBR-preview-shader gap. BDD-017 row's stale `objTrees.clear()` sentence (Estimator turn-20 NOTE fold-in) replaced with D-026 lifetimeId-gate citation.
+  - **`docs/DECISIONS.md`** gained D-027 with file/function, decision (Shape B), alternatives-considered (Shape A direct mutation, validation-in-setMaterial, pendingOnly-no-live-update, commit-on-release), rationale, and the invariant for future material consumers.
 - What's tested:
-  - **36/36 self-test PASS** on macOS Apple Silicon, deterministic across 5 runs.
-  - Doctest binaries unchanged (verified mid-slice; will re-run verify-light before stop).
-  - **No matrix-row promotion** — Block 19 covers a CM, not a BDD row.
-- Non-goals respected: no Shape B invalidate API, no `lifetimeId` persistence in scene format, no inspector ergonomics, no other matrix rows.
-- The "CM-008 production-side fix" item is now **dropped from RESUME's carry-forward list**.
-- What's next: Estimator review. Expect verdict at NOTE level — D-026 closes a tracked CM with bug-probe-verified mechanization + harness cleanup.
+  - **40/40 self-test PASS** on macOS Apple Silicon, deterministic across 5 runs.
+  - Doctest binaries unchanged.
+  - **BDD-005 row promotion**: `pending → warning` with the PBR-preview-shader clause parked as documented gap.
+- Non-goals respected: no PBR preview shader, no validation/clamping inside setMaterial (slider widget range is the clamp), no material presets, no behavior assignment UI, no rotation Euler ergonomics.
+- The "Material editing UI (FR-005 / BDD-005) data-layer" item is **dropped from RESUME's carry-forward list**; replaced with "PBR preview shader slice (FR-005 renderer-side clause)".
+- What's next: Estimator review. Expect verdict at NOTE level — D-027 closes BDD-005's data-layer with bug-probe-verified mechanization + matrix promotion + estimator-turn-20 NOTE fold-in.

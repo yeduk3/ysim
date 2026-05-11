@@ -33,6 +33,24 @@ struct MeshInspectorTarget {
     // must be set together to enable the InputFloat4 row.
     float* rotation_wxyz = nullptr;
     std::function<void(int, float, float, float, float)> on_rotate;
+    // FR-005 / D-027 inspector material path. The 4 scalar/vec3 pointers
+    // read the mesh's material fields (D-005's v1 OpenPBR subset: base_color,
+    // metallic, roughness, specular_weight, emission_color). Widgets mutate
+    // these in place for live preview (the renderer reads mesh.material.*
+    // every frame). On every change the callback fires with the full Material
+    // snapshot so Simulator::setMaterial can also write pendingMaterials[id]
+    // for re-pack survival via D-025. The 5 fields + callback must all be
+    // set together to enable the material rows. The callback signature
+    // takes individual primitives to avoid coupling this header to main.cpp's
+    // Material struct (same pattern as on_rotate).
+    float* metallic = nullptr;
+    float* roughness = nullptr;
+    float* specular_weight = nullptr;
+    tinym::vec3* emission_color = nullptr;
+    std::function<void(int /*meshId*/,
+                       tinym::vec3 /*baseColor*/, float /*metallic*/,
+                       float /*roughness*/, float /*specularWeight*/,
+                       tinym::vec3 /*emissionColor*/)> on_material_edit;
 };
 
 void drawMeshInspectorWindow(
