@@ -1680,6 +1680,15 @@ struct RayHit {
 struct SceneEnvironment {
     tinym::vec3 gravity = tinym::vec3(0.0f, -9.81f, 0.0f);
     tinym::vec3 wind    = tinym::vec3(0.0f, 0.0f, 0.0f);
+    // D-028 follow-on: scene-global directional-light tint + magnitude.
+    // The shader's `lightColor` uniform is set to (lightColor * lightIntensity)
+    // each frame; defaults give white tint at ~1.6 radiance, matching the
+    // tuned PBR-preview brightness from the initial D-028 commit. Not
+    // currently persisted in scene_format (in-memory only) — promote to
+    // schema if/when scene authoring needs lighting setups to survive
+    // save/load.
+    tinym::vec3 lightColor = tinym::vec3(1.0f, 1.0f, 1.0f);
+    float       lightIntensity = 1.6f;
 };
 
 template <typename BE, typename PR>
@@ -4911,7 +4920,12 @@ struct Simulator {
 
     void draw(Program& shader) {
         for(auto& mesh : scene.meshes) {
-            renderState.getOrCreate(mesh).draw(shader, mesh.material.baseColor);
+            renderState.getOrCreate(mesh).draw(shader,
+                mesh.material.baseColor,
+                mesh.material.metallic,
+                mesh.material.roughness,
+                mesh.material.specularWeight,
+                mesh.material.emissionColor);  // D-028
         }
 
         if(selectedObj >= 0) {
@@ -7683,6 +7697,15 @@ int main(int argc, char** argv) {
             if (ImGui::InputFloat3("Wind", wind)) {
                 env.wind = tinym::vec3(wind[0], wind[1], wind[2]);
             }
+            // D-028 follow-on: scene-global PBR preview light controls.
+            // lightColor is the tint (default white); lightIntensity is
+            // the scalar magnitude. The shader receives the product as
+            // direct radiance — see SceneEnvironment doc-comment.
+            ImGui::Separator();
+            ImGui::TextDisabled("Lighting (preview shader)");
+            ImGui::ColorEdit3("Light Color", env.lightColor.v);
+            ImGui::SliderFloat("Light Intensity", &env.lightIntensity,
+                               0.0f, 10.0f, "%.2f");
             ImGui::End();
         }
 
@@ -7717,7 +7740,9 @@ int main(int argc, char** argv) {
                     tinym::vec4(0.0f,0.0f,1.0f,0.0f),
                     tinym::vec4(w+0, h+0, 0.0f, 1.0f));
             shader.setUniform("ViewportMatrix", viewport);
-            shader.setUniform("lightColor", tinym::vec3(160.0f));
+            shader.setUniform("lightColor",
+                Scene<Backend, Precision>::environment.lightColor
+                * Scene<Backend, Precision>::environment.lightIntensity);
 
             {
                 auto drawScope = frameProfiler.scoped("scene_draw");
@@ -7758,7 +7783,9 @@ int main(int argc, char** argv) {
                     tinym::vec4(0.0f,0.0f,1.0f,0.0f),
                     tinym::vec4(w+0, h+0, 0.0f, 1.0f));
             shader.setUniform("ViewportMatrix", viewport);
-            shader.setUniform("lightColor", tinym::vec3(160.0f));
+            shader.setUniform("lightColor",
+                Scene<Backend, Precision>::environment.lightColor
+                * Scene<Backend, Precision>::environment.lightIntensity);
 
             simulator.draw(shader);
 

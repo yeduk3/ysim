@@ -126,8 +126,23 @@ struct MeshGL<CPU> {
         glBufferSubData(GL_ARRAY_BUFFER, 0, vertexNum * sizeof(float) * 3, normalPtr);
     }
 
-    void draw(Program& shader, const tinym::vec3& baseColor) {
-        shader.setUniform("diffuseColor", baseColor);
+    // D-028: PBR preview signature. Takes the 5 D-005 material primitives
+    // rather than a Material struct to avoid coupling this header to
+    // main.cpp's Material type (same convention as MeshInspectorTarget's
+    // on_material_edit callback per D-027). Shader-side uniform names
+    // mirror the Material field names exactly so the binding is
+    // grep-able from either direction.
+    void draw(Program& shader,
+              const tinym::vec3& baseColor,
+              float metallic,
+              float roughness,
+              float specularWeight,
+              const tinym::vec3& emissionColor) {
+        shader.setUniform("baseColor",      baseColor);
+        shader.setUniform("metallic",       metallic);
+        shader.setUniform("roughness",      roughness);
+        shader.setUniform("specularWeight", specularWeight);
+        shader.setUniform("emissionColor",  emissionColor);
         glBindVertexArray(vao);
         glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, facetBuffer);
 
