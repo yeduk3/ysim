@@ -1,4 +1,4 @@
-# Estimation — 2026-05-12 turn 27
+# Estimation — 2026-05-13 turn 28
 
 Status: UPDATED
 
@@ -6,16 +6,16 @@ Status: UPDATED
 WARNING
 
 ## BLOCK
-(none)
+- none
 
 ## WARNING
-- `src/main.cpp:7959`, `src/main.cpp:7960`, `src/main.cpp:7961`, `include/program.hpp:85`, `include/program.hpp:180`, `include/program.hpp:183` — the new `skip("fbo-shader-load", ...)` branch assumes `Program::loadShader()` will return control on missing shader files, but the loader still routes failures through `linkShader()` and `printLog()`/`exit(1)`. The happy path is fine, but the documented unsupported-cwd case is not clearly skip-safe.
+- BDD-018 behavior-tag clause remains parked: `docs/TEST_MATRIX.md:32` — the row is marked `pass`, but the slice still explicitly defers the "if the behavior changed" half of the spec to BDD-006/Q2, so the acceptance wording in `docs/TESTS.md` is only partially mechanized. This is a standing parked gap, not a new regression.
 
 ## NOTE
-- `include/HiddenGLContext.hpp:31`, `include/HiddenGLContext.hpp:43`, `include/HiddenGLContext.hpp:51` — constructor failure paths return without `glfwTerminate()`, so early GLFW/GLEW setup failure leaves GLFW initialized until process exit. That is acceptable for the one-shot self-test, but future in-process reuse should harden the cleanup.
+- Block 26 mirrors the production `MeshInspectorTarget` wiring in `src/main.cpp:8157`; that is the right choice for this slice, but the duplicated callback setup is a future cleanup candidate if the inspector seam expands again.
 
 ## Test matrix delta
-- BDD-005: pass
+- BDD-018: pass
 
 ## Verify output (summary)
-`./scripts/verify.sh` configured and built successfully; both doctest suites passed (`159/159` and `1120/1120`). On this Metal-less host, `ysim --self-test` took the expected `metal-device` SKIP path, so the new Block 25 FBO test was not reached here. No failures were observed.
+`./scripts/verify.sh` completed with exit 0. The build finished, `ysim_primitive_tests` passed `159/159` assertions, `ysim_tests` passed `1120/1120` assertions, and the top-level `ysim --self-test` exited via `[self-test SKIP] metal-device: MTL::CreateSystemDefaultDevice() returned null`, which is the expected non-Metal host behavior.
