@@ -8090,6 +8090,268 @@ static int runSelfTest() {
         }
     }
 
+    // ---- Block 26: BDD-018 — Inspector edits propagate live. ----------------
+    // TESTS.md#BDD-018 wording (verbatim, *not* the matrix-row label):
+    //   Given a running simulation with an object selected
+    //   When  the user changes the object's color or behavior tag in the
+    //         inspector
+    //   Then  the change is visible in the very next rendered frame; if the
+    //         behavior changed, the next simulation step dispatches through
+    //         the new behavior.
+    //   Notes: must not require pause/resume of the simulation.
+    //
+    // Mechanization shape: option (b) from the slice brief — construct a
+    // mesh_inspector::MeshInspectorTarget exactly the way production does at
+    // src/main.cpp:8349-8387 (same field assignments, same lambda bodies that
+    // wrap Simulator::setMaterial / translateObject / rotateObject) and
+    // invoke each callback directly with synthetic edit values. This
+    // mechanizes the seam between inspector UI and Simulator without
+    // introducing an ImGui-side harness; ImGui itself stays upstream of the
+    // seam and is covered by the user's manual visual gate.
+    //
+    // Spec substitutions documented per PLANNER.md spec-substitution
+    // discipline:
+    //   - "color or behavior tag" → harness covers color (D-005 5-tuple via
+    //     D-027 setMaterial) AND translate (D-014) AND rotate (D-021) — the
+    //     three inspector edit paths implemented today. Behavior-tag edit is
+    //     parked under BDD-006 / Q2 (in-place behavior switching). Returns
+    //     to scope when BDD-006 ships.
+    //   - "visible in the very next rendered frame" → mechanized as
+    //     "the value the renderer reads each frame (mesh.material.* /
+    //     mesh.transformPosition / state.x) is updated in place by the time
+    //     the callback returns." No FBO render; this BDD's load-bearing
+    //     claim is on the *input* data path, not output pixels.
+    //   - "must not require pause/resume" → mechanized as "no
+    //     sim.initialize() between callback fire and next sim.update()."
+    //
+    // Stricter-than-spec per PLANNER.md procedure step 7: each clause
+    // asserts exactly-one-setter-call via a counter captured by reference,
+    // not just "value propagated somewhere." Double-fire bugs in the
+    // inspector wiring (a regression that would invoke setMaterial twice
+    // per widget interaction) would slip past a loose assertion.
+    //
+    // Float cube at origin: Float pins state.x against gravity so the
+    // pre/post-update state.x is stable for strict-equality witness math.
+    {
+        resetScene();
+        sim.addCube(tinym::vec3(0.0f, 0.0f, 0.0f), /*tess=*/2,
+                    /*size=*/0.5f, /*mass=*/0.1f);
+        sim.initialize();
+        const int inspId = 0;
+
+        auto* m0 = Scene<Backend, Precision>::findById(inspId);
+        if (!m0) {
+            fail("BDD-018 / material inspector edit propagates live",
+                 "cube id=" + std::to_string(inspId) + " not found after init");
+        } else {
+            // Pump 1 frame to let any cold-start drift settle. Float
+            // integrator is a no-op so this is defensive; state.x stays
+            // pinned at the addCube layout.
+            pumpFrames(sim, 1);
+
+            // Counters for exactly-one-setter-call assertions.
+            int materialCalls = 0;
+            int translateCalls = 0;
+            int rotateCalls = 0;
+
+            // Build target the way production does (src/main.cpp:8349-8387).
+            // Same field assignments, same lambda bodies. The counters are
+            // the only deviation — they let the harness assert "callback
+            // fired exactly once" without modifying the Simulator side.
+            mesh_inspector::MeshInspectorTarget target;
+            target.mesh_id = m0->id;
+            target.behavior_label = behaviorTypeName(m0->behaviorType);
+            target.shape_label = shapeTypeName(m0->shapeType);
+            target.base_color = &m0->material.baseColor;
+            target.transform_position = &m0->transformPosition;
+            target.on_translate = [&sim, &translateCalls](int id, tinym::vec3 v) {
+                ++translateCalls;
+                sim.translateObject(id, v);
+            };
+            target.rotation_wxyz = &m0->rotationQuat.w;
+            target.on_rotate = [&sim, &rotateCalls](int id, float w, float x,
+                                                    float y, float z) {
+                ++rotateCalls;
+                sim.rotateObject(id, ::Quat{w, x, y, z});
+            };
+            target.metallic = &m0->material.metallic;
+            target.roughness = &m0->material.roughness;
+            target.specular_weight = &m0->material.specularWeight;
+            target.emission_color = &m0->material.emissionColor;
+            target.on_material_edit = [&sim, &materialCalls](int id,
+                                                             tinym::vec3 bc,
+                                                             float mt, float rg,
+                                                             float sw,
+                                                             tinym::vec3 ec) {
+                ++materialCalls;
+                ::Material m;
+                m.baseColor = bc;
+                m.metallic = mt;
+                m.roughness = rg;
+                m.specularWeight = sw;
+                m.emissionColor = ec;
+                sim.setMaterial(id, m);
+            };
+
+            // ---- Material clause ----
+            // Synthetic widget edit: baseColor=red, metallic=0.5,
+            // roughness=0.25, specularWeight=0.7, emission=zero.
+            target.on_material_edit(target.mesh_id,
+                                    tinym::vec3(1.0f, 0.0f, 0.0f),
+                                    0.5f, 0.25f, 0.7f,
+                                    tinym::vec3(0.0f, 0.0f, 0.0f));
+
+            const float matTol = 1e-6f;
+            auto* mMat = Scene<Backend, Precision>::findById(inspId);
+            bool ptrAlias = mMat && (target.base_color == &mMat->material.baseColor);
+            bool matValuesOk =
+                materialCalls == 1 &&
+                mMat &&
+                std::abs(mMat->material.baseColor.r - 1.0f) < matTol &&
+                std::abs(mMat->material.baseColor.g - 0.0f) < matTol &&
+                std::abs(mMat->material.baseColor.b - 0.0f) < matTol &&
+                std::abs(mMat->material.metallic - 0.5f) < matTol &&
+                std::abs(mMat->material.roughness - 0.25f) < matTol &&
+                std::abs(mMat->material.specularWeight - 0.7f) < matTol &&
+                std::abs(mMat->material.emissionColor.x - 0.0f) < matTol &&
+                std::abs(mMat->material.emissionColor.y - 0.0f) < matTol &&
+                std::abs(mMat->material.emissionColor.z - 0.0f) < matTol;
+
+            // "Must not require pause/resume" — pump once WITHOUT
+            // sim.initialize() between callback fire and pump.
+            sim.update();
+            auto* mMatPost = Scene<Backend, Precision>::findById(inspId);
+            bool matSurvivesStep =
+                mMatPost &&
+                std::abs(mMatPost->material.baseColor.r - 1.0f) < matTol &&
+                std::abs(mMatPost->material.metallic - 0.5f) < matTol &&
+                std::abs(mMatPost->material.roughness - 0.25f) < matTol;
+
+            if (!matValuesOk || !matSurvivesStep || !ptrAlias) {
+                fail("BDD-018 / material inspector edit propagates live",
+                     "materialCalls=" + std::to_string(materialCalls)
+                     + " ptrAlias=" + std::to_string((int)ptrAlias)
+                     + " survivesStep=" + std::to_string((int)matSurvivesStep)
+                     + " got baseColor=("
+                     + std::to_string(mMat ? mMat->material.baseColor.r : -1.0f) + ","
+                     + std::to_string(mMat ? mMat->material.baseColor.g : -1.0f) + ","
+                     + std::to_string(mMat ? mMat->material.baseColor.b : -1.0f) + ")"
+                     + " metallic=" + std::to_string(mMat ? mMat->material.metallic : -1.0f)
+                     + " roughness=" + std::to_string(mMat ? mMat->material.roughness : -1.0f)
+                     + " specWeight=" + std::to_string(mMat ? mMat->material.specularWeight : -1.0f));
+            } else {
+                pass("BDD-018 / material inspector edit propagates live");
+            }
+
+            // ---- Translate clause ----
+            // Snapshot witness position right before translate so the delta
+            // assertion is on a fresh baseline (one prior sim.update() ran
+            // for the material clause; Float pins state.x but be defensive).
+            auto* mPreT = Scene<Backend, Precision>::findById(inspId);
+            const double pre_x = mPreT->state.x.ptr[0];
+            const double pre_y = mPreT->state.x.ptr[1];
+            const double pre_z = mPreT->state.x.ptr[2];
+
+            target.on_translate(target.mesh_id, tinym::vec3(1.0f, 2.0f, 3.0f));
+
+            const double posTol = 1e-5;
+            auto* mT = Scene<Backend, Precision>::findById(inspId);
+            bool transValuesOk =
+                translateCalls == 1 &&
+                mT &&
+                std::abs(mT->transformPosition.x - 1.0f) < posTol &&
+                std::abs(mT->transformPosition.y - 2.0f) < posTol &&
+                std::abs(mT->transformPosition.z - 3.0f) < posTol &&
+                std::abs(mT->state.x.ptr[0] - (pre_x + 1.0)) < posTol &&
+                std::abs(mT->state.x.ptr[1] - (pre_y + 2.0)) < posTol &&
+                std::abs(mT->state.x.ptr[2] - (pre_z + 3.0)) < posTol;
+
+            // "Must not require pause/resume" — pump once WITHOUT
+            // sim.initialize() between callback fire and pump.
+            sim.update();
+            auto* mTPost = Scene<Backend, Precision>::findById(inspId);
+            bool transSurvivesStep =
+                mTPost &&
+                std::abs(mTPost->state.x.ptr[0] - (pre_x + 1.0)) < posTol &&
+                std::abs(mTPost->state.x.ptr[1] - (pre_y + 2.0)) < posTol &&
+                std::abs(mTPost->state.x.ptr[2] - (pre_z + 3.0)) < posTol;
+
+            if (!transValuesOk || !transSurvivesStep) {
+                fail("BDD-018 / translate inspector edit propagates live",
+                     "translateCalls=" + std::to_string(translateCalls)
+                     + " survivesStep=" + std::to_string((int)transSurvivesStep)
+                     + " tp=(" + std::to_string(mT ? mT->transformPosition.x : -1.0f) + ","
+                     + std::to_string(mT ? mT->transformPosition.y : -1.0f) + ","
+                     + std::to_string(mT ? mT->transformPosition.z : -1.0f) + ")"
+                     + " state.x[0]=(" + std::to_string(mT ? mT->state.x.ptr[0] : 0.0) + ","
+                     + std::to_string(mT ? mT->state.x.ptr[1] : 0.0) + ","
+                     + std::to_string(mT ? mT->state.x.ptr[2] : 0.0) + ")"
+                     + " expected=(" + std::to_string(pre_x + 1.0) + ","
+                     + std::to_string(pre_y + 2.0) + ","
+                     + std::to_string(pre_z + 3.0) + ")");
+            } else {
+                pass("BDD-018 / translate inspector edit propagates live");
+            }
+
+            // ---- Rotate clause ----
+            // 90°-Z quaternion: q = (cos(45°), 0, 0, sin(45°)).
+            // Pivot = transformPosition = (1, 2, 3) after translate clause.
+            // Pre-rotate world position of vertex 0 = (pre_x + 1, pre_y + 2,
+            // pre_z + 3). Offset from pivot = (pre_x, pre_y, pre_z).
+            // 90°-Z rotation maps (dx, dy, dz) → (-dy, dx, dz).
+            // Post-rotate world = pivot + (-pre_y, pre_x, pre_z)
+            //                   = (1 - pre_y, 2 + pre_x, 3 + pre_z).
+            // Hand-computed witness math (NOT via D-022's rotateVector) to
+            // avoid using the implementation to verify the implementation.
+            constexpr float kPi26 = 3.14159265358979323846f;
+            const float halfAngle26 = (kPi26 * 0.5f) * 0.5f;  // 90° / 2
+            ::Quat q90Z{std::cos(halfAngle26), 0.0f, 0.0f, std::sin(halfAngle26)};
+
+            target.on_rotate(target.mesh_id, q90Z.w, q90Z.x, q90Z.y, q90Z.z);
+
+            auto* mR = Scene<Backend, Precision>::findById(inspId);
+            const double quatTol = 1e-5;
+            bool rotValuesOk =
+                rotateCalls == 1 &&
+                mR &&
+                std::abs(mR->rotationQuat.w - q90Z.w) < quatTol &&
+                std::abs(mR->rotationQuat.x - q90Z.x) < quatTol &&
+                std::abs(mR->rotationQuat.y - q90Z.y) < quatTol &&
+                std::abs(mR->rotationQuat.z - q90Z.z) < quatTol &&
+                std::abs(mR->state.x.ptr[0] - (1.0 - pre_y)) < posTol &&
+                std::abs(mR->state.x.ptr[1] - (2.0 + pre_x)) < posTol &&
+                std::abs(mR->state.x.ptr[2] - (3.0 + pre_z)) < posTol;
+
+            // "Must not require pause/resume" — pump once WITHOUT
+            // sim.initialize() between callback fire and pump.
+            sim.update();
+            auto* mRPost = Scene<Backend, Precision>::findById(inspId);
+            bool rotSurvivesStep =
+                mRPost &&
+                std::abs(mRPost->state.x.ptr[0] - (1.0 - pre_y)) < posTol &&
+                std::abs(mRPost->state.x.ptr[1] - (2.0 + pre_x)) < posTol &&
+                std::abs(mRPost->state.x.ptr[2] - (3.0 + pre_z)) < posTol;
+
+            if (!rotValuesOk || !rotSurvivesStep) {
+                fail("BDD-018 / rotate inspector edit propagates live",
+                     "rotateCalls=" + std::to_string(rotateCalls)
+                     + " survivesStep=" + std::to_string((int)rotSurvivesStep)
+                     + " rotQuat=(" + std::to_string(mR ? mR->rotationQuat.w : -1.0f) + ","
+                     + std::to_string(mR ? mR->rotationQuat.x : -1.0f) + ","
+                     + std::to_string(mR ? mR->rotationQuat.y : -1.0f) + ","
+                     + std::to_string(mR ? mR->rotationQuat.z : -1.0f) + ")"
+                     + " state.x[0]=(" + std::to_string(mR ? mR->state.x.ptr[0] : 0.0) + ","
+                     + std::to_string(mR ? mR->state.x.ptr[1] : 0.0) + ","
+                     + std::to_string(mR ? mR->state.x.ptr[2] : 0.0) + ")"
+                     + " expected=(" + std::to_string(1.0 - pre_y) + ","
+                     + std::to_string(2.0 + pre_x) + ","
+                     + std::to_string(3.0 + pre_z) + ")");
+            } else {
+                pass("BDD-018 / rotate inspector edit propagates live");
+            }
+        }
+    }
+
     if (failures == 0) {
         std::cerr << "[self-test] all checks passed\n";
         return 0;
