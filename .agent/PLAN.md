@@ -1,559 +1,348 @@
-# Plan — BVH refit benchmarking harness (`feat/bvh-refit-bench`)
+# Plan — FBO-based render harness + BVH GPU-only default (`feat/fbo-render-harness`)
 
 > Owner: **Planner** writes; **Generator** executes; **Estimator** judges.
 > Updated: 2026-05-12
 
 ## Course note: previous slice's verdict
 
-Estimator turn 25 returned **WARNING** (no BLOCK) on the
-hybrid-bottom-up slice (D-030). Single WARNING: default
-`bottomUpHybridDepth = 3` (the field was set to 3 in the shipped
-code; turn 25's report cited 2 from an earlier draft) is not
-backed by measurement. **This slice closes that WARNING** by
-producing the measurement: a benchmark harness that times
-`broad_refit` across four refit methods × four particle counts ×
-ten frames, with artifacts under `profiles/experiment/`.
+Estimator turn 26 returned **WARNING** on the bvh-refit-bench
+slice (D-031). Two doc-drift items folded into this slice as a
+small Todo:
+
+1. **D-031 measured-result prose error**: the claim "Hybrid D=1/D=2 never beat FullCPU" is contradicted by the populated CSV at 499,849 vertices (HybridD2 mean ≈ 673 ms vs FullCPU mean ≈ 731 ms). Affected files: `docs/DECISIONS.md` D-031 entry, `.agent/PROJECT_STATE.md` (the rolling summary line). The shipped/merged `.agent/CURRENT_WORK.md` is historical (this is its successor turn — the NEW CURRENT_WORK overwrites entirely).
+2. **README placeholder drift**: `profiles/experiment/bvh-refit-2026-05-12/README.ko.md:110` calls `refit_bench.csv` a "header-only placeholder" but the file already has 160 rows committed.
+
+Both are tiny prose fixes (~10 lines across 3 files). Per PLANNER.md small-WARNING folding rule, fold into this slice as Todo #16.
 
 ## Why this slice now
 
-D-030 shipped a runtime knob for the GPU/CPU bottom-up split but
-did not benchmark it. The user is now asking for the data: which
-method is fastest at which particle count. The slice ships the
-**harness** (runs on demand, writes CSV, generates chart) and a
-**smoke test** (1×1×1 micro-config exercised in `--self-test` so
-the harness mechanism stays regression-tested). Tuning the
-production default `bottomUpHybridDepth` is OUT OF SCOPE here —
-that's a follow-up "set default from data" slice once the user
-inspects the chart and decides.
+User's brief (verbatim):
 
-## Design call (D-031)
+> 우선 BVH는 GPU only bottom up combine 구조로 가자. 우선 벤치마킹이나 BVH 수정하던거는 잊고, 다음으로 시뮬레이션 엔진에서 구현해야 하는 부분을 파악해서 계획하자. 이전에 PBR까지 했었던 듯.
 
-Six resolved decisions:
+Three asks:
 
-### (a) Entry point — new CLI flag `--bench-bvh-refit`
+1. **Bake D-031's measured finding into the production default.** Raise `bottomUpHybridDepth` from `3` to `30` (the bench's "FullGPU" value; effectively pure-GPU walk-to-root). Closes the "default is unmeasured starting point" half of D-030's rationale (originally Estimator turn 25's WARNING).
+2. **Stop the BVH/bench thread.** No new bench columns, no kernel changes, no source-file split, no `bottomUpHybrid` driver edits. Hybrid still callable; just a new default.
+3. **Pick the next simulation-engine feature after PBR (D-028).** Closes the standing structural WARNING on BDD-005's render-side clause: "preview render reflects the lower roughness" was parked manual-test-only when D-028 shipped, with an FBO harness slice as the documented exit path.
 
-**Decision: add `--bench-bvh-refit` as a second argv branch in
-`main()` next to the existing `--self-test` branch.** Reasons:
+## Design call
 
-- The bench takes seconds to minutes (4 methods × 4 cloth sizes ×
-  10 frames × 60 substeps; the 500k case is the long tail). It
-  cannot run on every `--self-test` invocation. A dedicated flag
-  keeps `--self-test` fast (`verify.sh` still completes quickly).
-- The flag exits immediately after the bench (no GUI window),
-  mirroring `--self-test`'s exit-after-run pattern. Simple
-  `argv[1]` string compare; no new argparse dependency.
-- Mutually exclusive with `--self-test`; first matching branch
-  wins. (User runs ONE of: GUI, self-test, or bench.)
+Five resolved decisions.
 
-### (b) Methods × particle counts (the sweep grid)
+### (a) Headless context — hidden GLFW window
 
-**Decision: 4 methods × 4 cloth resolutions × 10 frames = 160
-data rows.** Methods map to values of the existing
-`bottomUpHybridDepth` runtime knob:
+**Decision: `HiddenGLContext` (new class in `include/HiddenGLContext.hpp`).** GLFW with `GLFW_VISIBLE = GLFW_FALSE` before `glfwCreateWindow`, then GLEW init, then `glfwMakeContextCurrent`. Apple Silicon supports this (the macOS Window Server doesn't show it, but the GL context is real). Reasons:
 
-| User-facing label | `bottomUpHybridDepth` value | Code path                                                                 |
-|-------------------|-----------------------------|----------------------------------------------------------------------------|
-| Full CPU          | `0`                         | `bottomUpHybrid` skips GPU, calls `bottomUpCombine()`                      |
-| Hybrid D=1        | `1`                         | `bottomUpHybrid` → `bottomUpBoxesPartialGPU(1)` + `bottomUpCombineWithSkip` |
-| Hybrid D=2        | `2`                         | `bottomUpHybrid` → `bottomUpBoxesPartialGPU(2)` + `bottomUpCombineWithSkip` |
-| Full GPU          | `30`                        | `bottomUpHybrid` → `bottomUpBoxesPartialGPU(30)` (kernel walks to root; CPU `bottomUpCombineWithSkip` short-circuits at root because `treeVisitCounts[0] == 2`) |
+- Same code path as production `YGLWindow` (production uses GLFW too).
+- `GLFW_VISIBLE` is a one-line hint; the rest of GL init is unchanged.
+- Per the make-means-add-new rule: new class next to existing `YGLWindow`, NOT a `createHidden()` factory inside `YGLWindow`. Both classes coexist.
 
-**Note on "Full GPU."** This is `bottomUpBoxesPartialGPU(30)`,
-NOT the D-029 `bottomUpBoxesGPU` directly. The two paths differ
-by ONE register-read + ONE compare per kernel-loop iteration
-(the unused depth counter). Dwarfed by the atomic + 2 seq_cst
-fences in the same iteration; measurement-wise indistinguishable.
-This slice **does not** introduce a new `bench-only` enum that
-dispatches the D-029 path strictly — the parallel-symbol rule
-keeps both kernels callable, but the bench routes everything
-through `bottomUpHybrid`'s runtime knob so the harness stays a
-4-line table swap. A future slice can add a strict-D-029 column
-if a measurement-vs-noise question arises.
+Rejected: (i) CGLPBuffer (deprecated on macOS, deeper API churn), (ii) OSMesa (not available on Apple Silicon), (iii) headless GLFW (not supported on macOS).
 
-**Cloth resolutions** (FastGridCloth, `particleNum1D × particleNum1D` grid):
+### (b) FBO target — 256×256 RGBA8 + 24-bit depth renderbuffer
 
-| User-facing label | `particleNum1D` | Vertex count | Triangle count (2×(N-1)²) |
-|-------------------|-----------------|--------------|----------------------------|
-| 1k                | 32              | 1,024        | 1,922                      |
-| 10k               | 100             | 10,000       | 19,602                     |
-| 100k              | 316             | 99,856       | 198,450                    |
-| 500k              | 707             | 499,849      | 996,072                    |
+**Decision: reuse the existing `Framebuffer` struct from `include/framebuffer.hpp`.** Already supports `init` + `attachTexture2D(GL_RGBA8)` + `attachRenderBuffer(GL_DEPTH_COMPONENT24)` + bind/unbind. 256×256 is small enough to be fast (~65k pixels per render) but large enough that specular highlights span ~10-50 pixels — enough for the metric in (c) to discriminate.
 
-Triangle count is what scales BVH leaf-count and therefore refit
-time. README.ko.md will state this so the chart's x-axis label
-("particle 수") matches the user's mental model while the chart
-caption/description notes the 2×(N−1)² triangle expansion.
+Rejected: 1024×1024 (too slow for a regression test); 64×64 (specular hotspot under-resolved).
 
-### (c) Simulation parameters — defaults, accept divergence
+### (c) Discriminator metric — max per-channel byte diff between two renders
 
-**Decision: use `Simulator::addClothGridFast` defaults
-(kstretch=1e5, kshear=1e5, kbend=3e5, thickness=0.001, mass=0.1)
-for ALL four resolutions.** Reasons:
+**Decision: render the same scene twice with `roughness ∈ {0.1, 0.9}`, glReadPixels each into RGBA8 byte buffers, then compute the maximum absolute byte difference across all pixel/channel positions. Assert `max_diff > 30` (~12% on 0..255).** Reasons:
 
-- The bench measures refit *time*, which is a function of tree
-  size (= triangle count) and AABB topology. It does NOT depend
-  on whether particles converge to a stable drape. Even an
-  exploded cloth still has well-defined particle positions per
-  frame, BVH leaves still get rewritten by `buildLeafGPU`, and
-  `bottomUpHybrid` still walks the tree. The "refit time" we
-  measure stays representative.
-- The user's brief acknowledges this implicitly:
-  "각 particle 수에 따라 안정적으로 시뮬레이션되는 파라미터 값은
-  시행착오를 통해 찾아볼 수 있다" — i.e., "we can hunt for stable
-  params later if needed." For this slice, defaults are the
-  baseline.
-- If a particular config crashes (rare; usually instability is
-  positions-only, not a crash), the bench should catch the
-  exception/error and record `refit_time_ms = -1` for that row.
-  The chart script skips negative rows.
+- Direct signal: "preview render REFLECTS the roughness change" → at least one pixel differs perceptibly.
+- Single threshold (one number), no compound parameters.
+- Robust to bg constancy: backgrounds + diffuse-only pixels stay identical between the two renders, but the specular hotspot region differs by 50–150 byte values per channel between roughness 0.1 (concentrated highlight) and 0.9 (spread-out highlight). The MAX across the image is dominated by the most-changed pixel — typically 80–150 on 0..255.
+- 30 is a load-bearing-but-conservative floor: noise from FP rounding is ~1–2 byte values; the specular delta is two orders of magnitude above noise. Bug-probe by rendering both passes with the SAME roughness → max diff = 0, well below 30 → FAIL with expected diagnostic.
 
-### (d) Per-frame timing source — existing `broad_refit` FrameProfiler scope
+Rejected alternatives:
+- (i) Full-image RMS — gets diluted by the (mostly unchanged) bg + diffuse area; threshold harder to pick, more brittle.
+- (ii) Specific-pixel sampling — couples to camera/lighting orientation; fragile under any rendering tweak.
+- (iii) Threshold-pixel-count — two free parameters; max-diff with single threshold is simpler and equally discriminating.
 
-**Decision: read `section_ms[broad_refit]` from a per-frame
-`FrameProfiler` snapshot accumulated across all 60 substeps of
-one `sim.update()` call.** Reasons:
+### (d) Scene for the render test — single hand-built cube, no Simulator
 
-- `broad_refit` is already instrumented at `src/main.cpp:4910` and
-  `:4927` via `profiler->scoped("broad_refit")`. FrameProfiler
-  accumulates per-substep refit time into a single per-frame
-  total via `addSample`. No new hook needed; bench harness only
-  needs to construct a local `FrameProfiler`, wire it to
-  `sim.profiler`, and read the snapshot after each `endFrame()`.
-- This is the cost the user *actually pays* per frame:
-  60 substeps × per-substep refit cost. Matches the per-frame
-  number the user would see in the GUI profiler.
-- Bench discards frame index 0 as "warmup" (Metal command queue
-  cold-start, first-buffer-allocation effects). Records frames
-  1–10 → 10 data rows per method/size combination. Total
-  rows = 4 methods × 4 sizes × 10 frames = 160.
+**Decision: Block 25 builds a tiny cube mesh directly (8 vertex positions, 8 vertex normals, 12 triangle indices), uploads it to a fresh `MeshGL`, and renders that.** Reasons:
 
-### (e) Output schema and folder layout
+- No Simulator → no Scene → no `Scene<>::numMeshes` static state interaction with prior Blocks 1–24's leftover state. Block 25 is independent.
+- No `Simulator::initialize` → no GL coupling concerns (D-011 lifted GL out of `mesh.initialize` precisely to make this kind of harness possible).
+- The harness only needs to verify "the shader respects the roughness uniform" — that's a pure rendering claim, independent of physics.
+- The cube primitive's normals are deliberately simple (one direction per face) so the specular highlight is well-defined and predictable.
 
-**Decision: `profiles/experiment/bvh-refit-2026-05-12/` folder.**
-Files inside:
+Rejected: (i) call `sim.addCube` + `sim.initialize` (drags in the whole Metal/scene pipeline, irrelevant to the render claim); (ii) load an OBJ file (extra dependency on file paths from `build/` cwd).
 
-- `README.ko.md` — Korean experiment description (what was run,
-  why, the 4 methods, the 4 resolutions, hardware/OS at run time,
-  caveats around instability and warmup-frame discard).
-- `refit_bench.csv` — raw data, header `method,particle_count,frame_index,refit_time_ms`.
-- `chart.py` — self-contained Python script (matplotlib +
-  csv stdlib) that reads `refit_bench.csv` (relative path) and
-  writes `refit_chart_line.png` (log-log line chart, one line
-  per method) and `refit_chart_bar.png` (grouped bar chart, one
-  group per particle count, 4 bars per group). Re-runnable.
-- `refit_chart_line.png`, `refit_chart_bar.png` — generated by
-  `chart.py` after a bench run. Committed alongside the CSV so
-  the slice ships a viewable result.
+### (e) Production default `bottomUpHybridDepth = 30` (new D-033)
 
-Folder name `bvh-refit-2026-05-12` is a date-stamp; future re-runs
-can land in a sibling folder (e.g., `bvh-refit-2026-06-XX-after-tuning`)
-without overwriting historical data.
+**Decision: change `src/main.cpp:3181` from `int bottomUpHybridDepth = 3;` to `int bottomUpHybridDepth = 30;` and update the surrounding comment block (lines 3172–3180) to cite D-031's measurement data and link to `profiles/experiment/bvh-refit-2026-05-12/`.** Reasons:
 
-### (f) Mechanization — Block 24 smoke test in `runSelfTest`
+- D-031's chart (`profiles/experiment/bvh-refit-2026-05-12/refit_chart_line.png`) shows FullGPU wins decisively at 100k (~1.8×) and 500k (~2.0×).
+- At 1k–10k all four methods are noise-equivalent → no penalty for picking FullGPU as the default.
+- HybridD2 marginally beats FullCPU at 500k (~673 ms vs ~731 ms; ~8% improvement), but loses to FullGPU by ~2× regardless. So HybridD2 is dominated.
+- Value 30 ≥ log2 of any realistic tree depth (~21 for 1M leaves); kernel walks to root for ANY mesh.
+- The `bottomUpHybridDepth` knob stays runtime-tunable — user can lower it to a hybrid value for measurement/debug. Just changes the default.
 
-**Decision: Block 24 is a thin smoke test that calls
-`runRefitBench(smokeCfg)` with a 1-method × 1-size × 1-frame
-config and asserts the CSV file gets written with the expected
-header + 1 data row.** Reasons:
-
-- The full bench is too slow to run on every `--self-test` (CI
-  loop would balloon). The smoke config completes in <1 second.
-- The smoke test verifies the *harness mechanism* (CSV writing,
-  FrameProfiler wiring, `bottomUpHybridDepth` toggling, exit
-  path) — NOT the perf numbers themselves (those are noisy and
-  non-deterministic; can't be PASS/FAIL'd anyway).
-- The smoke writes to `/tmp/ysim_refit_bench_smoke.csv` (BDD-019
-  precedent — harness hygiene routes profile-shaped artifacts to
-  `/tmp` when run from `--self-test`).
-- Pass label: `D-031 / refit bench harness writes one row for one frame`.
-- Bug-probe: temporarily comment out the `csv << row` line in
-  `runRefitBench`; smoke must FAIL with "expected 1 data row,
-  got 0". Restore.
-
-Self-test count: 43 → 44.
-
-**No new BDD / FR / TEST_MATRIX row.** This is a perf-measurement
-slice, not a behavior slice. The smoke test is harness-self-test,
-not BDD mechanization.
+This is a new decision (D-033) because it's measurement-driven and persistent; reverting requires either new measurement data or a workload-shift argument. D-030's rationale text stays valid (the knob is still load-bearing); only the field initializer changes.
 
 ## Goal
 
 After this slice:
 
-- New CLI flag `--bench-bvh-refit` runs the full 4×4×10
-  benchmark, writing CSV + charts to
-  `profiles/experiment/bvh-refit-2026-05-12/`.
-- New `runRefitBench(const BenchConfig&)` function in
-  `src/main.cpp` (a sibling of `runSelfTest`; the user
-  explicitly asked for the bench to live "in main, the way you
-  write tests" pending a future source-split refactor).
-- New `BenchConfig` struct (methods, sizes, frames, output dir,
-  warmup-frame count). Default-constructed = full sweep; smoke
-  config used by Block 24.
-- New `BVHRefitMethod` enum (FullCPU, HybridD1, HybridD2, FullGPU)
-  + a helper that maps each enum value to a
-  `bottomUpHybridDepth` integer.
-- New `profiles/experiment/bvh-refit-2026-05-12/` folder with
-  README.ko.md + chart.py + populated CSV + 2 PNG charts.
-- New Block 24 in `runSelfTest` (smoke test); self-test count
-  43 → 44.
-- New D-031 in `docs/DECISIONS.md` recording the bench design.
+- New `include/HiddenGLContext.hpp` provides offscreen GL context construction (GLFW hidden window + GLEW), self-contained ~50 lines.
+- New Block 25 in `runSelfTest` exercises the PBR shader via FBO render at two roughness values; asserts max pixel diff > 30. Pass label `BDD-005 / FBO PBR render reflects roughness change`. SKIPs gracefully on GL-init or shader-load failure.
+- Production `bottomUpHybridDepth` default raised from 3 → 30, recorded as D-033.
+- New D-032 records the FBO harness design (HiddenGLContext + Block 25 + threshold + SKIP-vs-FAIL semantics).
+- New D-033 records the depth default tuning, citing D-031's chart.
+- D-031's prose error (Hybrid D=2 vs FullCPU at 500k) corrected in `docs/DECISIONS.md` D-031 entry + `.agent/PROJECT_STATE.md` rolling summary.
+- `profiles/experiment/bvh-refit-2026-05-12/README.ko.md:110` "placeholder" language updated to reflect populated CSV.
+- `docs/TEST_MATRIX.md` BDD-005 row promoted `warning → pass` (the standing structural WARNING introduced by D-028 is now closed).
+- Self-test count 44 → 45.
 
 ## Scope
 
-### 1. New entry point — `runRefitBench(const BenchConfig&)`
+### 1. New `include/HiddenGLContext.hpp`
 
-**`src/main.cpp::runRefitBench`** — new free function near
-`runSelfTest`. Mirrors `runSelfTest`'s structure (early-return on
-Metal-less host with SKIP, otherwise iterate configs and write
-rows).
+Header-only class. Constructor takes `width`, `height`. Body:
 
 ```cpp
-enum class BVHRefitMethod { FullCPU, HybridD1, HybridD2, FullGPU };
+struct HiddenGLContext {
+    GLFWwindow* window = nullptr;
+    bool ok = false;
 
-inline int depthForMethod(BVHRefitMethod m) {
-    switch (m) {
-        case BVHRefitMethod::FullCPU:   return 0;
-        case BVHRefitMethod::HybridD1:  return 1;
-        case BVHRefitMethod::HybridD2:  return 2;
-        case BVHRefitMethod::FullGPU:   return 30;  // >= log2(largest tree depth)
+    HiddenGLContext(int w, int h) {
+        if (!glfwInit()) return;
+#ifdef __APPLE__
+        glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 4);
+        glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 1);
+        glfwWindowHint(GLFW_OPENGL_FORWARD_COMPAT, GL_TRUE);
+        glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
+#endif
+        glfwWindowHint(GLFW_VISIBLE, GLFW_FALSE);
+        window = glfwCreateWindow(w, h, "ysim-hidden", nullptr, nullptr);
+        if (!window) { glfwTerminate(); return; }
+        glfwMakeContextCurrent(window);
+        if (glewInit() != GLEW_OK) {
+            glfwDestroyWindow(window);
+            glfwTerminate();
+            window = nullptr;
+            return;
+        }
+        ok = true;
     }
-    return 0;
-}
 
-inline const char* labelForMethod(BVHRefitMethod m) {
-    switch (m) {
-        case BVHRefitMethod::FullCPU:   return "FullCPU";
-        case BVHRefitMethod::HybridD1:  return "HybridD1";
-        case BVHRefitMethod::HybridD2:  return "HybridD2";
-        case BVHRefitMethod::FullGPU:   return "FullGPU";
+    ~HiddenGLContext() {
+        if (window) glfwDestroyWindow(window);
+        // NOTE: do NOT call glfwTerminate() here — production main() may
+        // have its own YGLWindow active concurrently in a different
+        // process state. For runSelfTest's one-shot usage, leaving GLFW
+        // initialized at process exit is harmless.
     }
-    return "Unknown";
-}
 
-struct BenchConfig {
-    std::vector<BVHRefitMethod> methods;  // default: all 4
-    std::vector<int> particleNum1Ds;      // default: {32, 100, 316, 707}
-    int warmupFrames = 1;                 // first N frames discarded
-    int measuredFrames = 10;              // recorded after warmup
-    std::string outCsvPath;               // full path; smoke uses /tmp
+    HiddenGLContext(const HiddenGLContext&) = delete;
+    HiddenGLContext& operator=(const HiddenGLContext&) = delete;
 };
-
-static int runRefitBench(const BenchConfig& cfg);
 ```
 
-Body of `runRefitBench`:
+Does NOT touch `YGLWindow`. Parallel symbol; both classes remain callable.
 
-- Open output CSV; write header `method,particle_count,frame_index,refit_time_ms`.
-- For each method ∈ cfg.methods:
-  - For each particleNum1D ∈ cfg.particleNum1Ds:
-    - Construct fresh `Simulator<METAL, Precision, ExplicitSystem>`
-      with `h = 1/60`, `subSteps = 60`. Cloth-only scene: one
-      `addClothGridFast(particleNum1D, /*size1D=*/1.0f, ...defaults)`
-      call.
-    - Call `sim.initialize()`.
-    - Set
-      `sim.collisionPipeline.broadPhase.objTrees[0].bottomUpHybridDepth = depthForMethod(method);`
-      (and for the scene-level `broadPhase.tree.bottomUpHybridDepth` — only
-      relevant if scene BVH has >1 mesh, but set for consistency).
-    - Construct a local `FrameProfiler localProfiler(64);` and
-      assign `sim.profiler = &localProfiler;`. Reset
-      `sim.profiler` back to `nullptr` (or the previous value)
-      after the inner loop.
-    - For frameIdx in 0 .. cfg.warmupFrames + cfg.measuredFrames - 1:
-      - `localProfiler.beginFrame(frameIdx, frameIdx * sim.system.h);`
-      - `sim.update();`
-      - `localProfiler.endFrame();`
-      - If `frameIdx >= cfg.warmupFrames`:
-        - Read the latest snapshot from
-          `localProfiler.history().frames().back()`.
-        - Look up `broad_refit` section index from the history's
-          `sectionIndex("broad_refit")`. If not found, record
-          `refit_time_ms = -1` (means refit never ran; should
-          not happen for a cloth-only scene).
-        - Write CSV row.
-- Close CSV. Return 0 (success) / non-zero (mismatch / IO error).
+### 2. Block 25 — FBO PBR roughness-diff smoke
 
-### 2. New CLI branch in `main()`
-
-**`src/main.cpp::main`** at line ~7672:
+Append after Block 24. Mechanization:
 
 ```cpp
-int main(int argc, char** argv) {
-    if (argc > 1 && std::string(argv[1]) == "--self-test") {
-        return runSelfTest();
-    }
-    if (argc > 1 && std::string(argv[1]) == "--bench-bvh-refit") {
-        BenchConfig cfg;  // default-constructed = full 4x4x10 sweep
-        cfg.methods         = {BVHRefitMethod::FullCPU,
-                               BVHRefitMethod::HybridD1,
-                               BVHRefitMethod::HybridD2,
-                               BVHRefitMethod::FullGPU};
-        cfg.particleNum1Ds  = {32, 100, 316, 707};
-        cfg.warmupFrames    = 1;
-        cfg.measuredFrames  = 10;
-        cfg.outCsvPath      = std::string(YSIM_PROJECT_ROOT)
-                            + "/profiles/experiment/bvh-refit-2026-05-12/refit_bench.csv";
-        return runRefitBench(cfg);
-    }
-
-    std::cout << "Run simulator" << std::endl;
-    // ... existing GUI launch ...
-}
-```
-
-`YSIM_PROJECT_ROOT` is the existing CMake-define used by
-`FrameProfiler` CSV exports (per CLAUDE.md).
-
-### 3. Block 24 — smoke test in `runSelfTest`
-
-Append after Block 23. Smoke config: 1 method × 1 size × 1
-measured frame, /tmp output.
-
-```cpp
-// ---- Block 24: D-031 — refit bench harness writes one row for one frame. ----
-// Thin smoke test verifying the runRefitBench() mechanism: CSV is
-// written with the expected header and one data row, FrameProfiler
-// captures a `broad_refit` measurement, and the bottomUpHybridDepth
-// knob actually toggles. NOT a perf test — the time value isn't
-// asserted, only its presence and non-negative value.
+// ---- Block 25: D-032 — FBO PBR render reflects roughness change. ----
+// Builds a hidden GL context (GLFW + GLEW), loads the production
+// shader (shader.vert/geom/frag), uploads a hand-built cube to a
+// fresh MeshGL, allocates a 256x256 RGBA8 FBO with depth renderbuffer,
+// then renders twice with different roughness uniforms (0.1 and 0.9).
+// Asserts max per-channel byte diff between the two captures > 30.
 //
-// Bug-probe direction: commenting out the CSV row-write line in
-// runRefitBench should make this block FAIL with "expected 1 data
-// row, got 0". This is the load-bearing assertion.
+// This closes BDD-005's render clause that was parked as standing
+// structural WARNING when D-028 (PBR preview shader) shipped without
+// an FBO harness.
+//
+// SKIP-safe: if GLFW/GLEW init fails or the shader can't load from
+// cwd (running --self-test from outside build/), skip rather than
+// FAIL — those are unsupported environments per ESTIMATOR.md.
+//
+// Bug-probe: render both passes at the same roughness (0.1, 0.1)
+// → max diff = 0 → Block 25 FAILs with "max pixel diff 0 below
+// threshold 30". Restore.
 {
-    BenchConfig smokeCfg;
-    smokeCfg.methods         = {BVHRefitMethod::HybridD2};
-    smokeCfg.particleNum1Ds  = {16};   // 16x16 = 256 particles, tiny
-    smokeCfg.warmupFrames    = 0;
-    smokeCfg.measuredFrames  = 1;
-    smokeCfg.outCsvPath      = "/tmp/ysim_refit_bench_smoke.csv";
-
-    int rc = runRefitBench(smokeCfg);
-    if (rc != 0) {
-        fail("D-031 / refit bench harness writes one row for one frame",
-             "runRefitBench returned non-zero: " + std::to_string(rc));
+    HiddenGLContext glctx(256, 256);
+    if (!glctx.ok) {
+        skip("fbo-glfw-init",
+             "glfwInit/createWindow/glewInit failed — no GL on this host");
     } else {
-        // Verify CSV exists, has header + exactly 1 data row, and the
-        // refit_time_ms field is parseable as a non-negative double.
-        std::ifstream in("/tmp/ysim_refit_bench_smoke.csv");
-        if (!in) {
-            fail("D-031 / refit bench harness writes one row for one frame",
-                 "CSV file not written at /tmp/ysim_refit_bench_smoke.csv");
+        Program shader;
+        shader.loadShader("shader.vert", "shader.geom", "shader.frag");
+        if (!shader.programID) {
+            skip("fbo-shader-load",
+                 "shader.vert/geom/frag not loadable from cwd");
         } else {
-            std::string header, row, extra;
-            std::getline(in, header);
-            std::getline(in, row);
-            bool hasExtra = (bool)std::getline(in, extra);
-            const std::string expectedHeader =
-                "method,particle_count,frame_index,refit_time_ms";
-            if (header != expectedHeader) {
-                fail("D-031 / refit bench harness writes one row for one frame",
-                     "header mismatch: got '" + header + "'");
-            } else if (row.empty()) {
-                fail("D-031 / refit bench harness writes one row for one frame",
-                     "no data row written");
-            } else if (hasExtra && !extra.empty()) {
-                fail("D-031 / refit bench harness writes one row for one frame",
-                     "expected 1 data row, got more: '" + extra + "'");
+            // Build a hand-rolled cube directly into a MeshGL — 8 verts,
+            // 24 normal-per-corner-of-face (because the shader's
+            // normal interpolation needs per-face normals; lifting one
+            // per vertex would smear the specular). Or simpler: use 8
+            // verts + averaged corner normals, accept softer specular.
+            // Generator picks; both work for the discriminator metric.
+            MeshGL<CPU> mesh;
+            // ... cube vertex/normal/index upload ...
+            mesh.initialize(/*vertexCount=*/N, /*facetCount=*/M,
+                            vertexPtr, normalPtr, indexPtr);
+
+            // FBO setup — reuse include/framebuffer.hpp::Framebuffer.
+            Framebuffer fbo;
+            fbo.init(glctx.window, 256, 256);
+            fbo.attachTexture2D(/*nTexture=*/1, GL_RGBA8, 256, 256);
+            fbo.attachRenderBuffer(GL_DEPTH_COMPONENT24);
+
+            // Camera / view / projection / light uniforms ---------
+            shader.use();
+            // Generator sets: model, view, projection, lightDir,
+            // lightColor, lightIntensity, viewPos, ambient — whatever
+            // the production shader currently expects (grep shader.frag
+            // for `uniform` declarations).
+            // ...
+
+            auto renderAndCapture = [&](float roughness) -> std::vector<uint8_t> {
+                fbo.bind();
+                glViewport(0, 0, 256, 256);
+                glEnable(GL_DEPTH_TEST);
+                glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+                glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+                mesh.draw(shader,
+                          tinym::vec3(0.8f, 0.2f, 0.2f),  // baseColor: red
+                          /*metallic=*/0.0f,
+                          roughness,
+                          /*specularWeight=*/1.0f,
+                          tinym::vec3(0.0f));              // emissionColor
+                glFinish();
+                std::vector<uint8_t> px(256 * 256 * 4);
+                glReadPixels(0, 0, 256, 256, GL_RGBA, GL_UNSIGNED_BYTE,
+                             px.data());
+                fbo.unbind();
+                return px;
+            };
+
+            auto roughLo = renderAndCapture(0.1f);  // sharp specular
+            auto roughHi = renderAndCapture(0.9f);  // broad specular
+
+            int maxDiff = 0;
+            for (size_t i = 0; i < roughLo.size(); ++i) {
+                int d = std::abs((int)roughLo[i] - (int)roughHi[i]);
+                if (d > maxDiff) maxDiff = d;
+            }
+
+            if (maxDiff > 30) {
+                pass("BDD-005 / FBO PBR render reflects roughness change");
             } else {
-                // Parse the 4 comma-separated fields; assert refit_time_ms >= 0.
-                auto lastComma = row.rfind(',');
-                bool parsed = false;
-                if (lastComma != std::string::npos) {
-                    try {
-                        double t = std::stod(row.substr(lastComma + 1));
-                        if (t >= 0.0) parsed = true;
-                    } catch (...) {}
-                }
-                if (parsed) {
-                    pass("D-031 / refit bench harness writes one row for one frame");
-                } else {
-                    fail("D-031 / refit bench harness writes one row for one frame",
-                         "refit_time_ms not parseable / negative in row: '" + row + "'");
-                }
+                fail("BDD-005 / FBO PBR render reflects roughness change",
+                     "max per-channel pixel diff " + std::to_string(maxDiff)
+                     + " below threshold 30 — shader does not reflect "
+                     "roughness uniform change");
             }
         }
     }
 }
 ```
 
-Pass label: `D-031 / refit bench harness writes one row for one frame`.
+Pass label: `BDD-005 / FBO PBR render reflects roughness change`.
 
-Self-test count: 43 → 44.
+Self-test count: 44 → 45 (on macOS dev host with GL+Metal). On
+Metal-less hosts the top-level SKIP returns before Block 25 reaches.
 
-### 4. `profiles/experiment/bvh-refit-2026-05-12/` folder
+### 3. Production `bottomUpHybridDepth` default raised 3 → 30
 
-Author three text artifacts (no PNG yet — chart.py will produce
-those after the user runs the full `--bench-bvh-refit`):
+**`src/main.cpp` line 3181:**
 
-- **`README.ko.md`** — Korean experiment description. Sections:
-  - 실험 개요 (purpose, links to D-030 / D-031).
-  - 방법론 (4 methods table + Korean description; 4 resolutions
-    table noting that vertex count is what's reported, and the
-    triangle-count expansion).
-  - 실행 방법 (`./build/src/ysim --bench-bvh-refit` from the
-    build dir; `python3 chart.py` to regenerate PNGs).
-  - 캐비어트 (warmup frame discard; instability acceptance;
-    hardware-dependence note; `enableSelfCollisions = false`
-    default; cloth-only scene assumption).
-- **`chart.py`** — self-contained Python script. Reads
-  `refit_bench.csv` (relative path); writes
-  `refit_chart_line.png` (log-log: x = vertex count {1024,
-  10000, 99856, 499849}, y = mean refit_ms per method, error
-  bars = stddev across the 10 measured frames) and
-  `refit_chart_bar.png` (grouped bars: one group per cloth size,
-  4 bars per group = 4 methods, height = mean ms, whiskers =
-  stddev). Uses matplotlib + csv stdlib only — no pandas
-  dependency. Re-runnable.
-- **`refit_bench.csv`** — placeholder header row only; the
-  user runs `--bench-bvh-refit` to populate. (The slice ships
-  a header-only CSV so the chart.py script's I/O paths are
-  unit-testable without running the full bench.)
+```cpp
+// D-033: raised from 3 to 30 based on D-031 chart data
+// (profiles/experiment/bvh-refit-2026-05-12/refit_chart_line.png):
+// FullGPU wins ~1.8x at 100k vertices and ~2.0x at 500k on Apple
+// Silicon Metal 3.2; hybrid values (1, 2, 3) lose to FullGPU at
+// 100k+ and are noise-equivalent at smaller sizes. 30 >= log2 of
+// any realistic tree depth (~21 for 1M leaves), so the kernel
+// walks to root for ANY mesh. The runtime knob stays — user can
+// lower to a hybrid value for measurement/debug.
+int bottomUpHybridDepth = 30;
+```
 
-The 2 PNGs are NOT committed in this slice; the user produces
-them after a full bench run. If the user wants the slice to
-commit reference PNGs, they can add them in a follow-up commit
-(or the post-slice CSV-population step). PLAN.md flags this
-explicitly so the Estimator doesn't flag missing PNGs as a gap.
+Comment block above the field (lines 3172–3180) updates to reference D-033 + D-031's chart.
 
-### 5. New D-031 in `docs/DECISIONS.md`
+### 4. D-032 + D-033 entries in `docs/DECISIONS.md`
 
-Standard format. File/function (runRefitBench + CLI flag +
-BenchConfig + BVHRefitMethod), decision (bench design above with
-the 4 method labels and depth mapping), alternatives-considered
-(separate enum-driven bench-only path with strict-D-029 column;
-in-process unit-test mechanism vs CLI flag; pandas vs stdlib for
-chart script; full sweep in self-test vs smoke only), rationale.
+Standard format. Append both at the end (after D-031).
 
-### 6. PROJECT_STATE.md additions
+- **D-032** — FBO render harness (HiddenGLContext + Block 25 + threshold + SKIP semantics). Alternatives considered: full-image RMS vs max-diff vs single-pixel sample vs threshold-pixel-count; CGLPBuffer vs OSMesa vs hidden GLFW window; Simulator-driven scene vs hand-built cube; YGLWindow-extension vs new HiddenGLContext (parallel-symbol rule).
+- **D-033** — Production default depth raised to 30 (effectively pure GPU). Cite D-031's chart. Document that the runtime knob stays callable for hybrid measurement/debug.
 
-The Planner (this turn) has already updated PROJECT_STATE.md
-with:
-- The shipped D-030 entry (Hybrid bottom-up combine).
-- The new in-flight pointer to this slice.
-- A new "Standing feature candidates" entry for the
-  **source-file split slice** that the user mentioned in their
-  brief (move `runSelfTest` + `runRefitBench` out of main.cpp
-  once the classes themselves split — explicitly deferred per
-  user note).
+### 5. `docs/TEST_MATRIX.md` BDD-005 row update
+
+Promote `warning → pass`. Test address: Block 25 in `src/main.cpp`. Updates the standing structural WARNING the PBR slice (D-028) introduced.
+
+### 6. Folded-in turn-26 WARNING fixes
+
+- `docs/DECISIONS.md` D-031 entry "Measured result" paragraph (around line ~291): rewrite the "Hybrid D=1 and D=2 do NOT outperform FullCPU at any size" sentence to reflect that at 500k, HybridD2 (~673 ms) IS faster than FullCPU (~731 ms), but both are dominated by FullGPU (~353 ms) by ~2×. Adjust the tuning-recommendation sentence accordingly.
+- `.agent/PROJECT_STATE.md`'s D-030/D-031 "Shipped previous slice" paragraph (around line ~47): same correction.
+- `profiles/experiment/bvh-refit-2026-05-12/README.ko.md:110` "placeholder" sentence: rewrite to say the CSV is populated with the bench's 160-row sweep.
 
 ### 7. Bookkeeping
 
-- `.agent/CURRENT_WORK.md` + `.agent/RESUME.md` — slice progress.
-- `docs/TEST_MATRIX.md` — NO new row (no BDD).
-- `docs/TESTS.md` — NO new scenario (no BDD).
+- `.agent/CURRENT_WORK.md` + `.agent/RESUME.md` — overwrite with this slice's progress.
+- `.agent/PROJECT_STATE.md` — mark D-031 (bvh-refit-bench) as shipped; set in-flight pointer to this slice. Remove the "Tune-default-bottomUpHybridDepth" candidate (closed by D-033). Standing candidates that survive: source-file split (still deferred), strict-D-029-column (still on the shelf), inspector ergonomics, BDD-018 mechanization, FR-006/008/013 (blocked).
 
 ## Non-goals (this slice)
 
-- **Tuning the production default `bottomUpHybridDepth`.** The
-  bench produces the data; choosing the default from that data is
-  a follow-up slice. The user explicitly wants to inspect the
-  chart before committing to a new default.
-- **A strict-D-029 measurement column** (calling
-  `bottomUpBoxesGPU(sceneBox)` directly without the depth
-  counter). "Full GPU" in this slice means
-  `bottomUpBoxesPartialGPU(30)`. The overhead delta is
-  near-noise; if a future measurement question demands it, add
-  in a follow-up.
-- **Cross-scene benchmarks** (cloth + rigid, cloth + ground, etc.).
-  Cloth-only per user brief.
-- **Self-collision-enabled benchmarks.** Default
-  `enableSelfCollisions = false`.
-- **GPU profiling primitives** (Metal performance counters,
-  GPUFrameCapture, etc.). Wall-clock from `std::chrono::steady_clock`
-  inside FrameProfiler is the only timing source.
-- **Stability-tuned sim parameters per resolution.** Defaults
-  for all; instability is acceptable as refit time doesn't depend
-  on convergence.
-- **CI integration of `--bench-bvh-refit`.** Manual-invocation
-  only. Smoke test (Block 24) is the regression net.
-- **Inspector widget to switch methods at runtime in the GUI.**
-  Out of scope; the bench drives the knob.
-- **New BDD / FR.** Perf-measurement slice; spec unaffected.
-- **Source-file split** (deferred per user brief). Added as
-  candidate for a future slice.
+- **Multi-mesh FBO rendering.** Block 25 renders one cube. Compositing N meshes is a future slice if/when needed.
+- **Wider material coverage** (metallic sweep, specularWeight sweep, baseColor diff). The render clause only requires "render reflects roughness change"; one diff is enough.
+- **Camera control / animation.** Static camera + static cube + static light. No matrix tuning beyond the minimum to put the cube in view.
+- **Anti-aliasing / MSAA.** Plain RGBA8 readback; pixel-exact comparison.
+- **Pixel-exact reference image** committed to the repo. The harness is the discriminator; no golden image.
+- **glReadPixels of depth or normal buffers.** Color only.
+- **GUI integration of the harness.** `--self-test`-only.
+- **Replacement of the strict D-029 path** with the partial kernel. D-029's `bottomUpBoxes` + `bottomUpBoxesGPU` stay callable (parallel-symbol rule).
+- **Source-file split** (user-deferred per D-031 brief).
+- **New `--bench-*` flags** (D-031 was the last for now).
+- **New BDD / FR.** This slice closes coverage on existing BDD-005 + tunes the existing D-030 default.
 
 ## Todo
 
 Ordered. Generator executes top-to-bottom.
 
-1. **Branch hygiene.** Already on `feat/bvh-refit-bench` (off
-   `main` at `febc19b`). Commit prefix: `add:` (new bench
-   harness).
+1. **Branch hygiene.** Already on `feat/fbo-render-harness` (off `main` at `bb3b667`). Commit prefix: `add:`.
 
-2. **Re-read the design call.** Six decisions settled; do not
-   second-guess unless implementation surfaces a blocker (e.g.,
-   `FrameProfiler` can't expose section_ms by name without a
-   public lookup helper — then add one alongside, don't refactor
-   the profiler).
+2. **Re-read the design call.** Five decisions settled; do not second-guess unless implementation surfaces a blocker (e.g., GLFW init fails inside `--self-test` because some other test already terminated GLFW — then add ordering guard, don't refactor).
 
-3. **Add `BVHRefitMethod` enum + helpers** (`depthForMethod`,
-   `labelForMethod`) at the top of the runSelfTest area in
-   `src/main.cpp`, so both `runRefitBench` and Block 24 can
-   reference them.
+3. **Author `include/HiddenGLContext.hpp`** per §1. Self-contained; depends only on GLFW + GLEW + (transitively) OpenGL headers. Header guard or `#pragma once`.
 
-4. **Add `BenchConfig` struct** (§1 above) near the helpers.
+4. **Verify the cube primitive shape**: pick a vertex/normal/index layout. Simplest is the 24-vertex form (4 per face × 6 faces) so each face has its own normal — predictable specular. Generator's call; both 8-vert and 24-vert layouts produce a discriminating diff.
 
-5. **Author `runRefitBench(const BenchConfig&)`** per §1. Use
-   the existing `Simulator<METAL, Precision, ExplicitSystem>`
-   construction pattern from `main()` (line ~7696). Open the
-   output CSV via `std::ofstream`; create the parent directory
-   via `std::filesystem::create_directories` (project already
-   uses `<filesystem>` per the profile-export path in
-   `analyze_profile.py` precedent — verify by grepping).
+5. **Author Block 25** per §2. Read `src/shader/shader.frag` first to enumerate the uniforms the harness must set (camera matrices, light, view position). Set sensible defaults: camera at (0, 0, 3) looking at origin; directional light from (1, 1, 1) normalized; light color white; ambient via the shader's existing constant.
 
-6. **Add the `--bench-bvh-refit` branch** in `main()` per §2.
-   Keep the argv parsing pattern identical to `--self-test`'s
-   line.
+6. **Change the BVH default** per §3. One-line value change + multi-line comment update + nothing else.
 
-7. **Verify `FrameProfiler` exposes a public way to look up a
-   section_ms by name.** Read `include/FrameProfiler.hpp`. If a
-   `sectionIndex(const std::string&)` returns -1 / size_t::max
-   when not found, use it. If not, add a small const helper
-   inline (~5 lines) — flag this in CURRENT_WORK as a thin
-   scaffold added during build-time discovery.
+7. **Add D-032 + D-033 to `docs/DECISIONS.md`** per §4.
 
-8. **Author Block 24** per §3. Smoke config. Pass label
-   `D-031 / refit bench harness writes one row for one frame`.
+8. **Promote BDD-005 row** in `docs/TEST_MATRIX.md` per §5. Test address `src/main.cpp::runSelfTest::Block 25`.
 
-9. **Build cleanly.** `cmake --build build`. Expect zero new
-   warnings.
+9. **Apply turn-26 WARNING fold-in fixes** per §6 (D-031 prose, PROJECT_STATE summary, README.ko.md line 110). Tiny.
 
-10. **Run `./scripts/verify-light.sh`.** Doctest binaries should
-    stay 159/159 + 1120/1120.
+10. **Build cleanly.** `cmake --build build`. Expect zero new warnings. Watch for GLFW/GLEW link-order issues — if Block 25 introduces a duplicate-`glewInit` linker complaint, that's a build-time discovery → small fix on-the-way (likely already linked; the production binary depends on the same).
 
-11. **Run `--self-test` 5+ times.** Expect **44/44 PASS**
-    consistently (current 43 + Block 24).
+11. **Run `./scripts/verify-light.sh`.** Doctest binaries should stay 159/159 + 1120/1120.
 
-12. **Bug-probe.** Two probes:
-    - **(a) Skip the CSV row-write.** Comment out the
-      `csv << row` line in `runRefitBench`. Block 24 should FAIL
-      with "no data row written" / "got 0". Restore.
-    - **(b) Wire the wrong depth knob.** Change
-      `setMethod` to apply `depthForMethod(method) + 100`. Block 24
-      should still PASS (the smoke doesn't assert which depth ran).
-      Document this as "smoke test is mechanism-only, not method-
-      identity" in CURRENT_WORK. The bench's experimental output
-      is the user's gate for method-identity correctness; the
-      Estimator should not flag this as a coverage gap.
+12. **Run `--self-test` 5+ times.** Expect **45/45 PASS** consistently (current 44 + Block 25). On a host where GLFW init fails the block SKIPs (44 PASS + 1 SKIP); the macOS dev host should hit 45/45.
 
-13. **Author `profiles/experiment/bvh-refit-2026-05-12/` folder
-    contents** per §4. README.ko.md, chart.py, header-only
-    refit_bench.csv. No PNGs yet.
+13. **Bug-probe.** Three probes:
+    - **(a) Render both passes at same roughness (e.g., 0.1, 0.1).** Block 25 should FAIL with "max diff 0 below threshold 30". Restore.
+    - **(b) Comment out the roughness uniform setter in `mesh.draw`.** Block 25 should FAIL — the shader keeps stale roughness from the prior frame; second render is identical to first; max diff = 0. Restore. **This is the load-bearing probe** — it proves the PBR shader actually consumes the roughness uniform per-render (and that D-028's wiring is intact).
+    - **(c) Set BVH default back to 3.** Self-test still passes (43 still pass, plus Block 25 unchanged because it doesn't touch BVH). Confirms the BVH knob change is value-only and independent. Restore.
 
-14. **Run the full bench** (`./build/src/ysim --bench-bvh-refit`
-    from the build dir). Expected runtime: a few seconds for the
-    small sizes, possibly minutes for 500k with 60 substeps × 10
-    frames. If 500k OOMs / crashes / hangs > 10 min: Generator
-    halts, reports, hands back to Planner with the actual
-    failure (probably a memory cap; we may need to drop 500k or
-    halve frames). If it finishes: commit the populated CSV.
+14. **Run `--self-test` 5+ more times** after all probes restored. Expect 45/45 deterministic.
 
-15. **Run `chart.py`** (`python3 profiles/experiment/bvh-refit-2026-05-12/chart.py`)
-    to produce the 2 PNGs. Commit them.
+15. **(D-032 → D-033 sanity probe).** After the BVH default change, run the bench (`./build/src/ysim --bench-bvh-refit`) ONCE to confirm it doesn't regress the bench harness. The bench mutates `bottomUpHybridDepth` per run, so production default doesn't matter for the bench itself; this is a smoke-only sanity check. CSV gets overwritten; we don't commit the updated CSV unless the chart visibly changes (it shouldn't — same code paths, same hardware). **Generator's call: skip this if it adds friction. The Block 24 smoke covers the harness mechanism.**
 
-16. **Add D-031 to `docs/DECISIONS.md`.** Standard format.
+16. **Apply turn-26 WARNING fold-in** if not done earlier (Todo #9). Re-verify the D-031 entry now reads consistent with the CSV.
 
 17. **Update `CURRENT_WORK.md` / `RESUME.md`** per §7.
 
@@ -561,92 +350,36 @@ Ordered. Generator executes top-to-bottom.
 
 ## Course corrections
 
-- **Stricter-than-spec assertion** (PLANNER.md step 7). Block 24
-  asserts both the CSV header AND the row-count AND the
-  parseability of `refit_time_ms` as a non-negative double. A
-  single "file exists" check would silently pass even on
-  zero-byte CSVs. The 3-clause check fails noisier.
+- **Stricter-than-spec assertion** (PLANNER.md step 7). Block 25's bug-probe (b) — "shader respects the roughness uniform per render" — is stronger than the literal BDD-005 wording ("preview render reflects the lower roughness"). The literal wording could be satisfied by ANY visual change (background tint, lighting shift); probe (b) verifies the change is *driven by the roughness uniform specifically*. This is the diff that caught D-028's initial under-tuning (lighting too dim before the C++-side `lightColor * lightIntensity` upload fix).
 
 - **Architectural invariants applying here:**
-  - **D-029** (atomic single-dispatch + Metal 3.2 fences) — held
-    UNCHANGED. Bench does not touch kernel internals.
-  - **D-030** (parallel-symbol shape; runtime depth knob;
-    `treeVisitCounts == 2` frontier invariant; check-before-atomic
-    placement; the parallel-symbol pair must not collapse) —
-    APPLIES. The bench toggles `bottomUpHybridDepth` per run and
-    exercises all four code paths through the existing
-    `bottomUpHybrid` driver. NO new bench-only dispatch enum
-    inside `bottomUpHybrid` — the slice respects the parallel-
-    symbol shape by routing every method through the existing
-    runtime knob.
-  - **CM-011** (substep-loop commit-boundary forensic) — APPLIES
-    indirectly. The bench reads per-frame accumulated refit
-    time from FrameProfiler's `broad_refit` scope; each substep
-    refit's commitAndWait happens inside `bottomUpHybrid` per
-    D-030. Frame-level total = sum of 60 substep refits =
-    representative production cost.
-  - **Make-means-add-new rule** (`.claude/skills/slice/SKILL.md`)
-    — APPLIES. The user's brief uses creation verbs
-    ("뽑아보고자 한다", "차트로 보고싶다", implicit "experiment를
-    실행할 c++ 코드는 적어놓자"). All new symbols
-    (`runRefitBench`, `BenchConfig`, `BVHRefitMethod`, the new
-    `--bench-bvh-refit` argv branch, Block 24, the experiment
-    folder); no modifications to `BVH::refit`, `BroadPhase::refit`,
-    `bottomUpHybrid`, `bottomUpCombine`, `bottomUpBoxesGPU`,
-    `bottomUpBoxesPartialGPU`, or any existing Block.
+  - **D-005 / D-027** (material data layer) — APPLIES; the harness sets all 5 D-005 uniforms even though only roughness varies between the two passes. Cleanest mirror of production `mesh.draw` signature.
+  - **D-011** (render-state decoupled from `mesh.initialize`) — APPLIES. Block 25 can construct a `MeshGL` directly without going through Simulator.
+  - **D-028** (PBR preview shader + 5 uniforms through `mesh.draw`) — APPLIES. The harness exercises the same shader path; pixel-diff is the validation. Closes the standing structural WARNING D-028 introduced.
+  - **D-030** (parallel-symbol shape; runtime depth knob preserved) — UNAFFECTED by the value change. Both `bottomUpBoxes`/`bottomUpBoxesPartial` and `bottomUpBoxesGPU`/`bottomUpBoxesPartialGPU` stay callable.
+  - **D-031** (bench harness, FrameProfiler-based timing) — UNAFFECTED. Bench still runs.
+  - **D-032 / D-033** (introduced this slice).
+  - **make-means-add-new rule** (`.claude/skills/slice/SKILL.md`) — APPLIES. The new `HiddenGLContext` class is a parallel symbol to `YGLWindow`; new Block 25 is parallel to Blocks 1–24; no modifications to `YGLWindow`, `MeshGL`, `Framebuffer`, `Program`, shader source files, or any existing Block.
 
-- **"Full GPU" label vs strict D-029.** The bench's "Full GPU"
-  is `bottomUpBoxesPartialGPU(30)`, NOT `bottomUpBoxesGPU(sceneBox)`.
-  This is a small honest deviation — documented in
-  README.ko.md's 캐비어트 section. Justification: the
-  depth-counter overhead is one register-read + one compare per
-  loop iteration, dwarfed by the atomic + 2 seq_cst fences in
-  the same iteration. The alternative (adding a fifth code path
-  to the bench dispatcher) would (i) violate the parallel-symbol
-  intent of D-030's runtime knob and (ii) introduce a separate
-  dispatch line for what is functionally the same kernel. If a
-  future measurement question demands strict-D-029, that's a
-  follow-up slice.
+- **HiddenGLContext does NOT call `glfwTerminate()` in its destructor.** The production binary's `YGLWindow` already manages GLFW lifecycle in `~YGLWindow()`. If the harness's HiddenGLContext terminated GLFW, a follow-up Block (Block 26+) re-using a HiddenGLContext would fail because GLFW is uninitialized. Single-shot use in Block 25 is enough; process-exit cleanup is implicit and harmless.
 
-- **Smoke test is mechanism-only, not method-identity** (see
-  Todo bug-probe (b) above). Documenting up-front so the
-  Estimator doesn't flag this as a coverage gap. The full
-  4×4×10 bench output is the user's gate for method-identity
-  correctness; the smoke test only verifies that the harness
-  *can* write a row.
+- **Self-test count discipline.** Expecting 45/45 on macOS dev host. On Linux container / Metal-less host, the top-level Metal SKIP returns 0 before Block 25 reaches, so the count there is 0 PASS + 1 SKIP (the existing pattern). No new SKIP-vs-FAIL discrimination needed.
 
-- **Source-file split deferral.** User explicitly said: "이런
-  테스트들은 나중에 main 안에 있는 클래스들이 파일로 쪼개지면
-  테스트도 모두 분리해낼 계획임. 이것은 추후의 계획으로 우선
-  적어놓자." Recorded in PROJECT_STATE's "Standing feature
-  candidates"; this slice keeps `runRefitBench` in main.cpp
-  next to `runSelfTest`.
+- **Bug-probe (b) is load-bearing**, (a) and (c) are convenience probes. The Estimator should see clear bug-probe documentation for (b) in CURRENT_WORK.md.
+
+- **Don't fix the Estimator-turn-26 WARNING prose by re-running the bench.** The bench numbers in `refit_bench.csv` are committed and authoritative; the rewrite is only in the DECISIONS.md / PROJECT_STATE.md / README.ko.md prose that *interprets* those numbers. The CSV stays unchanged. (If the user re-ran the bench, the numbers would shift by Apple Silicon thermal noise — that's a separate measurement-repeatability question outside this slice.)
 
 ## What to read before writing code
 
-- `src/main.cpp::runSelfTest` (line 5720) — structure to mirror.
-  Note the Metal-less-host SKIP path at the top.
-- `src/main.cpp::main` (line 7672) — argv parsing pattern;
-  GUI-launch body to NOT trigger when `--bench-bvh-refit` is
-  given.
-- `src/main.cpp::Simulator<METAL, Precision, ExplicitSystem>`
-  construction at line ~7696 — copy this pattern for the bench's
-  per-config sim.
-- `src/main.cpp::Simulator::addClothGridFast` (line ~4613) — the
-  FastGridCloth entry point the bench calls per resolution.
-- `src/main.cpp::Simulator::profiler` field + the `auto scope =
-  profiler->scoped("broad_refit")` instrumentation at lines 4910
-  and 4927 — the timing source the bench reads.
-- `include/FrameProfiler.hpp::FrameProfiler` — class API; check
-  whether `sectionIndex(name)` is publicly accessible or needs a
-  small accessor added.
-- `src/main.cpp::BVH<METAL,PR,LINEAR,PRIMITIVE>::bottomUpHybridDepth`
-  field (line 3181) — the runtime knob the bench toggles.
-- `src/main.cpp::BroadPhase::refit()` (line 4158) — per-mesh
-  refit dispatch; the bench's measured cost comes from inside
-  this function via `objTrees[i].refit()` (line 4160).
-- `scripts/analyze_profile.py` — existing Python pattern (csv +
-  stdlib + minimal deps); use as a reference for `chart.py`'s
-  style.
-- `CLAUDE.md`'s `YSIM_PROJECT_ROOT` define note — use that for
-  the default outCsvPath construction.
+- `include/YGLWindow.hpp` — production GLFW + GLEW bring-up pattern to mirror in `HiddenGLContext`.
+- `include/framebuffer.hpp::Framebuffer` — already supports the FBO setup the harness needs.
+- `include/MeshGL.hpp::MeshGL::draw` (line 135) — production draw signature with 5 D-005 uniforms; Block 25 mirrors this for both renders.
+- `include/program.hpp::Program::loadShader` — pattern for loading the production shader by file name (cwd is `build/` per CLAUDE.md).
+- `src/shader/shader.frag` — enumerate uniforms (camera, light, view position, etc.) so Block 25 sets ALL of them, not just the 5 D-005 materials.
+- `src/shader/shader.vert` + `src/shader/shader.geom` — the vert/geom side; Block 25 doesn't author shader code, just loads the existing pipeline.
+- `src/main.cpp:3181` (`int bottomUpHybridDepth = 3;`) — line to change to 30.
+- `src/main.cpp::runSelfTest` Blocks 22–24 — template for SKIP-vs-FAIL discipline (Block 22 N=1 path) + smoke-test discipline (Block 24).
+- `docs/DECISIONS.md` D-028 entry — the PBR slice that introduced the standing structural WARNING this slice closes.
+- `docs/DECISIONS.md` D-031 entry "Measured result" paragraph — text to correct per turn-26 WARNING fold-in.
+- `profiles/experiment/bvh-refit-2026-05-12/README.ko.md` line 110 — placeholder text to rewrite.
+- `docs/TEST_MATRIX.md` BDD-005 row — to promote `warning → pass`.

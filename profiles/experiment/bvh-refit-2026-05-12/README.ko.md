@@ -107,8 +107,9 @@ python3 chart.py
 
 ## 산출물
 
-- `refit_bench.csv` — header row만 있는 placeholder 상태로 commit됨.
-  `--bench-bvh-refit` 실행 후 160 row로 populate됨.
+- `refit_bench.csv` — `--bench-bvh-refit` 실행 결과로 160 row가
+  populate된 상태로 commit됨. 4 method × 4 cloth resolution × 10
+  measured frame. 재실행 시 덮어쓰기됨.
 - `chart.py` — 차트 생성 스크립트 (matplotlib + csv stdlib only;
   pandas dependency 없음).
 - `refit_chart_line.png` — log-log line chart, x = vertex count,

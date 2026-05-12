@@ -12,6 +12,7 @@
 #include "scene_format.hpp"
 #include "MeshGL.hpp"
 #include "MeshRenderState.hpp"
+#include "HiddenGLContext.hpp"
 
 #include "imgui.h"
 #include "imgui_impl_glfw.h"
@@ -3173,12 +3174,22 @@ struct BVH<BE, PR, BVHMODE::LINEAR, PRIMITIVE> {
     // `bottomUpHybridDepth` levels (from leaf side); CPU finishes
     // the remaining top-of-tree. Runtime-tunable so the user can
     // measure the sweet spot. Values: 0 = pure CPU (skips GPU
-    // dispatch, calls bottomUpCombine() directly); 1 or 2 (default)
-    // = hybrid; large value (~1000+) = pure GPU (recovers D-029
-    // walk-to-root behavior). The CPU side reads `treeVisitCounts`
-    // as a frontier marker: nodes with count == 2 were combined
-    // by GPU and their subtrees are skipped by the CPU walk.
-    int bottomUpHybridDepth = 3;
+    // dispatch, calls bottomUpCombine() directly); 1 or 2 = hybrid;
+    // large value (>= log2(numPrimitives), e.g., 30) = pure GPU
+    // (recovers D-029 walk-to-root behavior). The CPU side reads
+    // `treeVisitCounts` as a frontier marker: nodes with count == 2
+    // were combined by GPU and their subtrees are skipped by the
+    // CPU walk.
+    //
+    // D-033: default raised from 3 to 30 based on D-031's measured
+    // data (profiles/experiment/bvh-refit-2026-05-12/refit_chart_line.png).
+    // On Apple Silicon Metal 3.2, FullGPU wins ~1.8x at 100k vertices
+    // and ~2.0x at 500k; hybrid values (1, 2, 3) lose to FullGPU at
+    // 100k+ and are noise-equivalent at smaller sizes. 30 >= log2 of
+    // any realistic tree depth (~21 for 1M leaves), so the kernel
+    // walks to root for any mesh. The runtime knob stays — set to a
+    // hybrid value (1..log2(N)-1) for measurement/debug.
+    int bottomUpHybridDepth = 30;
 
     int objid; // who made this tree
     // D-026: cached at build() time from mesh->lifetimeId so
@@ -7906,6 +7917,174 @@ static int runSelfTest() {
                         fail("D-031 / refit bench harness writes one row for one frame",
                              "refit_time_ms unparseable / negative in row: '" + row + "'");
                     }
+                }
+            }
+        }
+    }
+
+    // ---- Block 25: D-032 — FBO PBR render reflects roughness change. ----
+    // Brings up a hidden GL context (HiddenGLContext: GLFW with
+    // GLFW_VISIBLE=false + GLEW), loads the production shader
+    // (shader.vert/geom/frag), uploads a hand-built 24-vertex cube
+    // (4 verts per face x 6 faces, so MeshGL::computeNormal produces
+    // per-face normals → sharp specular), allocates a 256x256 RGBA8
+    // + depth FBO via include/framebuffer.hpp's Framebuffer, then
+    // renders twice with `roughness ∈ {0.1, 0.9}` and `glReadPixels`
+    // each pass. Asserts max per-channel byte diff > 30 — the shader
+    // must visibly respond to the roughness uniform.
+    //
+    // Closes BDD-005's render-side clause (parked manual-test-only
+    // when D-028 PBR preview shader shipped). The standing structural
+    // WARNING introduced by D-028 is now mechanized.
+    //
+    // SKIP-safe: if GLFW/GLEW init fails (no display server / no GL
+    // driver) or the shader files aren't loadable from cwd (run
+    // outside build/), SKIP rather than FAIL — those are unsupported
+    // environments per ESTIMATOR.md, same discipline as Block 22's
+    // N=1 BVH guard.
+    //
+    // Load-bearing bug-probe: commenting out the roughness setUniform
+    // call inside MeshGL::draw makes the two renders identical (max
+    // diff = 0) and this block FAILs with the expected diagnostic.
+    // That probe proves the shader actually consumes the roughness
+    // uniform per-render — the proximate verification D-028's
+    // standing-WARNING was waiting on.
+    {
+        HiddenGLContext glctx(256, 256);
+        if (!glctx.ok) {
+            skip("fbo-glfw-init",
+                 "glfwInit/createWindow/glewInit failed — no GL on this host");
+        } else {
+            Program fboShader;
+            fboShader.loadShader("shader.vert", "shader.geom", "shader.frag");
+            if (!fboShader.programID) {
+                skip("fbo-shader-load",
+                     "shader.vert/geom/frag not loadable from cwd "
+                     "(run --self-test from build/)");
+            } else {
+                // Hand-built cube: 24 vertices (4 per face x 6 faces),
+                // 12 triangles. Each face has its own 4 verts so
+                // MeshGL::computeNormal gives per-face normals (sharp
+                // specular). Vertex order per face: BL, BR, TR, TL
+                // (counter-clockwise viewed from outside the cube).
+                const float s = 0.5f;
+                float cubeVerts[24 * 3] = {
+                    // +Z (front)
+                    -s, -s,  s,   s, -s,  s,   s,  s,  s,  -s,  s,  s,
+                    // -Z (back)
+                     s, -s, -s,  -s, -s, -s,  -s,  s, -s,   s,  s, -s,
+                    // +X (right)
+                     s, -s,  s,   s, -s, -s,   s,  s, -s,   s,  s,  s,
+                    // -X (left)
+                    -s, -s, -s,  -s, -s,  s,  -s,  s,  s,  -s,  s, -s,
+                    // +Y (top)
+                    -s,  s,  s,   s,  s,  s,   s,  s, -s,  -s,  s, -s,
+                    // -Y (bottom)
+                    -s, -s, -s,   s, -s, -s,   s, -s,  s,  -s, -s,  s,
+                };
+                unsigned int cubeIdx[12 * 3];
+                for (int f = 0; f < 6; ++f) {
+                    unsigned int b = f * 4;
+                    cubeIdx[f*6+0] = b+0; cubeIdx[f*6+1] = b+1; cubeIdx[f*6+2] = b+2;
+                    cubeIdx[f*6+3] = b+0; cubeIdx[f*6+4] = b+2; cubeIdx[f*6+5] = b+3;
+                }
+                float cubeNormals[24 * 3] = {0};
+                MeshGL<CPU> cubeMesh(24, cubeVerts, 12, cubeIdx, cubeNormals);
+
+                // FBO setup via existing Framebuffer struct. Note:
+                // Framebuffer::attachTexture2D(int, GLint, ...) only
+                // auto-derives format+type for GL_RGBA32F (see
+                // framebuffer.hpp::TextureFormat::generate). For RGBA8
+                // we construct the TextureFormat explicitly.
+                Framebuffer fbo;
+                fbo.init(glctx.window, 256, 256);
+                TextureFormat tf;
+                tf.internalFormat = GL_RGBA8;
+                tf.format         = GL_RGBA;
+                tf.type           = GL_UNSIGNED_BYTE;
+                fbo.attachTexture2D(/*nTexture=*/1, tf, 256, 256);
+                fbo.attachRenderBuffer(GL_DEPTH_COMPONENT24);
+
+                // Camera and light collocated at (0.7, 0.7, 3) — both
+                // looking at origin. With camera ~near +Z axis, the
+                // half-vector H ≈ view direction; NdotH on the +Z face
+                // ranges from ~0.87 (far corner) to ~1.0 (near
+                // corner), so the specular hotspot sits inside one
+                // corner of the face. That gives the roughness 0.1
+                // case a sharp small bright spot vs roughness 0.9's
+                // spread-out lower-magnitude glow — discriminating
+                // across the image.
+                fboShader.use();
+                tinym::mat4 M(1.0f);
+                tinym::mat4 V = tinym::lookAt(
+                    tinym::vec3(0.7f, 0.7f, 3.0f),
+                    tinym::vec3(0.0f, 0.0f, 0.0f),
+                    tinym::vec3(0.0f, 1.0f, 0.0f));
+                tinym::mat4 P = tinym::perspective(
+                    /*fovy_rad=*/0.7854f /*45deg*/,
+                    /*aspect=*/1.0f, /*near=*/0.1f, /*far=*/100.0f);
+                fboShader.setUniform("M", M);
+                fboShader.setUniform("V", V);
+                fboShader.setUniform("P", P);
+                fboShader.setUniform("lightPosition",
+                                     tinym::vec3(0.7f, 0.7f, 3.0f));
+                // Light radiance. Production defaults to ~(160,160,160)
+                // which saturates the harness's small framebuffer to
+                // pure white everywhere (clamped 255 after gamma).
+                // Use a smaller value so non-specular pixels land in
+                // the discriminating range (~50–230) and the specular
+                // hotspot's roughness-dependent falloff differs between
+                // the two renders.
+                fboShader.setUniform("lightColor",
+                                     tinym::vec3(3.0f, 3.0f, 3.0f));
+
+                auto renderAndReadback = [&](float roughness) -> std::vector<uint8_t> {
+                    fbo.bind();
+                    glViewport(0, 0, 256, 256);
+                    glEnable(GL_DEPTH_TEST);
+                    glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+                    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+                    cubeMesh.draw(fboShader,
+                                  // Silver-ish metallic: at metallic=1
+                                  // F0 = baseColor, so specular term
+                                  // dominates and roughness changes
+                                  // produce visually large shifts. With
+                                  // non-metallic (F0=0.04), specular is
+                                  // only ~4% of incident — diffuse swamps
+                                  // it and the GGX peak (which is
+                                  // sub-pixel-thin at low roughness) is
+                                  // invisible in a rasterized image.
+                                  tinym::vec3(0.85f, 0.85f, 0.85f),  // baseColor: silver
+                                  /*metallic=*/1.0f,
+                                  roughness,
+                                  /*specularWeight=*/1.0f,
+                                  tinym::vec3(0.0f));                  // emissionColor
+                    glFinish();
+                    std::vector<uint8_t> px(256 * 256 * 4);
+                    glReadPixels(0, 0, 256, 256, GL_RGBA, GL_UNSIGNED_BYTE,
+                                 px.data());
+                    fbo.unbind();
+                    return px;
+                };
+
+                std::vector<uint8_t> roughLo = renderAndReadback(0.1f);
+                std::vector<uint8_t> roughHi = renderAndReadback(0.9f);
+
+                int maxDiff = 0;
+                for (std::size_t i = 0; i < roughLo.size(); ++i) {
+                    int d = std::abs((int)roughLo[i] - (int)roughHi[i]);
+                    if (d > maxDiff) maxDiff = d;
+                }
+
+                const int threshold = 30;
+                if (maxDiff > threshold) {
+                    pass("BDD-005 / FBO PBR render reflects roughness change");
+                } else {
+                    fail("BDD-005 / FBO PBR render reflects roughness change",
+                         "max per-channel pixel diff " + std::to_string(maxDiff)
+                         + " <= threshold " + std::to_string(threshold)
+                         + " — shader did not visibly respond to roughness "
+                         "uniform change between 0.1 and 0.9");
                 }
             }
         }

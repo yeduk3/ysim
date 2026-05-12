@@ -1,51 +1,46 @@
-# Resume — BVH refit benchmarking harness (D-031; `--bench-bvh-refit` CLI flag; FrameProfiler-based timing)
+# Resume — FBO PBR render harness + BVH GPU-only default (D-032 + D-033)
 
 ## Must remember
 
-- **Branch:** `feat/bvh-refit-bench` (off `main` at `febc19b`).
-- **D-031 closes Estimator turn 25's WARNING** ("default `bottomUpHybridDepth=3` unmeasured") by producing actual wall-clock data. The slice ships the HARNESS (CLI flag + chart pipeline + Korean README), not the tuned default — choosing the new default is a follow-up "Tune-default-bottomUpHybridDepth" slice candidate in PROJECT_STATE.
-- **Measured finding (surprising):** FullGPU wins decisively at 100k (~1.8×) and 500k (~2.0×); Hybrid D=1 / D=2 do NOT beat FullCPU at any measured size. D-030's hybrid-sweet-spot hypothesis is NOT supported by Apple Silicon Metal 3.2 measurement.
-- **`runRefitBench` is a NEW free function**, sibling of `runSelfTest` in `src/main.cpp`. Both will move out together once the source-file split slice lands. Per user note in the slice brief ("이런 테스트들은 나중에 main 안에 있는 클래스들이 파일로 쪼개지면 테스트도 모두 분리해낼 계획임."), this is explicitly deferred.
-- **Method labels → depth knob:**
-  | Label      | `bottomUpHybridDepth` | What it actually runs                                  |
-  |------------|-----------------------|--------------------------------------------------------|
-  | FullCPU    | 0                     | `bottomUpCombine()` (pure CPU, GPU dispatch skipped)   |
-  | HybridD1   | 1                     | `bottomUpBoxesPartialGPU(1)` + `bottomUpCombineWithSkip` |
-  | HybridD2   | 2                     | `bottomUpBoxesPartialGPU(2)` + `bottomUpCombineWithSkip` |
-  | FullGPU    | 30                    | `bottomUpBoxesPartialGPU(30)` (kernel walks to root)   |
-- **"FullGPU" is NOT strict D-029.** It routes through `bottomUpBoxesPartialGPU(30)`, which has 1 extra register-read + 1 extra compare per kernel-loop iteration vs `bottomUpBoxesGPU(sceneBox)`. Documented as sub-noise vs the atomic + 2 seq_cst fences in the same iteration. A future "Strict-D-029-column" follow-up slice can add a fifth method if the question matters.
-- **Timing source = FrameProfiler's `broad_refit` scope.** Already instrumented at `src/main.cpp:4910` (SH path) and `:4927` (BVH path). `runRefitBench` wires its own local `FrameProfiler`, reads `history().sectionIndex("broad_refit")` + `latestFrame()` after `endFrame()`. **DO NOT rename the `broad_refit` scope** — the bench writes `-1` silently if the section name lookup fails (the chart.py skips negative rows). Keep the name stable.
-- **Block 24 smoke is mechanism-only, NOT method-identity.** Bug-probe (a) — disable CSV row write — FAILs loudly. Bug-probe (b) — wrong depth mapping — PASSes silently because the smoke doesn't validate which method ran. The full-bench output is the user's gate for method-identity correctness.
-- **The bench mutates `bottomUpHybridDepth` per run on the per-mesh `objTrees[i]` AND `broadPhase.tree` (scene-level).** Scene-level is trivial for cloth-only (1 leaf) but set for consistency / future multi-mesh scenes.
-- **`[Pool] Tried to allocate more than the capacity` warnings appear during 500k bench runs.** Non-fatal; bench still produces correct row counts. Worth investigating in a follow-up but not load-bearing for this slice's claims.
+- **Branch:** `feat/fbo-render-harness` (off `main` at `bb3b667`).
+- **D-032 closes BDD-005's render-side standing structural WARNING** (introduced by D-028 when the PBR preview shader shipped without an FBO harness). Block 25 in `runSelfTest` is now the canonical mechanization; the matrix row promotes `warning → pass`.
+- **D-033 bakes D-031's measurement into the production default.** `bottomUpHybridDepth = 30` (was 3); kernel walks to root for any realistic mesh; runtime knob unchanged. Future workload-shift requiring a different default needs a new D-NNN tying the new value to a measurement.
+- **`HiddenGLContext` is a NEW class** in `include/HiddenGLContext.hpp` — parallel symbol to `YGLWindow`. Does NOT modify `YGLWindow`. Destructor destroys window but deliberately does NOT call `glfwTerminate()` (process-exit cleanup is implicit). Both classes coexist.
+- **Block 25 uses metallic=1 silver-ish material**, NOT non-metallic. At metallic=0 the GGX peak at low roughness is sub-pixel-thin and the harness's max-diff stays at noise level (~4 byte values). At metallic=1 F0=baseColor amplifies specular by 20×, max-diff lands at ~100+. The metallic choice is load-bearing for the threshold > 30.
+- **Camera and light collocated at `(0.7, 0.7, 3.0)` looking at origin.** This puts H ≈ V; NdotH on the +Z face peaks near 1 at the near corner — the hotspot needed for GGX's narrow peak at low roughness to register in a rasterized image. Future tweaks must preserve this geometric property.
+- **`Framebuffer::attachTexture2D(int, GLint, ...)` only auto-derives format+type for `GL_RGBA32F`.** For RGBA8 the harness constructs an explicit `TextureFormat{GL_RGBA8, GL_RGBA, GL_UNSIGNED_BYTE}` and uses the `TextureFormat`-taking overload. NOT a `Framebuffer` modification — both overloads were already present.
+- **Block 25 SKIPs (does not FAIL) on:**
+  - GLFW/GLEW init failure (`HiddenGLContext::ok == false`).
+  - Shader load failure (`Program::programID == 0`, e.g., running `--self-test` from outside `build/`).
+- **Bug-probe (b) is load-bearing** — disable `setUniform("roughness", ...)` in `MeshGL::draw` → Block 25 FAILs with `max diff 0`. This is the proximate verification BDD-005's standing-WARNING was waiting on. Probe (a) — both passes at same roughness — is a convenience probe that confirms the discriminator's symmetry.
+- **D-031 prose-fix landed** in the Generator-rewritten "Measured result" paragraph: HybridD2 at 500k (~673 ms) DOES beat FullCPU (~731 ms) by ~8%, both dominated by FullGPU (~353 ms) by ~2×. HybridD1 is the worst at 500k.
 
 ## Last decisions + why
 
-- **D-031 — parallel-symbol bench harness with runtime-knob method selection.**
-  - All 4 methods route through D-030's existing `bottomUpHybrid` runtime knob (`bottomUpHybridDepth`), no new dispatch enum in production code.
-  - FrameProfiler's existing `broad_refit` scope is the timing source — no new instrumentation hook needed.
-  - CSV is the canonical output schema; matplotlib chart is generated post-run by the shipped `chart.py`.
-  - Block 24 = mechanism smoke only (CSV header + 1 row + parseable refit_ms ≥ 0); does not assert perf correctness because perf is noisy + non-deterministic.
-  - "FullGPU" approximates strict D-029 via `bottomUpBoxesPartialGPU(30)` — depth-counter overhead is sub-noise; strict comparison is a follow-up candidate.
+- **D-032 — FBO PBR render harness with max-pixel-diff > 30 threshold.**
+  - HiddenGLContext as parallel symbol over YGLWindow-extension (make-means-add-new rule).
+  - Hand-built cube over Simulator-driven scene (no static-Scene state coupling; independent of prior Blocks).
+  - Metallic=1 silver over non-metallic red (specular dominance ensures GGX peak registers in rasterized output).
+  - Collocated camera + light over off-axis (NdotH near 1 somewhere on visible face is necessary).
+  - Max-pixel-diff threshold over RMS / single-pixel / threshold-count (one number, hotspot-location-invariant).
+
+- **D-033 — Production default `bottomUpHybridDepth` raised 3 → 30 based on D-031's chart.** Runtime knob preserved; bench harness's per-run mutation still works. Future workload shifts that warrant a different default need a new D-NNN.
 
 ## Next step you were about to take
 
-Slice complete. Next concrete step is the **Estimator's** turn (Codex) — `./scripts/verify.sh` should exit 0 with **44/44** self-test PASS lines. Expected verdict: NOTE or WARNING. Possible items:
+Slice complete. Next concrete step is the **Estimator's** turn (Codex) — `./scripts/verify.sh` should exit 0 with **45/45** self-test PASS lines on the macOS dev host. On the Estimator's Linux container the top-level Metal SKIP returns 0 before Block 25 reaches, so no Block 25 execution there. Expected verdict: NOTE or WARNING. Possible items:
 
-- (i) `[Pool] Tried to allocate more than the capacity` warning lines during 500k bench — informational, not a slice break, but the Estimator may flag for follow-up.
-- (ii) The "FullGPU = bottomUpBoxesPartialGPU(30)" approximation is documented in both D-031 rationale and `README.ko.md`'s caveats, but is a measurement-honesty deviation from a strict D-029 column. Estimator may NOTE it.
-- (iii) D-031's rationale paragraph includes a measured-result-driven recommendation ("raise production default toward FullGPU") that arguably belongs in a follow-up slice plan, not in DECISIONS.md. Informational; could be NOTE-level.
-- (iv) Smoke test is mechanism-only and Bug-probe (b) shows it can't catch method-identity bugs — documented honestly; standing acceptable structural limitation per PLAN's course corrections.
+- (i) Block 25's "metallic=1 silver-ish" choice means the test only exercises the metallic specular branch of the PBR shader, not the dielectric branch. A future "dielectric render coverage" slice could add a parallel render-test; recorded as a possible follow-up.
+- (ii) The cwd discipline (run `--self-test` from `build/`) is enforced at the file-load level (shader files must be in cwd), not by the harness itself. If a future user runs from project root, both the smoke Block 24 and the new Block 25 SKIP gracefully — but via different mechanisms (Block 24 has the bench's own SKIP path; Block 25 SKIPs on `Program::programID == 0`).
+- (iii) The build-time discovery about `Framebuffer::attachTexture2D` only auto-deriving format+type for `GL_RGBA32F` is documented inline in Block 25 + in D-032 — could also be a CM-NNN entry if a future caller is likely to hit it. Generator's judgment call: deferred unless it recurs.
 
 After this lands, planner-tracked candidates per `PROJECT_STATE.md`:
 
-- **Tune-default-bottomUpHybridDepth slice** — direct follow-up; pick the production default from the chart this slice produced. ~1-line change.
-- **Source-file split slice** — user-deferred per slice brief.
-- **Strict-D-029-column bench slice (follow-up to D-031)** — only if measurement-vs-noise becomes a question.
-- **FBO-based render harness slice** — for BDD-005's render-side clause.
-- **Inspector ergonomics for rotation** — Euler / axis-angle input.
-- **BDD-018 inspector live-edit propagation** — needs ImGui-side simulation.
-- **Behavior assignment UI (FR-006 / BDD-006)** — Q2 open.
+- **Source-file split slice** — user-deferred per D-031 brief; still queued.
+- **Strict-D-029-column bench slice** — only if measurement-vs-noise becomes a question.
+- **Inspector ergonomics for rotation** — Euler / axis-angle input per FR-004 Notes.
+- **BDD-018 inspector live-edit propagation** — implementation exists; mechanization needs ImGui-side simulation.
+- **Behavior assignment UI (FR-006 / BDD-006)** — Q2 still open.
 - **Rigid body (FR-008)** — Q4 blocked.
 - **Alembic export (FR-013)** — Q5+Q6 blocked.
 - **Role-doc maintenance pass.**
