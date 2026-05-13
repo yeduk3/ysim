@@ -1,37 +1,20 @@
-# Current Work — Loadshader skip-safety + HiddenGLContext cleanup (`fix/loadshader-skip-safety`)
+# Current Work — D-035 BLOCK fix-turn: axis-angle antipodal canonicalization (`feat/inspector-rotation-ergonomics`)
 
-- File in flight: none — slice complete. **49/49 self-test PASS** deterministic across 5 runs. Doctest 159/159 + 1120/1120 green via `verify-light.sh`.
-- How far: all PLAN todos done.
-  - **D-034 — `Program::loadShader` returns silently on failure with `programID = 0`.** Three changes in `include/program.hpp`:
-    - **`printLog()`**: removed `exit(1)` at the end of the function. Caller decides fatality.
-    - **`linkShader()`**: calls `cleanUp()` after `printLog()` on link-status failure, so `programID` becomes 0 and the caller's `if (!programID)` check fires.
-    - **Each `loadShader` overload (4 total: 2-shader / 3-shader / 4-shader / 5-shader)**: early-returns `if (!programID) return;` after each `loadShaderOf` call to avoid wasteful `glAttachShader(0, ...)` after a compile failure has nuked the program.
-  - **D-034 — `HiddenGLContext` symmetric cleanup.** `include/HiddenGLContext.hpp`:
-    - New `bool glfwInitialized = false` field.
-    - Constructor sets `glfwInitialized = true` right after `glfwInit()` succeeds.
-    - Destructor calls `glfwTerminate()` if `glfwInitialized` (post-`glfwDestroyWindow`).
-    - Header comment block rewritten to reflect the new contract (symmetric cleanup; original "avoids invalidating future YGLWindow" rationale obsolete because `--self-test` mode and default-main mode are mutually exclusive at runtime). Documented limitation noted: GLFW's `glfwInit` is NOT ref-counted, so concurrent `HiddenGLContext` instances would invalidate each other.
-  - **Production caller defensive check.** `src/main.cpp` near line 8460 (the single main shader load): after `shader.loadShader("shader.vert", "shader.geom", "shader.frag")`, added `if (!shader.programID) { std::cerr << ... << "Run from build/ directory.\n"; std::exit(1); }`. Preserves loud-failure behavior in production while letting the harness use SKIP semantics. **Other 4 production callers** (`debugLineShader.loadShader("line.vert", "line.frag")` at lines 5050, 5058, 5129, 5149) are all guarded by `if(! debugLineShader.programID)` BEFORE the call, so a failed load just means they'll retry on the next frame — no defensive exit needed (acceptable behavior).
-  - **NEW Block 27 in `runSelfTest`** (between Block 26's closing brace and the failure-counter summary). Mechanization:
-    - Brings up `HiddenGLContext glctx(64, 64)`; SKIPs if `!ok` (no-GL host).
-    - Constructs a `Program p` (NOT the production shader — a local instance).
-    - Calls `p.loadShader("__ysim_nonexistent_vert__.vert", "__ysim_nonexistent_geom__.geom", "__ysim_nonexistent_frag__.frag")`.
-    - Asserts `p.programID == 0`. Pass label `D-034 / Program::loadShader returns programID=0 on missing shader files`.
-    - Self-test count: 48 → 49.
-  - **`docs/DECISIONS.md`** appended with D-034 entry: title, file/function pointers, rationale, Shape A vs Shape B reasoning, implementation notes, caller invariants (production loud-failure preserved via call-site check; harness SKIP semantic now honest), bug-probe shape, link to CM-012.
-  - **`docs/mistakes/COMMON_MISTAKES.md`** appended with CM-012 entry: "Utility helper calls `exit(1)` on failure path, defeating harness SKIP semantics." Low-level cause / high-level cause / fix direction / audit pattern. Marked RESOLVED.
-  - **No `docs/TEST_MATRIX.md` changes** — this slice doesn't touch any BDD.
+- File in flight: none — BLOCK fix-turn complete. **51/51 self-test PASS** deterministic across 5 runs. Doctest 159/159 + 1120/1120 green via `verify-light.sh`. Turn-30 BLOCK closed.
+- How far: all fix-turn PLAN todos done.
+  - **D-035 fix — antipodal canonicalization at extractor entry.** Applied to both parallel implementations in the same commit (lockstep per turn-30 NOTE):
+    - `src/main.cpp::quatToAxisAngle` (~line 1635): added `if (qw < 0) { qw=-qw; qx=-qx; qy=-qy; qz=-qz; }` block right after the function entry. Downstream logic operates on local `qw/qx/qy/qz` copies instead of `q.w / q.x / q.y / q.z`. The `clamp qw < -1` line was removed since `qw ∈ [0, 1]` after canonicalization (only `qw > 1` overshoot remains).
+    - `include/MeshInspectorWindow.hpp::quatWxyzToAxisAngleDeg` (~line 61): identical shape, identical math, identical comment block citing the turn-30 fix.
+  - **Block 28 AxisAngle clause extended with regression-protection probes.** Now uses `quatAntipodalEqual` (accepts `a == b` OR `a == -b`) instead of strict `quatComponentEqual`. The probe array switched from forward-built (axis, angle) records to direct-constructed `::Quat` records — first 3 are positive-w forward-built (preserve coverage from D-035), last 2 are turn-30 BLOCK probes: `qAntipodalIdent = (-1, 0, 0, 0)` (360° rotation case) and `qAntipodal90Y = (-cos(π/4), 0, -sin(π/4), 0)` (antipodal form of a 90°-Y rotation). Assertion also rejects NaN/inf components explicitly via `std::isfinite` so the BLOCK signature surfaces as `finite=0` in the diagnostic when something does go wrong.
+  - **D-035 turn-30 addendum** appended to `docs/DECISIONS.md`: documents the canonicalization, explains why forward direction is deliberately unchanged (standard pattern: storage may drift across antipodal boundary, read-time canonicalization picks canonical representative), notes the lockstep maintenance constraint.
 - What's tested:
-  - 49/49 self-test PASS deterministic across 5 consecutive runs from `build/`.
-  - Block 27 + Blocks 1–26 all green.
-  - Doctest 159/159 + 1120/1120 SUCCESS via `verify-light.sh`.
-- **Bug-probes:**
-  - **(a) (LOAD-BEARING) Re-introduce `exit(1)` into `printLog()`:** Self-test reports only 48 PASS lines and exits non-zero — Block 27's `p.loadShader(...)` call abort the harness mid-`linkShader` before Block 27 can print its FAIL diagnostic. This probe proves the fix is load-bearing: without it, the harness can only observe loader failures as process-abort, NOT as a clean `programID == 0` SKIP/FAIL signal. Restored.
-  - **(b) HiddenGLContext destructor**: visual review only (runtime probe requires forcing `glfwInit` failure mid-test, which on macOS would require a temporary process-environment override or a wrapping subprocess test — not practical in the self-test harness). The new `glfwInitialized` field is the audit surface; the destructor's `if (glfwInitialized) glfwTerminate();` is a syntactic check. Skipped per PLAN.md non-goal.
-- **Build-time observation (no slice expansion).** When Block 27's `loadShader` runs against nonexistent files, `loadText` returns "" so each `loadShaderOf`'s GLSL source is empty. Empty GLSL compiles SUCCESSFULLY on most drivers (no syntax errors in empty source) — so the early-return guards in `loadShader` (after `loadShaderOf`) don't fire on missing-file failures. The actual failure is at LINK time (the linked program lacks `main()` in any stage), which is exactly what `linkShader`'s new `cleanUp() + return` path handles. The link error output (`Shader Link Error on Program ID 1!!!!!!` + `ERROR: Compiled vertex shader was corrupt.`) is verbose but accurate — the loader honestly reports what went wrong before returning with `programID == 0`. Documented in D-034.
-- Non-goals respected: no production-side audit beyond the 5 `loadShader` call sites already in `main.cpp` (4 debugLineShader sites are pre-guarded, 1 main shader site got the defensive check); no change to `loadText` / `shaderCompileCheck` / `cleanUp` / `~Program`; no new BDD/FR; no matrix row changes; no folding of turn-28 WARNING (BDD-006/Q2-blocked) or turn-28 NOTE (queued for source-file split slice).
-- What's next: Estimator review (Codex). Expected verdict: NOTE or WARNING. Possible items:
-  - (i) Production behavior change (loud-abort → silent programID=0 inside the loader; defensive call-site check preserves the abort) may warrant a NOTE — future `loadShader` callers added without the defensive check will silently render nothing. The audit pattern is in CM-012 but not enforced at compile time.
-  - (ii) `glfwInit` is non-ref-counted → concurrent `HiddenGLContext` would clash. v1 has no concurrent use; future concurrent use would need a process-global init counter. Documented in the header comment and D-034 but not enforced.
-  - (iii) HiddenGLContext destructor cleanup verified by visual review only (no runtime probe). NOTE-able.
-  - (iv) Block 27's output is verbose ("Shader Link Error on Program ID 1!!!!!!" + corrupted-shader errors) — accurate but noisy. Could be NOTEd as cosmetic. Skipped this slice; cosmetic-only.
+  - 51/51 self-test PASS deterministic across 5 consecutive runs from `build/` (same count as before fix-turn — probes added to existing clause, no new PASS labels).
+  - Block 28 AxisAngle clause now exercises 5 probes (3 positive-w + 2 negative-w) + identity-fallback edge.
+  - Doctest 159/159 + 1120/1120 SUCCESS.
+- **Bug-probe (LOAD-BEARING).** Temporarily reverted the `if (qw < 0) negate` block in BOTH `quatToAxisAngle` AND `quatWxyzToAxisAngleDeg` simultaneously. Block 28's AxisAngle clause FAILed with exactly the turn-30 BLOCK signature: `AxisAngle round-trip drifted for antipodal identity q=(-1,0,0,0) — turn-30 BLOCK probe: axisOut=(nan,nan,nan) angleOut=6.283185 qBack=(-1.000000,nan,nan,nan) finite=0`. This confirms (i) the new probes actually exercise the BLOCK case, (ii) the canonicalization is what closes it (not some other code path). Both files restored simultaneously per lockstep discipline.
+- **Manual GUI test (user-driven, post-fix).** Before `/codex:rescue`: launch `./build/src/ysim`, create a cube, open Inspector → Rotation → Axis-Angle mode, enter `angle = 360°` and commit. The widget should now snap to angle=0, axis=(1,0,0) rather than display NaN values. (Pre-fix behavior: NaN cascaded into next callback, corrupting `mesh.rotationQuat`.)
+- Non-goals respected: no new D-NNN (D-035 addendum extends existing entry); no new BDD/FR/CM; no TEST_MATRIX changes; no change to forward direction (`quatFromAxisAngle` / `axisAngleDegToQuatWxyz` unchanged); no change to Euler helpers; no change to `mesh_inspector_gui.cpp` (rotation panel transparently benefits); no folding of any other open NOTE.
+- What's next: Estimator review (Codex). Expected verdict: NOTE (BLOCK closed). Possible items:
+  - (i) Parallel-implementations lockstep NOTE from turn-30 persists as a standing reminder until source-file split lands. Documented in the addendum.
+  - (ii) Block 28's antipodal-equivalent comparison accepts sign-flipped pairs as equal — geometrically correct but a future regression that silently sign-flipped extractor output would PASS this assertion. A separate "strict positive-w on extraction output" assertion could be added later if persistence canonicalization needs it; not in scope here.
+  - (iii) The forward direction is allowed to produce negative-w output (standard pattern). Documented in D-035 addendum.

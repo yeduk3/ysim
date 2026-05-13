@@ -85,12 +85,60 @@ void drawMeshInspectorWindow(
 
     if (target.rotation_wxyz && target.on_rotate) {
         if (ImGui::CollapsingHeader("Rotation", ImGuiTreeNodeFlags_DefaultOpen)) {
-            float q[4] = { target.rotation_wxyz[0], target.rotation_wxyz[1],
-                           target.rotation_wxyz[2], target.rotation_wxyz[3] };
-            ImGui::InputFloat4("Quat (w,x,y,z)", q);
-            if (ImGui::IsItemDeactivatedAfterEdit()) {
-                target.on_rotate(target.mesh_id, q[0], q[1], q[2], q[3]);
-                state.status_message = "Rotation updated.";
+            // D-035: mode toggle selects how the rotation is shown / edited.
+            // Canonical storage is still Quat on the mesh; Euler XYZ and
+            // Axis-Angle are display-time conversions via the helpers in
+            // MeshInspectorWindow.hpp. Mode state is per-window
+            // (state.rotation_input_mode); the mesh's `*target.rotation_wxyz`
+            // is the source of truth that all three widgets read from.
+            ImGui::Combo("Mode", &state.rotation_input_mode,
+                         "Quat\0Euler XYZ (deg)\0Axis-Angle (deg)\0\0");
+
+            const float currWxyz[4] = {
+                target.rotation_wxyz[0], target.rotation_wxyz[1],
+                target.rotation_wxyz[2], target.rotation_wxyz[3]
+            };
+
+            if (state.rotation_input_mode == 0) {
+                // Quat mode — direct 4-float edit, pre-D-035 default.
+                float q[4] = { currWxyz[0], currWxyz[1], currWxyz[2], currWxyz[3] };
+                ImGui::InputFloat4("Quat (w,x,y,z)", q);
+                if (ImGui::IsItemDeactivatedAfterEdit()) {
+                    target.on_rotate(target.mesh_id, q[0], q[1], q[2], q[3]);
+                    state.status_message = "Rotation updated (quat).";
+                }
+            } else if (state.rotation_input_mode == 1) {
+                // Euler XYZ mode — display radians-derived degrees;
+                // on commit convert back to wxyz.
+                float xyzDeg[3];
+                quatWxyzToEulerXYZDeg(currWxyz, xyzDeg);
+                ImGui::InputFloat3("Euler XYZ (deg)", xyzDeg);
+                if (ImGui::IsItemDeactivatedAfterEdit()) {
+                    float newWxyz[4];
+                    eulerXYZDegToQuatWxyz(xyzDeg, newWxyz);
+                    target.on_rotate(target.mesh_id,
+                                     newWxyz[0], newWxyz[1], newWxyz[2], newWxyz[3]);
+                    state.status_message = "Rotation updated (Euler XYZ deg).";
+                }
+            } else {
+                // Axis-Angle mode — axis (vec3) + angle (degrees).
+                // Edits to either widget commit a fresh wxyz on commit.
+                float axis[3];
+                float angleDeg = 0.0f;
+                quatWxyzToAxisAngleDeg(currWxyz, axis, angleDeg);
+                bool axisCommit = false;
+                bool angleCommit = false;
+                ImGui::InputFloat3("Axis (x,y,z)", axis);
+                if (ImGui::IsItemDeactivatedAfterEdit()) axisCommit = true;
+                ImGui::InputFloat("Angle (deg)", &angleDeg);
+                if (ImGui::IsItemDeactivatedAfterEdit()) angleCommit = true;
+                if (axisCommit || angleCommit) {
+                    float newWxyz[4];
+                    axisAngleDegToQuatWxyz(axis, angleDeg, newWxyz);
+                    target.on_rotate(target.mesh_id,
+                                     newWxyz[0], newWxyz[1], newWxyz[2], newWxyz[3]);
+                    state.status_message = "Rotation updated (axis-angle).";
+                }
             }
         }
     }

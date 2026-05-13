@@ -1602,6 +1602,102 @@ inline tinym::vec3 rotateVector(const Quat& q, const tinym::vec3& v) {
     return tinym::vec3(r.x, r.y, r.z);
 }
 
+// D-035: inspector rotation ergonomics — conversion helpers between
+// the canonical Quat representation and user-facing Euler / axis-angle
+// forms. Free functions next to D-019/D-022's quat family, by the same
+// convention. Inspector widgets display values in degrees; these
+// helpers operate in radians internally — degree conversion happens
+// at the inspector boundary.
+//
+// quatFromAxisAngle: auto-normalizes the axis. If axis-norm < 1e-12,
+// returns identity (caller intent is ambiguous; identity is the safe
+// fallback). Angle is in radians.
+inline Quat quatFromAxisAngle(tinym::vec3 axis, float angleRadians) {
+    float n = std::sqrt(axis.x * axis.x + axis.y * axis.y + axis.z * axis.z);
+    if (n < 1e-12f) return Quat{};
+    float nx = axis.x / n;
+    float ny = axis.y / n;
+    float nz = axis.z / n;
+    float half = angleRadians * 0.5f;
+    float s = std::sin(half);
+    return Quat{std::cos(half), nx * s, ny * s, nz * s};
+}
+
+// quatToAxisAngle: inverse of quatFromAxisAngle. Returns angle in
+// [0, π] and a unit-norm axis. Identity-quat fallback: angle=0,
+// axis=(1, 0, 0) canonical. Caller passes a unit-norm q.
+//
+// Turn-30 fix (BLOCK closure for D-035): input is antipodally
+// canonicalized at entry (negate all 4 components when q.w < 0) so
+// qw ∈ [0, 1] always, acos(qw) ∈ [0, π/2], and the returned angle
+// stays in [0, π] by construction. Without this, q = (-1, 0, 0, 0)
+// (the antipodal identity / 360° rotation case) produced
+// s = sqrt(1 - qw²) = 0 and axis = q.x/s = NaN/inf — the BLOCK
+// surfaced by Estimator turn 30. After canonicalization, qw = +1 →
+// acos(1) = 0 → the identity-fallback branch catches it cleanly.
+inline void quatToAxisAngle(const Quat& q, tinym::vec3& outAxis,
+                            float& outAngleRadians) {
+    // Antipodal canonicalization: q and -q represent the same
+    // rotation; pick the q.w >= 0 representative.
+    float qw = q.w, qx = q.x, qy = q.y, qz = q.z;
+    if (qw < 0.0f) {
+        qw = -qw; qx = -qx; qy = -qy; qz = -qz;
+    }
+    // Clamp qw to [0, 1] to guard against tiny rounding overshoot
+    // (acos is undefined outside [-1, 1]; after canonicalization the
+    // valid range is [0, 1]).
+    if (qw > 1.0f) qw = 1.0f;
+    outAngleRadians = 2.0f * std::acos(qw);
+    if (outAngleRadians < 1e-6f) {
+        outAxis = tinym::vec3(1.0f, 0.0f, 0.0f);
+        outAngleRadians = 0.0f;
+        return;
+    }
+    float s = std::sqrt(1.0f - qw * qw);
+    outAxis = tinym::vec3(qx / s, qy / s, qz / s);
+}
+
+// quatFromEulerXYZ: intrinsic Tait-Bryan XYZ.
+//   rotation = R_z(zRad) * R_y(yRad) * R_x(xRad)
+// "Apply X first in body frame, then Y, then Z" — matches Blender's
+// default Euler convention. Compose via three axis-angle quaternions
+// using D-019's Hamilton product (`a * b = apply b first then a`).
+inline Quat quatFromEulerXYZ(float xRad, float yRad, float zRad) {
+    Quat qx = quatFromAxisAngle(tinym::vec3(1.0f, 0.0f, 0.0f), xRad);
+    Quat qy = quatFromAxisAngle(tinym::vec3(0.0f, 1.0f, 0.0f), yRad);
+    Quat qz = quatFromAxisAngle(tinym::vec3(0.0f, 0.0f, 1.0f), zRad);
+    return qz * qy * qx;
+}
+
+// quatToEulerXYZ: extract Tait-Bryan XYZ from a unit-norm Quat using
+// the standard formulas (see e.g., Diebel 2006 "Representing Attitude").
+// Output is in radians, with pitch (Y) in [-π/2, π/2]. Gimbal-lock
+// fallback: when |sinp| ≥ 1 - 1e-6 (within 0.0257° of pitch=±90°),
+// set roll (X) = 0 and derive yaw (Z) from the residual. The
+// round-trip through gimbal lock is lossy by design — Euler cannot
+// uniquely represent gimbal-locked rotations. Documented in D-035.
+inline void quatToEulerXYZ(const Quat& q, float& outX, float& outY,
+                           float& outZ) {
+    // sinp = 2 * (q.w * q.y - q.z * q.x) corresponds to sin(pitch)
+    // in this Tait-Bryan XYZ convention.
+    float sinp = 2.0f * (q.w * q.y - q.z * q.x);
+    if (sinp > 1.0f) sinp = 1.0f;
+    else if (sinp < -1.0f) sinp = -1.0f;
+    if (std::abs(sinp) >= 1.0f - 1e-6f) {
+        // Gimbal lock. Pitch is ±π/2; collapse roll into yaw.
+        outY = (sinp > 0.0f) ? (3.14159265358979323846f * 0.5f)
+                             : (-3.14159265358979323846f * 0.5f);
+        outX = 0.0f;
+        outZ = 2.0f * std::atan2(q.z, q.w);
+    } else {
+        outY = std::asin(sinp);
+        outX = std::atan2(2.0f * (q.w * q.x + q.y * q.z),
+                          1.0f - 2.0f * (q.x * q.x + q.y * q.y));
+        outZ = std::atan2(2.0f * (q.w * q.z + q.x * q.y),
+                          1.0f - 2.0f * (q.y * q.y + q.z * q.z));
+    }
+}
+
 template <typename BE, typename PR>
 struct GeneralMesh {
     int id;
@@ -8389,6 +8485,179 @@ static int runSelfTest() {
                      "got programID=" + std::to_string(p.programID)
                      + " — loader's failure path still doesn't honor the SKIP contract");
             }
+        }
+    }
+
+    // ---- Block 28: D-035 — Quat ⇌ AxisAngle / Euler XYZ round-trip math. ----
+    // FR-004 Notes: "UI may expose Euler/axis-angle as input affordances."
+    // The inspector's rotation panel uses the new free-function helpers
+    // (quatFromAxisAngle / quatToAxisAngle / quatFromEulerXYZ /
+    // quatToEulerXYZ) to convert between the canonical Quat storage and
+    // user-facing input modes. Widget rendering is manual-test-only
+    // (no headless ImGui in the harness); this block covers ONLY the
+    // math layer.
+    //
+    // Conventions (D-035):
+    //   - Euler XYZ is intrinsic Tait-Bryan (R_z * R_y * R_x — apply X
+    //     first in body frame, then Y, then Z). Matches Blender default.
+    //   - Axis-angle output is in [0, π] with auto-normalized axis;
+    //     identity-quat fallback returns angle=0 axis=(1, 0, 0).
+    //   - Gimbal-lock fallback for Euler extraction is lossy by design.
+    //     Round-trip tests SKIP singular inputs deliberately.
+    //
+    // Bug-probe (a): swap q.x / q.y inside quatFromAxisAngle → AxisAngle
+    //   round-trip clause FAILs.
+    // Bug-probe (b): change Euler `from` order to qx * qy * qz without
+    //   changing `to` → Euler round-trip clause FAILs (the two
+    //   conventions disagree and the round-trip drifts).
+    {
+        const float roundTripTol = 1e-5f;
+        auto quatComponentEqual = [](const ::Quat& a, const ::Quat& b, float tol) {
+            return std::abs(a.w - b.w) < tol
+                && std::abs(a.x - b.x) < tol
+                && std::abs(a.y - b.y) < tol
+                && std::abs(a.z - b.z) < tol;
+        };
+        // Turn-30 fix: q and -q are the same rotation. After D-035's
+        // antipodal canonicalization at extraction time, the rebuilt
+        // quat is always in the qBack.w >= 0 form, so a negative-w
+        // input rebuilds to its positive-w antipode. The assertion
+        // accepts either componentwise match or sign-flipped match.
+        auto quatAntipodalEqual = [&](const ::Quat& a, const ::Quat& b, float tol) {
+            ::Quat negB{-b.w, -b.x, -b.y, -b.z};
+            return quatComponentEqual(a, b, tol)
+                || quatComponentEqual(a, negB, tol);
+        };
+
+        // --- AxisAngle round-trip clause ---
+        // Three non-degenerate forward-built probes + identity edge +
+        // two direct-construction negative-w probes (turn-30 BLOCK
+        // regression protection: pre-fix, q.w < 0 inputs hit
+        // s = sqrt(1 - qw²) = 0 → divide-by-zero NaN).
+        struct AxisAngleProbe {
+            ::Quat q;
+            const char* label;
+        };
+        // Forward-built quats (positive-w by construction since
+        // quatFromAxisAngle uses cos(angle/2) with angle ∈ [0, π]).
+        ::Quat qForward1 = quatFromAxisAngle(tinym::vec3(1.0f, 0.0f, 0.0f), 0.5f);
+        ::Quat qForward2 = quatFromAxisAngle(tinym::vec3(0.0f, 1.0f, 0.0f), 1.5f);
+        ::Quat qForward3 = quatFromAxisAngle(tinym::vec3(1.0f, 1.0f, 1.0f), 2.0f);
+
+        // Turn-30 negative-w probes: directly synthesize quats with
+        // q.w < 0 to exercise the antipodal canonicalization at the
+        // extractor entry. q = (-1, 0, 0, 0) is the antipodal identity
+        // (also the result of a 360° rotation around any axis); q with
+        // -cos(π/4) is the antipodal form of a 90°-Y rotation.
+        const float kHalfPi4_cos = std::cos(3.14159265358979323846f * 0.25f);
+        const float kHalfPi4_sin = std::sin(3.14159265358979323846f * 0.25f);
+        ::Quat qAntipodalIdent{-1.0f, 0.0f, 0.0f, 0.0f};
+        ::Quat qAntipodal90Y{-kHalfPi4_cos, 0.0f, -kHalfPi4_sin, 0.0f};
+
+        const AxisAngleProbe aaProbes[] = {
+            { qForward1, "x-axis 0.5 rad (positive-w)" },
+            { qForward2, "y-axis 1.5 rad (positive-w)" },
+            { qForward3, "diagonal 2.0 rad (positive-w)" },
+            { qAntipodalIdent, "antipodal identity q=(-1,0,0,0) — turn-30 BLOCK probe" },
+            { qAntipodal90Y, "antipodal 90°-Y q=(-c,0,-s,0) — turn-30 BLOCK probe" },
+        };
+
+        bool aaOk = true;
+        std::string aaFailReason;
+        for (const auto& probe : aaProbes) {
+            tinym::vec3 axisOut;
+            float angleOut = 0.0f;
+            quatToAxisAngle(probe.q, axisOut, angleOut);
+            ::Quat qBack = quatFromAxisAngle(axisOut, angleOut);
+            // Reject NaN/inf explicitly — without the fix, the
+            // negative-w probes return NaN axis components and
+            // quatFromAxisAngle would propagate them; the antipodal-
+            // equal comparison would then short-circuit to false but
+            // the failure reason should call out the corruption.
+            bool finite = std::isfinite(qBack.w) && std::isfinite(qBack.x)
+                       && std::isfinite(qBack.y) && std::isfinite(qBack.z);
+            if (!finite || !quatAntipodalEqual(probe.q, qBack, roundTripTol)) {
+                aaOk = false;
+                aaFailReason = std::string("AxisAngle round-trip drifted for ")
+                             + probe.label
+                             + ": q=(" + std::to_string(probe.q.w) + "," + std::to_string(probe.q.x)
+                             + "," + std::to_string(probe.q.y) + "," + std::to_string(probe.q.z) + ")"
+                             + " axisOut=(" + std::to_string(axisOut.x) + ","
+                             + std::to_string(axisOut.y) + "," + std::to_string(axisOut.z) + ")"
+                             + " angleOut=" + std::to_string(angleOut)
+                             + " qBack=(" + std::to_string(qBack.w) + "," + std::to_string(qBack.x)
+                             + "," + std::to_string(qBack.y) + "," + std::to_string(qBack.z) + ")"
+                             + " finite=" + std::to_string((int)finite);
+                break;
+            }
+        }
+        // Identity edge: angle=0 axis canonical fallback.
+        if (aaOk) {
+            ::Quat qIdent{1.0f, 0.0f, 0.0f, 0.0f};
+            tinym::vec3 axisOut;
+            float angleOut = 1.0f;  // sentinel; expect overwritten to 0.
+            quatToAxisAngle(qIdent, axisOut, angleOut);
+            if (std::abs(angleOut) > roundTripTol
+                || std::abs(axisOut.x - 1.0f) > roundTripTol
+                || std::abs(axisOut.y) > roundTripTol
+                || std::abs(axisOut.z) > roundTripTol) {
+                aaOk = false;
+                aaFailReason = "identity-quat fallback: expected angle=0 axis=(1,0,0), "
+                               "got angle=" + std::to_string(angleOut)
+                             + " axis=(" + std::to_string(axisOut.x) + ","
+                             + std::to_string(axisOut.y) + "," + std::to_string(axisOut.z) + ")";
+            }
+        }
+
+        if (aaOk) {
+            pass("D-035 / Quat ⇌ AxisAngle round-trips within 1e-5 for non-degenerate inputs");
+        } else {
+            fail("D-035 / Quat ⇌ AxisAngle round-trips within 1e-5 for non-degenerate inputs",
+                 aaFailReason);
+        }
+
+        // --- Euler XYZ round-trip clause ---
+        // Test points: 3 non-singular triples. Avoid pitch (Y) near ±π/2
+        // (gimbal lock band). The round-trip is asserted on Quat
+        // components, not on Euler triples, because Euler equivalence is
+        // modulo 2π and the extracted triple may differ from the input
+        // even when the resulting rotation is the same.
+        struct EulerProbe {
+            float x, y, z;
+            const char* label;
+        };
+        const EulerProbe eulerProbes[] = {
+            { 0.1f, 0.2f, 0.3f, "(0.1, 0.2, 0.3) rad" },
+            { -0.4f, 0.5f, -0.6f, "(-0.4, 0.5, -0.6) rad" },
+            { 1.0f, 0.0f, 0.0f, "(1.0, 0.0, 0.0) rad — pure X rotation" },
+        };
+
+        bool eulerOk = true;
+        std::string eulerFailReason;
+        for (const auto& probe : eulerProbes) {
+            ::Quat q = quatFromEulerXYZ(probe.x, probe.y, probe.z);
+            float xOut = 0.0f, yOut = 0.0f, zOut = 0.0f;
+            quatToEulerXYZ(q, xOut, yOut, zOut);
+            ::Quat qBack = quatFromEulerXYZ(xOut, yOut, zOut);
+            if (!quatComponentEqual(q, qBack, roundTripTol)) {
+                eulerOk = false;
+                eulerFailReason = std::string("Euler XYZ round-trip drifted for ")
+                                + probe.label
+                                + ": q=(" + std::to_string(q.w) + "," + std::to_string(q.x)
+                                + "," + std::to_string(q.y) + "," + std::to_string(q.z) + ")"
+                                + " qBack=(" + std::to_string(qBack.w) + "," + std::to_string(qBack.x)
+                                + "," + std::to_string(qBack.y) + "," + std::to_string(qBack.z) + ")"
+                                + " extracted=(" + std::to_string(xOut) + ","
+                                + std::to_string(yOut) + "," + std::to_string(zOut) + ")";
+                break;
+            }
+        }
+
+        if (eulerOk) {
+            pass("D-035 / Quat ⇌ Euler XYZ round-trips within 1e-5 for non-singular angles");
+        } else {
+            fail("D-035 / Quat ⇌ Euler XYZ round-trips within 1e-5 for non-singular angles",
+                 eulerFailReason);
         }
     }
 

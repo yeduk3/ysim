@@ -302,13 +302,20 @@ struct Program
             glDeleteProgram(programID);
         if (vertexShaderID)
             glDeleteShader(vertexShaderID);
+        if (tessControlShaderID)
+            glDeleteShader(tessControlShaderID);
+        if (tessEvalShaderID)
+            glDeleteShader(tessEvalShaderID);
         if (geomShaderID)
             glDeleteShader(geomShaderID);
         if (fragShaderID)
             glDeleteShader(fragShaderID);
 
-        // value reset
-        programID = vertexShaderID = geomShaderID = fragShaderID = 0;
+        // value reset (D-035 fold-in of turn-29 NOTE-1: tess fields
+        // were previously omitted, leaving stale handles after cleanup
+        // — a footgun if the 4-arg / 5-arg loadShader overloads get used).
+        programID = vertexShaderID = tessControlShaderID
+                  = tessEvalShaderID = geomShaderID = fragShaderID = 0;
     }
     ~Program()
     {
