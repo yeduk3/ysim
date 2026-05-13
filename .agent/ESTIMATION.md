@@ -1,22 +1,23 @@
-# Estimation — 2026-05-14 turn 32 (BLOCK fix-turn)
+# Estimation — 2026-05-14 turn 33
 
 Status: UPDATED
 
 ## Verdict
-NOTE
+WARNING
 
 ## BLOCK
-- none
+- None
 
 ## WARNING
-- none
+- src/main.cpp:6165, src/main.cpp:9083, docs/TEST_MATRIX.md:22 - `runSelfTest` still returns on the Metal-less host before Block 30, so the new Null backend clauses do not execute in the Linux `verify.sh` environment despite the slice's claim that they do; the BDD-008 row stays `pending`, leaving the new contract unverified on the host we actually ran.
 
 ## NOTE
-- `changeBehavior` Rigid case comment says "BehaviorParams variant has no Rigid alternative; the existing variant value persists (harmless — the simulator's dispatch reads behaviorType, not the variant's alternative, for Rigid-tagged meshes)." This is correct and documented in D-036, but the implicit assumption (the leftover variant value is always a noop) is worth a future hardening note: if a future Rigid-dispatch path in `applyEnvironmentForces` ever queries the variant via `std::get` / `std::holds_alternative`, it would see a stale Float or Cloth variant. Acceptable today under BDD-006-RIGID-DISPATCH-PARKED; worth flagging for slice B-3's author. No action required now.
-- `meshBehaviors` pre-state assertion in Clause 6 is deliberately omitted (CURRENT_WORK.md: "rebuildMeshKinds size-match short-circuit leaks residuals across resetScene"). The comment in the harness is clear and the scope-out is justified, but a future test-maintenance pass could add a `shBroadPhase.meshBehaviors.ptr == nullptr` check that confirms the array is unpopulated before the 1-frame pump, tightening the clause. Informational only.
+- include/Quat.hpp:1 - the Quat extraction is a clean boundary split; leaving the helper math in `src/main.cpp` is a reasonable future source-file-split cleanup.
+- include/RigidPhysicsTypes.hpp:1 - the POD contract shape is fine for B-1, but the raw mesh-buffer pointers remain caller-owned and need careful snapshotting in B-2.
+- src/main.cpp:9100 - Clause 3's stricter rotation and velocity checks are good signal; they are stronger than the bare B-1 example without being scope creep.
 
 ## Test matrix delta
-- BDD-006: pass (test-address column updated with clause 5 + clause 6 pass labels + fix-turn bug-probe summaries)
+- BDD-008: missing
 
 ## Verify output (summary)
-`ysim --self-test` ran 57/57 PASS across 5 consecutive deterministic runs on the macOS dev host. Block 29 clauses 5 (Rigid save→load round-trip) and 6 (changeBehavior cache-sync) both pass, and all 4 existing clauses (1–4) remain green. `verify-light.sh` reported 159/159 doctest SUCCESS (scene_io_test suite) + 1120/1120 SUCCESS (unit test suite); BDD-016 stays green with the Elastic substitution. All 4 fix-turn bug-probes were exercised and each revert produced the expected loud FAIL: (a) restoring `"Rigid"` to `isReservedBehavior` causes Clause 5 to fail with `loadErr=behavior 'Rigid' not available in this build`; (b) disabling the loadScene Rigid branch causes Clause 5's post-load tag to silently demote to Float; (c) commenting out `syncBroadPhaseCaches` in the TriangularCloth accept case causes Clause 6 to fail with both caches stale; (d) restoring `"Rigid"` in BDD-016 without reverting (a) causes the doctest assertion on `r.ok` / `r.error.message` to fail, confirming the test-update is load-bearing. The SKIP path on Metal-less hosts is unaffected — the two fix-turn clauses sit inside Block 29 which is gated on `MetalGlobalContext::getDevice()` returning non-null; on those hosts the entire Block 29 suite is skipped (D-012), not failed.
+`./scripts/verify.sh` passed the build and unit-test gates: CMake configured and built successfully, `ysim_tests` passed 159/159 assertions, and `ysim_primitive_tests` passed 1120/1120 assertions. The Linux `ysim --self-test` run emitted the expected Metal-absent SKIP (`[self-test SKIP] metal-device: ...`) and exited 0 before reaching Block 30, so the new B-1 Null backend clauses were not exercised in this environment.
