@@ -8352,6 +8352,46 @@ static int runSelfTest() {
         }
     }
 
+    // ---- Block 27: D-034 — Program::loadShader returns programID=0 on missing files. ----
+    // Mechanizes the D-034 loader-failure contract: after this slice's
+    // refactor of `printLog()` / `linkShader()` to stop calling exit(1),
+    // a `loadShader` call with nonexistent shader files must return
+    // silently with `programID == 0`. Block 25's documented
+    // `if (!fboShader.programID) skip(...)` path now actually fires
+    // when shaders are missing — previously the loader aborted the
+    // process via printLog → exit(1) before the SKIP could observe.
+    //
+    // Bug-probe (a): temporarily revert printLog's exit(1) removal in
+    // include/program.hpp and rebuild → Block 27's loadShader call
+    // aborts the harness mid-test instead of returning cleanly. That
+    // probe is load-bearing for the fix — the loud-FAIL diagnostic
+    // and the harness's process-abort are the two observable
+    // failure modes the loud-FAIL test must distinguish.
+    //
+    // SKIP-safe: if GLFW/GLEW init fails (no display server / no GL
+    // driver), skip rather than fail. Same discipline as Block 25.
+    {
+        HiddenGLContext glctx(64, 64);
+        if (!glctx.ok) {
+            skip("loadshader-no-gl",
+                 "GL context unavailable — loader contract check needs a "
+                 "live program to glCreateProgram against");
+        } else {
+            Program p;
+            p.loadShader("__ysim_nonexistent_vert__.vert",
+                         "__ysim_nonexistent_geom__.geom",
+                         "__ysim_nonexistent_frag__.frag");
+            if (p.programID == 0) {
+                pass("D-034 / Program::loadShader returns programID=0 on missing shader files");
+            } else {
+                fail("D-034 / Program::loadShader returns programID=0 on missing shader files",
+                     "expected programID=0 after loading 3 nonexistent shader files, "
+                     "got programID=" + std::to_string(p.programID)
+                     + " — loader's failure path still doesn't honor the SKIP contract");
+            }
+        }
+    }
+
     if (failures == 0) {
         std::cerr << "[self-test] all checks passed\n";
         return 0;
@@ -8458,6 +8498,17 @@ int main(int argc, char** argv) {
 
     Program shader;
     shader.loadShader("shader.vert", "shader.geom", "shader.frag");
+    // D-034: after the loader contract change, loadShader no longer
+    // calls exit(1) on compile/link failure. Production keeps the
+    // loud-failure behavior via this defensive check at the call site.
+    // The harness (Block 25 / Block 27) consults `programID == 0`
+    // for SKIP semantics instead.
+    if (!shader.programID) {
+        std::cerr << "[ysim] main shader load failed (shader.vert / "
+                     "shader.geom / shader.frag missing or malformed). "
+                     "Run from build/ directory.\n";
+        std::exit(1);
+    }
 
 
     bool debugEachBoxes = false;

@@ -1,34 +1,37 @@
-# Current Work — BDD-018 inspector live-edit propagation (`feat/bdd-018-inspector-live-edit`)
+# Current Work — Loadshader skip-safety + HiddenGLContext cleanup (`fix/loadshader-skip-safety`)
 
-- File in flight: none — slice complete. **48/48 self-test PASS** deterministic across 5 runs. Doctest 159/159 + 1120/1120 green via `verify-light.sh`.
+- File in flight: none — slice complete. **49/49 self-test PASS** deterministic across 5 runs. Doctest 159/159 + 1120/1120 green via `verify-light.sh`.
 - How far: all PLAN todos done.
-  - **NEW Block 26 in `src/main.cpp::runSelfTest`** (between Block 25's closing brace and the failure-counter summary; ~210 lines including comments). Three pass clauses:
-    - `BDD-018 / material inspector edit propagates live` — `target.on_material_edit(meshId, red, 0.5, 0.25, 0.7, zero)` → asserts `materialCalls == 1`, all 5 D-005 fields written through `mesh.material`, `target.base_color == &mesh->material.baseColor` pointer aliasing holds, and one `sim.update()` (no `sim.initialize()` between) preserves the edit.
-    - `BDD-018 / translate inspector edit propagates live` — `target.on_translate(meshId, (1,2,3))` → asserts `translateCalls == 1`, `transformPosition == (1,2,3)`, witness `state.x[0]` shifted by `(1,2,3)` from pre-translate baseline within `1e-5`, and one `sim.update()` preserves the shift.
-    - `BDD-018 / rotate inspector edit propagates live` — `target.on_rotate(meshId, q90Z)` (Hamilton w/x/y/z, `q = (cos45°, 0, 0, sin45°)`) → asserts `rotateCalls == 1`, `rotationQuat` matches `q90Z` within `1e-5`, witness `state.x[0]` matches hand-computed `(pivot.x - pre_y, pivot.y + pre_x, pivot.z + pre_z)` (90°-Z rotation around `transformPosition = (1,2,3)` pivot) within `1e-5`, and one `sim.update()` preserves the rotation.
-  - **NO production-side changes.** Only `src/main.cpp` Block 26 (new) + `docs/TEST_MATRIX.md` BDD-018 row + `.agent/PLAN.md` + `.agent/PROJECT_STATE.md` (planner-side) + `.agent/CURRENT_WORK.md` + `.agent/RESUME.md` (this file).
-  - **NO new symbols outside the harness block.** `mesh_inspector::MeshInspectorTarget` untouched. `mesh_inspector_gui.cpp` untouched. `Simulator::setMaterial / translateObject / rotateObject` signatures and bodies untouched. Block 26 only USES the existing struct and invokes its callbacks — no new struct field, no new callback signature, no production-side helper extraction.
-  - **Mechanization shape: option (b) from the slice brief.** Construct `MeshInspectorTarget` matching production at `src/main.cpp:8349-8387` exactly, then invoke callbacks directly. Option (a) ImGui event synthesis and (c) parallel `InspectorBindings` struct rejected with reasoning in PLAN.md Scope.
-  - **Stricter-than-spec per PLANNER.md procedure step 7:** per-callback counters (`int materialCalls / translateCalls / rotateCalls = 0`) captured by reference in each lambda; assertions require `*Calls == 1` exactly. Double-fire bugs in the inspector wiring would slip past a loose "value propagated somewhere" assertion but fail the strict counter assertion.
-  - **Spec substitutions** (documented in Block 26's comment block AND in TEST_MATRIX.md row):
-    - "color or behavior tag" → mechanized as color/material (D-005 5-tuple) + translate (D-014) + rotate (D-021). Behavior-tag clause **parked under BDD-006 / Q2** (in-place behavior switching not yet implemented — `MeshInspectorTarget` has no behavior-tag field). Returns to scope when BDD-006 ships.
-    - "visible in the very next rendered frame" → mechanized as "the value the renderer reads each frame (mesh.material.* / mesh.transformPosition / state.x) is updated in place by the time the callback returns." NO FBO render — BDD-018's load-bearing claim is on the *input* data path, not output pixels (FBO is D-032's territory and isn't needed here).
-    - "must not require pause/resume" → mechanized as "no `sim.initialize()` between callback fire and next `sim.update()`." Block 26 pumps `sim.update()` between each clause's callback fire and survival check; never calls `sim.initialize()` after the initial setup.
+  - **D-034 — `Program::loadShader` returns silently on failure with `programID = 0`.** Three changes in `include/program.hpp`:
+    - **`printLog()`**: removed `exit(1)` at the end of the function. Caller decides fatality.
+    - **`linkShader()`**: calls `cleanUp()` after `printLog()` on link-status failure, so `programID` becomes 0 and the caller's `if (!programID)` check fires.
+    - **Each `loadShader` overload (4 total: 2-shader / 3-shader / 4-shader / 5-shader)**: early-returns `if (!programID) return;` after each `loadShaderOf` call to avoid wasteful `glAttachShader(0, ...)` after a compile failure has nuked the program.
+  - **D-034 — `HiddenGLContext` symmetric cleanup.** `include/HiddenGLContext.hpp`:
+    - New `bool glfwInitialized = false` field.
+    - Constructor sets `glfwInitialized = true` right after `glfwInit()` succeeds.
+    - Destructor calls `glfwTerminate()` if `glfwInitialized` (post-`glfwDestroyWindow`).
+    - Header comment block rewritten to reflect the new contract (symmetric cleanup; original "avoids invalidating future YGLWindow" rationale obsolete because `--self-test` mode and default-main mode are mutually exclusive at runtime). Documented limitation noted: GLFW's `glfwInit` is NOT ref-counted, so concurrent `HiddenGLContext` instances would invalidate each other.
+  - **Production caller defensive check.** `src/main.cpp` near line 8460 (the single main shader load): after `shader.loadShader("shader.vert", "shader.geom", "shader.frag")`, added `if (!shader.programID) { std::cerr << ... << "Run from build/ directory.\n"; std::exit(1); }`. Preserves loud-failure behavior in production while letting the harness use SKIP semantics. **Other 4 production callers** (`debugLineShader.loadShader("line.vert", "line.frag")` at lines 5050, 5058, 5129, 5149) are all guarded by `if(! debugLineShader.programID)` BEFORE the call, so a failed load just means they'll retry on the next frame — no defensive exit needed (acceptable behavior).
+  - **NEW Block 27 in `runSelfTest`** (between Block 26's closing brace and the failure-counter summary). Mechanization:
+    - Brings up `HiddenGLContext glctx(64, 64)`; SKIPs if `!ok` (no-GL host).
+    - Constructs a `Program p` (NOT the production shader — a local instance).
+    - Calls `p.loadShader("__ysim_nonexistent_vert__.vert", "__ysim_nonexistent_geom__.geom", "__ysim_nonexistent_frag__.frag")`.
+    - Asserts `p.programID == 0`. Pass label `D-034 / Program::loadShader returns programID=0 on missing shader files`.
+    - Self-test count: 48 → 49.
+  - **`docs/DECISIONS.md`** appended with D-034 entry: title, file/function pointers, rationale, Shape A vs Shape B reasoning, implementation notes, caller invariants (production loud-failure preserved via call-site check; harness SKIP semantic now honest), bug-probe shape, link to CM-012.
+  - **`docs/mistakes/COMMON_MISTAKES.md`** appended with CM-012 entry: "Utility helper calls `exit(1)` on failure path, defeating harness SKIP semantics." Low-level cause / high-level cause / fix direction / audit pattern. Marked RESOLVED.
+  - **No `docs/TEST_MATRIX.md` changes** — this slice doesn't touch any BDD.
 - What's tested:
-  - 48/48 self-test PASS deterministic across 5 consecutive runs from `build/`.
-  - Block 26 + Blocks 1–25 all green.
-  - Doctest 159/159 + 1120/1120 SUCCESS via `verify-light.sh` (no test/ files edited; doctest counts unchanged).
-- **Bug-probes (all three load-bearing):**
-  - **(a) Comment out `sim.setMaterial(id, m);` inside `target.on_material_edit`'s lambda body:** Block 26's material clause FAILs with `materialCalls=1 ptrAlias=1 survivesStep=0 got baseColor=(1.0, 1.0, 1.0) metallic=0.0 roughness=0.5 specWeight=1.0` — the callback fired (counter incremented) but the value didn't propagate to `mesh.material`. Restored.
-  - **(b) Comment out `sim.translateObject(id, v);` inside `target.on_translate`'s lambda body:** Block 26's translate clause FAILs with `translateCalls=1 survivesStep=0 tp=(0,0,0) state.x[0]=(0.25, -0.25, -0.25) expected=(1.25, 1.75, 2.75)`. The rotate clause ALSO fails because its pivot expectation depends on translate having run — this is the expected cross-clause coupling and not a false-positive. Restored.
-  - **(c) Comment out `sim.rotateObject(id, ::Quat{w,x,y,z});` inside `target.on_rotate`'s lambda body:** Block 26's rotate clause FAILs with `rotateCalls=1 survivesStep=0 rotQuat=(1.0, 0.0, 0.0, 0.0) [identity] state.x[0]=(1.25, 1.75, 2.75) [post-translate, unrotated] expected=(1.25, 2.25, 2.75)`. Restored.
-- **No new D-NNN, no new CM-NNN, no new BDD/FR** — pure mechanization slice as planned.
-- **NOT folded** (per user explicit direction in slice brief):
-  - Turn-27 WARNING on `Program::loadShader`'s `exit(1)`-on-failure → queued for a future small `fix/loadshader-skip-safety` slice.
-  - Turn-27 NOTE on `HiddenGLContext` destructor not calling `glfwTerminate()` on early-init failure → travels with the loadshader fix slice.
-- Non-goals respected: no `MeshInspectorTarget` widening, no `mesh_inspector_gui.cpp` modification, no production-side helper extraction, no ImGui event synthesis, no new parallel struct, no behavior-tag mechanization, no FBO render, no source-file split, no new BDD/FR.
+  - 49/49 self-test PASS deterministic across 5 consecutive runs from `build/`.
+  - Block 27 + Blocks 1–26 all green.
+  - Doctest 159/159 + 1120/1120 SUCCESS via `verify-light.sh`.
+- **Bug-probes:**
+  - **(a) (LOAD-BEARING) Re-introduce `exit(1)` into `printLog()`:** Self-test reports only 48 PASS lines and exits non-zero — Block 27's `p.loadShader(...)` call abort the harness mid-`linkShader` before Block 27 can print its FAIL diagnostic. This probe proves the fix is load-bearing: without it, the harness can only observe loader failures as process-abort, NOT as a clean `programID == 0` SKIP/FAIL signal. Restored.
+  - **(b) HiddenGLContext destructor**: visual review only (runtime probe requires forcing `glfwInit` failure mid-test, which on macOS would require a temporary process-environment override or a wrapping subprocess test — not practical in the self-test harness). The new `glfwInitialized` field is the audit surface; the destructor's `if (glfwInitialized) glfwTerminate();` is a syntactic check. Skipped per PLAN.md non-goal.
+- **Build-time observation (no slice expansion).** When Block 27's `loadShader` runs against nonexistent files, `loadText` returns "" so each `loadShaderOf`'s GLSL source is empty. Empty GLSL compiles SUCCESSFULLY on most drivers (no syntax errors in empty source) — so the early-return guards in `loadShader` (after `loadShaderOf`) don't fire on missing-file failures. The actual failure is at LINK time (the linked program lacks `main()` in any stage), which is exactly what `linkShader`'s new `cleanUp() + return` path handles. The link error output (`Shader Link Error on Program ID 1!!!!!!` + `ERROR: Compiled vertex shader was corrupt.`) is verbose but accurate — the loader honestly reports what went wrong before returning with `programID == 0`. Documented in D-034.
+- Non-goals respected: no production-side audit beyond the 5 `loadShader` call sites already in `main.cpp` (4 debugLineShader sites are pre-guarded, 1 main shader site got the defensive check); no change to `loadText` / `shaderCompileCheck` / `cleanUp` / `~Program`; no new BDD/FR; no matrix row changes; no folding of turn-28 WARNING (BDD-006/Q2-blocked) or turn-28 NOTE (queued for source-file split slice).
 - What's next: Estimator review (Codex). Expected verdict: NOTE or WARNING. Possible items:
-  - (i) Block 26 duplicates the production `buildSelectedMeshTarget` shape rather than refactoring it into a shared helper — could be a NOTE about future deduplication when source-file split lands.
-  - (ii) Behavior-tag clause spec-substituted out (BDD-006/Q2 blocked) — a future BDD-006 slice will need to extend Block 26 (or add a parallel block) to mechanize the dispatch claim.
-  - (iii) The witness math in the rotate clause is hand-computed (not via D-022's `rotateVector`) — catches D-022 regressions but any error in the hand math is on the harness side, not production. Documented in PLAN.md Course corrections.
-  - (iv) Bug-probe (b)'s rotate-clause cascade FAIL (translate failure breaks rotate's pivot expectation) could be NOTEd as cross-clause coupling, but is intentional — the clauses chain on shared scene state by design (translate sets the pivot the rotate clause uses).
+  - (i) Production behavior change (loud-abort → silent programID=0 inside the loader; defensive call-site check preserves the abort) may warrant a NOTE — future `loadShader` callers added without the defensive check will silently render nothing. The audit pattern is in CM-012 but not enforced at compile time.
+  - (ii) `glfwInit` is non-ref-counted → concurrent `HiddenGLContext` would clash. v1 has no concurrent use; future concurrent use would need a process-global init counter. Documented in the header comment and D-034 but not enforced.
+  - (iii) HiddenGLContext destructor cleanup verified by visual review only (no runtime probe). NOTE-able.
+  - (iv) Block 27's output is verbose ("Shader Link Error on Program ID 1!!!!!!" + corrupted-shader errors) — accurate but noisy. Could be NOTEd as cosmetic. Skipped this slice; cosmetic-only.

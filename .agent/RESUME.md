@@ -1,41 +1,37 @@
-# Resume — BDD-018 inspector live-edit propagation
+# Resume — Loadshader skip-safety + HiddenGLContext cleanup (D-034 + CM-012)
 
 ## Must remember
 
-- **Branch:** `feat/bdd-018-inspector-live-edit` (off `main` at `01092b9`).
-- **Closes BDD-018** matrix row 32 (`pending → pass`) via Block 26 in `runSelfTest`. No production-side changes — pure harness slice.
-- **Block 26 = three pass clauses** (material / translate / rotate); 45 → 48 self-test count. Each clause asserts the corresponding inspector callback path: counter == 1 (exactly one setter call), live in-place mutation, and `sim.update()` survival without `sim.initialize()`.
-- **Mechanization shape (b)** from the slice brief: harness constructs `mesh_inspector::MeshInspectorTarget` matching the production shape at `src/main.cpp:8349-8387` EXACTLY (same field assignments, same lambda bodies that wrap `Simulator::setMaterial / translateObject / rotateObject`). Harness invokes the callbacks directly with synthetic edit values. Options (a) ImGui event synthesis and (c) parallel `InspectorBindings` struct rejected with reasoning in PLAN.md.
-- **Spec substitutions documented** (PLAN.md Scope + Block 26 comment + matrix row note):
-  - "color or behavior tag" → harness covers color/material + translate + rotate. **Behavior-tag clause parked under BDD-006 / Q2** (in-place behavior switching not yet wired into `MeshInspectorTarget`). Returns to scope when BDD-006 ships.
-  - "visible in the very next rendered frame" → mechanized as in-place pointer value the renderer reads each frame. NO FBO render — BDD-018's load-bearing claim is on the *input* data path, not output pixels.
-  - "must not require pause/resume" → mechanized as no `sim.initialize()` between callback fire and pump.
-- **Stricter-than-spec per PLANNER.md step 7:** per-callback counters (`int materialCalls / translateCalls / rotateCalls = 0`) captured by reference. Assertions require exact `== 1`. Catches double-fire bugs that a loose "value propagated somewhere" assertion would miss.
-- **Pointer-aliasing assertion:** `target.base_color == &mesh->material.baseColor`. Production discipline — if these don't alias, the renderer reads from a different memory than the inspector writes through. Block 26 asserts the addresses match.
-- **Witness math in rotate clause is hand-computed**, NOT via D-022's `rotateVector` — avoids "use the implementation to verify the implementation" tautology. The hand-math: post-rotate state.x[0] = (pivot.x - pre_y, pivot.y + pre_x, pivot.z + pre_z) for a 90°-Z rotation around `pivot = transformPosition = (1, 2, 3)` (set by the translate clause).
-- **Bug-probe (b) cascades to rotate-clause FAIL** because the rotate's pivot expectation depends on translate having run. This is intentional cross-clause coupling — Block 26's clauses chain on shared scene state by design.
-- **NOT folded** per user explicit direction: turn-27 WARNING on `Program::loadShader` skip-safety + turn-27 NOTE on `HiddenGLContext` destructor cleanup. Both queued for a future small `fix/loadshader-skip-safety` slice.
-- **No new D-NNN, no new CM-NNN, no new BDD/FR** — pure mechanization slice.
+- **Branch:** `fix/loadshader-skip-safety` (off `main` at `1d8b6d9`).
+- **D-034 — Loader failure contract refactor.** `Program::printLog` no longer calls `exit(1)`; `Program::linkShader` calls `cleanUp()` after `printLog()` on link failure so `programID` becomes 0; each `loadShader` overload early-returns after each `loadShaderOf` once `programID` is 0. Callers MUST check `programID != 0` before using the program.
+- **Production behavior is preserved at the call site, NOT inside the loader.** `src/main.cpp:8460` (main shader) gets `if (!shader.programID) std::exit(1)` after the load — loud failure stays loud where production wants it. The 4 `debugLineShader` call sites at lines 5050/5058/5129/5149 are PRE-guarded by `if(! debugLineShader.programID)` BEFORE the load, so a failed load just means they retry next frame — acceptable, no defensive check added.
+- **Harness uses `programID == 0` for SKIP semantics.** Block 25 (FBO PBR) was the original consumer; Block 27 (this slice) mechanizes the contract by calling `loadShader` with bogus filenames and asserting `programID == 0`.
+- **D-034 — `HiddenGLContext` symmetric cleanup.** New `bool glfwInitialized` field; constructor sets true after `glfwInit()` succeeds; destructor calls `glfwTerminate()` if true. Documented limitation: GLFW's `glfwInit` is NOT ref-counted, so two concurrent `HiddenGLContext` instances would invalidate each other on first destruction. v1 sequences them non-overlappingly (Block 25 → Block 27).
+- **CM-012 trap pattern.** "Utility helper calls `exit(1)` on failure path, defeating harness SKIP semantics." Audit pattern in COMMON_MISTAKES.md: when adding a utility helper, check whether it makes process-lifetime decisions implicitly. A `[[noreturn]]` helper makes the contract visible; a print-and-exit helper hides it.
+- **Self-test count 48 → 49.** Block 27 adds 1 PASS clause: `D-034 / Program::loadShader returns programID=0 on missing shader files`.
+- **Empty GLSL compiles successfully** on most drivers — so `loadShaderOf("__nonexistent__")` doesn't trigger the early-return in `loadShader` (compile succeeds with empty source). The actual failure is at LINK time (no `main()` in any stage), and `linkShader`'s new `cleanUp() + return` is what makes `programID == 0` observable. Block 27's output is verbose ("Shader Link Error... ERROR: Compiled vertex shader was corrupt") but accurate.
+- **Bug-probe (a) is load-bearing.** Re-introducing `exit(1)` into `printLog` makes the harness abort inside Block 27 (only 48 PASS emit instead of 49). Without the fix, loader failures are observable ONLY as process-abort, not as a clean SKIP/FAIL signal.
+- **Bug-probe (b) HiddenGLContext destructor**: skipped per PLAN — runtime probe requires forcing `glfwInit` failure mid-test, not practical on macOS. Visual review + the new `glfwInitialized` field is the audit surface.
+- **NOT folded this slice.** Estimator turn 28's WARNING (BDD-018 behavior-tag) is BDD-006/Q2-blocked. Turn 28's NOTE (duplicated `MeshInspectorTarget` wiring between production and Block 26) is queued for the source-file split slice.
 
 ## Last decisions + why
 
-- **PLAN.md option (b) chosen** over (a) ImGui event synthesis and (c) parallel `InspectorBindings` struct. Rationale: option (b) mechanizes the load-bearing seam (callback → Simulator → in-place mutation) without an ImGui-side test harness; (a) is brittle and tests the widget layer that's already user-validated; (c) is redundant since `MeshInspectorTarget` already serves.
-- **Witness vertex from `state.x[0]`** captured fresh before each clause that depends on it. Float behavior pins state.x against gravity so the prior `sim.update()` doesn't drift, but the harness re-snapshots defensively in case of future integrator changes.
-- **Float cube over cloth** for Block 26: Float pins state.x against gravity (force=0), so one `sim.update()` leaves state.x unchanged. Cloth would complicate the survival assertion with mass-spring drift.
+- **D-034 picked Shape B over Shape A.** Shape A (return-only-inside-loadShader) doesn't work because the actual `exit(1)` lives inside `printLog`, called by `linkShader`, called by `loadShader`. A syntactic Shape A patch would have needed cleanup duplication into every `loadShader` overload (4 total) without fixing the underlying contract. Shape B fixes it at the source: `printLog` prints only; `linkShader` returns with `programID = 0` on failure.
+- **Production defensive check at the single critical call site** (main shader load in `main.cpp:8460`), NOT a project-wide audit. The 4 `debugLineShader` sites are pre-guarded, so they're fine. Adding defensive checks at every call site would be cargo-cult; the CM-012 audit pattern documents the future discipline.
+- **`HiddenGLContext::glfwInitialized` as a per-instance bool**, NOT a process-global counter. v1 has no concurrent use; the simpler design is correct for current usage and the limitation is documented for future use.
 
 ## Next step you were about to take
 
-Slice complete. Next concrete step is the **Estimator's** turn (Codex) — `./scripts/verify.sh` should exit 0 with **48/48** self-test PASS lines on the macOS dev host. On the Estimator's Linux container the top-level Metal SKIP returns 0 before Block 26 reaches; doctest binaries pass unchanged. Expected verdict: NOTE or WARNING. Possible items:
+Slice complete. Next concrete step is the **Estimator's** turn (Codex) — `./scripts/verify.sh` should exit 0 with **49/49** self-test PASS lines on the macOS dev host. On the Estimator's Linux container the top-level Metal SKIP returns 0 before Block 27 reaches; doctest binaries pass unchanged. Expected verdict: NOTE or WARNING. Possible items:
 
-- (i) Block 26 duplicates the production `buildSelectedMeshTarget` shape (src/main.cpp:8349-8387) rather than refactoring it into a shared helper — could be a NOTE about future deduplication when source-file split lands.
-- (ii) Behavior-tag inspector edit spec-substituted out (BDD-006 / Q2 blocked) — a future BDD-006 slice will need to extend Block 26 or add a parallel block to mechanize the "if the behavior changed, the next simulation step dispatches through the new behavior" clause.
-- (iii) Rotate-clause witness math is hand-computed (not via `rotateVector`) — catches D-022 regressions but any error in the hand math is on the harness side, not production. Trade-off documented in PLAN.md Course corrections.
-- (iv) Bug-probe (b)'s rotate-clause cascade FAIL (translate failure breaks rotate's pivot expectation) is intentional cross-clause coupling. Could be NOTEd but is by-design.
+- (i) Production behavior change inside loader (loud-abort → silent programID=0; defensive check preserves abort at call site). Future `loadShader` callers added without the defensive check will silently render nothing. NOTE-able; the audit pattern is in CM-012 but not enforced.
+- (ii) `glfwInit` non-ref-counted → concurrent `HiddenGLContext` instances would clash. Documented limitation; v1 safe. NOTE-able.
+- (iii) HiddenGLContext destructor cleanup verified by visual review only. NOTE-able trade-off.
+- (iv) Block 27's verbose error output ("Shader Link Error... corrupted vertex shader") is cosmetic noise. Skip-able NOTE.
 
 After this lands, planner-tracked candidates per `PROJECT_STATE.md`:
 
-- **Loadshader skip-safety fix slice** — addresses turn-27 WARNING + NOTE that this slice deliberately did NOT fold.
-- **Inspector ergonomics for rotation** — Euler / axis-angle input per FR-004 Notes.
+- **Inspector ergonomics for rotation** — Euler / axis-angle input per FR-004 Notes. Small UX; no clean BDD path.
 - **Behavior assignment UI (FR-006 / BDD-006)** — Q2 still open; would unblock BDD-018's behavior-tag clause.
 - **Rigid body (FR-008)** — Q4 blocked.
 - **Alembic export (FR-013)** — Q5+Q6 blocked.

@@ -67,36 +67,47 @@ struct Program
         return true;
     }
 
+    // D-034: each loadShader variant early-returns once `loadShaderOf`
+    // has nuked `programID` (via cleanUp() on compile failure). Skipping
+    // the subsequent loadShaderOf + linkShader calls is correctness
+    // (avoids spurious glAttachShader(0, ...) GL errors) and economy
+    // (no wasted compile attempts after the program is already lost).
     void loadShader(const char *vShaderFile, const char *fShaderFile)
     {
         cleanUp();
-        
+
         // Create Program
         programID = glCreateProgram();
         std::cout << "Program " << programID << " created" << std::endl;
-        
+
         vertexShaderID = loadShaderOf(vShaderFile, GL_VERTEX_SHADER);
+        if (!programID) return;
         fragShaderID   = loadShaderOf(fShaderFile, GL_FRAGMENT_SHADER);
-        
+        if (!programID) return;
+
         linkShader();
+        if (!programID) return;
         use();
     }
-    
+
     void loadShader(const char *vShaderFile, const char *gShaderFile, const char *fShaderFile)
     {
         cleanUp();
-        
+
         // Create Program
         programID = glCreateProgram();
         std::cout << "Program " << programID << " created" << std::endl;
-        
+
         vertexShaderID = loadShaderOf(vShaderFile, GL_VERTEX_SHADER);
+        if (!programID) return;
         geomShaderID   = loadShaderOf(gShaderFile, GL_GEOMETRY_SHADER);
+        if (!programID) return;
         fragShaderID   = loadShaderOf(fShaderFile, GL_FRAGMENT_SHADER);
-        
+        if (!programID) return;
+
         linkShader();
     }
-    
+
     void loadShader(const char *vShaderFile,
                     const char *tcShaderFile,
                     const char *teShaderFile,
@@ -104,40 +115,49 @@ struct Program
                     const char *fShaderFile)
     {
         cleanUp();
-        
+
         // Create Program
         programID = glCreateProgram();
         std::cout << "Program " << programID << " created" << std::endl;
-        
+
         vertexShaderID      = loadShaderOf(vShaderFile,  GL_VERTEX_SHADER);
+        if (!programID) return;
         tessControlShaderID = loadShaderOf(tcShaderFile, GL_TESS_CONTROL_SHADER);
+        if (!programID) return;
         tessEvalShaderID    = loadShaderOf(teShaderFile, GL_TESS_EVALUATION_SHADER);
+        if (!programID) return;
         geomShaderID        = loadShaderOf(gShaderFile,  GL_GEOMETRY_SHADER);
+        if (!programID) return;
         fragShaderID        = loadShaderOf(fShaderFile,  GL_FRAGMENT_SHADER);
-        
+        if (!programID) return;
+
         linkShader();
     }
-    
+
     void loadShader(const char *vShaderFile,
                     const char *tcShaderFile,
                     const char *teShaderFile,
                     const char *fShaderFile)
     {
         cleanUp();
-        
+
         // Create Program
         programID = glCreateProgram();
         std::cout << "Program " << programID << " created" << std::endl;
 
         vertexShaderID      = loadShaderOf(vShaderFile,  GL_VERTEX_SHADER);
         std::cout << "VShader " << vertexShaderID << " created" << std::endl;
+        if (!programID) return;
         tessControlShaderID = loadShaderOf(tcShaderFile, GL_TESS_CONTROL_SHADER);
         std::cout << "TCShader " << tessControlShaderID << " created" << std::endl;
+        if (!programID) return;
         tessEvalShaderID    = loadShaderOf(teShaderFile, GL_TESS_EVALUATION_SHADER);
         std::cout << "TEShader " << tessEvalShaderID << " created" << std::endl;
+        if (!programID) return;
         fragShaderID        = loadShaderOf(fShaderFile,  GL_FRAGMENT_SHADER);
         std::cout << "FShader " << fragShaderID << " created" << std::endl;
-        
+        if (!programID) return;
+
         linkShader();
     }
     
@@ -164,6 +184,12 @@ struct Program
         return shaderID;
     }
     
+    // D-034: print-the-log helper no longer exits the process. Callers
+    // decide whether the failure is fatal (production callers crash on
+    // their own; harness callers SKIP). Previously this exit(1) defeated
+    // Block 25's documented `programID == 0` SKIP semantic — the harness
+    // never got to observe the failure because the process was gone.
+    // See CM-012.
     void printLog()
     {
         GLint maxLength = 0;
@@ -177,9 +203,12 @@ struct Program
         {
             std::cout << e;
         }
-        exit(1);
     }
 
+    // D-034: on link failure, call cleanUp() so `programID` becomes 0
+    // and callers can observe the failure via the standard
+    // `if (!programID)` check. Without the cleanUp() call, programID
+    // would remain a valid-looking handle for an unlinked program.
     void linkShader()
     {
         // 다 붙이면 링크 후 사용 등록
@@ -192,6 +221,7 @@ struct Program
 
             printLog();
 
+            cleanUp();
             return;
         }
         std::cout << "Program " << programID << " link successed." << std::endl;
