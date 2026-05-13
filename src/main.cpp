@@ -476,6 +476,9 @@ struct GlobalAutoAllocator {
 //    void reset() { this->marker = 0; }
 //};
 #include "tinym.hpp"
+#include "Quat.hpp"
+#include "RigidPhysicsTypes.hpp"
+#include "NullRigidPhysicsBackend.hpp"
 
 using Precision = float;
 
@@ -1549,14 +1552,11 @@ struct Material {
     tinym::vec3 emissionColor = tinym::vec3(0.0f);
 };
 
-// Order matches the on-disk schema: [w, x, y, z]. Identity is the v1 default;
-// no consumer applies the rotation yet, but it must round-trip through save/load.
-struct Quat {
-    float w = 1.0f;
-    float x = 0.0f;
-    float y = 0.0f;
-    float z = 0.0f;
-};
+// D-037: `struct Quat` definition lives in `include/Quat.hpp` (included near
+// the top of this file). Body unchanged; only the physical location moved so
+// `include/RigidPhysicsTypes.hpp` (RigidInitial holds Quat by value) can see
+// the complete type. Helper functions (operator*, quatNormalize, etc.) stay
+// in this file below.
 
 // D-019: canonical quaternion math. Hamilton product convention is `a * b
 // = apply b first, then a` — i.e., to rotate by R1 then R2, write R2 * R1.
@@ -9077,6 +9077,119 @@ static int runSelfTest() {
                      + " postObjBehaviorOk=" + std::to_string((int)postObjBehaviorOk)
                      + " postMeshBehaviorsOk=" + std::to_string((int)postMeshBehaviorsOk));
             }
+        }
+    }
+
+    // ---- Block 30: D-037 — NullRigidPhysicsBackend contract round-trip. -----
+    // Pure-C++ null backend; no Metal calls; runs on macOS + Linux containers.
+    // Foundation for slice B-2 (Bullet impl) and B-3 (Rigid behavior wiring).
+    // Outside the Metal gate by design — the contract surface compiles and
+    // round-trips even on Metal-less hosts where higher-numbered blocks SKIP.
+    {
+        // ---- Clause 1 — Lifecycle ---------------------------------------
+        {
+            ysim::physics::NullRigidPhysicsBackend backend;
+            const char* name = backend.backendName();
+            bool nameOk = (name != nullptr && std::string(name) == "Null");
+            bool initOk = backend.initialize(tinym::vec3(0.0f, -9.81f, 0.0f));
+            backend.setGravity(tinym::vec3(0.0f, -1.0f, 0.0f));  // must not crash
+            backend.shutdown();                                   // must not crash
+            bool reinitOk = backend.initialize(tinym::vec3(0.0f, -9.81f, 0.0f));
+
+            if (nameOk && initOk && reinitOk) {
+                pass("D-037 / NullRigidPhysicsBackend lifecycle: name + init + setGravity + shutdown + re-init");
+            } else {
+                fail("D-037 / NullRigidPhysicsBackend lifecycle: name + init + setGravity + shutdown + re-init",
+                     "nameOk=" + std::to_string((int)nameOk)
+                     + " initOk=" + std::to_string((int)initOk)
+                     + " reinitOk=" + std::to_string((int)reinitOk));
+            }
+        }
+
+        // ---- Clause 2 — Body state query --------------------------------
+        // Fresh backend so Clause 1's state doesn't leak in.
+        ysim::physics::NullRigidPhysicsBackend backend;
+        backend.initialize(tinym::vec3(0.0f, -9.81f, 0.0f));
+
+        ysim::physics::RigidInitial init{};
+        init.position         = tinym::vec3(0.0f, 5.0f, 0.0f);
+        init.rotation         = ::Quat{1.0f, 0.0f, 0.0f, 0.0f};   // explicit identity
+        init.linear_velocity  = tinym::vec3(1.0f, 2.0f, 3.0f);
+        init.angular_velocity = tinym::vec3(-0.5f, 0.0f, 0.5f);
+        init.mass             = 1.0f;
+        init.shape.type       = ysim::physics::RigidShapeType::Sphere;
+        init.shape.half_extents = tinym::vec3(0.5f, 0.0f, 0.0f);  // radius
+
+        ysim::physics::BodyHandle h = backend.addBody(init);
+        bool handleOk = (h >= 0);
+
+        tinym::vec3 pos = backend.getPosition(h);
+        ::Quat      rot = backend.getRotation(h);
+        tinym::vec3 lv  = backend.getLinearVelocity(h);
+        tinym::vec3 av  = backend.getAngularVelocity(h);
+
+        bool posOk = (std::abs(pos.x - 0.0f) < 1e-5f
+                   && std::abs(pos.y - 5.0f) < 1e-5f
+                   && std::abs(pos.z - 0.0f) < 1e-5f);
+        bool rotOk = (std::abs(rot.w - 1.0f) < 1e-5f
+                   && std::abs(rot.x) < 1e-5f
+                   && std::abs(rot.y) < 1e-5f
+                   && std::abs(rot.z) < 1e-5f);
+        bool lvOk  = (std::abs(lv.x - 1.0f) < 1e-5f
+                   && std::abs(lv.y - 2.0f) < 1e-5f
+                   && std::abs(lv.z - 3.0f) < 1e-5f);
+        bool avOk  = (std::abs(av.x + 0.5f) < 1e-5f
+                   && std::abs(av.y) < 1e-5f
+                   && std::abs(av.z - 0.5f) < 1e-5f);
+
+        if (handleOk && posOk && rotOk && lvOk && avOk) {
+            pass("D-037 / NullRigidPhysicsBackend addBody+query: stored initial position/rotation/velocities round-trip");
+        } else {
+            fail("D-037 / NullRigidPhysicsBackend addBody+query: stored initial position/rotation/velocities round-trip",
+                 "handleOk=" + std::to_string((int)handleOk)
+                 + " posOk=" + std::to_string((int)posOk)
+                 + " rotOk=" + std::to_string((int)rotOk)
+                 + " lvOk=" + std::to_string((int)lvOk)
+                 + " avOk=" + std::to_string((int)avOk));
+        }
+
+        // ---- Clause 3 — step + force/impulse/setVelocity are no-ops -----
+        // Apply external forces + setVelocity BEFORE step (null backend
+        // ignores them all). Reuses backend + handle from Clause 2.
+        backend.applyForce(h, tinym::vec3(100.0f, 100.0f, 100.0f), tinym::vec3(0.0f));
+        backend.applyImpulse(h, tinym::vec3(10.0f, 10.0f, 10.0f), tinym::vec3(0.0f));
+        backend.setLinearVelocity(h, tinym::vec3(999.0f, 999.0f, 999.0f));
+        backend.setAngularVelocity(h, tinym::vec3(999.0f, 999.0f, 999.0f));
+
+        backend.step(1.0f / 60.0f, 1);
+
+        tinym::vec3 posPost = backend.getPosition(h);
+        ::Quat      rotPost = backend.getRotation(h);
+        tinym::vec3 lvPost  = backend.getLinearVelocity(h);
+        tinym::vec3 avPost  = backend.getAngularVelocity(h);
+
+        bool posInvariantOk = (std::abs(posPost.x - 0.0f) < 1e-5f
+                            && std::abs(posPost.y - 5.0f) < 1e-5f
+                            && std::abs(posPost.z - 0.0f) < 1e-5f);
+        bool rotInvariantOk = (std::abs(rotPost.w - 1.0f) < 1e-5f
+                            && std::abs(rotPost.x) < 1e-5f
+                            && std::abs(rotPost.y) < 1e-5f
+                            && std::abs(rotPost.z) < 1e-5f);
+        bool lvInvariantOk  = (std::abs(lvPost.x - 1.0f) < 1e-5f
+                            && std::abs(lvPost.y - 2.0f) < 1e-5f
+                            && std::abs(lvPost.z - 3.0f) < 1e-5f);
+        bool avInvariantOk  = (std::abs(avPost.x + 0.5f) < 1e-5f
+                            && std::abs(avPost.y) < 1e-5f
+                            && std::abs(avPost.z - 0.5f) < 1e-5f);
+
+        if (posInvariantOk && rotInvariantOk && lvInvariantOk && avInvariantOk) {
+            pass("D-037 / NullRigidPhysicsBackend step+force/impulse/setVelocity are no-ops (kinematic; B-2 Bullet + B-3 wiring enable dynamics)");
+        } else {
+            fail("D-037 / NullRigidPhysicsBackend step+force/impulse/setVelocity are no-ops (kinematic; B-2 Bullet + B-3 wiring enable dynamics)",
+                 "posInvariantOk=" + std::to_string((int)posInvariantOk)
+                 + " rotInvariantOk=" + std::to_string((int)rotInvariantOk)
+                 + " lvInvariantOk=" + std::to_string((int)lvInvariantOk)
+                 + " avInvariantOk=" + std::to_string((int)avInvariantOk));
         }
     }
 

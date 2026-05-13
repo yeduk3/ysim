@@ -1,37 +1,39 @@
-# Resume — BDD-006 BLOCK fix-turn (D-036 turn-32 addendum)
+# Resume — B-1 RigidPhysicsBackend contract + Null impl (D-037)
 
 ## Must remember
 
-- **Branch / worktree**: working in `.claude/worktrees/fixturn-bdd-006` (branch `fixturn-bdd-006`, branched off `037d83f` with slice WIP patched in). The primary checkout's `feat/bdd-006-behavior-assignment-ui` still carries the pre-fix-turn slice WIP uncommitted; merge requires unstaging the primary's WIP first. Commit prefix `fix:` per BLOCK-fix-turn cadence; the close-out lands as ONE `fix:` commit containing both the original D-036 slice content + the turn-32 fix-turn changes (D-035 turn-30 precedent — commit `1f21335 fix: ...`).
-- **BLOCK closure (option b — load-side accept Rigid)**: `scene_format::isReservedBehavior` narrowed `{Rigid, Elastic, Fluid, Generator}` → `{Elastic, Fluid, Generator}`; `isKnownBehavior` widened to include `"Rigid"`; new `else if (o.behavior.type == "Rigid")` branch in `Simulator::loadScene` sets `btype = Rigid + bparams = FloatBehaviorParams<PR>{}` (FloatBehaviorParams placeholder satisfies the variant; Rigid is tag-set only per D-036 invariant). Symmetric with `Simulator::changeBehavior` (already accepts Rigid). Round-trip preserved; forward-compat with B-3 (which widens dispatch, not persistence).
-- **WARNING closure (cache-sync in changeBehavior)**: `syncBroadPhaseCaches(BehaviorType bt)` lambda inside `changeBehavior` writes `objTrees[idx].objBehavior` AND `shBroadPhase.meshBehaviors[idx]` directly when caches are allocated (gated on `.ptr` / size). Called at the tail of each accept case. D-026's `builtForLifetimeId` invariant is preserved — lifetime tracking is unchanged.
-- **`test/scene_io_test.cpp` BDD-016 swap**: example changed Rigid → Elastic so the test's intent (reserved-not-shipped rejection on load) is preserved. The new error-message find is `"Elastic"`.
-- **Block 29 grew 4 → 6 clauses**. Clause 5 = Rigid round-trip; Clause 6 = changeBehavior cache-sync. Self-test count 55 → 57.
-- **Clause 6 pre-state asymmetry**: pre-state asserts `objTrees[0].objBehavior == Float` (D-026's skip-rebuild gate re-populates on `!= Float || lifetimeId mismatch`) but does NOT assert `meshBehaviors[0] == Float` because `rebuildMeshKinds()` short-circuits on size-match, leaking residuals from prior clauses (e.g., Clause 3 leaves `meshBehaviors[0] = FastGridCloth = 1`). The post-state check is what closes the WARNING — bug-probe (c) confirms it's load-bearing.
-- **All 4 bug-probes verified, load-bearing.** (a) scene_format reserved-list revert → Clause 5 FAILs with turn-32 BLOCK signature. (b) loadScene Rigid-branch revert → Clause 5 `loadOk=1 postTagOk=0`. (c) cache-sync revert → Clause 6 `postObjBehaviorOk=0 postMeshBehaviorsOk=0`. (d) BDD-016 test-update revert → doctest FAILs (3 assertions). All restored.
-- **No new D-NNN, no new CM-NNN.** D-036 turn-32 fix-turn addendum captures both invariants. BDD-006-RIGID-DISPATCH-PARKED standing constraint narrows (persistence done; only integrator dispatch parked until B-3).
-- **Manual GUI gate post-fix-turn**: cube → Rigid → save → load → confirm Rigid tag preserved; Float→Cloth switch reacts in the same frame (no one-frame collision-filter lag).
+- **Branch / worktree**: `feat/b-1-rigid-physics-backend-contract` in worktree `.claude/worktrees/b-1-rigid-backend`, branched off local `main` HEAD `186578d`. Commit prefix `add:` (new feature). Worktree's `third_party/imgui` submodule was initialized fresh with `git submodule update --init --recursive` so cmake builds the imgui sources from third_party rather than the system path. The `/slice` close-out merges `feat/b-1-rigid-physics-backend-contract` to `main` via `--ff-only` with one `add:` commit + one `chore: estimator turn 33` commit.
+- **Three new headers under `include/`**: `Quat.hpp` (cut/paste from src/main.cpp:1554; struct body byte-identical), `RigidPhysicsTypes.hpp` (POD types in `namespace ysim::physics`), `NullRigidPhysicsBackend.hpp` (12-method contract no-op class). All inline in headers (the null backend's bodies are short; future B-2 Bullet impl will likely have a .cpp).
+- **Block 30 placed OUTSIDE the Metal-gated section** in `runSelfTest` (~line 9081, immediately after Block 29). Pure C++ contract surface runs on macOS + Linux containers alike. 3 clauses: lifecycle / body-state-query / step-is-noop. Pass labels use `D-037 / ...` prefix.
+- **Baseline 56, not 57**. The prior BDD-006 fix-turn merged to `main` reported "57/57" in PROJECT_STATE.md / PLAN.md / CURRENT_WORK.md, but the actual measured PASS count at commit `186578d` is **56**. The discrepancy is an off-by-one counting bug in the prior slice's reported headline (the underlying clauses still PASS). B-1 adds 3 → measured total is **59/59 PASS deterministic** across 5 runs. D-037 entry documents this in its "Self-test baseline note" paragraph.
+- **PRESERVED**: Simulator template signature UNCHANGED (no 4th `RigidBackend` parameter — B-3's surface change); `ExplicitSystem<METAL, PR>::update`'s Rigid branch UNCHANGED (still no-op fall-through at src/main.cpp:5891); `GeneralMesh<BE, PR>` UNCHANGED (no `rigidBodyHandle` field yet); `applyEnvironmentForces` UNCHANGED (still accumulates gravity into Rigid-tagged meshes — harmless because the integrator doesn't read it). All four are B-3 surface changes.
+- **CM-012 discipline**: NullRigidPhysicsBackend methods contain NO `exit()` / `abort()` / release `assert()`. Out-of-range BodyHandle returns sentinel zeros / identity quat; caller (Simulator at B-3) decides fatality at its layer.
+- **New standing constraint RIGID-BACKEND-PORTABILITY**: any contract change must update every backend in the same commit. Recorded in `docs/roles/PLANNER.md` Standing constraints subsection (last bullet, after BDD-102-vs-ALEMBIC-BYTES). Future Estimator turns reference by label.
+- **BDD-006-RIGID-DISPATCH-PARKED** standing constraint UNCHANGED. B-1 doesn't retire it; B-3 does. BDD-008 row in TEST_MATRIX stays `pending` (Null backend is kinematic by design; row promotes to `pass` when B-3 lands).
+- **All 4 bug-probes verified load-bearing.** (a) `addBody` returns `kInvalidBodyHandle` → Clause 2 `handleOk=0` (cascade). (b) `getPosition` returns zero unconditionally → Clause 2 `posOk=0` + Clause 3 `posInvariantOk=0`. (c) `step()` mutates position by `gravity*h*h` → Clause 3 `posInvariantOk=0` only (Clauses 1+2 still PASS). (d) `getRotation` returns `::Quat{0,0,0,0}` → Clause 2 `rotOk=0` + Clause 3 `rotInvariantOk=0`. All restored. No BUG-PROBE markers remain in src/ or include/.
+- **C-1..C-4 FlatBuffers mesh-cache slices deferred indefinitely** per user directive 2026-05-14 (memory: `~/.claude/projects/-Users-gyu-codes-ysim/memory/project_flatbuffers_caching_skipped.md`). Active order: B-1 (this) → B-2 (Bullet) → B-3 (wire Rigid behavior). Alembic export slice (when picked up) goes direct to Alembic library, not via FlatBuffers intermediate.
 
 ## Last decisions + why
 
-- **Option (b) over (a) over (c) for BLOCK**: load-side accept is symmetric with runtime, preserves the user's behavior choice across save/load (no silent data loss), forward-compatible with B-3.
-- **Cache-sync via in-method lambda over a helper method**: keeps the sync localized to changeBehavior so future readers see the invariant alongside the mutation. The 4× DRY via lambda beats inline duplication.
-- **Clause 6 drops meshBehaviors pre-check**: stale-cache leak across `resetScene` boundaries is a pre-existing condition unrelated to this fix-turn; would be scope expansion to fix `rebuildMeshKinds`. Post-check alone closes the WARNING and bug-probe (c) keeps the assertion load-bearing.
-- **D-036 addendum over new D-NNN**: this fix-turn enforces existing D-036 invariants (persistence symmetry; runtime cache consistency) that the original entry under-specified. New D-NNN reserved for new architectural patterns.
+- **D-037 (DECISIONS.md)** — RigidPhysicsBackend template-based contract + Null impl. Foundation slice; Simulator surface deferred to B-3. Per-body initial snapshot for round-trip semantics over stateless null (latter loses the design doc's example assertion). Three headers under `include/` (split for compile-time isolation; Quat extracted as minimum scope-expansion for `RigidInitial::rotation` by-value storage). CM-012 discipline preserved (no `exit()` in helpers).
+- **Quat extraction** — only the aggregate body moves to `include/Quat.hpp`; helpers (`operator*`, `quatNormalize`, `quatFromAxisAngle`, etc. at src/main.cpp:~1562-1700+) stay in main.cpp. Migrating helpers is future cleanup (likely with source-file split slice).
+- **Block 30 outside Metal gate** — pure C++ contract surface has no Metal dependency; placing it outside means Estimator's Linux Metal-less container runs Block 30 too (60→60 there, not SKIP-emits-0 for the new clauses). Block 29 stays inside the Metal gate per its existing structure.
+- **Stricter-than-design assertions** in Clause 3 — design doc only asserts position invariant; we additionally assert rotation + linear + angular velocity invariants. PLANNER §7: "stricter-than-spec assertions are valuable signal." Gives bug-probe (d) a target.
 
 ## Next step you were about to take
 
-Fix-turn complete. Next concrete step: **user's manual GUI test** (cube → Rigid → save → load → confirm tag preserved) then the **Estimator's turn 33** (Codex). `./scripts/verify.sh` should exit 0 with **57/57** self-test PASS on macOS. Expected verdict: NOTE or WARNING. Possible items:
+Slice complete. Next concrete step: **Estimator's turn 33** (Codex). `./scripts/verify.sh` should exit 0 with **59/59** self-test PASS on macOS AND Linux containers (Block 30 outside Metal gate). Expected verdict: NOTE-clean. Possible NOTE items:
 
-- (i) D-036 turn-32 fix-turn addendum prose is long — could trim for CHANGELOG-style. NOTE-able.
-- (ii) Clause 6's pre-state asymmetry (meshBehaviors deliberately not asserted) — informational. The source comment explains.
-- (iii) BDD-006-RIGID-DISPATCH-PARKED narrowing — first appearance of the narrowed text.
+- (i) Block 30 placement (outside Metal gate) — taste-level call; either is defensible.
+- (ii) Quat helpers stay in main.cpp — future cleanup with source-file split.
+- (iii) `RigidShape::mesh_vertex_data` / `mesh_index_data` as raw `const float*` / `const uint32_t*` — caller-owns-buffer dangling-pointer subtlety. D-037 mentions it; null backend never reads the pointers, but B-2's Bullet backend will snapshot.
+- (iv) Block 30 doesn't exercise ConvexMesh / StaticMesh shape types. Null backend ignores shape; B-2 will cover.
+- (v) Out-of-range handle behavior covered indirectly (Clause 2's `handleOk=true` is the proxy); no explicit out-of-range clause.
+- (vi) Self-test baseline counting note in D-037 (prior "57" was off by one) — informational.
 
-After this fix-turn lands + Estimator approves + `/slice` close-out merges:
+After this slice lands + Estimator approves + `/slice` close-out merges:
 
-- **C-1 (FlatBuffers mesh-cache writer)** — next per agreed slice order.
-- **B-1 (Rigid physics backend contract + Null impl)** — after C-1.
-- **B-2 (Bullet impl)** — after B-1.
-- **B-3 (Wire Rigid behavior tag into Bullet)** — retires BDD-006-RIGID-DISPATCH-PARKED + BDD-018-BEHAVIOR-TAG-PARKED.
+- **B-2 Bullet RigidPhysicsBackend impl** — vendor Bullet 3.25 under `include/bullet3/`, replace `NullRigidPhysicsBackend` in Block 30 with `BulletRigidPhysicsBackend`, add 2 dynamics assertions (sphere falls under gravity for one step within 1e-4; sphere + static plane rest at y ≈ radius). 59 → 61 self-test count.
+- **B-3 Wire Rigid behavior tag into Bullet backend** — adds `GeneralMesh::rigidBodyHandle` field; widens `Simulator` template with 4th `RigidBackend` parameter; new `Simulator::addRigidBody(...)` mutator; `ExplicitSystem::update`'s Rigid branch reads `rigid_.getPosition / getRotation` and updates `state.x` via D-021's rotateVector path. **Retires BDD-006-RIGID-DISPATCH-PARKED + BDD-018-BEHAVIOR-TAG-PARKED.** BDD-008 row promotes `pending → pass`.
 
 See `.agent/PLAN.md` and `.agent/CURRENT_WORK.md` for full plan and progress.
