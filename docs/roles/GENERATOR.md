@@ -78,6 +78,19 @@ When a new assertion lands on a real bug, **bug-probe before declaring done**: t
 
 Always grep for `BUG-PROBE` before committing — the marker comment is the easiest leftover to forget.
 
+### Edge-case probe enumeration for math-layer slices
+
+When authoring probes for a math conversion / extraction / inverse function, sense-check the probe array against the function's natural input domain BEFORE declaring the block done. If PLAN.md's "Course corrections" lists domain edges (per PLANNER step 9), exercise each one explicitly; if PLAN.md is silent, ask: does the function's domain naturally split into regimes (positive-w vs negative-w quaternions, near-zero vs near-π angles, axis-aligned vs degenerate axes)? If yes, the probe array MUST cover each regime, not just one — "happens to round-trip in regime A" isn't coverage.
+
+Standard checklist for math functions:
+- **Antipodes** (`q` vs `-q`, `θ` vs `2π - θ`). Identity case at qw=+1 AND its antipode at qw=-1.
+- **Singularities / divide-by-zero risks**. If the function computes `1/x` or `x/sqrt(1-y²)`, probe x or y at the limit values.
+- **Degenerate inputs**. Zero-norm axis, identity rotation, NaN/inf rejection.
+- **Boundary clamps**. `acos`/`asin` input at exactly ±1; check that the function doesn't `NaN` from rounding overshoot.
+- **Sign symmetry**. If `f(-x) = -f(x)` is expected, probe a negative input. If `f(x) == f(-x)` is expected, probe both.
+
+Bitten on **D-035 turn-30**: Block 28's 3 positive-w forward-built probes missed the antipodal-identity case `q = (-1, 0, 0, 0)` entirely — `quatToAxisAngle` produced `axis = q.x / sqrt(1 - 1) = NaN`. The Estimator caught it BLOCK-level by reading the diff (positive-w-only coverage was visible from the probe array). The fix-turn extended the array with 2 direct-constructed negative-w probes; the bug-probe "revert the canonicalization, observe `axisOut=(NaN,NaN,NaN)`" proved the fix is load-bearing.
+
 ## Build-time discoveries (small fix-on-the-way OR hand back)
 
 When a harness assertion fails for a reason outside the slice's stated scope (e.g., production code has a bug the test exposes), there are two clean paths:
@@ -86,6 +99,12 @@ When a harness assertion fails for a reason outside the slice's stated scope (e.
 - **Hand back** when the fix would expand the slice meaningfully — multiple call-site changes, kernel-side coordination, ABI change, design questions you can't answer without the Planner. Examples: CM-007 (`rand()`-jiggle determinism — three fix-direction options needed Planner choice; first attempt to mask via SKIP got BLOCKed).
 
 Don't silence the failing assertion to pass the gate. The Estimator BLOCKs SKIP-as-suppression; FAIL on a slice-critical assertion is the right signal that the scope needs re-planning.
+
+**CM-012 trap** — when a build-time discovery surfaces that a utility helper calls `exit(1)` / `abort()` / `terminate()` unilaterally inside a failure path, treat it as the canonical CM-012 pattern (utility decides process lifetime, defeats harness SKIP semantics). Fix-on-the-way is appropriate if the surface is small (D-034 refactored `printLog` + `linkShader` + each `loadShader` overload's early-return in ~30 lines total). Hand back if the surface is larger (multiple helpers, multiple call sites, ABI implications). The pattern was bitten on D-034 when Block 25's documented `programID == 0` SKIP branch never observed loader failure because `printLog` exited the process first.
+
+### Bug-fix turns in response to an Estimator BLOCK
+
+The fix-turn stays on the same slice branch (commit prefix `fix:` rather than `add:`). For each BLOCK item, write a regression-protection probe inside the harness that exercises the missed edge AND a **revert-the-fix bug-probe**: temporarily undo the fix, build, rebuild, run `--self-test`, confirm the same BLOCK signature reproduces, restore. The revert-the-fix pattern proves the fix is what closes the BLOCK (not some unrelated code-path change that happened to mask it). Bitten on D-035 turn-30: reverting the `if (qw < 0) negate` block reproduced exactly `axisOut=(NaN,NaN,NaN) finite=0` — the original BLOCK signature.
 
 ## Stable harness gotchas (read before writing a new Block)
 
@@ -96,3 +115,4 @@ Don't silence the failing assertion to pass the gate. The Estimator BLOCKs SKIP-
 - **`sim.applyPendingMaterials()`** (despite the name) writes both materials AND `pendingRotations[mesh.id]` into `mesh.rotationQuat`. Call it after `loadScene + initialize` if your block reads rotation post-load.
 - **Pass-label wording stays verbatim from `docs/TESTS.md` "Then" clauses.** The matrix-row label is too compressed; assertions written from labels have BLOCKed past slices. Spec-substitutions go in the **block comment** + **pass label** explicitly so the Estimator can audit without re-reading the spec.
 - **`numMeshes` pre-call read in `addCloth`/`addCube`/etc.** is the about-to-be-assigned mesh id (D-015 / D-018 invariant). Read it BEFORE the `addGeneralMesh` call; reading after gets the next id.
+- **Parallel-implementation lockstep.** When a math conversion (or any shared utility) has parallel copies in two TUs — e.g., `src/main.cpp` Quat-based vs `include/MeshInspectorWindow.hpp` float-array per D-035 — any change to one MUST mirror to the other in the same commit. Before declaring done, grep both files to confirm the change landed in both. Bitten on D-035 turn-30 fix-turn: the antipodal-canonicalization patch had to be applied to `quatToAxisAngle` AND `quatWxyzToAxisAngleDeg` simultaneously; missing either side would have left the BLOCK partially open. The canonical list of currently-active parallel-impl constraints lives in `docs/roles/PLANNER.md`'s "Standing constraints" subsection.

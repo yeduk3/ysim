@@ -29,7 +29,7 @@ You must **not** write to `src/`, `test/`, `.agent/PLAN.md`, `.agent/CURRENT_WOR
    - **`ysim --self-test` SKIP is not a failure.** On a Linux container or any host without Metal, `MetalGlobalContext::getDevice()` returns null and the harness prints `[self-test SKIP] metal-device: …` then exits 0 (D-012). That branch is the *correct* behavior — the gate's authority on those hosts comes from the build + doctest binaries, not the Metal-backed assertions. Distinguish "skipped because no Metal" from "skipped because the Generator silenced an assertion" by reading the SKIP line.
 2. **Reconcile diff against PLAN.** Does the diff implement the PLAN's todo? Is anything in the diff *outside* the plan's scope (silent scope creep)? Both directions matter.
 3. **Reconcile diff against specs.** For each behavior id touched, does the implementation actually satisfy the BDD/FRD wording, or did the Generator pattern-match on the name? **Open `docs/TESTS.md` and read the "Then" clauses verbatim** — assertions written from the matrix-row labels (rather than `TESTS.md`) have BLOCKed past slices because the labels are too compressed to drive the assertion off.
-4. **Check the test matrix.** Every new/changed behavior id should have a test address filled in and a passing status. A behavior id with code but no test is at minimum WARNING.
+4. **Check the test matrix.** Every new/changed behavior id should have a test address filled in and a passing status. A behavior id with code but no test is at minimum WARNING. **For math-layer slices**, additionally check whether the probe array's inputs span the function's natural domain — if probes are all in one regime (e.g., all positive-w quaternions, all axis-aligned rotations), that's a domain-coverage gap worth flagging even when the matrix row is clean. See "Missing-edge probe coverage in math-layer slices" under "What to flag, what to skip."
 5. **Write `ESTIMATION.md`** in the structure below. Mark at the top whether the file was updated this turn so the Planner can detect it.
    - **Standing parked failures vs new regressions.** When the only `verify.sh` failure is a known parked clause (e.g., a CM-NNN entry tagged "fixed in next slice"), call it out explicitly: "BLOCK driven by parked CM-NNN, not new regression." The Planner uses this to distinguish "next slice should fix CM-NNN" from "this slice introduced a new break."
 
@@ -76,6 +76,7 @@ Flag:
 - Tests that hit mocks where the spec implies an integration boundary.
 - Decisions that contradict an entry in `DECISIONS.md` without that entry being updated.
 - Files in `COMMON_MISTAKES.md` whose listed mitigation is not visible in the diff.
+- **Missing-edge probe coverage in math-layer slices.** When the Generator's probe array exercises only one regime of a function's natural input domain (positive-w-only quaternions, near-zero-only angles, single-axis-only rotations, etc.), flag the gap. Severity: **WARNING** if the missed edge would only surface as a future regression hazard; **BLOCK** if the existing production code-path on the missed edge produces NaN / process-corruption / divide-by-zero observable today (D-035 turn-30: the antipodal-identity probe gap let `axis = q.x / 0 = NaN` ship; that was BLOCK-worthy because the next inspector callback would feed the NaN back into `Simulator::rotateObject` and corrupt `mesh.rotationQuat`). This is the domain-coverage sibling of "stricter-than-spec assertions are valuable signal" — if the probe array's inputs all sit in one regime, the harness's clean PASS doesn't mean the function is correct; it means we didn't test what could break.
 
 Skip:
 
@@ -111,6 +112,8 @@ Some WARNINGs persist across multiple slices because their close requires upstre
 - Re-flag standing WARNINGs the first time they appear, then carry them forward as PROJECT_STATE acknowledgements.
 - **Not** re-flag them every estimation turn — that's noise. Once it's documented, the next turn's verdict can drop the line unless the situation changed.
 - Distinguish "standing structural WARNING" from "new regression" explicitly in the verdict text. A turn-N WARNING that says "BDD-102 still uses state.x not Alembic bytes" is fine; "BDD-102 still uses state.x not Alembic bytes (new this turn)" would be wrong.
+
+The canonical list of long-lived documented limitations lives in **`docs/roles/PLANNER.md`'s "Standing constraints" subsection** (PARALLEL-IMPL-LOCKSTEP, GLFWINIT-NON-REF-COUNTED, DUPLICATED-INSPECTOR-WIRING, BDD-018-BEHAVIOR-TAG-PARKED, BDD-102-vs-ALEMBIC-BYTES, etc.). Pull from there rather than maintaining a parallel list here. When a slice introduces a new long-lived limitation, the Planner adds it to that subsection; the Estimator references it by label in subsequent verdicts.
 
 ## Pass-label coverage gaps deserve WARNING even when verify.sh exits 0
 

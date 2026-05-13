@@ -1,20 +1,32 @@
-# Current Work — D-035 BLOCK fix-turn: axis-angle antipodal canonicalization (`feat/inspector-rotation-ergonomics`)
+# Current Work — Role-doc maintenance pass (`chore/role-doc-maintenance-pass`)
 
-- File in flight: none — BLOCK fix-turn complete. **51/51 self-test PASS** deterministic across 5 runs. Doctest 159/159 + 1120/1120 green via `verify-light.sh`. Turn-30 BLOCK closed.
-- How far: all fix-turn PLAN todos done.
-  - **D-035 fix — antipodal canonicalization at extractor entry.** Applied to both parallel implementations in the same commit (lockstep per turn-30 NOTE):
-    - `src/main.cpp::quatToAxisAngle` (~line 1635): added `if (qw < 0) { qw=-qw; qx=-qx; qy=-qy; qz=-qz; }` block right after the function entry. Downstream logic operates on local `qw/qx/qy/qz` copies instead of `q.w / q.x / q.y / q.z`. The `clamp qw < -1` line was removed since `qw ∈ [0, 1]` after canonicalization (only `qw > 1` overshoot remains).
-    - `include/MeshInspectorWindow.hpp::quatWxyzToAxisAngleDeg` (~line 61): identical shape, identical math, identical comment block citing the turn-30 fix.
-  - **Block 28 AxisAngle clause extended with regression-protection probes.** Now uses `quatAntipodalEqual` (accepts `a == b` OR `a == -b`) instead of strict `quatComponentEqual`. The probe array switched from forward-built (axis, angle) records to direct-constructed `::Quat` records — first 3 are positive-w forward-built (preserve coverage from D-035), last 2 are turn-30 BLOCK probes: `qAntipodalIdent = (-1, 0, 0, 0)` (360° rotation case) and `qAntipodal90Y = (-cos(π/4), 0, -sin(π/4), 0)` (antipodal form of a 90°-Y rotation). Assertion also rejects NaN/inf components explicitly via `std::isfinite` so the BLOCK signature surfaces as `finite=0` in the diagnostic when something does go wrong.
-  - **D-035 turn-30 addendum** appended to `docs/DECISIONS.md`: documents the canonicalization, explains why forward direction is deliberately unchanged (standard pattern: storage may drift across antipodal boundary, read-time canonicalization picks canonical representative), notes the lockstep maintenance constraint.
+- File in flight: none — slice complete. **No code/test changes** (docs-only). 51/51 self-test PASS (sanity, single run — nothing executable changed); doctest 159/159 + 1120/1120 SUCCESS via `verify-light.sh`.
+- How far: all PLAN todos done. 5 discipline lessons folded across 3 role docs + PROJECT_STATE entry.
+  - **`docs/roles/PLANNER.md`** — added 2 new procedure steps + augmented 1 existing step + new "Standing constraints" subsection + Output discipline CM-012 note (~70 net lines added):
+    - **Procedure step 9 — "Domain-edge probe enumeration for math-layer slices"**: enumerate antipodes / singularities / degenerate inputs / boundary clamps / sign symmetry in PLAN.md Course corrections; pass as required probe coverage to the Generator. References D-035 turn-30 as canonical bite.
+    - **Procedure step 10 — "Planning a BLOCK fix-turn"**: Goal names the BLOCK item verbatim; Scope is narrow; no new D-NNN if BLOCK is enforcement of existing decision (use addendum instead); bug-probe shape is "revert-the-fix, observe-same-BLOCK-signature." References D-035 turn-30 fix-turn.
+    - **Procedure step 7** ("Author assertions stricter than the BDD's literal wording") gains a 1-line reference to Block 28's antipodal-equivalent comparison as another example.
+    - **New "Standing constraints" subsection** beside the spec-substitution log, with 5 initial entries: PARALLEL-IMPL-LOCKSTEP, GLFWINIT-NON-REF-COUNTED, DUPLICATED-INSPECTOR-WIRING, BDD-018-BEHAVIOR-TAG-PARKED, BDD-102-vs-ALEMBIC-BYTES. Each: source slice/decision, constraint description, resolution trigger.
+    - **Output discipline** gains CM-012 procedural note about utility-helper exit semantics with D-034 as canonical bite.
+  - **`docs/roles/GENERATOR.md`** — added an "Edge-case probe enumeration" sub-section + a parallel-impl-lockstep gotcha + CM-012 reference + BLOCK fix-turn bug-probe pattern note (~55 net lines added):
+    - **Bug-probe discipline → "Edge-case probe enumeration for math-layer slices"** sub-section: standard checklist (antipodes / singularities / divide-by-zero / degenerate inputs / boundary clamps / sign symmetry) with D-035 turn-30 as canonical bite.
+    - **Stable harness gotchas → "Parallel-implementation lockstep"** entry: grep both files before declaring done; canonical list lives in PLANNER's Standing constraints. References D-035 turn-30 fix-turn.
+    - **Build-time discoveries → CM-012 trap** entry: when a utility helper exits unilaterally, treat as CM-012; fix-on-the-way if small (D-034 was ~30 lines).
+    - **New sub-section "Bug-fix turns in response to an Estimator BLOCK"**: revert-the-fix bug-probe pattern explicitly named. References D-035 turn-30.
+  - **`docs/roles/ESTIMATOR.md`** — added a new "What to flag" item + augmented procedure step 4 + cross-reference to PLANNER's Standing constraints (~25 net lines added):
+    - **"What to flag, what to skip" → "Missing-edge probe coverage in math-layer slices"** item: WARNING if missed edge is regression hazard; BLOCK if observable today (NaN / process-corruption / divide-by-zero). D-035 turn-30 as canonical bite.
+    - **Procedure step 4** ("Check the test matrix") gains a math-layer addendum: also check whether the probe array's inputs span the function's natural domain.
+    - **"Standing structural WARNINGs"** section gains a pointer to PLANNER's "Standing constraints" subsection as the canonical list.
+  - **`.agent/PROJECT_STATE.md`** — added a "Recent scope changes" entry for the 2026-05-13 role-doc maintenance pass.
 - What's tested:
-  - 51/51 self-test PASS deterministic across 5 consecutive runs from `build/` (same count as before fix-turn — probes added to existing clause, no new PASS labels).
-  - Block 28 AxisAngle clause now exercises 5 probes (3 positive-w + 2 negative-w) + identity-fallback edge.
-  - Doctest 159/159 + 1120/1120 SUCCESS.
-- **Bug-probe (LOAD-BEARING).** Temporarily reverted the `if (qw < 0) negate` block in BOTH `quatToAxisAngle` AND `quatWxyzToAxisAngleDeg` simultaneously. Block 28's AxisAngle clause FAILed with exactly the turn-30 BLOCK signature: `AxisAngle round-trip drifted for antipodal identity q=(-1,0,0,0) — turn-30 BLOCK probe: axisOut=(nan,nan,nan) angleOut=6.283185 qBack=(-1.000000,nan,nan,nan) finite=0`. This confirms (i) the new probes actually exercise the BLOCK case, (ii) the canonicalization is what closes it (not some other code path). Both files restored simultaneously per lockstep discipline.
-- **Manual GUI test (user-driven, post-fix).** Before `/codex:rescue`: launch `./build/src/ysim`, create a cube, open Inspector → Rotation → Axis-Angle mode, enter `angle = 360°` and commit. The widget should now snap to angle=0, axis=(1,0,0) rather than display NaN values. (Pre-fix behavior: NaN cascaded into next callback, corrupting `mesh.rotationQuat`.)
-- Non-goals respected: no new D-NNN (D-035 addendum extends existing entry); no new BDD/FR/CM; no TEST_MATRIX changes; no change to forward direction (`quatFromAxisAngle` / `axisAngleDegToQuatWxyz` unchanged); no change to Euler helpers; no change to `mesh_inspector_gui.cpp` (rotation panel transparently benefits); no folding of any other open NOTE.
-- What's next: Estimator review (Codex). Expected verdict: NOTE (BLOCK closed). Possible items:
-  - (i) Parallel-implementations lockstep NOTE from turn-30 persists as a standing reminder until source-file split lands. Documented in the addendum.
-  - (ii) Block 28's antipodal-equivalent comparison accepts sign-flipped pairs as equal — geometrically correct but a future regression that silently sign-flipped extractor output would PASS this assertion. A separate "strict positive-w on extraction output" assertion could be added later if persistence canonicalization needs it; not in scope here.
-  - (iii) The forward direction is allowed to produce negative-w output (standard pattern). Documented in D-035 addendum.
+  - No code changes; the "test" is the Estimator's diff-reading pass (sense-check that each addition matches the lesson it claims to capture).
+  - `verify-light.sh` green (doctest 159/159 + 1120/1120 SUCCESS).
+  - `./src/ysim --self-test` 51/51 PASS (single run, no determinism stress needed).
+  - `git diff --stat src/ test/ include/` is empty (confirmed).
+- **No bug-probe step** — docs-only slice. The lessons themselves were forensically derived from real slice incidents (D-035 turn-30, D-034 turn-27 + turn-29, turn-28 NOTE, BDD-102 stale-substitution).
+- **Special-case write-set extension** for this meta-slice: Generator authored all 3 role docs + PROJECT_STATE entry. Same convention as the prior role-doc maintenance pass (commit `4217619`). The Estimator's strict write set (`.agent/ESTIMATION.md` + `docs/TEST_MATRIX.md`) means the Estimator can't write to ESTIMATOR.md; the Generator handles it under Planner direction.
+- Non-goals respected: no `.claude/skills/slice/SKILL.md` modification; no changes to specs / ARCHITECTURE / DECISIONS / mistakes / TESTS / TEST_MATRIX; no retroactive editing of past PLAN/CURRENT_WORK/RESUME/ESTIMATION; no new D-NNN / CM-NNN / BDD / FR.
+- What's next: Estimator review (Codex). Expected verdict: NOTE (docs-only sense-check). Possible items:
+  - (i) PLANNER's new "Standing constraints" subsection might want its own canonical home (a separate `docs/standing-constraints.md` file) if the list grows beyond ~10 entries — current 5 entries fit comfortably inside PLANNER.md; defer.
+  - (ii) The GENERATOR "Edge-case probe enumeration" sub-section could benefit from a second worked example beyond D-035 — defer to next maintenance pass when more examples accumulate.
+  - (iii) The pacing observation in PLAN.md Course corrections ("~14 cycles per maintenance pass; future passes can wait for similar accumulation") is informational — Estimator may flag it as outside the scope of the pass itself; it's an internal-to-PLAN.md note, not in the role docs.
