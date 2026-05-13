@@ -31,6 +31,43 @@ void drawMeshInspectorWindow(
     if (target.behavior_label) ImGui::Text("Behavior: %s", target.behavior_label);
     if (target.shape_label) ImGui::Text("Shape: %s", target.shape_label);
 
+    // FR-006 / BDD-006 / D-036: behavior-tag editing dropdown.
+    // 4 entries — Float / TriangularCloth / FastGridCloth / Rigid;
+    // reserved-not-shipped (Elastic / Fluid / Generator) absent.
+    // FastGridCloth is disabled unless target.grid_eligible (square-
+    // regular grid topology); Rigid is selectable but dispatch is
+    // parked under BDD-006-RIGID-DISPATCH-PARKED until slice B-3.
+    if (target.current_behavior_index >= 0 && target.on_behavior_change) {
+        if (ImGui::CollapsingHeader("Behavior", ImGuiTreeNodeFlags_DefaultOpen)) {
+            static const char* kBehaviorLabels[] = {
+                "Float", "Triangular Cloth", "Fast Grid Cloth", "Rigid"
+            };
+            int idx = target.current_behavior_index;
+            const char* preview = (idx >= 0 && idx < 4) ? kBehaviorLabels[idx] : "(unknown)";
+            if (ImGui::BeginCombo("Behavior##editable", preview)) {
+                for (int i = 0; i < 4; ++i) {
+                    // FastGridCloth (index 2) requires a square-regular grid.
+                    bool selectable = (i != 2) || target.grid_eligible;
+                    bool isSelected = (idx == i);
+                    ImGui::BeginDisabled(!selectable);
+                    if (ImGui::Selectable(kBehaviorLabels[i], isSelected) && selectable) {
+                        bool ok = target.on_behavior_change(target.mesh_id, i);
+                        if (ok) {
+                            state.status_message = std::string("Behavior set to ")
+                                                 + kBehaviorLabels[i] + ".";
+                        } else {
+                            state.status_message = std::string(kBehaviorLabels[i])
+                                + " rejected (invalid for this shape).";
+                        }
+                    }
+                    if (isSelected) ImGui::SetItemDefaultFocus();
+                    ImGui::EndDisabled();
+                }
+                ImGui::EndCombo();
+            }
+        }
+    }
+
     if (ImGui::CollapsingHeader("Appearance", ImGuiTreeNodeFlags_DefaultOpen)) {
         // D-027: material edits write through *target.base_color / metallic /
         // ... in place for live preview (renderer reads mesh.material.*

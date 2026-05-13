@@ -281,11 +281,16 @@ inline std::string toString(const SceneSnapshot& s) {
 }
 
 inline bool isReservedBehavior(const std::string& t) {
-    return t == "Rigid" || t == "Elastic" || t == "Fluid" || t == "Generator";
+    // D-036 turn-32 addendum: "Rigid" moved out of reserved-not-shipped —
+    // it has runtime tag-set support per D-036; persistence round-trips
+    // the tag. Integrator dispatch stays parked under
+    // BDD-006-RIGID-DISPATCH-PARKED until slice B-3.
+    return t == "Elastic" || t == "Fluid" || t == "Generator";
 }
 
 inline bool isKnownBehavior(const std::string& t) {
-    return t == "Float" || t == "TriangularCloth" || t == "FastGridCloth";
+    return t == "Float" || t == "TriangularCloth" || t == "FastGridCloth"
+        || t == "Rigid";
 }
 
 inline bool isReservedShape(const std::string& /*s*/) {

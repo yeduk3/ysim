@@ -184,6 +184,27 @@ struct MeshInspectorTarget {
                        tinym::vec3 /*baseColor*/, float /*metallic*/,
                        float /*roughness*/, float /*specularWeight*/,
                        tinym::vec3 /*emissionColor*/)> on_material_edit;
+    // FR-006 / BDD-006 / D-036 inspector behavior-tag editing path.
+    // current_behavior_index is set by production each frame to the
+    // mesh's current behavior tag mapped to a dropdown index:
+    //   0 = Float, 1 = TriangularCloth, 2 = FastGridCloth, 3 = Rigid.
+    // Reserved-not-shipped (Elastic / Fluid / Generator) are absent
+    // from the dropdown — hard-coded 4-entry list. -1 means the field
+    // is uninitialized / behavior editing is disabled for this target.
+    // grid_eligible is true when the mesh's initializer is a
+    // MeshGridInitializer (the only producer of a square-regular
+    // grid topology); FastGridCloth combo entry is selectable only
+    // when this is true. on_behavior_change applies the user's
+    // dropdown selection by mapping the index back to BehaviorType
+    // and invoking Simulator::changeBehavior at the production
+    // boundary. The callback returns false when the setter rejects
+    // (e.g., FastGridCloth on a non-grid shape) so the widget can
+    // surface a status message. The int-pointer / int-index pattern
+    // avoids coupling this header to main.cpp's BehaviorType enum;
+    // production owns the mapping table.
+    int current_behavior_index = -1;
+    bool grid_eligible = false;
+    std::function<bool(int /*meshId*/, int /*newBehaviorIndex*/)> on_behavior_change;
 };
 
 void drawMeshInspectorWindow(

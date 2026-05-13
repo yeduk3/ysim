@@ -235,6 +235,11 @@ TEST_CASE("BDD-016: reject scene file missing format_version") {
 }
 
 TEST_CASE("BDD-016: reject reserved-but-not-shipped behavior type") {
+    // D-036 turn-32 addendum: "Rigid" is no longer reserved-not-shipped
+    // (it round-trips via persistence per BDD-006 fix-turn). Reserved
+    // set is now {Elastic, Fluid, Generator}; we exercise the rejection
+    // path with "Elastic" so the test's intent (loader rejects reserved
+    // behavior names) is preserved.
     auto path = tempPath("016c");
     REQUIRE(writeText(path, R"({
       "format_version": 1,
@@ -243,13 +248,13 @@ TEST_CASE("BDD-016: reject reserved-but-not-shipped behavior type") {
         "source": {"type":"primitive","shape":"grid","size":1.0,"tessellation":2},
         "transform": {"position":[0,0,0],"rotation":[1,0,0,0]},
         "material": {"base_color":[1,1,1],"metallic":0.0,"roughness":0.5,"specular_weight":1.0,"emission_color":[0,0,0]},
-        "behavior": {"type":"Rigid","params":{}}
+        "behavior": {"type":"Elastic","params":{}}
       }],
       "environment": {"gravity":[0,0,0],"wind":[0,0,0]}
     })"));
     auto r = readFromFile(path);
     CHECK_FALSE(r.ok);
-    CHECK(r.error.message.find("Rigid") != std::string::npos);
+    CHECK(r.error.message.find("Elastic") != std::string::npos);
     CHECK(r.error.message.find("not available") != std::string::npos);
     std::remove(path.c_str());
 }

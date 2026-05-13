@@ -4904,6 +4904,96 @@ struct Simulator {
         pendingMaterials[meshId] = mat;
     }
 
+    // BDD-006 / D-036: in-place behavior switch. Preserves mesh.id +
+    // transform + shape + state.x + state.v; the next sim.update()
+    // dispatches the new behavior. Returns false on invalid request
+    // (mesh not found, reserved-not-shipped behavior, FastGridCloth
+    // on non-grid topology). Reserved (Elastic / Fluid / Generator)
+    // are rejected here AND hidden from the inspector dropdown — see
+    // mesh_inspector_gui.cpp's behavior combo.
+    //
+    // BDD-006-RIGID-DISPATCH-PARKED (standing constraint): Rigid tag
+    // is accepted, but applyEnvironmentForces' dispatch above treats
+    // anything that isn't Float/TriangularCloth/FastGridCloth as a
+    // non-wind-susceptible body with no specific dispatch — effectively
+    // kinematic until slice B-3 wires IRigidPhysicsBackend's Bullet impl.
+    bool changeBehavior(int meshId, BehaviorType newType) {
+        auto* mesh = Scene<BE, PR>::findById(meshId);
+        if (!mesh) return false;
+        // D-036 turn-32 addendum: keep broad-phase's cached behavior
+        // arrays in lock-step with mesh.behaviorType so the per-pair
+        // Float-skip in BroadPhase reflects the new tag immediately
+        // (instead of lagging until the next full rebuild).
+        // `objTrees[idx].objBehavior` is set at build() but the
+        // skip-rebuild gate keeps the stale value otherwise (D-026);
+        // `shBroadPhase.meshBehaviors[idx]` short-circuits when
+        // size matches numMeshes. Guards handle the not-yet-allocated
+        // edge (changeBehavior before initialize): next rebuild then
+        // picks up the correct value from mesh->behaviorType.
+        auto syncBroadPhaseCaches = [&](BehaviorType bt) {
+            if (Scene<BE, PR>::meshes.empty()) return;
+            Index idx = (Index)(mesh - &Scene<BE, PR>::meshes[0]);
+            if (idx < 0 || idx >= (Index)Scene<BE, PR>::meshes.size()) return;
+            if (idx < (Index)collisionPipeline.broadPhase.objTrees.size()) {
+                collisionPipeline.broadPhase.objTrees[idx].objBehavior = bt;
+            }
+            if (shBroadPhase.meshBehaviors.ptr
+                && idx < (Index)shBroadPhase.meshBehaviors.size) {
+                shBroadPhase.meshBehaviors[idx] = (uint32_t)bt;
+            }
+        };
+        switch (newType) {
+            case BehaviorType::Float:
+                mesh->behaviorType = BehaviorType::Float;
+                mesh->behaviorParams = FloatBehaviorParams<PR>{};
+                syncBroadPhaseCaches(BehaviorType::Float);
+                return true;
+            case BehaviorType::TriangularCloth:
+                mesh->behaviorType = BehaviorType::TriangularCloth;
+                mesh->behaviorParams = ClothBehaviorParams<PR>{
+                    PR(1e5), PR(1e5), PR(3e5), PR(0.01)
+                };
+                syncBroadPhaseCaches(BehaviorType::TriangularCloth);
+                return true;
+            case BehaviorType::FastGridCloth: {
+                // Only valid on a square-regular grid topology. The
+                // sole initializer that produces one is
+                // MeshGridInitializer; dynamic_cast is the standing
+                // discriminator. pn1D < 2 is degenerate (single line
+                // of particles) and rejected by the same gate.
+                auto* g = dynamic_cast<MeshGridInitializer<BE, PR>*>(mesh->initializer);
+                if (!g) return false;
+                Index pn1D = g->params.particleNum1D;
+                if (pn1D < 2) return false;
+                PR size1D = g->params.size1D;
+                PR rest = size1D / PR(pn1D);
+                mesh->behaviorType = BehaviorType::FastGridCloth;
+                mesh->behaviorParams = FastGridClothBehaviorParams<PR>{
+                    static_cast<uint>(pn1D),
+                    rest, rest * std::sqrt(PR(2)), rest * PR(2),
+                    PR(1e5), PR(1e5), PR(3e5), PR(0.001)
+                };
+                syncBroadPhaseCaches(BehaviorType::FastGridCloth);
+                return true;
+            }
+            case BehaviorType::Rigid:
+                // Tag-set only; BDD-006-RIGID-DISPATCH-PARKED.
+                mesh->behaviorType = BehaviorType::Rigid;
+                // BehaviorParams variant has no Rigid alternative; the
+                // existing variant value persists (harmless — the
+                // simulator's dispatch reads behaviorType, not the
+                // variant's alternative, for Rigid-tagged meshes).
+                syncBroadPhaseCaches(BehaviorType::Rigid);
+                return true;
+            case BehaviorType::Elastic:
+            case BehaviorType::Fluid:
+            case BehaviorType::Generator:
+            default:
+                // Reserved-not-shipped per PRD v1.
+                return false;
+        }
+    }
+
     void memoryAllocation() {
         //for(auto& plane : sceneObjects.planes) plane.memoryAllocation(pool);
         for(auto& mesh : scene.meshes) mesh.memoryAllocation();
@@ -5438,6 +5528,15 @@ struct Simulator {
                 p.kbend         = o.behavior.params.value("k_bend",       PR(0));
                 p.thickness     = o.behavior.params.value("thickness",    PR(0));
                 bparams = p;
+            } else if (o.behavior.type == "Rigid") {
+                // D-036 turn-32 addendum: Rigid is tag-set only until
+                // slice B-3 wires IRigidPhysicsBackend. No params to
+                // read; FloatBehaviorParams placeholder satisfies the
+                // variant (BehaviorParams has no Rigid alternative —
+                // the simulator's dispatch reads behaviorType, not the
+                // variant's alternative, for Rigid-tagged meshes).
+                btype = BehaviorType::Rigid;
+                bparams = FloatBehaviorParams<PR>{};
             }
 
             tinym::vec3 pos((float)o.transform.position[0],
@@ -8661,6 +8760,326 @@ static int runSelfTest() {
         }
     }
 
+    // ---- Block 29: BDD-006 — Assign behavior type to an object. ------------
+    // TESTS.md#BDD-006 wording (verbatim):
+    //   Given an object with BehaviorType::Float
+    //   When  the user changes its behavior to Cloth via the inspector
+    //   Then  the object's behavior tag is Cloth, its parameter struct
+    //         is populated with cloth defaults, and the next simulation
+    //         step dispatches it through the cloth pipeline.
+    //   Notes: cover all three v1 behaviors (Float, Cloth, Rigid).
+    //          Selecting a reserved-but-not-shipped behavior must not be
+    //          possible from the v1 UI.
+    //
+    // Mechanization: Simulator::changeBehavior(meshId, newType) is the
+    // in-place mutator (D-036). Block 29 covers Float ↔ TriangularCloth
+    // (BDD's literal scenario) plus FastGridCloth grid-only enforcement
+    // (Q2's UX constraint). Rigid dispatch is parked under
+    // BDD-006-RIGID-DISPATCH-PARKED (slice B-3); the harness doesn't
+    // assert Rigid pipeline dispatch — applyEnvironmentForces dispatch
+    // above zeros external forces only for Float, so a Rigid-tagged
+    // mesh accumulates gravity force into externalForces but the
+    // integrator's spring-force path skips Rigid, leaving state.x
+    // unchanged-ish (kinematic-ish). Outside Block 29's scope.
+    //
+    // Bug-probes (LOAD-BEARING):
+    //   (a) comment out mesh->behaviorType = newType in changeBehavior
+    //       → Clause 1 + Clause 2 FAIL (tag stuck at original value).
+    //   (b) skip the dynamic_cast<MeshGridInitializer> guard for
+    //       FastGridCloth → Clause 3 FAILs (cube accepted as
+    //       FastGridCloth-eligible).
+    //   (c) make Reserved (Elastic) return true instead of false
+    //       → Clause 4 (defensive) FAILs.
+    {
+        auto* device = MetalGlobalContext::getDevice();
+        if (!device) {
+            // The Metal-less host already SKIPped at the top of
+            // runSelfTest; reaching this point implies Metal IS
+            // present, so we don't re-skip here.
+        }
+
+        // --- Clause 1: Float → TriangularCloth dispatch (cube falls under gravity) ---
+        {
+            resetScene();
+            sim.addCube(tinym::vec3(0.0f, 0.0f, 0.0f), /*tess=*/2,
+                        /*size=*/0.5f, /*mass=*/0.1f);
+            sim.initialize();
+            const int bhMeshId = 0;
+            auto* m0 = Scene<Backend, Precision>::findById(bhMeshId);
+            if (!m0) {
+                fail("BDD-006 / Float → TriangularCloth in-place; tag + cloth defaults + cloth pipeline",
+                     "cube id=0 not found after init");
+            } else {
+                if (m0->behaviorType != BehaviorType::Float) {
+                    fail("BDD-006 / Float → TriangularCloth in-place; tag + cloth defaults + cloth pipeline",
+                         "pre-changeBehavior tag was not Float — test scaffolding broken");
+                } else {
+                    // Pump 1 frame as Float — state.x stable.
+                    pumpFrames(sim, 1);
+                    auto* mFloat = Scene<Backend, Precision>::findById(bhMeshId);
+                    const Index nv = mFloat->state.x.size / 3;
+                    double preMeanY = 0.0;
+                    for (Index v = 0; v < nv; ++v) preMeanY += mFloat->state.x.ptr[v*3+1];
+                    preMeanY /= (double)nv;
+
+                    bool ok = sim.changeBehavior(bhMeshId, BehaviorType::TriangularCloth);
+                    auto* mPost = Scene<Backend, Precision>::findById(bhMeshId);
+                    bool tagOk = mPost && (mPost->behaviorType == BehaviorType::TriangularCloth);
+                    bool paramsOk = false;
+                    if (mPost) {
+                        if (auto* clothP = std::get_if<ClothBehaviorParams<Precision>>(&mPost->behaviorParams)) {
+                            paramsOk = (std::abs(clothP->stretch - 1e5f) < 1.0f)
+                                    && (std::abs(clothP->thickness - 0.01f) < 1e-5f);
+                        }
+                    }
+
+                    // Pump 1 frame as Cloth — state.x should drop under gravity.
+                    pumpFrames(sim, 1);
+                    auto* mAfterStep = Scene<Backend, Precision>::findById(bhMeshId);
+                    double postMeanY = 0.0;
+                    for (Index v = 0; v < nv; ++v) postMeanY += mAfterStep->state.x.ptr[v*3+1];
+                    postMeanY /= (double)nv;
+                    bool clothDispatched = (postMeanY < preMeanY - 1e-4);
+
+                    if (ok && tagOk && paramsOk && clothDispatched) {
+                        pass("BDD-006 / Float → TriangularCloth in-place; tag + cloth defaults + cloth pipeline");
+                    } else {
+                        fail("BDD-006 / Float → TriangularCloth in-place; tag + cloth defaults + cloth pipeline",
+                             "changeBehavior=" + std::to_string((int)ok)
+                             + " tagOk=" + std::to_string((int)tagOk)
+                             + " paramsOk=" + std::to_string((int)paramsOk)
+                             + " preMeanY=" + std::to_string(preMeanY)
+                             + " postMeanY=" + std::to_string(postMeanY)
+                             + " (expected postMeanY < preMeanY under gravity)");
+                    }
+                }
+            }
+        }
+
+        // --- Clause 2: TriangularCloth → Float dispatch (state.x preserved) ---
+        // Continue from clause 1's scene (cloth mid-fall) — switch back to
+        // Float and confirm gravity no longer applies (state.x stable).
+        {
+            const int bhMeshId = 0;
+            auto* mPre = Scene<Backend, Precision>::findById(bhMeshId);
+            if (!mPre) {
+                fail("BDD-006 / TriangularCloth → Float in-place; tag + Float pipeline (state.x preserved)",
+                     "mesh id=0 missing — clause 1 scaffold broken");
+            } else if (mPre->behaviorType != BehaviorType::TriangularCloth) {
+                fail("BDD-006 / TriangularCloth → Float in-place; tag + Float pipeline (state.x preserved)",
+                     "pre-state not TriangularCloth — clause 1 left scene in wrong state");
+            } else {
+                const Index nv = mPre->state.x.size / 3;
+                std::vector<float> snapshot(nv * 3);
+                std::memcpy(snapshot.data(), mPre->state.x.ptr, sizeof(float) * nv * 3);
+
+                bool ok = sim.changeBehavior(bhMeshId, BehaviorType::Float);
+                auto* mPost = Scene<Backend, Precision>::findById(bhMeshId);
+                bool tagOk = mPost && (mPost->behaviorType == BehaviorType::Float);
+
+                // Pump 1 frame as Float — state.x stable.
+                pumpFrames(sim, 1);
+                auto* mAfter = Scene<Backend, Precision>::findById(bhMeshId);
+                bool stable = true;
+                const float posTol = 1e-5f;
+                for (Index v = 0; v < nv * 3; ++v) {
+                    if (std::abs(mAfter->state.x.ptr[v] - snapshot[v]) > posTol) {
+                        stable = false;
+                        break;
+                    }
+                }
+
+                if (ok && tagOk && stable) {
+                    pass("BDD-006 / TriangularCloth → Float in-place; tag + Float pipeline (state.x preserved)");
+                } else {
+                    fail("BDD-006 / TriangularCloth → Float in-place; tag + Float pipeline (state.x preserved)",
+                         "changeBehavior=" + std::to_string((int)ok)
+                         + " tagOk=" + std::to_string((int)tagOk)
+                         + " state.x stable=" + std::to_string((int)stable)
+                         + " (expected state.x unchanged under Float pipeline)");
+                }
+            }
+        }
+
+        // --- Clause 3: FastGridCloth grid-only enforcement (setter rejects on non-grid) ---
+        {
+            resetScene();
+            sim.addCube(tinym::vec3(0.0f, 0.0f, 0.0f), /*tess=*/2,
+                        /*size=*/0.5f, /*mass=*/0.1f);
+            sim.initialize();
+            const int bhMeshId = 0;
+            bool rejected = !sim.changeBehavior(bhMeshId, BehaviorType::FastGridCloth);
+            auto* mCube = Scene<Backend, Precision>::findById(bhMeshId);
+            bool tagUnchanged = mCube && (mCube->behaviorType == BehaviorType::Float);
+
+            // Reverse direction: grid mesh should accept FastGridCloth.
+            resetScene();
+            sim.addCloth(/*particleNum1D=*/4, /*size1D=*/0.5,
+                         tinym::vec3(0.0f, 0.25f, 0.0f));
+            sim.initialize();
+            const int gridMeshId = 0;
+            bool accepted = sim.changeBehavior(gridMeshId, BehaviorType::FastGridCloth);
+            auto* mGrid = Scene<Backend, Precision>::findById(gridMeshId);
+            bool gridTagOk = mGrid && (mGrid->behaviorType == BehaviorType::FastGridCloth);
+            bool gridParamsOk = false;
+            if (mGrid) {
+                if (auto* gp = std::get_if<FastGridClothBehaviorParams<Precision>>(&mGrid->behaviorParams)) {
+                    gridParamsOk = (gp->particleNum1D == 4);
+                }
+            }
+
+            if (rejected && tagUnchanged && accepted && gridTagOk && gridParamsOk) {
+                pass("BDD-006 / FastGridCloth only valid on square-regular grid (setter reject; grid accept)");
+            } else {
+                fail("BDD-006 / FastGridCloth only valid on square-regular grid (setter reject; grid accept)",
+                     "cube-rejected=" + std::to_string((int)rejected)
+                     + " cube-tagUnchanged=" + std::to_string((int)tagUnchanged)
+                     + " grid-accepted=" + std::to_string((int)accepted)
+                     + " grid-tagOk=" + std::to_string((int)gridTagOk)
+                     + " grid-paramsOk=" + std::to_string((int)gridParamsOk));
+            }
+        }
+
+        // --- Clause 4 (defensive): Reserved-not-shipped behaviors rejected by setter ---
+        {
+            resetScene();
+            sim.addCube(tinym::vec3(0.0f, 0.0f, 0.0f), /*tess=*/2,
+                        /*size=*/0.5f, /*mass=*/0.1f);
+            sim.initialize();
+            const int bhMeshId = 0;
+            bool elasticRejected = !sim.changeBehavior(bhMeshId, BehaviorType::Elastic);
+            bool fluidRejected = !sim.changeBehavior(bhMeshId, BehaviorType::Fluid);
+            bool generatorRejected = !sim.changeBehavior(bhMeshId, BehaviorType::Generator);
+            auto* m = Scene<Backend, Precision>::findById(bhMeshId);
+            bool tagStillFloat = m && (m->behaviorType == BehaviorType::Float);
+
+            if (elasticRejected && fluidRejected && generatorRejected && tagStillFloat) {
+                pass("BDD-006 / reserved-not-shipped behaviors rejected by setter (Elastic / Fluid / Generator)");
+            } else {
+                fail("BDD-006 / reserved-not-shipped behaviors rejected by setter (Elastic / Fluid / Generator)",
+                     "elasticRejected=" + std::to_string((int)elasticRejected)
+                     + " fluidRejected=" + std::to_string((int)fluidRejected)
+                     + " generatorRejected=" + std::to_string((int)generatorRejected)
+                     + " tagStillFloat=" + std::to_string((int)tagStillFloat));
+            }
+        }
+
+        // --- Clause 5: Rigid round-trip through saveScene/loadScene (D-036 turn-32 addendum) ---
+        // User scenario: toggle a mesh to Rigid via inspector → save scene
+        // → reload → Rigid tag must survive the round-trip. Pre fix-turn
+        // 32, this broke because scene_format::isReservedBehavior listed
+        // "Rigid" as reserved-not-shipped (rejected on load even though
+        // changeBehavior accepted the tag at runtime).
+        {
+            resetScene();
+            sim.addCube(tinym::vec3(0.0f, 0.0f, 0.0f), /*tess=*/2,
+                        /*size=*/0.5f, /*mass=*/0.1f);
+            sim.initialize();
+            const int bhMeshId = 0;
+            bool tagSet = sim.changeBehavior(bhMeshId, BehaviorType::Rigid);
+            auto* mPre = Scene<Backend, Precision>::findById(bhMeshId);
+            bool preTagOk = mPre && (mPre->behaviorType == BehaviorType::Rigid);
+
+            const std::string path = "/tmp/ysim_bdd006_rigid_roundtrip.ysim.json";
+            std::string saveErr;
+            bool saveOk = sim.saveScene(path, &saveErr);
+
+            bool loadOk = false;
+            bool postTagOk = false;
+            std::string loadErr;
+            if (saveOk) {
+                auto lr = sim.loadScene(path);
+                if (lr.ok) {
+                    sim.initialize();
+                    sim.applyPendingMaterials();
+                    auto* mPost = Scene<Backend, Precision>::findById(bhMeshId);
+                    postTagOk = mPost && (mPost->behaviorType == BehaviorType::Rigid);
+                    loadOk = true;
+                } else {
+                    loadErr = lr.error.message;
+                }
+            }
+
+            if (tagSet && preTagOk && saveOk && loadOk && postTagOk) {
+                pass("BDD-006 / Rigid round-trip through saveScene/loadScene preserves the Rigid tag (D-036 addendum, turn-32 fix-turn)");
+            } else {
+                fail("BDD-006 / Rigid round-trip through saveScene/loadScene preserves the Rigid tag (D-036 addendum, turn-32 fix-turn)",
+                     "tagSet=" + std::to_string((int)tagSet)
+                     + " preTagOk=" + std::to_string((int)preTagOk)
+                     + " saveOk=" + std::to_string((int)saveOk)
+                     + " saveErr=" + saveErr
+                     + " loadOk=" + std::to_string((int)loadOk)
+                     + " loadErr=" + loadErr
+                     + " postTagOk=" + std::to_string((int)postTagOk));
+            }
+            std::remove(path.c_str());
+        }
+
+        // --- Clause 6: changeBehavior immediately syncs broad-phase cached behavior arrays (D-036 turn-32 addendum) ---
+        // The broad-phase reads `objTrees[idx].objBehavior` for the
+        // per-pair Float-skip; after changeBehavior the cached value
+        // would otherwise stay stale until the next full rebuild
+        // (D-026's skip-rebuild gate matches on lifetimeId, which
+        // doesn't change for in-place behavior switches). Clause asserts
+        // the in-place sync writes happen immediately on the mutation.
+        {
+            resetScene();
+            sim.addCube(tinym::vec3(0.0f, 0.0f, 0.0f), /*tess=*/2,
+                        /*size=*/0.5f, /*mass=*/0.1f);
+            sim.initialize();
+            pumpFrames(sim, 1);  // populate broad-phase caches
+
+            // Pre-state: cube is Float; objTrees objBehavior cache should
+            // reflect that. objTrees gets rebuilt across resetScene
+            // boundaries because the skip-rebuild gate at BroadPhase::build
+            // requires `objBehavior == Float` (the value being checked),
+            // so non-Float residuals from prior clauses naturally invalidate.
+            //
+            // shBroadPhase.meshBehaviors is NOT asserted pre-state: its
+            // rebuildMeshKinds() short-circuits on (ptr && size==numMeshes),
+            // so residual values from prior clauses can leak through (e.g.,
+            // Clause 3 leaves it at FastGridCloth=1 even though the new
+            // cube is Float=4). The cache-sync write is the only mechanism
+            // that updates the mirror without a full rebuild — exactly
+            // what this clause's post-state assertion exercises.
+            bool preObjBehaviorOk = false;
+            if (!sim.collisionPipeline.broadPhase.objTrees.empty()) {
+                preObjBehaviorOk = (sim.collisionPipeline.broadPhase.objTrees[0].objBehavior
+                                    == BehaviorType::Float);
+            }
+
+            bool changed = sim.changeBehavior(0, BehaviorType::TriangularCloth);
+
+            // Post-state: BEFORE any further BroadPhase::build / refit /
+            // rebuildMeshKinds, BOTH caches must reflect the new tag.
+            // objTrees post-check is load-bearing (BVH/SCENE skip-gate
+            // depends on it); meshBehaviors post-check is load-bearing
+            // (GPU-side spatial-hashing depends on it).
+            bool postObjBehaviorOk = false;
+            if (!sim.collisionPipeline.broadPhase.objTrees.empty()) {
+                postObjBehaviorOk = (sim.collisionPipeline.broadPhase.objTrees[0].objBehavior
+                                     == BehaviorType::TriangularCloth);
+            }
+            bool postMeshBehaviorsOk = true;
+            if (sim.shBroadPhase.meshBehaviors.ptr
+                && sim.shBroadPhase.meshBehaviors.size > 0) {
+                postMeshBehaviorsOk = (sim.shBroadPhase.meshBehaviors[0]
+                                       == (uint32_t)BehaviorType::TriangularCloth);
+            }
+
+            if (changed && preObjBehaviorOk
+                && postObjBehaviorOk && postMeshBehaviorsOk) {
+                pass("BDD-006 / changeBehavior immediately syncs broad-phase cached behavior arrays (D-036 addendum, turn-32 fix-turn)");
+            } else {
+                fail("BDD-006 / changeBehavior immediately syncs broad-phase cached behavior arrays (D-036 addendum, turn-32 fix-turn)",
+                     "changed=" + std::to_string((int)changed)
+                     + " preObjBehaviorOk=" + std::to_string((int)preObjBehaviorOk)
+                     + " postObjBehaviorOk=" + std::to_string((int)postObjBehaviorOk)
+                     + " postMeshBehaviorsOk=" + std::to_string((int)postMeshBehaviorsOk));
+            }
+        }
+    }
+
     if (failures == 0) {
         std::cerr << "[self-test] all checks passed\n";
         return 0;
@@ -8963,6 +9382,31 @@ int main(int argc, char** argv) {
                     m.specularWeight = specularWeight;
                     m.emissionColor = emissionColor;
                     simulator.setMaterial(id, m);
+                };
+                // FR-006 / BDD-006 / D-036: behavior-tag editing.
+                // Map enum → dropdown index (reserved-not-shipped
+                // entries collapse to -1, disabling the combo).
+                auto behaviorToIndex = [](BehaviorType t) -> int {
+                    switch (t) {
+                        case BehaviorType::Float:           return 0;
+                        case BehaviorType::TriangularCloth: return 1;
+                        case BehaviorType::FastGridCloth:   return 2;
+                        case BehaviorType::Rigid:           return 3;
+                        default:                            return -1;
+                    }
+                };
+                target.current_behavior_index = behaviorToIndex(selectedMesh->behaviorType);
+                target.grid_eligible = (dynamic_cast<MeshGridInitializer<Backend, Precision>*>(
+                    selectedMesh->initializer) != nullptr);
+                target.on_behavior_change = [&simulator](int id, int newIndex) -> bool {
+                    static const BehaviorType kIndexToType[] = {
+                        BehaviorType::Float,
+                        BehaviorType::TriangularCloth,
+                        BehaviorType::FastGridCloth,
+                        BehaviorType::Rigid,
+                    };
+                    if (newIndex < 0 || newIndex > 3) return false;
+                    return simulator.changeBehavior(id, kIndexToType[newIndex]);
                 };
             }
             return target;
