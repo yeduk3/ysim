@@ -96,9 +96,15 @@ public:
         }
 
         // Legacy fallback: construct from packed sub-views (pre-R-2 path).
-        // Reachable when a mesh shows up in scene.meshes without a prior
-        // registerPreviewBinding call. Retained for safety + parallel-symbol
-        // invariant (the new path is preferred; the old path is not removed).
+        // D-042 R-7 (2026-05-14) audit: every Simulator::addX wrapper +
+        // loadScene calls registerPreviewBinding BEFORE any MeshGL can be
+        // materialized, so in production this branch is effectively dead
+        // code — reachable only by a hand-built MeshGL construction that
+        // bypasses the addX path (e.g., a future test harness or third-
+        // party integration). Retained for safety + parallel-symbol
+        // invariant. R-7 cleanup chose comment-only documentation over
+        // removal: keeping the path makes accidental future bypass a
+        // graceful degradation rather than a NULL deref.
         it = state.emplace(std::piecewise_construct,
             std::forward_as_tuple(mesh.id),
             std::forward_as_tuple(

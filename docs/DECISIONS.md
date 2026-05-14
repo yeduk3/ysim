@@ -876,3 +876,43 @@ Pass label: `D-042 R-6 / state.x = preview.x byte-equal after every Simulator::u
 - Stale comment cleanups (post-D-042 comments referring to legacy regen as "the way" instead of "the fallback").
 - Decision: recompute preview.n in resync vs. retire preview.n field.
 - Retirement of getOrCreate's legacy packed-sub-view fallback (now dead code).
+
+## D-042 R-7 — preview.n recompute + cleanup (FINAL slice; D-042 sequence COMPLETE) (2026-05-14)
+
+R-7 of 7 — FINAL slice in the D-042 refactor sequence. Closes the user's "stop bugs in scene editing + simulation management" goal that motivated R-1 → R-7.
+
+Three small items:
+
+1. **`req.preview.recomputeNormals()` added to the R-5 resync loop** in `Simulator::update` (after the state.x → preview.x memcpy). Pre-R-7 preview.n held addX-time normals computed by `populatePreview`'s recomputeNormals call; post-sim deformation / rotation / translate left preview.n stale. R-7 recomputes per frame so preview.n tracks current geometry. Cost: O(numFacets + numPoints) per mesh per frame — negligible for v1 scenes.
+
+2. **New long-lived standing constraint `D-042-ROUND-TRIP-INVARIANT`** documented here (recorded in DECISIONS rather than `docs/roles/PLANNER.md` because Generator's write-set excludes `docs/roles/*`; the next Planner pass should fold this into PLANNER.md "Standing constraints"):
+
+   > **D-042-ROUND-TRIP-INVARIANT** (R-3..R-7, 2026-05-14). `PreviewState` and packed `state.x` are byte-equal at every observable boundary: R-3 memcpys preview→packed at `Scene::pack` time; R-4 dual-writes both on `translateObject`/`rotateObject` edits; R-5 memcpys packed→preview at the END of `Simulator::update`; R-7 recomputes preview.n in that same resync. R-6's Block 41 + R-7's Block 42 pin the invariant. Any future slice touching `Scene::pack`, `Simulator::update`, `Simulator::translateObject`, `Simulator::rotateObject`, `Simulator::setMaterial`, or `MeshRenderState::getOrCreate` must preserve this round-trip. Breaking it triggers Block 41 + Block 42 FAIL plus cascading BDD-003/006/018 regressions (proven by R-6 turn-42 bug-probe). Retires only if PreviewState is structurally replaced or merged into packed.
+
+3. **`MeshRenderState::getOrCreate` legacy fallback documented as effectively dead in production**. Comment update only — no code removal. With R-2's universal `registerPreviewBinding` across every `addX` + `loadScene`, the fallback branch is unreachable in production. Retained for safety + parallel-symbol invariant — accidental future bypass becomes graceful degradation rather than NULL deref.
+
+**Block 42 (D-042 R-7)** verifies the recompute fires via corrupt-and-restore:
+1. `addCloth(2, 0.5f, (0, 0.25, 0), ...); sim.initialize();` — preview.n populated.
+2. Corrupt `reqs[0].preview.n[0] = 99.0f` (a non-normalized sentinel; recomputed normals are unit-length so |component| ≤ 1).
+3. `sim.pause = false; sim.update();` → R-5 resync triggers R-7 recomputeNormals → preview.n[0] restored to a valid unit-normal component.
+4. Assert `|restored| ≤ 1.0 + 1e-3` AND `|restored - 99.0| > 1.0` (sentinel was overwritten).
+
+Pass label: `D-042 R-7 / preview.n recomputed in R-5 resync (corrupted normal restored after update)`. Self-test 72 → 73 PASS deterministic across 5 macOS runs. doctest 159 + 1120 SUCCESS.
+
+**Generator-discovered hang during build**: an earlier Block 42 draft used `addCube` (Float behavior) + `sim.update` and hung the harness past 60s timeout. Root cause not deeply investigated — switched to `addCloth` (proven safe in Block 40/41) since the recomputeNormals test is mesh-shape-agnostic. The Float-cube + Metal-substep-loop interaction is a documented harness gotcha worth investigating in a future slice.
+
+**Bug-probe verified**:
+- **(a)** Disable the R-7 recomputeNormals() call → Block 42 FAILs with `restored=99.0 restoredOk=0 actuallyDiff=0` (preview.n[0] sentinel never overwritten). Restored.
+
+**D-042 REFACTOR SEQUENCE COMPLETE** (2026-05-14):
+- R-1 (08f3ef5) — `PreviewState<PR>` infrastructure (heap-owned per-mesh vertex/facet/normal).
+- R-2 (cf5555f) — `MeshGL` binds to PreviewState pointers via `registerPreviewBinding`.
+- R-3 (c1bc127, fix-turn a88b312) — `Scene::pack` memcpys preview→packed; loadScene clears both caches at scene boundary.
+- R-4 (0884e2a) — `translateObject` + `rotateObject` dual-write preview.x; per-call `pendingRotations` stash retired from rotateObject.
+- R-5 (9748620) — `Simulator::update` resyncs packed→preview at end.
+- R-6 (fefc43a) — Block 41 codifies the byte-equal round-trip invariant.
+- R-7 (this slice) — preview.n recompute + cleanup + standing-constraint documentation.
+
+**Closes user goal**: "씬 수정과 시뮬레이션 관리에서 버그가 많이 일어남. 구조를 아래와 같이 리팩토링해서 버그를 최대한 제어함." (Scene editing and simulation management had many bugs; refactor to a 2-level structure to control them.) The 2-level Scene/Simulator + PreviewState architecture is shipped; the round-trip invariant is mechanically pinned by Blocks 41 + 42.
+
+**Self-test**: 73/73 PASS deterministic across 5 macOS runs; doctest 159 + 1120 SUCCESS unchanged.

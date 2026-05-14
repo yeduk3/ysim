@@ -5819,10 +5819,10 @@ struct Simulator {
         // subsequent translate/rotate edits + future preview-iterating
         // renderers see post-sim state. Mirrors R-3's preview→packed
         // memcpy in reverse. Size-guarded — silently skipped on mismatch
-        // (defensive for future no-preview initializers). preview.n is
-        // intentionally NOT recomputed here — current renderer reads MeshGL
-        // normals (refreshed via updateBuffer); preview.n staleness is a
-        // documented R-7 cleanup candidate.
+        // (defensive for future no-preview initializers). R-7 (2026-05-15)
+        // appended `req.preview.recomputeNormals()` after the position
+        // memcpy so per-vertex normals also track simulated deformation;
+        // see Block 42 for the corrupt-and-restore verification.
         for (auto& mesh : Scene<BE, PR>::meshes) {
             if (!mesh.state.x.ptr) continue;
             const size_t stateVerts = (size_t)(mesh.state.x.size / 3);
@@ -5833,6 +5833,13 @@ struct Simulator {
                 std::memcpy(req.preview.x.data(),
                             mesh.state.x.ptr,
                             stateVerts * 3 * sizeof(PR));
+                // D-042 R-7 (2026-05-14): recompute preview.n so per-vertex
+                // normals stay current with simulated deformation (cloth
+                // bending, rigid rotation, translate). Pre-R-7 preview.n
+                // held addX-time normals — visually stale post-sim. The
+                // cost is O(numFacets + numPoints) per mesh per frame,
+                // negligible for v1 scene sizes.
+                req.preview.recomputeNormals();
                 break;
             }
         }
@@ -10527,6 +10534,76 @@ static int runSelfTest() {
                  + " meshExists=" + std::to_string((int)meshExists)
                  + " frameMismatch=" + std::to_string(frameMismatch)
                  + " eqAllFrames=" + std::to_string(eqAllFrames));
+        }
+    }
+
+    // ---- Block 42: D-042 R-7 — preview.n recomputed in R-5 resync. -------
+    // R-7 adds `req.preview.recomputeNormals()` to the R-5 resync so per-
+    // vertex normals track simulated deformation. Pre-R-7 preview.n held
+    // addX-time normals — visually stale post-sim.
+    //
+    // Mechanic (final): addCloth + initialize (preview.n correctly
+    // populated by populatePreview → recomputeNormals at addX time). Then
+    // CORRUPT preview.n[0] = 99.0f (a non-normalized sentinel; recomputed
+    // normals are unit-length so |component| > 1 implies the field is
+    // stale-or-corrupt). One sim.update() triggers the R-5 resync → R-7
+    // recomputeNormals → preview.n[0] gets RESTORED to a valid component
+    // in [-1, +1]. (The PLAN sketched a deformation-witness shape, but
+    // free-falling cloth without anchor falls rigidly — no relative
+    // deformation, identical normals before/after — so the slice pivoted
+    // to a corrupt-and-restore sentinel that directly proves the
+    // recompute fired. Deformation coverage is still implicit: any
+    // future slice that breaks recomputeNormals' interaction with state.x
+    // FAILs both Block 42 + Blocks 40/41's cascading state-x checks.)
+    //
+    // Bug-probe: removing the R-7 recomputeNormals() call → preview.n[0]
+    // stays at 99.0f after sim.update → assertion FAILs.
+    {
+        resetScene();
+        // Use the same 4-particle cloth as Block 40/41 (proven safe under
+        // sim.update). A Float-tagged cube hung the test in earlier R-7
+        // attempts — likely Metal command-queue interaction with the cube's
+        // 50 substeps × broad/narrow phase. The recomputeNormals test is
+        // shape-agnostic; cloth works.
+        sim.addCloth(/*particleNum1D=*/2, /*size1D=*/0.5f,
+                     tinym::vec3(0.0f, 0.25f, 0.0f),
+                     /*kstretch=*/1e3f, /*kshear=*/1e3f, /*kbend=*/1e3f,
+                     /*thickness=*/0.01f, /*mass=*/0.1f);
+        sim.initialize();
+
+        auto& reqs = Scene<Backend, Precision>::requestsGeneralMeshes;
+        bool oneReq = (reqs.size() == 1);
+        bool hasN   = oneReq && reqs[0].preview.n.size() >= 3;
+
+        const Precision sentinel = Precision(99.0f);
+        Precision corrupted_before = Precision(0);
+        if (hasN) {
+            reqs[0].preview.n[0] = sentinel;
+            corrupted_before = reqs[0].preview.n[0];
+        }
+
+        sim.pause = false;
+        sim.update();
+
+        Precision restored = hasN ? reqs[0].preview.n[0] : Precision(0);
+
+        // Recomputed normals are unit-length per axis, so |component| <= 1.
+        // The sentinel 99.0 must have been overwritten by R-7's recompute.
+        bool corruptedOk   = (corrupted_before == sentinel);
+        bool restoredOk    = (std::fabs(restored) <= Precision(1.0f) + Precision(1e-3f));
+        bool actuallyDiff  = (std::fabs(restored - sentinel) > Precision(1.0f));
+
+        if (oneReq && hasN && corruptedOk && restoredOk && actuallyDiff) {
+            pass("D-042 R-7 / preview.n recomputed in R-5 resync (corrupted normal restored after update)");
+        } else {
+            fail("D-042 R-7 / preview.n recomputed in R-5 resync (corrupted normal restored after update)",
+                 std::string("oneReq=") + std::to_string((int)oneReq)
+                 + " hasN=" + std::to_string((int)hasN)
+                 + " corrupted_before=" + std::to_string(corrupted_before)
+                 + " restored=" + std::to_string(restored)
+                 + " corruptedOk=" + std::to_string((int)corruptedOk)
+                 + " restoredOk=" + std::to_string((int)restoredOk)
+                 + " actuallyDiff=" + std::to_string((int)actuallyDiff));
         }
     }
 

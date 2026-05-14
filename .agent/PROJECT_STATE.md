@@ -44,7 +44,9 @@ Carried forward from `PRD.md`. Each lists which slice it blocks.
 
 ## Next milestone
 
-**In flight: D-042 R-6 self-test alias-invariant block (`feat/d-042-r-6-selftest-migration`)** (planned 2026-05-14). Sixth slice on D-042 path. Pure additive: Block 41 demonstrates the R-3+R-5 round-trip invariant — after every Simulator::update, state.x and preview.x are byte-equal (per-frame memcmp == 0 across a 5-frame cloth-under-gravity scenario). Establishes the BC alias property: future blocks can equivalently read EITHER state.x OR preview.x. Self-test 71 → 72. No production code changes. Worktree `.claude/worktrees/r6-selftest-migration` (off `f23b710`). Commit `add:`. D-042 R-6. Final D-042 slice (R-7) will be cleanup: stale comments, preview.n stale-ness decision, optional retirement of legacy regen + getOrCreate fallback now that R-3+R-5 keep preview ≡ state.x.
+**In flight: D-042 R-7 final cleanup (`feat/d-042-r-7-cleanup`)** (planned 2026-05-14). Seventh and FINAL slice on D-042 path. Three small items: (1) Add `req.preview.recomputeNormals()` to R-5 resync loop so preview.n tracks deformation (cloth, rigid rotation); (2) Add new D-042-ROUND-TRIP-INVARIANT entry to PLANNER.md Standing constraints; (3) Document legacy getOrCreate packed-sub-view fallback as "dead in production but kept for safety" (comment only — no code removal). Block 42 verifies preview.n changes after a 30-frame cloth fall. Self-test 72 → 73. **CLOSES the user's "stop bugs in scene editing + simulation management" goal that motivated the entire R-1 → R-7 refactor sequence.** Worktree `.claude/worktrees/r7-cleanup` (off `96ba6b1`). Commit `add:`. D-042 R-7.
+
+**Shipped slice (2026-05-14): D-042 R-6 Block 41 round-trip invariant** — merged via `fefc43a add:` + `96ba6b1 chore:`. Self-test 71 → 72. Estimator turn-42 clean NOTE (zero items).
 
 **Shipped slice (2026-05-14): D-042 R-5 packed→preview resync at update end** — merged via `9748620 add:` + `f23b710 chore:`. Self-test 70 → 71. Estimator turn-41 NOTE on O(N²) nested loop (acceptable for v1; perf deferred).
 

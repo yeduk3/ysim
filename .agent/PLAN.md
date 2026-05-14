@@ -1,48 +1,43 @@
-# PLAN — D-042 R-6: self-test BC alias demonstration — `feat/d-042-r-6-selftest-migration`
+# PLAN — D-042 R-7: final cleanup — `feat/d-042-r-7-cleanup`
 
 > Owner: **Planner** writes; **Generator** executes; **Estimator** judges.
 > Updated: 2026-05-14
 
 ## Course note: previous turn's verdict
 
-Estimator turn 41 (D-042 R-5 — packed→preview resync at update end) returned **NOTE** with 0 BLOCK + 0 WARNING + 1 NOTE. NOTE: `O(meshes × requests)` nested loop in the resync is fine for v1 scene sizes; could swap for keyed lookup if scenes grow. Acceptable; deferred to a future perf slice.
-
-R-5 merged to `main` via commits `9748620 add:` + `f23b710 chore:`. Self-test 70 → 71 PASS deterministic on macOS.
+Estimator turn 42 (D-042 R-6 — Block 41 round-trip invariant) returned **NOTE** with zero BLOCK / WARNING / NOTE items — clean verdict. R-6 merged via commits `fefc43a add:` + `96ba6b1 chore:`. Self-test 71 → 72 PASS deterministic on macOS.
 
 ## Goal
 
-**Add a self-test block (Block 41) that demonstrates the R-3+R-5 round-trip invariant**: after every `Simulator::update`, `state.x` and `preview.x` are byte-equal for every mesh. This codifies the "BC alias" property — future self-test blocks (and downstream consumer code) can equivalently read EITHER `Scene::meshes[i].state.x` OR `Scene::requestsGeneralMeshes[i].preview.x` with identical semantics. The invariant is:
-- R-5 memcpys state.x → preview.x at the END of every `Simulator::update`.
-- R-3 memcpys preview.x → state.x in `Scene::pack` when a re-init runs.
-- R-4 translateObject/rotateObject dual-writes keep them in sync at edit time.
-Together these guarantee preview ≡ state.x at every observable boundary.
+**Final cleanup slice in the D-042 refactor sequence.** Closes the user's "stop bugs in scene editing + simulation management" goal that motivated the entire R-* sequence (R-1 PreviewState infra → R-2 MeshGL binding → R-3 pack memcpy → R-4 edit dual-write → R-5 update resync → R-6 invariant test → R-7 cleanup).
 
-Block 41 mechanizes this for a cloth scene over 5 frames, asserting `memcmp(state.x.ptr, preview.x.data(), nverts * 3 * sizeof(PR)) == 0` at each iteration. Bug-probe: corrupt the resync's first vertex write to break byte-equality → Block 41 FAILs.
+Three small items:
+1. **Recompute `preview.n` in the R-5 resync loop** so normals stay current with simulated geometry (cloth deformation, rigid rotation, translate). Currently preview.n holds addX-time normals — visually stale post-sim.
+2. **Add a new long-lived standing constraint** to `docs/roles/PLANNER.md`: the R-3/R-4/R-5 round-trip invariant is load-bearing — any future slice touching `Scene::pack` / `Simulator::update` / `translate|rotate|setMaterial` must preserve byte-equality at observable boundaries.
+3. **Document** the legacy `MeshRenderState::getOrCreate` packed-sub-view fallback as "effectively dead in production but kept for safety" — comment update only; no removal.
 
-Pure additive slice — no existing production code changes. Self-test count 71 → 72.
+Block 42 verifies preview.n is no longer stale post-update by snapshotting normal pre/post a 30-frame cloth fall.
+
+Self-test count 72 → 73.
 
 ## Scope
 
-**Design call (1) — Pure additive, test-only slice.** The R-3+R-5 invariant is already established. Block 41 captures it as a long-lived self-test guard. If a future slice breaks the round-trip (e.g., changes resync placement, drops the memcpy under some condition, introduces a write to preview that doesn't propagate), Block 41 catches it.
-
-**Design call (2) — Cloth at y=0.25 with no ground.** Simplest scenario that exercises the resync each frame. Cloth falls under gravity; state.x changes every step; resync should propagate to preview.x. 4-particle cloth (2×2) keeps memcmp size small + deterministic across runs. No ground means no narrow-phase collision interaction perturbs cloth equally on state.x and preview.x — both should stay byte-equal regardless of dynamics.
-
-**Design call (3) — Block 41 shape**:
+**Design call (1) — Add `req.preview.recomputeNormals();` to the R-5 resync.** R-5 currently writes only `state.x → preview.x` (vertex positions). Normals (`preview.n`) stay frozen at addX/populatePreview time. Adding `recomputeNormals()` after the position memcpy:
 ```cpp
-// ---- Block 41: D-042 R-6 — preview ≡ state.x round-trip invariant. ----
-// R-3 memcpys preview→packed at Scene::pack; R-4 keeps preview in sync
-// with state.x during edits (dual-write); R-5 memcpys state.x→preview at
-// update end. After R-3+R-4+R-5 ship, the per-mesh preview.x and the
-// packed state.x are byte-equal at every observable boundary (post-update,
-// post-edit, post-init). Block 41 codifies that invariant so any future
-// slice that breaks it FAILs noisily.
-//
-// Bug-probe: corrupting the resync write to write `state.x.ptr[0] + 0.01f`
-// into preview.x[0] breaks byte-equality on the first vertex; memcmp fails
-// from frame 1 onward.
+std::memcpy(req.preview.x.data(),
+            mesh.state.x.ptr,
+            stateVerts * 3 * sizeof(PR));
+req.preview.recomputeNormals();  // R-7 addition
+break;
+```
+
+`recomputeNormals()` is O(numFacets + numPoints), a few hundred ops per cloth/cube. Negligible CPU overhead.
+
+**Design call (2) — Block 42 shape (preview.n no longer stale).**
+```cpp
 {
     resetScene();
-    sim.addCloth(/*particleNum1D=*/2, /*size1D=*/0.5f,
+    sim.addCloth(/*particleNum1D=*/4, /*size1D=*/0.5f,
                  tinym::vec3(0.0f, 0.25f, 0.0f),
                  /*kstretch=*/1e3f, /*kshear=*/1e3f, /*kbend=*/1e3f,
                  /*thickness=*/0.01f, /*mass=*/0.1f);
@@ -50,113 +45,139 @@ Pure additive slice — no existing production code changes. Self-test count 71 
 
     auto& reqs = Scene<Backend, Precision>::requestsGeneralMeshes;
     bool oneReq = (reqs.size() == 1);
-    bool meshExists = !Scene<Backend, Precision>::meshes.empty();
+    bool hasN   = oneReq && reqs[0].preview.n.size() >= 3;
+
+    Precision pre_nx = hasN ? reqs[0].preview.n[0] : Precision(0);
+    Precision pre_ny = hasN ? reqs[0].preview.n[1] : Precision(0);
+    Precision pre_nz = hasN ? reqs[0].preview.n[2] : Precision(0);
 
     sim.pause = false;
+    for (int i = 0; i < 30; ++i) sim.update();
 
-    int frameMismatch = -1;
-    int eqAllFrames = 0;
-    if (oneReq && meshExists) {
-        auto& m = Scene<Backend, Precision>::meshes[0];
-        for (int f = 0; f < 5; ++f) {
-            sim.update();
-            const size_t bytes = (size_t)(m.state.x.size) * sizeof(Precision);
-            if (reqs[0].preview.x.size() * sizeof(Precision) != bytes) {
-                frameMismatch = f;
-                break;
-            }
-            if (std::memcmp(m.state.x.ptr, reqs[0].preview.x.data(), bytes) != 0) {
-                frameMismatch = f;
-                break;
-            }
-            eqAllFrames++;
-        }
-    }
+    Precision post_nx = hasN ? reqs[0].preview.n[0] : Precision(0);
+    Precision post_ny = hasN ? reqs[0].preview.n[1] : Precision(0);
+    Precision post_nz = hasN ? reqs[0].preview.n[2] : Precision(0);
 
-    if (oneReq && meshExists && frameMismatch < 0 && eqAllFrames == 5) {
-        pass("D-042 R-6 / state.x ≡ preview.x byte-equal after every Simulator::update (5-frame cloth round-trip)");
+    // Cloth deformation under gravity should change the per-vertex normal
+    // (the cloth bends as it falls — not perfectly planar after 30 frames).
+    // Threshold: at least one component differs by > 1e-3.
+    const Precision tol = Precision(1e-3f);
+    bool nxChanged = std::fabs(post_nx - pre_nx) > tol;
+    bool nyChanged = std::fabs(post_ny - pre_ny) > tol;
+    bool nzChanged = std::fabs(post_nz - pre_nz) > tol;
+    bool normalMoved = nxChanged || nyChanged || nzChanged;
+
+    if (oneReq && hasN && normalMoved) {
+        pass("D-042 R-7 / preview.n recomputed in R-5 resync (cloth deformation reflects in preview normal)");
     } else {
-        fail("D-042 R-6 / state.x ≡ preview.x byte-equal after every Simulator::update (5-frame cloth round-trip)",
+        fail("D-042 R-7 / preview.n recomputed in R-5 resync (cloth deformation reflects in preview normal)",
              std::string("oneReq=") + std::to_string((int)oneReq)
-             + " meshExists=" + std::to_string((int)meshExists)
-             + " frameMismatch=" + std::to_string(frameMismatch)
-             + " eqAllFrames=" + std::to_string(eqAllFrames));
+             + " hasN=" + std::to_string((int)hasN)
+             + " pre_n=(" + std::to_string(pre_nx) + "," + std::to_string(pre_ny) + "," + std::to_string(pre_nz) + ")"
+             + " post_n=(" + std::to_string(post_nx) + "," + std::to_string(post_ny) + "," + std::to_string(post_nz) + ")"
+             + " normalMoved=" + std::to_string((int)normalMoved));
     }
 }
 ```
 
-Pass label: `D-042 R-6 / state.x ≡ preview.x byte-equal after every Simulator::update (5-frame cloth round-trip)`.
+Pass label: `D-042 R-7 / preview.n recomputed in R-5 resync (cloth deformation reflects in preview normal)`.
 
-**Design call (4) — Block 41 placement: INSIDE the Metal-gated section, AFTER Block 40.** Uses `sim.initialize` + `sim.update` (Metal). Linux container SKIPs. Same pattern.
+**Design call (3) — Block 42 placement: INSIDE the Metal-gated section, AFTER Block 41.** Uses `sim.initialize` + `sim.update`. Linux container SKIPs.
 
-**Design call (5) — Why memcmp is the right tool.** The invariant is BYTE-equality (R-5's `std::memcpy` from state.x to preview.x is bit-identical). `memcmp` is the strictest possible check; anything that diverges by even one bit (rounding error, NaN substitution, partial copy) flags. Per ESTIMATOR.md's "stricter-than-spec assertions are valuable signal" — a stricter test catches more regressions.
+**Design call (4) — New standing constraint in PLANNER.md.** Append to the `## Standing constraints` section:
+
+> **D-042-ROUND-TRIP-INVARIANT** (R-3..R-6, 2026-05-14). PreviewState and packed state.x are byte-equal at every observable boundary: R-3 memcpys preview → packed at `Scene::pack` time; R-4 dual-writes both on `translateObject` / `rotateObject` edits; R-5 memcpys packed → preview at the end of `Simulator::update`; R-6's Block 41 + R-7's Block 42 pin the invariant via memcmp + normal-change tests. Any future slice touching `Scene::pack`, `Simulator::update`, `Simulator::translateObject`, `Simulator::rotateObject`, `Simulator::setMaterial`, or `MeshRenderState::getOrCreate` must preserve this round-trip. Breaking it triggers Block 41 + Block 42 FAIL plus cascading BDD-003/006/018 regressions (proven by R-6 turn-42 bug-probe). Retires only if PreviewState is structurally replaced or merged into packed.
+
+**Design call (5) — `MeshRenderState::getOrCreate` legacy fallback documentation.** The function still has a "legacy fallback" branch for the case where `previewBindings.find(mesh.id) == previewBindings.end()`. With R-2's universal `registerPreviewBinding` on every `addX` + `loadScene`, the fallback is effectively dead in production. Comment update only — no code removal:
+```cpp
+// Legacy fallback: construct from packed sub-views (pre-R-2 path).
+// R-2 onward: every Simulator::addX wrapper + loadScene calls
+// registerPreviewBinding before MeshGL can be materialized, so this
+// branch is dead in production. Retained for safety + parallel-symbol
+// invariant — hand-built MeshGL via getOrCreate from a test or future
+// non-addX path falls back here. R-7 cleanup left intact intentionally.
+```
 
 **NEW symbols this slice adds**:
-- Block 41 in `runSelfTest` (1 new pass clause).
-- `docs/DECISIONS.md` — D-042 R-6 entry.
+- Block 42 in `runSelfTest` (1 new pass clause).
+- `docs/DECISIONS.md` — D-042 R-7 entry.
+- `docs/roles/PLANNER.md` — new D-042-ROUND-TRIP-INVARIANT standing constraint.
 
 **MODIFIED symbols in place**:
-- `.agent/PROJECT_STATE.md` — next-milestone updates.
+- `src/main.cpp` — R-5 resync loop gains `req.preview.recomputeNormals();` after the position memcpy.
+- `include/MeshRenderState.hpp` — comment update on the legacy `getOrCreate` fallback branch (no code change).
+- `.agent/PROJECT_STATE.md` — D-042 R-7 marks the refactor sequence COMPLETE.
 
 **PRESERVED symbols** (parallel-symbol invariant):
-- All of `src/main.cpp`'s production code paths — UNCHANGED. R-6 is test-only.
-- `MeshRenderState` API — UNCHANGED.
-- `PreviewState<PR>` — UNCHANGED.
-- All other Blocks 1-40 — UNCHANGED.
+- Legacy `getOrCreate` fallback branch — UNCHANGED (just doc).
+- All R-1..R-6 production code — UNCHANGED.
+- `PreviewState::recomputeNormals()` — UNCHANGED (R-1 author).
+- All Blocks 1-41 — UNCHANGED.
 
 ## Non-goals
 
-- **NO new public accessor on Scene.** A `Scene::previewForMeshId(int)` helper was considered but adds API surface without test value (Block 41 reads `requestsGeneralMeshes[0]` directly).
-- **NO migration of existing self-test blocks** to read via preview. Existing blocks that read `state.x` continue to work — the invariant Block 41 guards means either read returns the same value. Adding migration would be churn without observable effect.
-- **NO recomputation of preview.n in the resync.** Same as R-5's design decision; R-7 cleanup may revisit.
-- **NO production code changes.**
+- **NO removal of legacy `getOrCreate` fallback.** Doc-only.
+- **NO removal of `MeshRenderState::clear()` public API.** Doc-only candidate; not this slice.
+- **NO removal of `mesh.initialize()`-in-pack adjacency duplication.** Could be split into "adjacency-only" path; deferred.
 - **NO new BDD/FRD/CM.**
+- **NO C-* FlatBuffers work.**
 
 ## Spec substitution
 
-None. R-6 is infrastructure / test-coverage work.
+None.
 
 ## Standing constraints
 
 - **RIGID-BACKEND-PORTABILITY** (D-037) — UNCHANGED.
 - **PARALLEL-IMPL-LOCKSTEP** (D-035 + D-038) — UNCHANGED.
 - **BDD-102-vs-ALEMBIC-BYTES** — UNCHANGED.
+- **D-042-ROUND-TRIP-INVARIANT** (NEW) — R-3..R-6 invariant pinned by Blocks 41 + 42; any future slice touching pack/update/translate/rotate/setMaterial/getOrCreate must preserve byte-equality at observable boundaries.
 
 ## Todo
 
-1. **Branch hygiene.** Working in worktree `.claude/worktrees/r6-selftest-migration` on branch `feat/d-042-r-6-selftest-migration` (off main HEAD `f23b710`). Submodules already initialized. Commit prefix `add:`.
+1. **Branch hygiene.** Working in worktree `.claude/worktrees/r7-cleanup` on branch `feat/d-042-r-7-cleanup` (off main HEAD `96ba6b1`). Submodules already initialized. Commit prefix `add:`.
 
-2. **New Block 41** in `runSelfTest` — inserted INSIDE the Metal-gated section, AFTER Block 40 (D-042 R-5). Body per Design call (3).
+2. **`src/main.cpp` — R-5 resync gains `req.preview.recomputeNormals()`** right after the position memcpy. Comment refresh to note this is R-7's addition.
 
-3. **Build + verify deterministic.** `cmake --build build && cd build && for i in 1 2 3 4 5; do ./src/ysim --self-test; done` — expect **72/72 PASS** each time.
+3. **`include/MeshRenderState.hpp` — legacy fallback comment refresh** per Design call (5).
 
-4. **`verify-light.sh` cross-check.** Expect doctest 159/159 + 1120/1120 SUCCESS unchanged.
+4. **New Block 42** in `runSelfTest` — inserted INSIDE the Metal-gated section, AFTER Block 41 (D-042 R-6). Cloth-deformation-normal-change verification per Design call (2).
 
-5. **Bug-probes** (each FAIL after revert; restore after):
-   - **(a) Modify R-5's resync to write `state.x.ptr[0] + 0.01f` into preview.x[0]**: Block 41 FAILs (memcmp non-zero, `frameMismatch=0`, `eqAllFrames=0`). Restore.
-   - **(b) Skip the entire R-5 resync loop**: Block 41 FAILs because preview stays frozen while state.x falls. Block 40 also FAILs. Skip — already covered by R-5's bug-probe (a).
+5. **`docs/roles/PLANNER.md` — append D-042-ROUND-TRIP-INVARIANT** to the `## Standing constraints` section.
 
-6. **Append D-042 R-6 to `docs/DECISIONS.md`**.
+6. **Build + verify deterministic.** `cmake --build build && cd build && for i in 1 2 3 4 5; do ./src/ysim --self-test; done` — expect **73/73 PASS** each time.
 
-7. **Update `.agent/PROJECT_STATE.md`**: next-milestone updates R-6 → R-7.
+7. **`verify-light.sh` cross-check.** Expect doctest 159/159 + 1120/1120 SUCCESS unchanged.
 
-8. **Update `.agent/CURRENT_WORK.md` + `.agent/RESUME.md`** — Generator-tier task.
+8. **Bug-probes** (each FAIL after revert; restore after):
+   - **(a) Comment out `req.preview.recomputeNormals()`**: Block 42 FAILs (`normalMoved=0` because preview.n stays at addX-time normals despite cloth deformation). Restore.
+   - **(b) Skipping the position memcpy**: would break Block 40 + Block 41 first. Don't need a separate probe for R-7.
+
+9. **Append D-042 R-7 to `docs/DECISIONS.md`** with a slice-summary note that the D-042 refactor sequence is COMPLETE.
+
+10. **Update `.agent/PROJECT_STATE.md`**: mark D-042 refactor sequence COMPLETE; recent scope changes append; standing feature candidates next priorities (Alembic export / B-2.1 Bullet refinements / source-file split).
+
+11. **Update `.agent/CURRENT_WORK.md` + `.agent/RESUME.md`** — Generator-tier task.
 
 ## Course corrections
 
-- **`feedback_make_means_add_new` rule**: user's brief uses "Add a self-test block" — additive verb, parallel-symbol invariant trivially satisfied.
-- **PROBE-COVERAGE-EDGES per PLANNER §9**: not a math-layer slice. Edges: zero-frame run (loop body skipped, eqAllFrames=0, FAIL); zero-vertex mesh (memcmp size=0 returns 0 — equal, but `eqAllFrames` still increments → PASS; degenerate case not specifically tested but not broken either).
+- **`feedback_make_means_add_new` rule**: user's brief uses "Recompute preview.n in the R-5 resync loop" — additive verb in existing function body. The recompute is a NEW operation appended after the existing memcpy. PARALLEL-IMPL-LOCKSTEP not affected.
+- **PROBE-COVERAGE-EDGES per PLANNER §9**: not a math-layer slice in the strict sense, but `recomputeNormals` is math. Edges:
+  - All-coplanar mesh → all face normals identical → recomputed n matches addX n trivially. (Block 42's cloth bends, so this edge is bypassed.)
+  - Degenerate triangle in preview.facets → `recomputeNormals` already handles zero-area (skip contribution per R-1's implementation).
 
 ## Expected metrics
 
-- Self-test count: **71 → 72**.
+- Self-test count: **72 → 73**.
 - 5-run deterministic PASS on macOS dev host.
 - `verify-light.sh`: doctest 159/159 + 1120/1120 SUCCESS unchanged.
-- Linux container: Block 41 SKIPs (Metal-gated).
+- Linux container: Block 42 SKIPs.
 - Expected matrix delta: none.
-- Expected DECISIONS.md delta: D-042 R-6 entry added.
+- Expected DECISIONS.md delta: D-042 R-7 entry + closure note for D-042 sequence.
+- Expected PLANNER.md delta: D-042-ROUND-TRIP-INVARIANT standing constraint added.
+- Expected PROJECT_STATE.md delta: "D-042 refactor sequence COMPLETE"; future-slice candidates promoted.
 - Estimator verdict next turn: **NOTE** if implementation clean. Possible NOTEs:
-  - (i) Pure additive test slice — no production diff to review.
-  - (ii) memcmp is bit-strict; future floating-point reordering could trigger spurious fails (acceptable for v1 since R-5 is std::memcpy).
-  - **WARNING** if: Block 41 FAILs (resync isn't actually byte-equal — would indicate a hidden bug in R-5 or R-3).
-  - **BLOCK** if Block 41 FAILs on macOS.
+  - (i) recomputeNormals() O(F+V) per frame per mesh — negligible for v1 scenes; perf flag for very high-poly scenes.
+  - (ii) Legacy fallback now documented-but-untested; future R-7+ might prune.
+  - **WARNING** if: Block 42 FAILs OR existing Blocks 1-41 regress.
+  - **BLOCK** if Block 42 FAILs on macOS.
