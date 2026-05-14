@@ -4880,9 +4880,10 @@ struct Simulator {
     // object select
     int selectedObj = -1;
 
-    // Renderer-side per-mesh GL state (D-011). Cleared on initialize()
-    // because Scene::pack() reallocates packedMeshData buffers; the cached
-    // MeshGL captured raw pointers into the previous pack and is stale.
+    // Renderer-side per-mesh GL state (D-011). D-042 R-2: MeshGL now binds
+    // to PreviewState heap pointers published via registerPreviewBinding at
+    // addX time; the prior clear()-on-initialize band-aid retires because
+    // preview buffers are stable across Scene::pack reallocations.
     MeshRenderState renderState;
 
     // D-040: rigid physics backend swapped Euler → Bullet 3.25 (B-3 BLOCK
@@ -4989,12 +4990,26 @@ struct Simulator {
         mesh.rigidLastBodyPos = init.position;
     }
 
+    // D-042 R-2: after every scene.addGeneralMesh, publish the R-1 preview
+    // pointers to MeshRenderState so MeshGL materializes from the stable
+    // heap-owned PreviewState buffers (not the volatile packed sub-views).
+    // CPU-only — safe to call from the harness without a GL context.
+    void registerPreviewBindingForLastRequest() {
+        if (Scene<BE, PR>::requestsGeneralMeshes.empty()) return;
+        auto& req = Scene<BE, PR>::requestsGeneralMeshes.back();
+        renderState.registerPreviewBinding(req.id,
+            req.preview.xPtr(), req.preview.numPoints(),
+            req.preview.facetsPtr(), req.preview.numFacets(),
+            req.preview.nPtr());
+    }
+
     void addClothFile(std::string prefix, std::string fileName, tinym::vec3 offset, PR scale, PR kstretch=1e5, PR kshear=1e5, PR kbend=3e5, PR thickness=0.001, PR mass=0.1) {
         scene.addGeneralMesh(
                 new MeshFileInitializer<BE, PR>({prefix, fileName, offset, scale, mass}),
                 BehaviorType::TriangularCloth,
                 ClothBehaviorParams<PR>{kstretch, kshear, kbend, thickness}
                 );
+        registerPreviewBindingForLastRequest();
     };
 
     void addFloatMesh(std::string prefix, std::string fileName, tinym::vec3 offset, PR scale, PR mass=0.1) {
@@ -5003,6 +5018,7 @@ struct Simulator {
                 BehaviorType::Float,
                 FloatBehaviorParams<PR>{}
                 );
+        registerPreviewBindingForLastRequest();
     }
 
     // BDD-002 import path. Path-existence guard runs *before* addFloatMesh so
@@ -5023,7 +5039,7 @@ struct Simulator {
     }
     void addClothGridFast(Index particleNum1D = 200, PR size1D = 100, PR kstretch=1e5, PR kshear=1e5, PR kbend=3e5, PR thickness=0.001, PR mass=0.1) {
         //particleNum1D(particleNum1D), particleNum2D(particleNum1D*particleNum1D), particleDataNum(particleNum2D*3),{
-        //size1D(size1D), stretchRestLength(size1D/PR(particleNum1D-1)), shearRestLength(stretchRestLength*std::sqrt(2)), bendRestLength(stretchRestLength*2) 
+        //size1D(size1D), stretchRestLength(size1D/PR(particleNum1D-1)), shearRestLength(stretchRestLength*std::sqrt(2)), bendRestLength(stretchRestLength*2)
         scene.addGeneralMesh(
             new MeshGridInitializer<BE, PR>({
                 PlaneDirection::XYPlane,
@@ -5033,18 +5049,19 @@ struct Simulator {
                 mass,
                 true
             }),
-            BehaviorType::FastGridCloth, 
+            BehaviorType::FastGridCloth,
             FastGridClothBehaviorParams<PR>{
-                particleNum1D, 
+                particleNum1D,
                 size1D/particleNum1D,
                 size1D/particleNum1D*std::sqrtf(2),
                 size1D/particleNum1D*2,
-                kstretch, 
-                kshear, 
+                kstretch,
+                kshear,
                 kbend,
                 thickness
             }
         );
+        registerPreviewBindingForLastRequest();
     }
 
     void addCloth(Index particleNum1D, PR size1D, tinym::vec3 center, PR kstretch=1e5, PR kshear=1e5, PR kbend=3e5, PR thickness=0.01, PR mass=0.1) {
@@ -5064,6 +5081,7 @@ struct Simulator {
             BehaviorType::TriangularCloth,
             ClothBehaviorParams<PR>{kstretch, kshear, kbend, thickness}
         );
+        registerPreviewBindingForLastRequest();
     };
     void addSphere(tinym::vec3 center, Index tessellation, PR size, PR mass=PR(0.1)) {
         scene.addGeneralMesh(
@@ -5071,6 +5089,7 @@ struct Simulator {
                 center, tessellation, size, mass)),
             BehaviorType::Float,
             FloatBehaviorParams<PR>{});
+        registerPreviewBindingForLastRequest();
     }
 
     void addCube(tinym::vec3 center, Index tessellation, PR size, PR mass=PR(0.1)) {
@@ -5079,6 +5098,7 @@ struct Simulator {
                 center, tessellation, size, mass)),
             BehaviorType::Float,
             FloatBehaviorParams<PR>{});
+        registerPreviewBindingForLastRequest();
     }
 
     void addGround(PlaneDirection dir, tinym::vec3 center, PR size1D, PR mass=0.1) {
@@ -5094,6 +5114,7 @@ struct Simulator {
             BehaviorType::Float,
             FloatBehaviorParams<PR>{}
         );
+        registerPreviewBindingForLastRequest();
     };
 
     // BDD-003: translate the named mesh by mutating state.x (and state.xPrev)
@@ -5247,6 +5268,11 @@ struct Simulator {
         pendingMaterials.erase(meshId);
         pendingRotations.erase(meshId);
         if (selectedObj == meshId) selectedObj = -1;
+        // D-042 R-2: drop the pending preview binding + any materialized
+        // MeshGL for the removed id. D-041 turn-2's monotone nextMeshId
+        // guarantees the slot won't be reused, but the entry would still
+        // leak otherwise (small per-remove leak before R-2's cleanup).
+        renderState.removeById(meshId);
         Scene<BE, PR>::dirty = true;
     }
 
@@ -5398,9 +5424,13 @@ struct Simulator {
         std::cout << "[Simulator Init] Memory pool allocated" << std::endl;
 
         Scene<BE, PR>::pack();
-        // Stale MeshGL entries point into the prior pack's buffers; drop them
-        // so the next draw lazy-creates fresh GL state from the new pointers.
-        renderState.clear();
+        // D-042 R-2: `renderState.clear()` call retired here — MeshGL is now
+        // bound to PreviewState heap pointers (R-1's std::vector buffers),
+        // which are stable across Scene::pack reallocations. The pre-R-2
+        // band-aid existed because MeshGL captured packed sub-view pointers
+        // that became dangling whenever pack rebuilt; preview heap is
+        // immune. `MeshRenderState::clear()` itself remains as a public API
+        // for future forced-rebuild paths if needed.
         collisionPipeline.broadPhase.build(scene);
         shBroadPhase.build(scene);
 
@@ -6083,6 +6113,7 @@ struct Simulator {
                     (PR)o.source.import.mass));
             }
             scene.addGeneralMesh(init, btype, bparams);
+            registerPreviewBindingForLastRequest();  // D-042 R-2
 
             if (Scene<BE,PR>::numMeshes > 0) {
                 int idx = Scene<BE,PR>::numMeshes - 1;
@@ -10100,6 +10131,44 @@ static int runSelfTest() {
                  + " sphereOk=" + std::to_string((int)sphereOk)
                  + " clothOk=" + std::to_string((int)clothOk)
                  + " groundOk=" + std::to_string((int)groundOk));
+        }
+    }
+
+    // ---- Block 37: D-042 R-2 — MeshGL binds to PreviewState pointers. -----
+    // R-1 populated `request.preview`. R-2 publishes those preview pointers
+    // to MeshRenderState via `registerPreviewBinding` immediately after every
+    // `scene.addGeneralMesh`. Block 37 verifies the binding is registered
+    // BEFORE `simulator.initialize()` runs, proving the MeshGL materialization
+    // path can pick up the stable preview pointers (instead of the volatile
+    // packed sub-views). Pure-CPU verification — no GL context needed; the
+    // actual MeshGL ctor still defers until `getOrCreate(mesh)` first fires
+    // in the GUI render loop.
+    {
+        resetScene();
+        sim.addCube(tinym::vec3(0.0f, 1.0f, 0.0f), 2, 0.2f, 1.0f);
+
+        auto& reqs = Scene<Backend, Precision>::requestsGeneralMeshes;
+        bool oneReq = (reqs.size() == 1);
+        auto& req = reqs[0];
+        const auto* binding = sim.renderState.previewBinding(req.id);
+        bool bindingExists = (binding != nullptr);
+        bool xMatch       = bindingExists && (binding->xPtr == (void*)req.preview.xPtr());
+        bool numVMatch    = bindingExists && (binding->numVerts == req.preview.numPoints()) && (binding->numVerts > 0);
+        bool facetPMatch  = bindingExists && (binding->facetPtr == req.preview.facetsPtr());
+        bool facetCMatch  = bindingExists && (binding->numFacets == req.preview.numFacets()) && (binding->numFacets > 0);
+        bool nMatch       = bindingExists && (binding->normalPtr == (void*)req.preview.nPtr());
+
+        if (oneReq && bindingExists && xMatch && numVMatch && facetPMatch && facetCMatch && nMatch) {
+            pass("D-042 R-2 / addX registers PreviewBinding immediately (pre-initialize) with stable preview pointers");
+        } else {
+            fail("D-042 R-2 / addX registers PreviewBinding immediately (pre-initialize) with stable preview pointers",
+                 std::string("oneReq=") + std::to_string((int)oneReq)
+                 + " bindingExists=" + std::to_string((int)bindingExists)
+                 + " xMatch="        + std::to_string((int)xMatch)
+                 + " numVMatch="     + std::to_string((int)numVMatch)
+                 + " facetPMatch="   + std::to_string((int)facetPMatch)
+                 + " facetCMatch="   + std::to_string((int)facetCMatch)
+                 + " nMatch="        + std::to_string((int)nMatch));
         }
     }
 

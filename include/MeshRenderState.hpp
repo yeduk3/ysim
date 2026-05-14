@@ -7,36 +7,107 @@
 // run without an active GL context, which was the structural blocker
 // behind CM-002, CM-003, CM-004, and the persistence-slice WARNING.
 //
-// Lazy: `getOrCreate(mesh)` constructs the GL state on first encounter
-// using duck-typed accessors (`mesh.id`, `mesh.state.x.{ptr,size}`,
-// `mesh.state.n.ptr`, `mesh.adjacency.facets.{ptr,size}`). The renderer
-// then forwards `updateBuffer` / `draw` to the cached MeshGL each frame.
-//
-// `clear()` should be called whenever Scene::pack() reallocates packed
-// buffers — the cached MeshGL captured raw pointers into the *previous*
-// pack's storage and is no longer valid. Simulator::initialize is the
-// canonical site for that call.
+// D-042 R-2 (2026-05-14): MeshGL's bound pointer migrates from packed
+// sub-views (volatile across Scene::pack reallocations) to PreviewState
+// heap-owned per-mesh buffers (stable). `registerPreviewBinding` is the
+// CPU-only API that addX-time code uses to publish the stable pointer
+// set; `getOrCreate` consumes the pending binding when first materializing
+// the MeshGL inside a live GL context. The legacy packed-sub-view fallback
+// remains for any code path that bypasses the binding step (paranoia /
+// future hand-built MeshGL via `getOrCreate`).
 
+#include <cstdint>
+#include <cstddef>
 #include <unordered_map>
 
 #include "MeshGL.hpp"
 
 class MeshRenderState {
 public:
+    // D-042 R-2: pending preview-binding metadata published at addX time.
+    // void*-typed so the class stays non-templated (only `Simulator<METAL,
+    // float>` exists in v1 but the API should not lock in PR).
+    struct PreviewBinding {
+        void* xPtr = nullptr;
+        std::size_t numVerts = 0;
+        std::uint32_t* facetPtr = nullptr;
+        std::size_t numFacets = 0;
+        void* normalPtr = nullptr;
+    };
+
+    // D-042 R-2: publish a stable preview-pointer binding for mesh `id`.
+    // Idempotent (last-write-wins) so addX after removeMesh on the same
+    // slot (would only happen if D-041 turn-2 nextMeshId monotone guarantee
+    // were violated) overwrites cleanly. No GL calls — safe to call from
+    // the harness without a live GL context.
+    template <typename PR>
+    void registerPreviewBinding(int id, PR* xPtr, std::size_t numVerts,
+                                std::uint32_t* facetPtr, std::size_t numFacets,
+                                PR* normalPtr) {
+        PreviewBinding b;
+        b.xPtr = (void*)xPtr;
+        b.numVerts = numVerts;
+        b.facetPtr = facetPtr;
+        b.numFacets = numFacets;
+        b.normalPtr = (void*)normalPtr;
+        previewBindings[id] = b;
+    }
+
+    // D-042 R-2: read-only accessor used by Block 37 + future harness probes
+    // to verify the binding registration is eager + correct. Returns nullptr
+    // when no binding is registered for `id` (or when it was already consumed
+    // by a prior `getOrCreate(mesh)` call inside a live GL context).
+    const PreviewBinding* previewBinding(int id) const {
+        auto it = previewBindings.find(id);
+        return (it == previewBindings.end()) ? nullptr : &it->second;
+    }
+
+    // D-042 R-2: drop both the pending preview binding AND any materialized
+    // MeshGL for `id`. Called from Simulator::removeMesh so the map doesn't
+    // grow unboundedly after repeated remove/add cycles.
+    void removeById(int id) {
+        previewBindings.erase(id);
+        state.erase(id);
+    }
+
     template <typename Mesh>
     MeshGL<CPU>& getOrCreate(Mesh& mesh) {
         auto it = state.find(mesh.id);
-        if (it == state.end()) {
+        if (it != state.end()) return it->second;
+
+        // D-042 R-2: prefer the PreviewState binding (heap-stable) over the
+        // packed sub-view (volatile across Scene::pack reallocations) when
+        // first materializing the MeshGL. The pending binding entry is
+        // consumed so subsequent lookups hit the cached MeshGL.
+        auto pit = previewBindings.find(mesh.id);
+        if (pit != previewBindings.end()) {
+            auto& pb = pit->second;
             it = state.emplace(std::piecewise_construct,
                 std::forward_as_tuple(mesh.id),
                 std::forward_as_tuple(
-                    mesh.state.x.size / 3,
-                    mesh.state.x.ptr,
-                    mesh.adjacency.facets.size / 3,
-                    mesh.adjacency.facets.ptr,
-                    mesh.state.n.ptr
+                    pb.numVerts,
+                    (float*)pb.xPtr,
+                    pb.numFacets,
+                    pb.facetPtr,
+                    (float*)pb.normalPtr
                 )).first;
+            previewBindings.erase(pit);
+            return it->second;
         }
+
+        // Legacy fallback: construct from packed sub-views (pre-R-2 path).
+        // Reachable when a mesh shows up in scene.meshes without a prior
+        // registerPreviewBinding call. Retained for safety + parallel-symbol
+        // invariant (the new path is preferred; the old path is not removed).
+        it = state.emplace(std::piecewise_construct,
+            std::forward_as_tuple(mesh.id),
+            std::forward_as_tuple(
+                mesh.state.x.size / 3,
+                mesh.state.x.ptr,
+                mesh.adjacency.facets.size / 3,
+                mesh.adjacency.facets.ptr,
+                mesh.state.n.ptr
+            )).first;
         return it->second;
     }
 
@@ -45,6 +116,7 @@ public:
 
 private:
     std::unordered_map<int, MeshGL<CPU>> state;
+    std::unordered_map<int, PreviewBinding> previewBindings;
 };
 
 #endif  // YSIM_MESH_RENDER_STATE_HPP

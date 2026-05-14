@@ -1,32 +1,28 @@
-# Current Work — B-3 + Bullet vendor BLOCK fix-turn complete (`feat/b-3-wire-rigid-behavior`)
+# Current Work — D-042 R-2 — MeshGL ↔ PreviewState binding
 
-- File in flight: none — slice complete. **63/63 self-test PASS** deterministic across 5 macOS runs. Doctest 159/159 + 1120/1120 SUCCESS via `verify-light.sh`. Bullet 3.25 vendored at `third_party/bullet3/` (release tag pinned). Both BDD-008 clauses ("falls" + "rests") PASS.
-- **User goal closed**: `/goal "bullet을 지금 넣자"` is satisfied — Bullet is in the build, linking, and serving as `Simulator::rigid_`. Estimator turn-35 BLOCK is closed because Bullet's real box-vs-plane contact resolution mechanizes BDD-008's "rests at floor" clause.
-- How far: all PLAN todos done + Bullet vendor fix-turn done in one shot.
-  - **`third_party/bullet3/` submodule** added (`.gitmodules` updated), pinned to release tag `3.25` (HEAD `2c204c49e`).
-  - **Root `CMakeLists.txt`** gains 11 Bullet build-option overrides + `CMAKE_POLICY_VERSION_MINIMUM = 3.5` (Bullet 3.25's CMakeLists declares `cmake_minimum_required(VERSION 2.x)`; modern CMake 4.x needs explicit policy compat) + `add_subdirectory(third_party/bullet3 EXCLUDE_FROM_ALL)`. Demos/extras/tests/Bullet3-experimental/shared/double-precision/pybullet all OFF.
-  - **`src/CMakeLists.txt`**: `BulletRigidPhysicsBackend.cpp` added to ysim sources; `target_link_libraries` extended with `BulletDynamics + BulletCollision + LinearMath`; `target_include_directories` extended with `third_party/bullet3/src`.
-  - **`include/BulletRigidPhysicsBackend.hpp`** (new, ~85 lines): class declaration in `namespace ysim::physics`. Bullet types forward-declared (heavy umbrella header `btBulletDynamicsCommon.h` only enters the .cpp TU). Per-body storage `BulletBody{shape, motionState, body}` — declaration order is destruction-order-correct (Bullet requires body destroyed before shape).
-  - **`src/BulletRigidPhysicsBackend.cpp`** (new, ~155 lines): method bodies satisfying D-037's 12-method contract. `initialize` builds `btDbvtBroadphase + btSequentialImpulseConstraintSolver + btDefaultCollisionConfiguration + btCollisionDispatcher + btDiscreteDynamicsWorld`. `addBody` shape-translates Box → `btBoxShape`, Sphere → `btSphereShape`, Plane → `btStaticPlaneShape`; ConvexMesh/StaticMesh stub-return `kInvalidBodyHandle`. Mass=0 → static (no `calculateLocalInertia`). Quat marshalling: ysim `::Quat{w,x,y,z}` ↔ Bullet `btQuaternion(x,y,z,w)`. `step(h, 1, h)` — exactly one substep per call. `getPosition/Rotation/LinearVelocity/AngularVelocity` query body state directly. `applyForce/Impulse` convert world-space application point to body-local via current transform. CM-012: every method bounds-checks + returns sentinel zero / identity on invalid handle.
-  - **`src/main.cpp` Simulator wiring**: `#include "BulletRigidPhysicsBackend.hpp"` added; `rigid_` member type **swapped** `EulerRigidPhysicsBackend → BulletRigidPhysicsBackend`. New `inferRigidShapeType(mesh)` helper uses `dynamic_cast<MeshCubeInitializer*>(mesh.initializer)` to pick Box for cubes (Sphere fallback otherwise). `ensureRigidBackendBody` uses the inferred type + sets `half_extents = (half, half, half)` for Box. `Simulator::initialize` adds an **implicit y=0 static ground plane** in the Bullet world immediately after `rigid_.initialize` (matches the Euler backend's previous built-in clamp; real collision body so Rigid bodies rest on it via Bullet's box-vs-plane contact). `Simulator::update` calls `rigid_.setGravity(scene.environment.gravity)` each frame BEFORE `rigid_.step` (folds Estimator turn-35 WARNING on runtime gravity propagation).
-  - **Block 32 (D-039 / cube falls)**: unchanged in intent. Still PASSes under Bullet (cube at y=5 doesn't reach the y=0 plane within 30 frames).
-  - **Block 33 NEW (D-040 / cube rests on floor)**: `addCube(0,2,0,size=0.2,mass=1) + initialize + changeBehavior(0, Rigid) + 240×sim.update() (4 s @ 60 Hz)`. Asserts body center.y in [0.04, 0.16] band around analytic rest height = half_extent = 0.1 (Bullet's solver allows shallow penetration). Velocity proxy: step one more frame, assert |Δy| < 0.001 m. Pass label: `BDD-008 / cube tagged Rigid rests on implicit y=0 ground plane after 240 frames (D-040)`. **Closes Estimator turn-35 BLOCK on BDD-008's "rests at floor" clause.**
-  - **`docs/DECISIONS.md`** D-040 appended.
-  - **`docs/TEST_MATRIX.md`** BDD-008 row rewritten to include Block 33 + D-040 + Bullet swap notes; status `pass` (now legitimate — both falls + rests mechanized).
-  - **`docs/roles/PLANNER.md`** RIGID-BACKEND-PORTABILITY entry updated: now load-bearing across THREE backends (Null + Euler + Bullet).
-- What's tested:
-  - **63/63 self-test PASS deterministic across 5 consecutive macOS runs** (61 prior + Block 32 + Block 33). 62 → 63 (B-3 alone was 62; D-040 fix-turn adds Block 33).
-  - Block 30 + Block 31 + Block 32 + Block 33 + Blocks 1-29 all green.
-  - Doctest 159/159 + 1120/1120 SUCCESS via `verify-light.sh`.
-  - Bullet first-build cost: ~1-2 min compile (CMake configure + libBulletCollision + libBulletDynamics + libLinearMath + libBullet3* skipped per BUILD_BULLET3=OFF).
-- Non-goals respected: NO Simulator template-parameter widening (still one-line type swap); NO rotation-correct vertex update (Δpos translation only — Bullet tracks rotation but state.x doesn't reflect it); NO per-mesh mass/friction/restitution API; NO ConvexMesh/StaticMesh shape support (stubs return kInvalidBodyHandle); NO determinism probe across Bullet runs (BDD-102 covers cloth only).
-- Bug-probes (B-3 original 3 verified earlier; D-040 fix-turn skipped re-probing — Block 33 plus the type-swap is itself the load-bearing proof that Bullet is wired; reverting `rigid_` to Euler would make Block 33 FAIL because Euler's sphere-clamp doesn't give the analytic 0.1 m rest height for a Box).
-- **Manual GUI test (user-driven, post-merge)**: launch `./build/src/ysim`, create a cube (Mesh menu), open Inspector, switch Behavior to Rigid. Cube starts falling immediately and rests on the implicit y=0 floor. Also: change Environment > Gravity y to a non-default value; the falling cube responds on the next frame (per-frame `rigid_.setGravity` propagation).
-- What's next: Estimator turn 36 review via `Agent(codex:codex-rescue)`. Expected verdict: **NOTE-clean** — both turn-35 issues are closed (BDD-008 BLOCK + runtime-gravity WARNING). Possible NOTE items:
-  - (i) Translation-only vertex update (state.x doesn't rotate with Bullet's body orientation) — documented limitation; future slice.
-  - (ii) `inferRigidShapeType`'s `dynamic_cast<MeshCubeInitializer*>` is a runtime-typed dispatch; works because every initializer is `GeneralMeshInitializer<BE, PR>*`. Could be tightened with an explicit shape field on GeneralMesh if more shape types are added.
-  - (iii) `rigid_.setGravity` called every frame even when gravity hasn't changed — wasteful by ~30 ns. Caching the last-pushed gravity is a future micro-optimization.
-  - (iv) ConvexMesh / StaticMesh paths remain stubbed. Acceptable.
-  - (v) Block 33 tolerance band `[0.04, 0.16]` around analytic 0.1 — Bullet's contact solver settles with shallow penetration; this is the standard Bullet "deep-contact penetration depth" behavior. Tighter assertion possible after Bullet config tuning.
-  - **WARNING** if: turn-35's BLOCK or WARNING re-surface (they shouldn't — both mechanized); Block 33 turns flaky across runs; Bullet's CMake policy compat fails on a future CMake version.
-  - **BLOCK** if Block 33 FAILs or Bullet build breaks.
+> Owner: **Generator**.
+> Updated: 2026-05-14
+
+## File in flight
+
+None — slice complete pending Estimator review.
+
+## How far
+
+- `include/MeshRenderState.hpp` — added `PreviewBinding` struct + `previewBindings` map + 3 methods (`registerPreviewBinding<PR>`, `previewBinding(int) const`, `removeById(int)`); modified `getOrCreate` to prefer preview binding over packed sub-view; legacy fallback retained for parallel-symbol invariant.
+- `src/main.cpp` — added `Simulator::registerPreviewBindingForLastRequest()` helper; wired into 7 addX wrappers (addClothFile/addFloatMesh/addClothGridFast/addCloth/addSphere/addCube/addGround) + `loadScene` addGeneralMesh site; `Simulator::removeMesh` calls `renderState.removeById(meshId)` before the request erase; `Simulator::initialize`'s `renderState.clear()` call retired (line 5403) with an explanatory comment block update.
+- `src/main.cpp` — new Block 37 (D-042 R-2) after Block 36 inside the Metal-gated section. Verifies pre-init `renderState.previewBinding(req.id)` exists + every pointer/count matches `req.preview.*Ptr()/numPoints()/numFacets()`.
+- `docs/DECISIONS.md` — D-042 R-2 entry appended.
+
+## What's tested
+
+- `./src/ysim --self-test` — **68/68 PASS deterministic across 5 macOS runs** (baseline 67 from R-1 + 1 new Block 37). Plan predicted 66 → 67; actual measured baseline was already 67 (one-off drift documented in DECISIONS).
+- `./scripts/verify-light.sh` — doctest 159/159 + 1120/1120 SUCCESS, unchanged from R-1 baseline.
+- Bug-probe (a): removing `registerPreviewBindingForLastRequest()` from `addCube` → Block 37 FAILs (`xMatch=0 ...`); restored.
+- Bug-probe (b): forcing `b.xPtr = nullptr` in `registerPreviewBinding` → Block 37 FAILs with `xMatch=0` only; restored.
+- Bug-probe (c) per PLAN: skipped per Generator note — the legacy packed-sub-view fallback in `getOrCreate` is dead code under R-2 (every addX registers), so harness can't drive the fallback path without a deliberate setup that bypasses addX. Documented gap.
+- No `BUG-PROBE` markers remain in `src/` or `include/`.
+
+## What's next
+
+Hand back to `/slice` orchestrator for Codex Estimator pass. Next planning cycle picks up R-3 (rewrite `Scene::pack` to memcpy preview → packed).

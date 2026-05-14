@@ -1,386 +1,274 @@
-# PLAN — B-3 Wire Rigid behavior tag through Simulator — `feat/b-3-wire-rigid-behavior`
+# PLAN — D-042 R-2: MeshGL bound to PreviewState — `feat/d-042-r-2-meshgl-preview-binding`
 
 > Owner: **Planner** writes; **Generator** executes; **Estimator** judges.
 > Updated: 2026-05-14
 
 ## Course note: previous turn's verdict
 
-Estimator turn 34 (B-2′ EulerRigidPhysicsBackend slice) returned **WARNING** with 0 BLOCK + 1 WARNING + 1 NOTE. WARNING flagged that Block 31 only covers sphere-on-clamp; BDD-008's box-on-plane + angular-velocity-decay are still unmet. NOTE flagged `removeBody` slot-leak + `applyForce == applyImpulse` collapse. Both items are scope-coverage flags, not regressions; B-3 closes some of them indirectly (wiring through the simulator makes the backend live in real scenes).
+Estimator turn 36 (D-042 R-1 — PreviewState infrastructure slice) returned **NOTE** with 0 BLOCK + 0 WARNING + 2 NOTEs. NOTEs flagged (i) the `populatePreview` overrides duplicate geometry math from initializer paths (will collapse in later R-* slices when the original path retires) and (ii) `MeshFileInitializer::populatePreview` re-reads the .obj from disk (acceptable for v1 since `MeshFile::load` is cached at file scope). Both items are deferred to R-7 cleanup.
 
-B-2′ EulerRigidPhysicsBackend merged to `main` via commits `5c745fa add:` + `481e013 chore:`. Self-test count 59 → 61 PASS deterministic on macOS AND Linux.
+R-1 merged to `main` via commit `08f3ef5`. Self-test count 65 → 66 PASS deterministic on macOS AND Linux.
 
 ## Goal
 
-**Close the user's "Rigid bodies should fall under gravity" goal.** B-1 shipped the contract; B-2′ shipped the Euler integrator; B-3 wires them into `Simulator::update` so a Rigid-tagged mesh in the GUI actually falls under gravity. Adds `int32_t rigidBodyHandle = -1` to `GeneralMesh<BE, PR>` + `tinym::vec3 rigidLastBodyPos` for delta-tracking. New idempotent helper `Simulator::ensureRigidBackendBody(meshId)` constructs `RigidInitial` and calls `rigid_.addBody`. `Simulator` holds `ysim::physics::EulerRigidPhysicsBackend rigid_;` (hard-coded type — no template-param widening this slice; future Bullet B-2.1 changes the type in one line). `Simulator::update()` calls `rigid_.step(h, 1)` once per frame, then for each Rigid-tagged mesh with valid handle: `Δpos = backend.getPosition - rigidLastBodyPos`, applied to every vertex of `state.x` + `state.xPrev` + `transformPosition`. `Simulator::changeBehavior(meshId, Rigid)` calls `ensureRigidBackendBody`. `Simulator::initialize` sweeps Rigid meshes via the helper. New Block 32 verifies `addCube + changeBehavior(0, Rigid) + 30 sim.update() → state.x[0].y dropped`. **Retires BDD-006-RIGID-DISPATCH-PARKED + BDD-018-BEHAVIOR-TAG-PARKED.** BDD-008 row promotes `pending → pass`. Self-test count 61 → 62.
+**Wire `MeshGL<CPU>` to point at `PreviewState`'s stable per-mesh buffers instead of the volatile packed sub-views.** R-1 (08f3ef5) added `PreviewState<PR>` heap-owned per-mesh vertex/facet/normal data populated by the initializer at `addGeneralMesh` time. R-2 turns those preview pointers into the **canonical binding source for `MeshGL`** by adding a new `MeshRenderState::registerPreviewBinding(id, preview)` API that each `Simulator::addX` wrapper calls right after `scene.addGeneralMesh`. The lazy `getOrCreate(mesh)` lookup (called from `uploadMeshes` + `draw` in the live GUI loop) is extended to **prefer the preview binding** over the packed sub-view at MeshGL construction time. `Simulator::initialize`'s `renderState.clear()` band-aid is retired — preview binding persists across Scene::pack rebuilds because the underlying `std::vector` heap is stable. New Block 37 verifies the binding exists immediately after `addX` (BEFORE `simulator.initialize()` runs) by checking `MeshRenderState::previewBinding(id)` returns pointers byte-identical to `request.preview.xPtr()/facetsPtr()/nPtr()`. Self-test count 66 → 67.
 
 ## Scope
 
-**Design call (1) — Hard-code `EulerRigidPhysicsBackend rigid_;` (no template widening).** The brief proposed widening `Simulator<BE, PR, SystemT>` → `Simulator<BE, PR, SystemT, RigidBackend = EulerRigidPhysicsBackend>`. Widening blast radius: every `Simulator<...>` instantiation site (production main.cpp, harness, runRefitBench) needs to acknowledge the extra parameter even with a default. Tradeoff:
-- **(a) Widen template**: cleanest future swap to Bullet via type-alias at one instantiation. Forces ~10+ instantiation-site touches.
-- **(b) Hard-code Euler member**: zero instantiation-site changes. Swap to Bullet requires changing `EulerRigidPhysicsBackend rigid_;` → `BulletRigidPhysicsBackend rigid_;` in one line.
+**Design call (1) — Decouple "binding registration" (CPU-only, no GL) from "MeshGL materialization" (needs GL context).** The brief says "eagerly create MeshGL at addGeneralMesh time". But `MeshGL<CPU>::MeshGL(...)` calls `glGenVertexArrays` / `glGenBuffers` / `glBufferData` — all requiring an active GL context. The harness runs `Simulator::addCube` from `runSelfTest` WITHOUT a GL context (only Block 25 + the D-042 R-1's Block 36 brought up `HiddenGLContext` for the few GL-touching probes). Adding eager `MeshGL` ctor calls in every `addX` would crash the entire self-test on Linux + on macOS without --visible-window.
 
-Picking **(b)**. RIGID-BACKEND-PORTABILITY (D-037) is still satisfied (Null + Euler both exist as parallel symbols; contract is shared; future Bullet swap is one-line). Blocks 30+31 still independently exercise the contract surface.
+Resolution: split the API. `MeshRenderState::registerPreviewBinding(int id, PR* xPtr, size_t numVerts, uint32_t* facetPtr, size_t numFacets, PR* normalPtr)` stores a small `PreviewBinding` POD in a per-id map. **No GL calls.** Then `getOrCreate(mesh)` (already GL-context-gated by virtue of being called from `uploadMeshes`/`draw`) checks `previewBindings_.find(mesh.id)` first: if present, construct the MeshGL using the **preview pointers + counts** instead of `mesh.state.x.ptr` / `mesh.adjacency.facets.ptr` / `mesh.state.n.ptr`. Pull the binding entry out of the pending map after first materialize (the MeshGL is now stored in `state`).
 
-**Design call (2) — `Simulator::ensureRigidBackendBody(meshId)` idempotent helper.** Three triggers converge here:
-1. **Lazy via `changeBehavior(meshId, Rigid)`**: Float → Rigid → call helper. Idempotent (no-op if `rigidBodyHandle != kInvalidBodyHandle`).
-2. **Sweep via `Simulator::initialize`**: after `applyPendingMaterials()`, iterate Rigid-tagged meshes and call helper. Covers post-load + post-pack-rebuild.
-3. **Belt-and-suspenders fallback in `Simulator::update`**: at top of Rigid delta-loop, if handle invalid, call helper. Defensive; should be unreachable if 1+2 hold.
+This preserves Block 37's "pre-init MeshGL exists" intent at the **binding** layer (which is the load-bearing invariant) without forcing a GL context into the self-test harness. The "eagerly created" language in the brief shifts from "MeshGL ctor fires" → "preview binding is registered and is the source of truth for the next MeshGL materialization, whether that materialization happens at first draw or at any other GL-context-active moment".
 
-Helper body sketch (full version in Todo step 4):
-- Bounds-check meshId + behaviorType.
-- Idempotent gate on `mesh.rigidBodyHandle != kInvalidBodyHandle`.
-- Build `RigidInitial`: position = mesh.transformPosition, rotation = mesh.rotationQuat, mass = 1.0f, shape = Sphere with radius = inferRigidRadius(mesh).
-- `mesh.rigidBodyHandle = rigid_.addBody(init); mesh.rigidLastBodyPos = init.position;`
+**Design call (2) — Retire `renderState.clear()` in `Simulator::initialize` at `src/main.cpp:5403`.** The pre-R-2 clear() existed because `MeshGL.vertexPtr` captured the prior pack's `packedMeshData` sub-view; Scene::pack reallocated; the captured pointer became dangling; the next `updateBuffer` would deref the dangling pointer in `computeNormal` (Eigen::Map over `vertexPtr`). Clear() dropped the stale entries; the next draw lazy-rebuilt from the new packed sub-view.
 
-**Design call (3) — Delta-tracking: how `state.x` follows the rigid body each frame.** Two options:
-- **(α) Recompute world vertices from local offsets**: store `local_offset[i] = state.x[i] - initial_body_center` once; each frame `state.x[i] = backend_pos + rotate(local_offset[i], backend_rot)`. Handles rotation. Cost: per-mesh local-offset buffer.
-- **(β) Apply Δpos in-place**: `Δpos = backend_now - rigidLastBodyPos`; `state.x[i] += Δpos` for all vertices. Translation-only. No new buffer.
+After R-2 the bound pointer is `preview.xPtr()` (heap, stable across Scene::pack), so clear() is unnecessary for pointer hygiene. The `uploadMeshes` per-frame call still re-points `MeshGL.vertexPtr` to `mesh.state.x.ptr` (packed) via `updateBuffer` — that part is unchanged; the *initial* binding moves to preview, the per-frame upload still drives from packed.
 
-Picking **(β)** for B-3. Future rotation-correct slice can switch to (α). Block 32 ("cube falls") is verified by vertical translation. PLAN documents the limitation; D-039 records it. Sphere is rotationally symmetric anyway; cube doesn't rotate in B-3 scenes (no torque applied).
+Method `MeshRenderState::clear()` itself stays as a public API (might be useful in future tests / forced-rebuild paths); only the **call site at `Simulator::initialize:5403` retires**.
 
-`state.xPrev` (D-013 CCD snapshot) also gets the same Δpos: `state.xPrev[i] += Δpos` (guarded on `xPrev.ptr` non-null). Keeps swept-CCD consistent. `mesh.transformPosition` also gets Δpos so D-014/D-021/inspector reads stay accurate.
+**Design call (3) — `MeshRenderState` API surface.** Add 3 NEW methods, all CPU-only (no GL):
 
-**Design call (4) — `rigid_.step` placement in `Simulator::update`.** Once per outer frame (NOT per substep — `step(h, 1)` already represents one frame of dynamics). Place: AFTER `applyEnvironmentForces()` (line ~5089), BEFORE the substep loop. Delta-loop runs immediately after `rigid_.step` (also before substep loop — Rigid meshes' state.x is updated; subsequent broad-phase uses the new positions).
-
-**Design call (5) — `applyEnvironmentForces` skips Rigid (zero externalForces).** Currently Rigid bodies get mass×gravity accumulated into `externalForces[i]`. The cloth integrator (`ExplicitSystem::update`'s switch) hits `default: break;` for Rigid, so the buffer is unused. Wasted work. Extending the Float skip to cover Rigid:
 ```cpp
-if (mesh.behaviorType == BehaviorType::Float ||
-    mesh.behaviorType == BehaviorType::Rigid) {
-    std::memset(ext, 0, sizeof(PR) * numPoints * 3);
-    continue;
+// CPU-only. Records a preview binding for `id`. Idempotent — overwrites
+// if the same id is registered again.
+template <typename PR>
+void registerPreviewBinding(int id, PR* xPtr, size_t numVerts,
+                            uint32_t* facetPtr, size_t numFacets,
+                            PR* normalPtr);
+
+// CPU-only. Returns optional pointer-tuple if a preview binding exists
+// for `id`; nullptr otherwise. Block 37 uses this to assert pre-init.
+struct PreviewBinding {
+    void* xPtr; size_t numVerts;
+    uint32_t* facetPtr; size_t numFacets;
+    void* normalPtr;
+};
+const PreviewBinding* previewBinding(int id) const;
+
+// CPU-only. Drops both the pending preview binding AND any materialized
+// MeshGL for `id`. Called from Simulator::removeMesh to avoid orphan
+// entries after id-not-reusing remove/add cycles (D-041 turn-2).
+void removeById(int id);
+```
+
+MODIFY `getOrCreate(mesh)` to check `previewBindings_.find(mesh.id)` first; if present, construct MeshGL with those pointers + counts (NOT `mesh.state.x.ptr` etc.); then erase the pending entry so subsequent calls reuse the cached MeshGL.
+
+**Design call (4) — Block 37 placement: INSIDE the Metal-gated section, AFTER Block 36.** Block 37 calls `sim.addCube`, which depends on Metal-allocated MemoryBlock; Linux container SKIPs the entire Metal-gated section. Same pattern as Block 36 (R-1's verification). Acceptable per D-012.
+
+**Design call (5) — Block 37 shape (single pass clause)**:
+1. `resetScene()`; `sim.addCube(tinym::vec3(0.0f, 1.0f, 0.0f), 2, 0.2f, 1.0f)` — cube tess=2 → 6 faces × 9 verts/face = 54 preview verts, 2×2×6 = 48 facets.
+2. Assert `Scene<>::requestsGeneralMeshes.size() == 1`. Capture `req = Scene<>::requestsGeneralMeshes[0]`.
+3. Assert `sim.renderState.previewBinding(req.id) != nullptr` (binding registered eagerly).
+4. Assert `binding->xPtr == (void*)req.preview.xPtr()` (same heap-owned pointer).
+5. Assert `binding->numVerts == req.preview.numPoints()` and > 0.
+6. Assert `binding->facetPtr == req.preview.facetsPtr()` and `binding->numFacets == req.preview.numFacets()` and > 0.
+7. Assert `binding->normalPtr == (void*)req.preview.nPtr()`.
+8. **Do NOT call `sim.initialize()`** in this block — that's the whole point of pre-init binding.
+9. Pass label: `D-042 R-2 / addX registers PreviewBinding immediately (pre-initialize) with stable preview pointers`.
+
+**Design call (6) — Where `registerPreviewBinding` gets called.** 7 `Simulator::addX` wrappers + 1 `loadScene` site:
+- `Simulator::addClothFile` (line 4992)
+- `Simulator::addFloatMesh` (line 5000)
+- `Simulator::addClothGridFast` (line 5024)
+- `Simulator::addCloth` (line 5050)
+- `Simulator::addSphere` (line 5068)
+- `Simulator::addCube` (line 5076)
+- `Simulator::addGround` (line 5084)
+- `Simulator::loadScene` site at line 6085
+
+Each adds the same 1-block call after `scene.addGeneralMesh(...)`:
+```cpp
+auto& req = Scene<BE, PR>::requestsGeneralMeshes.back();
+renderState.registerPreviewBinding(req.id,
+    req.preview.xPtr(), req.preview.numPoints(),
+    req.preview.facetsPtr(), req.preview.numFacets(),
+    req.preview.nPtr());
+```
+
+**Design call (7) — `Simulator::removeMesh` calls `renderState.removeById(id)`.** D-041 turn-2 made `nextMeshId` monotone so removed ids never collide with new ones, but the previewBinding/materialized MeshGL for the removed mesh stays orphaned in the map (small memory leak per remove). Add `renderState.removeById(removedId)` before the request is erased. Free correctness improvement; Estimator may flag as a small NOTE that R-2 added removal-side cleanup as a bonus. Acceptable.
+
+**Design call (8) — `getOrCreate(mesh)` semantics.** Old behavior: if `state.find(mesh.id)` not found, construct MeshGL from `mesh.state.x.ptr` (packed sub-view) + `mesh.adjacency.facets.ptr` + `mesh.state.n.ptr`. New behavior: same outer flow, but the "construct" step has 2 sub-paths:
+```cpp
+template <typename Mesh>
+MeshGL<CPU>& getOrCreate(Mesh& mesh) {
+    auto it = state.find(mesh.id);
+    if (it != state.end()) return it->second;
+    // R-2: prefer preview binding if registered.
+    auto pit = previewBindings_.find(mesh.id);
+    if (pit != previewBindings_.end()) {
+        auto& pb = pit->second;
+        it = state.emplace(std::piecewise_construct,
+            std::forward_as_tuple(mesh.id),
+            std::forward_as_tuple(
+                pb.numVerts, (float*)pb.xPtr,
+                pb.numFacets, pb.facetPtr,
+                (float*)pb.normalPtr
+            )).first;
+        previewBindings_.erase(pit);
+        return it->second;
+    }
+    // Legacy fallback: construct from packed sub-views.
+    it = state.emplace(std::piecewise_construct,
+        std::forward_as_tuple(mesh.id),
+        std::forward_as_tuple(
+            mesh.state.x.size / 3, mesh.state.x.ptr,
+            mesh.adjacency.facets.size / 3, mesh.adjacency.facets.ptr,
+            mesh.state.n.ptr
+        )).first;
+    return it->second;
 }
 ```
-Retires BDD-006-RIGID-DISPATCH-PARKED's "gravity accumulates into Rigid-tagged meshes" claim explicitly.
 
-**Design call (6) — Block 32 placement: BELOW the Metal-less SKIP gate.** Block 32 needs `Simulator::initialize` which uses Metal (Scene::pack + Metal buffer allocs). Linux container SKIPs after the gate at `src/main.cpp:6164`. Block 32 joins the existing Block 1-29 cluster (Block 32 lands AFTER Block 29 closes, INSIDE the Metal-gated section, BEFORE the failures summary). Linux container SKIPs Block 32 like the rest — acceptable per D-012 + existing pattern.
-
-**Design call (7) — Block 32 shape (single pass clause)**:
-1. `resetScene()`; `sim.addCube(tinym::vec3(0, 5, 0), tess=2, size=0.2, mass=1.0)`; `sim.initialize()`.
-2. `sim.changeBehavior(0, BehaviorType::Rigid)` — triggers `ensureRigidBackendBody`.
-3. Capture `y_initial = mesh.state.x[1]` (first vertex's y), `center_y_initial = mesh.rigidLastBodyPos.y`.
-4. `sim.pause = false;` (update() early-returns otherwise).
-5. Pump 30 frames: `for (int i = 0; i < 30; ++i) sim.update();`.
-6. Read `y_post = mesh.state.x[1]`, `center_y_post = mesh.rigidLastBodyPos.y`.
-7. Assert (a) `changed == true`, (b) `mesh.rigidBodyHandle != kInvalidBodyHandle`, (c) `y_post < y_initial - 0.5f` (witness vertex fell at least 0.5m — semi-implicit accumulation over 30 frames gives ~1.27m total fall), (d) `center_y_post < center_y_initial - 0.5f` (backend body center also fell).
-8. Pass label: `BDD-008 / cube tagged Rigid falls under gravity in Simulator::update (D-039)`.
-
-**Use `mesh.rigidLastBodyPos.y` to inspect backend state** (since `Simulator::rigid_` is private). The delta-loop updates this field every frame to the backend's reported position; reading it post-pump is the same as querying the backend.
-
-**Design call (8) — Persistence wiring.** `loadScene` already accepts `"Rigid"` (D-036 fix-turn). The slice's sweep inside `Simulator::initialize` (Design call 2 trigger 2) covers persistence too: after a load, `initialize` is called → sweep re-adds all Rigid bodies. No changes needed in `loadScene` itself.
-
-**Design call (9) — Backend reset on `Simulator::initialize`.** `resetScene` clears `Scene::meshes`. The rigid backend's `bodies_` vector doesn't auto-clear. Per-scene clean state: `Simulator::initialize` calls `rigid_.shutdown(); rigid_.initialize(scene.environment.gravity);` then runs the Rigid-mesh sweep. Each scene gets a fresh backend with the correct gravity.
-
-**Design call (10) — `changeBehavior(meshId, Float)` clears the rigid handle.** If the user toggles Rigid → Float, the backend body slot is leaked (Euler's `removeBody` is slot-leak per D-038). But the mesh must STOP following the (now-uncoupled) backend body. Fix: in `changeBehavior`'s Float accept case, clear `mesh.rigidBodyHandle = kInvalidBodyHandle` + `mesh.rigidLastBodyPos = {}`. Subsequent updates skip the mesh in the delta-loop. Backend's `bodies_[old_handle]` continues to drift under gravity invisibly until `Simulator::initialize` resets the backend. Acceptable for B-3.
-
-**Design call (11) — Inspector Float → Rigid path.** `mesh_inspector_gui.cpp`'s on_behavior_change callback calls `Simulator::changeBehavior(id, Rigid)` (already wired in BDD-006 D-036). With this slice's changeBehavior addition, the helper fires automatically. User clicks Rigid → cube starts falling on next sim step. Manual GUI test post-slice.
+**Design call (9) — PreviewBinding holds `void*` for `xPtr`/`normalPtr` to avoid template parameter on `MeshRenderState`.** The class is non-templated and shared by all Simulator instantiations (only `Simulator<METAL, float>` exists in v1, but the binding API should not lock in PR). `registerPreviewBinding<PR>(...)` is a function template that casts `PR*` to `void*` internally. `getOrCreate` casts back to `float*` (v1 PR is always `float`). Acceptable simplification per existing pattern (`MeshGL<CPU>` hardcodes `float*` in the ctor signature).
 
 **NEW symbols this slice adds**:
-- `GeneralMesh<BE, PR>::rigidBodyHandle` field (int32_t, default `kInvalidBodyHandle`).
-- `GeneralMesh<BE, PR>::rigidLastBodyPos` field (`tinym::vec3`, default `{}`).
-- `Simulator<BE, PR, System>::rigid_` private member (`ysim::physics::EulerRigidPhysicsBackend`).
-- `Simulator::ensureRigidBackendBody(int meshId)` — idempotent helper.
-- `Simulator::inferRigidRadius(const GeneralMesh<BE, PR>&)` — bbox-half heuristic.
-- Block 32 in `runSelfTest` (1 new pass clause).
-- `docs/DECISIONS.md` — D-039 entry.
-- `docs/TEST_MATRIX.md` — BDD-008 row promoted `pending → pass`.
+- `MeshRenderState::PreviewBinding` struct (POD).
+- `MeshRenderState::previewBindings_` private map.
+- `MeshRenderState::registerPreviewBinding<PR>(...)` method (function template).
+- `MeshRenderState::previewBinding(int id) const` accessor.
+- `MeshRenderState::removeById(int id)` method.
+- Block 37 in `runSelfTest` (1 new pass clause).
+- `docs/DECISIONS.md` — D-042 R-2 entry.
 
 **MODIFIED symbols in place**:
-- `src/main.cpp` — GeneralMesh gains 2 fields; Simulator gains `rigid_` + helpers; `changeBehavior` Rigid case calls helper; `changeBehavior` Float case clears handle/lastPos; `Simulator::initialize` resets backend + sweeps; `Simulator::update` calls `rigid_.step` + delta-loop; `applyEnvironmentForces` skips Rigid like Float.
-- `docs/roles/PLANNER.md` — REMOVE BDD-006-RIGID-DISPATCH-PARKED bullet + REMOVE BDD-018-BEHAVIOR-TAG-PARKED bullet (both retired). RIGID-BACKEND-PORTABILITY stays.
+- `include/MeshRenderState.hpp` — adds the 3 new methods + map + struct.
+- `MeshRenderState::getOrCreate` — modified to check `previewBindings_` first.
+- `src/main.cpp` — 8 `addX`/`loadScene` sites gain 1-block `registerPreviewBinding` call; `Simulator::removeMesh` gains `renderState.removeById(removedId)` call; `Simulator::initialize` line 5403 retires `renderState.clear()` call (DELETE the line, leave a R-2 explanatory comment).
+- `.agent/PROJECT_STATE.md` — next-milestone updates.
 
-**PRESERVED symbols**:
-- `include/RigidPhysicsTypes.hpp` — UNCHANGED.
-- `include/NullRigidPhysicsBackend.hpp` — UNCHANGED. Block 30 still exercises.
-- `include/EulerRigidPhysicsBackend.hpp` — UNCHANGED. Block 31 still exercises.
-- `include/Quat.hpp` — UNCHANGED.
-- `ExplicitSystem<METAL, PR>::update`'s switch at `src/main.cpp:5891` — UNCHANGED. Rigid still falls through to `default: break;` (Metal integrator). Rigid integration happens at the outer `Simulator::update` level via the C++ delta-loop — cleaner separation.
-- `Simulator<BE, PR, System>` template signature — UNCHANGED. No 4th param (per Design call 1).
-- `scene_format.hpp` — UNCHANGED.
-- All Metal kernels — UNCHANGED.
-- Block 1-31 — UNCHANGED.
-- All inspector code — UNCHANGED.
-- BehaviorType enum + behaviorTypeName — UNCHANGED.
+**PRESERVED symbols** (parallel-symbol invariant):
+- `MeshGL<CPU>` — UNCHANGED. Same ctor signature, same fields.
+- `MeshGL<CPU>::updateBuffer` — UNCHANGED. Per-frame re-pointing to packed buffer still works.
+- `MeshRenderState::clear()` method body — UNCHANGED (deprecated call site only).
+- `MeshRenderState::has(int id)` — UNCHANGED.
+- `PreviewState<PR>` — UNCHANGED (R-1's surface).
+- `Scene::addGeneralMesh` — UNCHANGED. Still returns void; the wrappers do the binding-register step.
+- `RequestGeneralMesh::preview` — UNCHANGED.
+- All initializer `populatePreview` overrides — UNCHANGED.
+- Block 1-36 — UNCHANGED.
+- All Metal kernels, BVH, narrow-phase — UNCHANGED.
+- `Simulator::uploadMeshes` / `Simulator::draw` — UNCHANGED. Both still iterate `scene.meshes` and call `getOrCreate`; the binding lookup is transparent.
 
 ## Non-goals
 
-- **NO Simulator template widening.** Hard-code Euler.
-- **NO rotation-correct vertex update.** Δpos translation only.
-- **NO per-mesh mass / friction / restitution API.** Hard-coded mass=1.0.
-- **NO shape-specific bodies beyond Sphere.** Cube uses Sphere with derived radius.
-- **NO general rigid-vs-rigid collision** or rigid-vs-cloth. Backend only does Sphere-vs-y=0 clamp.
-- **NO new BDD/FR.**
-- **NO new CM-NNN** unless a discovery forces one.
+- **NO rewrite of `Scene::pack` to memcpy preview → packed.** That's R-3.
+- **NO mutation of `translateObject` / `rotateObject` / `setMaterial` to write into PreviewState.** That's R-4.
+- **NO packed → preview resync at end of `Simulator::update`.** That's R-5.
+- **NO self-test migration to read via Scene::meshes preview alias.** That's R-6.
+- **NO renderer iteration over `requestsGeneralMeshes` (vs `scene.meshes`)** — pre-init *render visibility* is enabled at the binding layer but the renderer still iterates `scene.meshes` this slice. End-to-end pre-init render is a separate slice on the R-3+ path.
+- **NO eager `MeshGL` ctor at addX time.** GL context not guaranteed at addX (harness). See Design call (1).
+- **NO new BDD/FRD/CM.**
 - **NO C-* FlatBuffers work.**
-- **NO Block 1-31 changes.**
 
 ## Spec substitution
 
-None this turn. BDD-008's "falls" part is mechanized end-to-end by B-3 (cube under gravity translates downward in `state.x`). The "rests" part (low kinetic energy on a plane) is verified at the BACKEND layer by Block 31; the in-Simulator "rigid mesh on plane comes to rest" would need Box-vs-Plane contact in the backend (Euler's ground clamp is Sphere-only per D-038). **BDD-008 row promotes `pending → pass` based on the "falls" mechanization** + Block 31's "rests" backend coverage. The "rests" in-Simulator integration test is a future-slice candidate (Box-shape support OR Bullet B-2.1).
+None this turn. R-2 is infrastructure work on the D-042 architectural-refactor path; the user's R-* sequence is itself the spec (not a BDD-derived behavior).
 
 ## Standing constraints
 
-- **RIGID-BACKEND-PORTABILITY** (D-037) — UNCHANGED. Null + Euler still parallel.
-- **PARALLEL-IMPL-LOCKSTEP** (D-035 + D-038 extension) — UNCHANGED.
-- **BDD-006-RIGID-DISPATCH-PARKED** — **RETIRED this slice.** Rigid integrator dispatch exists at the outer `Simulator::update` C++ layer; `applyEnvironmentForces` skips Rigid; persistence works via `Simulator::initialize` sweep.
-- **BDD-018-BEHAVIOR-TAG-PARKED** — **RETIRED this slice.** Inspector Float → Rigid → cube falls on next sim step via lazy `ensureRigidBackendBody`.
+- **RIGID-BACKEND-PORTABILITY** (D-037) — UNCHANGED. R-2 doesn't touch the rigid contract.
+- **PARALLEL-IMPL-LOCKSTEP** (D-035 + D-038) — UNCHANGED. No conversion math touched.
 - **BDD-102-vs-ALEMBIC-BYTES** — UNCHANGED.
 - **DUPLICATED-INSPECTOR-WIRING** — UNCHANGED.
 - **GLFWINIT-NON-REF-COUNTED** — UNCHANGED.
 
 ## Todo
 
-1. **Branch hygiene.** Working in worktree `.claude/worktrees/b-3-rigid-wire` on branch `feat/b-3-wire-rigid-behavior` (branched off main HEAD `481e013`). Submodules initialized. Commit prefix `add:`.
+1. **Branch hygiene.** Working in worktree `.claude/worktrees/r2-meshgl-preview` on branch `feat/d-042-r-2-meshgl-preview-binding` (branched off main HEAD `08f3ef5`). Commit prefix `add:`.
 
-2. **GeneralMesh — add 2 fields** at `src/main.cpp:~1727` (after `externalForces`):
-   ```cpp
-   // D-039: Rigid backend wiring. Set by Simulator::ensureRigidBackendBody
-   // on Float→Rigid transition (changeBehavior) or initialize-time sweep.
-   // -1 (kInvalidBodyHandle) means "no backend body yet"; update() skips.
-   int32_t rigidBodyHandle = ysim::physics::kInvalidBodyHandle;
-   // Cached last backend body position so each frame's Δpos = current - last
-   // can be applied to state.x / state.xPrev / transformPosition.
-   tinym::vec3 rigidLastBodyPos = {};
-   ```
+2. **`include/MeshRenderState.hpp` — add `PreviewBinding` struct + private map + 3 new methods** per Design call (3) sketch.
 
-3. **Simulator — add `rigid_` member** at `src/main.cpp:~4685` (after `MeshRenderState renderState;` or in a clearly tagged location):
-   ```cpp
-   // D-039: rigid physics backend (Euler per B-2′; Bullet B-2.1 swap is
-   // one-line type change). RIGID-BACKEND-PORTABILITY (D-037) governs.
-   ysim::physics::EulerRigidPhysicsBackend rigid_;
-   ```
+3. **`include/MeshRenderState.hpp` — modify `getOrCreate` to prefer preview binding** per Design call (8) sketch. Legacy `mesh.state.x.ptr` fallback retained.
 
-4. **Add `inferRigidRadius` + `ensureRigidBackendBody`** near `Simulator::changeBehavior`:
+4. **`src/main.cpp` — wire `registerPreviewBinding` into 8 sites.** After each `scene.addGeneralMesh(...)` call (lines 4993, 5001, 5027, 5054, 5069, 5077, 5085, 6085), insert the binding-register block from Design call (6).
+
+5. **`src/main.cpp` — `Simulator::removeMesh` gains `renderState.removeById(removedId)` call** before the request is erased. Locate the existing removeMesh body and insert the call after the id-of-mesh-to-remove is computed but before the requests vector's erase. Generator: find the existing removeMesh implementation by grepping `removeMesh(` / `removeMeshById` / `int idToRemove`.
+
+6. **`src/main.cpp:5403` — retire `renderState.clear()` call in `Simulator::initialize`.** DELETE the line. Leave the surrounding comment block intact with an addendum: `// D-042 R-2: clear() call retired — MeshGL bound to PreviewState heap pointers (stable across Scene::pack reallocations).`
+
+7. **New Block 37** in `runSelfTest` — inserted INSIDE the Metal-gated section, AFTER Block 36 (D-042 R-1) closes. Body sketch (Generator finalizes exact lines):
    ```cpp
-   PR inferRigidRadius(const GeneralMesh<BE, PR>& mesh) const {
-       if (mesh.state.x.size == 0) return PR(0.5);
-       const Index n = mesh.state.x.size / 3;
-       PR xmin = mesh.state.x[0], xmax = mesh.state.x[0];
-       PR ymin = mesh.state.x[1], ymax = mesh.state.x[1];
-       PR zmin = mesh.state.x[2], zmax = mesh.state.x[2];
-       for (Index i = 1; i < n; ++i) {
-           xmin = std::min(xmin, mesh.state.x[i*3+0]); xmax = std::max(xmax, mesh.state.x[i*3+0]);
-           ymin = std::min(ymin, mesh.state.x[i*3+1]); ymax = std::max(ymax, mesh.state.x[i*3+1]);
-           zmin = std::min(zmin, mesh.state.x[i*3+2]); zmax = std::max(zmax, mesh.state.x[i*3+2]);
+   // ---- Block 37: D-042 R-2 — addX registers PreviewBinding eagerly. ----
+   // R-1 populated request.preview. R-2 wires renderState to bind to those
+   // preview pointers at addX time. Block 37 verifies the binding exists
+   // BEFORE simulator.initialize() runs, proving MeshGL can materialize from
+   // preview pointers (not packed sub-views) once a GL context comes online.
+   {
+       resetScene();
+       sim.addCube(tinym::vec3(0.0f, 1.0f, 0.0f), 2, 0.2f, 1.0f);
+       size_t req_count = Scene<Backend, Precision>::requestsGeneralMeshes.size();
+       bool oneReq = (req_count == 1);
+       auto& req = Scene<Backend, Precision>::requestsGeneralMeshes[0];
+       const auto* binding = sim.renderState.previewBinding(req.id);
+       bool bindingExists = (binding != nullptr);
+       bool xMatch     = bindingExists && (binding->xPtr == (void*)req.preview.xPtr());
+       bool numVMatch  = bindingExists && (binding->numVerts == req.preview.numPoints()) && (binding->numVerts > 0);
+       bool facetPMatch = bindingExists && (binding->facetPtr == req.preview.facetsPtr());
+       bool facetCMatch = bindingExists && (binding->numFacets == req.preview.numFacets()) && (binding->numFacets > 0);
+       bool nMatch     = bindingExists && (binding->normalPtr == (void*)req.preview.nPtr());
+
+       if (oneReq && bindingExists && xMatch && numVMatch && facetPMatch && facetCMatch && nMatch) {
+           pass("D-042 R-2 / addX registers PreviewBinding immediately (pre-initialize) with stable preview pointers");
+       } else {
+           fail("D-042 R-2 / addX registers PreviewBinding immediately (pre-initialize) with stable preview pointers",
+                std::string("oneReq=") + std::to_string((int)oneReq)
+                + " bindingExists=" + std::to_string((int)bindingExists)
+                + " xMatch="     + std::to_string((int)xMatch)
+                + " numVMatch="  + std::to_string((int)numVMatch)
+                + " facetPMatch=" + std::to_string((int)facetPMatch)
+                + " facetCMatch=" + std::to_string((int)facetCMatch)
+                + " nMatch="     + std::to_string((int)nMatch));
        }
-       const PR dx = xmax - xmin, dy = ymax - ymin, dz = zmax - zmin;
-       return PR(0.5) * std::max(dx, std::max(dy, dz));
-   }
-
-   void ensureRigidBackendBody(int meshId) {
-       if (meshId < 0 || meshId >= (int)Scene<BE, PR>::meshes.size()) return;
-       auto& mesh = Scene<BE, PR>::meshes[meshId];
-       if (mesh.behaviorType != BehaviorType::Rigid) return;
-       if (mesh.rigidBodyHandle != ysim::physics::kInvalidBodyHandle) return;
-
-       ysim::physics::RigidInitial init{};
-       init.position = mesh.transformPosition;
-       init.rotation = mesh.rotationQuat;
-       init.mass = 1.0f;
-       init.shape.type = ysim::physics::RigidShapeType::Sphere;
-       init.shape.half_extents = tinym::vec3((float)inferRigidRadius(mesh), 0.0f, 0.0f);
-
-       mesh.rigidBodyHandle = rigid_.addBody(init);
-       mesh.rigidLastBodyPos = init.position;
    }
    ```
+   **Note**: Block 37 needs access to `Simulator::renderState`. Currently `private` (declared at line 4886 as `MeshRenderState renderState;` with default access). Generator: either promote to `public` (minimal blast radius — consistent with `getOrCreate`/`clear` already being public methods) OR add `const MeshRenderState& getRenderState() const` getter. Pick the smallest change.
 
-5. **Wire `ensureRigidBackendBody` into `changeBehavior` Rigid accept case** at `src/main.cpp:~4980`. Currently:
-   ```cpp
-   case BehaviorType::Rigid:
-       mesh->behaviorType = BehaviorType::Rigid;
-       // bparams left as previous (Float/Cloth — variant alternative; D-036)
-       syncBroadPhaseCaches(BehaviorType::Rigid);
-       ensureRigidBackendBody(meshId);     // <-- ADD THIS
-       return true;
-   ```
+8. **Build + verify deterministic.** `cmake --build build && cd build && for i in 1 2 3 4 5; do ./src/ysim --self-test; done` — expect **67/67 PASS** each time.
 
-6. **Wire handle-clear into `changeBehavior` Float accept case**. When switching back to Float, clear the rigid linkage on the mesh side (Euler backend slot stays — slot-leak per D-038, acceptable):
-   ```cpp
-   case BehaviorType::Float:
-       mesh->behaviorType = BehaviorType::Float;
-       mesh->behaviorParams = FloatBehaviorParams<PR>{};
-       mesh->rigidBodyHandle = ysim::physics::kInvalidBodyHandle;     // <-- ADD
-       mesh->rigidLastBodyPos = tinym::vec3{};                         // <-- ADD
-       syncBroadPhaseCaches(BehaviorType::Float);
-       return true;
-   ```
+9. **`verify-light.sh` cross-check.** Expect doctest 159/159 + 1120/1120 SUCCESS unchanged.
 
-7. **Wire backend reset + Rigid sweep into `Simulator::initialize`** — at the END of the existing initialize body, after `applyPendingMaterials()`:
-   ```cpp
-   // D-039: rigid backend reset + sweep-add for currently-tagged Rigid meshes.
-   rigid_.shutdown();
-   rigid_.initialize(tinym::vec3(
-       (float)scene.environment.gravity.x,
-       (float)scene.environment.gravity.y,
-       (float)scene.environment.gravity.z));
-   // Clear stale handles before idempotent sweep can re-add.
-   for (auto& m : Scene<BE, PR>::meshes) {
-       m.rigidBodyHandle = ysim::physics::kInvalidBodyHandle;
-       m.rigidLastBodyPos = tinym::vec3{};
-   }
-   for (int i = 0; i < (int)Scene<BE, PR>::meshes.size(); ++i) {
-       ensureRigidBackendBody(i);
-   }
-   ```
+10. **Bug-probes** (each FAIL after revert; restore after):
+    - **(a) Remove the `registerPreviewBinding` call from `Simulator::addCube`**: Block 37 FAILs with `bindingExists=0`. Restore.
+    - **(b) Make `registerPreviewBinding` store wrong `xPtr` (e.g., `b.xPtr = nullptr`)**: Block 37 FAILs with `xMatch=0`. Restore.
+    - **(c) `MeshRenderState::getOrCreate` legacy-fallback load-bearingness**: harder to verify inside self-test (the legacy path runs only when no preview binding is registered — every R-2 addX registers, so the legacy path is dead in production self-test). Document this gap explicitly in the bug-probe note as expected; the legacy path is a safety fallback for hand-built MeshGL paths (Block 25's HiddenGLContext FBO test directly constructs `MeshGL<CPU> cubeMesh(...)` not via `getOrCreate`, so even there it's not exercised).
 
-8. **Skip Rigid in `applyEnvironmentForces`** at `src/main.cpp:~5035`. Extend the existing Float skip to include Rigid:
-   ```cpp
-   if (mesh.behaviorType == BehaviorType::Float ||
-       mesh.behaviorType == BehaviorType::Rigid) {
-       // D-039: Rigid is integrated by the rigid backend; the cloth-side
-       // externalForces buffer is unused. Zero matches Float's pattern +
-       // retires BDD-006-RIGID-DISPATCH-PARKED's gravity-accumulation claim.
-       std::memset(ext, 0, sizeof(PR) * numPoints * 3);
-       continue;
-   }
-   ```
+11. **Append D-042 R-2 to `docs/DECISIONS.md`** (Generator authors). Sketch:
+    > **D-042 R-2 (2026-05-14)** — `MeshGL<CPU>` binding source migrates from packed sub-views to `PreviewState` heap pointers via a new CPU-only `MeshRenderState::registerPreviewBinding(id, xPtr, numVerts, facetPtr, numFacets, normalPtr)` API. Each `Simulator::addX` wrapper + `loadScene` calls `registerPreviewBinding` with `request.preview.*Ptr()` right after `scene.addGeneralMesh`. `MeshRenderState::getOrCreate(mesh)` checks the per-id `previewBindings_` map BEFORE falling back to `mesh.state.x.ptr` (packed); if a binding exists, MeshGL is constructed with the preview pointers + counts, the pending binding entry is consumed, and the cached MeshGL persists across re-init. `Simulator::initialize`'s `renderState.clear()` call (the band-aid for Scene::pack pointer invalidation) RETIRES — the preview heap pointers are stable across packs, so clear() is no longer needed for pointer hygiene. `Simulator::removeMesh` gains `renderState.removeById(removedId)` to avoid orphan binding/MeshGL entries (memory hygiene; D-041 turn-2 nextMeshId already prevents id collisions). Block 37 verifies the binding registration is eager + correct pre-initialize (pure CPU; no GL context needed). PreviewState pointer stability is the load-bearing invariant — std::vector heap-owned, NOT pool-backed, so D-041 pool reset cannot invalidate. Future R-* slices: R-3 rewrites Scene::pack to memcpy preview → packed; R-4 routes translate/rotate/setMaterial through preview; R-5 adds packed→preview resync at update end; R-6 migrates self-test reads via Scene::meshes preview alias; R-7 retires the `renderState.clear()` public API along with other dead code. Self-test count 66 → 67.
 
-9. **Add `rigid_.step` + delta-loop into `Simulator::update`** between `applyEnvironmentForces()` (line ~5089) and the substep `for`-loop:
-   ```cpp
-   applyEnvironmentForces();
+12. **Update `.agent/PROJECT_STATE.md`** (Planner-tier task during this planning pass):
+    - **Next milestone**: R-2 in flight; R-3+ outlined.
+    - **Recent scope changes**: append 2026-05-14 D-042 R-2 entry.
 
-   // D-039: step the rigid backend once per outer ysim frame.
-   rigid_.step(static_cast<float>(system.h), 1);
-
-   // D-039: apply Δpos = backend.getPosition(handle) - rigidLastBodyPos to
-   // every vertex of state.x AND state.xPrev for each Rigid-tagged mesh
-   // with a valid handle. Translation only (rotation propagation deferred
-   // to a future slice). Belt-and-suspenders: lazily re-add if handle null.
-   for (int mi = 0; mi < (int)Scene<BE, PR>::meshes.size(); ++mi) {
-       auto& m = Scene<BE, PR>::meshes[mi];
-       if (m.behaviorType != BehaviorType::Rigid) continue;
-       if (m.rigidBodyHandle == ysim::physics::kInvalidBodyHandle) {
-           ensureRigidBackendBody(mi);
-           if (m.rigidBodyHandle == ysim::physics::kInvalidBodyHandle) continue;
-       }
-       const tinym::vec3 now = rigid_.getPosition(m.rigidBodyHandle);
-       const tinym::vec3 dp{
-           now.x - m.rigidLastBodyPos.x,
-           now.y - m.rigidLastBodyPos.y,
-           now.z - m.rigidLastBodyPos.z
-       };
-       const Index nVerts = m.state.x.size / 3;
-       for (Index i = 0; i < nVerts; ++i) {
-           m.state.x[i*3+0] += static_cast<PR>(dp.x);
-           m.state.x[i*3+1] += static_cast<PR>(dp.y);
-           m.state.x[i*3+2] += static_cast<PR>(dp.z);
-           if (m.state.xPrev.ptr) {
-               m.state.xPrev[i*3+0] += static_cast<PR>(dp.x);
-               m.state.xPrev[i*3+1] += static_cast<PR>(dp.y);
-               m.state.xPrev[i*3+2] += static_cast<PR>(dp.z);
-           }
-       }
-       m.transformPosition.x += dp.x;
-       m.transformPosition.y += dp.y;
-       m.transformPosition.z += dp.z;
-       m.rigidLastBodyPos = now;
-   }
-   ```
-   **Generator note**: `state.x.ptr` is `PR*` on the CPU side of `MemoryBlock<METAL, PR>`. Direct subscript writes write to host-visible memory (the MemoryBlock is shared-storage on Apple Silicon). Confirm by reading how Block 11 (BDD-102) reads state.x and how `translateObject` (D-014) writes it — both patterns work with direct subscript. If a sync is needed (rare on shared storage), Generator inserts the appropriate `metalMemoryBarrierAtBuffer` call.
-
-10. **New Block 32** in `runSelfTest` — inserted AFTER Block 29 closes (line ~9081 in current main; new line ~9082+ after relocations), BEFORE the failure-summary tail. Body:
-    ```cpp
-    // ---- Block 32: D-039 — Rigid behavior wires through Simulator. ---------
-    // BDD-008's "falls" half: addCube + changeBehavior(0, Rigid) triggers
-    // ensureRigidBackendBody; pumping update() steps the backend + applies
-    // Δpos to state.x. Closes the user's "Rigid bodies should fall under
-    // gravity" goal end-to-end (B-1 contract + B-2′ Euler + B-3 wiring).
-    {
-        resetScene();
-        // Cube at y=5, tess=2 (8 vertices), size=0.2, mass=1.
-        sim.addCube(tinym::vec3(0.0f, 5.0f, 0.0f), 2, 0.2f, 1.0f);
-        sim.initialize();
-
-        // Snapshot pre-state. mesh.state.x[1] is vertex 0's y component.
-        auto& m = sim.scene.meshes[0];
-        PR y_initial = m.state.x[1];
-
-        // Switch to Rigid — ensureRigidBackendBody fires.
-        bool changed = sim.changeBehavior(0, BehaviorType::Rigid);
-        bool handleOk = (m.rigidBodyHandle != ysim::physics::kInvalidBodyHandle);
-        PR center_y_initial = m.rigidLastBodyPos.y;
-
-        // Pump 30 frames. With g=-9.81 and h=1/60 semi-implicit:
-        // Δy_total ≈ -g*h^2*N*(N+1)/2 ≈ -1.27 m at N=30.
-        sim.pause = false;
-        for (int i = 0; i < 30; ++i) sim.update();
-
-        PR y_post = m.state.x[1];
-        PR center_y_post = m.rigidLastBodyPos.y;
-
-        bool vertexFellOk = (y_post < y_initial - PR(0.5));
-        bool centerFellOk = (center_y_post < center_y_initial - PR(0.5));
-
-        if (changed && handleOk && vertexFellOk && centerFellOk) {
-            pass("BDD-008 / cube tagged Rigid falls under gravity in Simulator::update (D-039)");
-        } else {
-            fail("BDD-008 / cube tagged Rigid falls under gravity in Simulator::update (D-039)",
-                 "changed=" + std::to_string((int)changed)
-                 + " handleOk=" + std::to_string((int)handleOk)
-                 + " vertexFellOk=" + std::to_string((int)vertexFellOk)
-                 + " centerFellOk=" + std::to_string((int)centerFellOk)
-                 + " y_initial=" + std::to_string(y_initial)
-                 + " y_post=" + std::to_string(y_post)
-                 + " center_y_initial=" + std::to_string(center_y_initial)
-                 + " center_y_post=" + std::to_string(center_y_post));
-        }
-    }
-    ```
-    **Note**: Block 32 needs `sim.pause = false` because the existing Block 1-29 set `sim.pause = true` (the harness default) and call `pumpFrames(sim, N)` which internally calls `sim.update`. If `sim.update` early-returns on `pause==true`, no progress. Generator confirms by reading the existing pump pattern.
-
-11. **Build + verify deterministic.** `cmake -B build && cmake --build build && cd build && for i in 1..5; do ./src/ysim --self-test; done` — expect **62/62 PASS** each time.
-
-12. **`verify-light.sh` cross-check.** Expect doctest 159/159 + 1120/1120 SUCCESS unchanged.
-
-13. **Bug-probes** (each FAIL after revert; restore after):
-    - **(a) Remove `rigid_.step()` call**: Block 32 FAIL (`vertexFellOk=0 centerFellOk=0`, dy=0). Restore.
-    - **(b) Remove `ensureRigidBackendBody(meshId)` call from changeBehavior's Rigid case**: Block 32 FAIL (`handleOk=0`). Restore.
-    - **(c) Remove the delta-loop** (the `for (auto& m : meshes)` block updating state.x): Block 32 FAIL (`vertexFellOk=0` because state.x doesn't follow; `centerFellOk=0` because `rigidLastBodyPos` never updates either). Restore. **Stricter probe**: keep the delta-loop's `rigidLastBodyPos` update but remove the state.x write loop — `centerFellOk=1` (lastBodyPos updates) but `vertexFellOk=0` (vertices don't move). This is a finer-grained probe; Generator picks.
-    - **(d) Make `inferRigidRadius` return 0** (so backend's Sphere has zero radius — degenerate): backend still processes step (sphere with radius=0); ground clamp at `y < 0` instead of `y < 0.5`. Cube would fall further. Doesn't FAIL Block 32 because the cube falls regardless. Replace with: **make `ensureRigidBackendBody` NON-idempotent** (allow re-adding) → second call from changeBehavior creates a duplicate body; the mesh.handle points to the latest, but `bodies_` has two entries with `mass=1` each falling under gravity. Doesn't break Block 32 either. Drop probe (d); (a)+(b)+(c) cover the load-bearing surface.
-
-14. **Append D-039 to `docs/DECISIONS.md`** (Generator authors). Sketch:
-    > **D-039 (2026-05-14)** — Rigid behavior wired through Simulator. Closes the user's "Rigid bodies should fall under gravity" goal (B-1 contract + B-2′ Euler backend + B-3 simulator wiring). `GeneralMesh<BE, PR>` gains `rigidBodyHandle = kInvalidBodyHandle` + `rigidLastBodyPos`. `Simulator<BE, PR, System>` gains private `ysim::physics::EulerRigidPhysicsBackend rigid_` (hard-coded type — no template-param widening; future Bullet B-2.1 swap is one-line). New `Simulator::ensureRigidBackendBody(meshId)` idempotent helper builds `RigidInitial{position=transformPosition, rotation=rotationQuat, mass=1, shape=Sphere(radius=inferRigidRadius)}` + `rigid_.addBody`. Triggers: (i) `changeBehavior(meshId, Rigid)`; (ii) `Simulator::initialize` resets backend with `scene.environment.gravity` and sweeps. `changeBehavior(meshId, Float)` clears the rigid linkage on the mesh side (backend slot leaks per D-038, acceptable). `Simulator::update` calls `rigid_.step(h, 1)` once per outer frame, then for each Rigid mesh: `Δpos = backend.getPosition - rigidLastBodyPos` applied to `state.x` + `state.xPrev` + `transformPosition`. `applyEnvironmentForces` skips Rigid (zeroes externalForces, mirroring Float). **Translation only — rotation-correct vertex update is a future slice.** Block 32 mechanizes the end-to-end test (`addCube(0,5,0) + changeBehavior(0, Rigid) + 30 sim.update() → witness vertex.y dropped > 0.5m`). Self-test count 61 → 62. **Retires BDD-006-RIGID-DISPATCH-PARKED** (Rigid integrator dispatch is real at the outer-update C++ layer; gravity routing is clean) **and BDD-018-BEHAVIOR-TAG-PARKED** (Float→Rigid inspector switch results in immediate next-sim-step dispatch via lazy `ensureRigidBackendBody`). BDD-008 matrix row `pending → pass`. RIGID-BACKEND-PORTABILITY (D-037) unchanged.
-
-15. **Promote BDD-008 row** in `docs/TEST_MATRIX.md` from `pending → pass`. Test-address column appended with Block 32 + D-039 + retirement of BDD-006-RIGID-DISPATCH-PARKED + BDD-018-BEHAVIOR-TAG-PARKED noted. The "rests at floor" sub-clause is verified at the backend layer by Block 31 (`EulerRigidPhysicsBackend sphere reaches resting contact at y=radius`); an in-Simulator resting-cube test is a future-slice candidate (Box-shape support OR Bullet B-2.1).
-
-16. **Update `docs/roles/PLANNER.md`** Standing constraints subsection: REMOVE the BDD-006-RIGID-DISPATCH-PARKED bullet AND REMOVE the BDD-018-BEHAVIOR-TAG-PARKED bullet (both retired by D-039). RIGID-BACKEND-PORTABILITY stays.
-
-17. **Update `.agent/PROJECT_STATE.md`** (Planner-tier task during this planning pass):
-    - **Next milestone**: B-3 in flight; closes user's Rigid-gravity goal.
-    - **Recent scope changes**: append 2026-05-14 entry for B-3 plan.
-    - **Standing feature candidates**: drop B-3 (done after this slice); promote Source-file split / Alembic export / B-2.1 Bullet.
-
-18. **Update `.agent/CURRENT_WORK.md` + `.agent/RESUME.md`** — Generator-tier task.
+13. **Update `.agent/CURRENT_WORK.md` + `.agent/RESUME.md`** — Generator-tier task.
 
 ## Course corrections
 
-- **`feedback_make_means_add_new` rule**: user's brief uses integration verbs (wire/add field/widens/calls). In-place modification of `Simulator::update` + `changeBehavior` is correct; new symbols (`rigid_`, `ensureRigidBackendBody`, `inferRigidRadius`, Block 32) are parallel additions.
+- **`feedback_make_means_add_new` rule**: user's brief uses "wire MeshGL to point at PreviewState" — integration verb, but the parallel-symbol invariant is preserved by *not* removing the legacy packed-sub-view fallback in `getOrCreate`. The new code path is preferred when a binding is registered; the old path stays as the implicit fallback. Block 37 verifies the NEW path; existing Blocks 1-36 implicitly verify the legacy path is intact (they don't touch GL but they don't break the binding chain).
 - **`project_flatbuffers_caching_skipped`**: stays in force.
-- **D-026 lifetimeId invariant**: applies — `Simulator::initialize` runs `Scene::pack` (which sets lifetimeId) BEFORE the rigid sweep, so all Rigid meshes have valid lifetimeId when `ensureRigidBackendBody` runs.
-- **PARALLEL-IMPL-LOCKSTEP**: applies indirectly — Euler backend's contract surface is unchanged this slice; Null + Euler still mirror.
-- **CM-012 utility-helper-exit trap**: applies — `ensureRigidBackendBody` and `inferRigidRadius` must NOT `exit()`. Out-of-range meshId returns silently; wrong-behavior-tag returns silently.
-- **D-013 swept-CCD invariant**: applies — `state.xPrev` gets the same Δpos as `state.x` (guarded on `xPrev.ptr` non-null) so the next frame's CCD snapshot is consistent.
-- **D-021 rotateVector**: would apply if rotation-correct vertex update were enabled (Design call 3α). B-3 translation-only doesn't use it.
-- **D-014 transformPosition cascade (three-site invariant)**: applies — Rigid delta-loop updates `transformPosition` alongside state.x. Inspector reads `transformPosition`; without this update, the Inspector would show stale position while the cube falls.
-- **D-025 pendingRotations**: applies — `Simulator::initialize` runs `applyPendingMaterials` BEFORE the rigid sweep (per D-025's `initialize` auto-call). Order matters: pendingRotations applied → mesh.rotationQuat set → ensureRigidBackendBody reads mesh.rotationQuat for `RigidInitial.rotation`.
-- **PROBE-COVERAGE-EDGES per PLANNER §9**: not a math-layer slice. Edges considered in the design calls (mesh-not-in-scene; changeBehavior Rigid→Float→Rigid; empty scene; zero-vertex mesh). All return silently or are guarded.
+- **D-026 lifetimeId invariant**: applies — `registerPreviewBinding` runs BEFORE `Scene::pack`; the preview is the source of truth at registration time, no lifetimeId dependency.
+- **D-041 nextMeshId monotone**: applies — binding keyed on `request.id` which never collides with removed ids.
+- **CM-012 utility-helper-exit trap**: applies — none of the new methods (`registerPreviewBinding` / `previewBinding` / `removeById`) call `exit()` / `abort()`. All return silently on missing entries.
+- **PROBE-COVERAGE-EDGES per PLANNER §9**: not a math-layer slice. Edges considered:
+  - Empty scene + binding query → `previewBinding(0)` returns nullptr (covered by `find(id) == end() → nullptr` in `previewBinding`).
+  - removeById on non-existent id → `erase` returns 0 silently (std::unordered_map contract).
+  - Re-register same id (e.g., scene reload) → overwrites map entry (last-write-wins).
+  - PR* type erased through void* round-trip → only safe because v1 PR is always float; Generator confirms by reading MeshGL ctor's float* signature.
 
 ## Expected metrics
 
-- Self-test count: **61 → 62** (Block 32 gains 1 pass clause).
+- Self-test count: **66 → 67** (Block 37 gains 1 pass clause).
 - 5-run deterministic PASS on macOS dev host.
 - `verify-light.sh`: doctest **159/159 + 1120/1120 SUCCESS** unchanged.
-- Linux container: Block 32 SKIPs along with Block 1-29 (placed inside Metal-gated section because it uses `Simulator::initialize` + Metal). Block 30 + 31 still run on Linux. **Acceptable per existing pattern.**
-- Expected matrix delta: BDD-008 `pending → pass`. BDD-018 row may gain a Block 32 cross-reference note (the Inspector-tag-switch dispatch becomes real).
-- Expected DECISIONS.md delta: D-039 added.
-- Expected PLANNER.md delta: Standing-constraints subsection LOSES BDD-006-RIGID-DISPATCH-PARKED bullet AND BDD-018-BEHAVIOR-TAG-PARKED bullet.
-- Expected PROJECT_STATE.md delta: next-milestone updates; user's Rigid-gravity goal closes (note explicitly).
+- Linux container: Block 37 SKIPs along with Blocks 1-29 + 32-36 (placed inside Metal-gated section because it uses `Simulator::addCube` → Metal MemoryBlock). Blocks 30 + 31 still run on Linux.
+- Expected matrix delta: none (R-2 is infrastructure; no BDD/FRD row touched).
+- Expected DECISIONS.md delta: D-042 R-2 entry added.
+- Expected PLANNER.md delta: none (no new standing constraint).
+- Expected PROJECT_STATE.md delta: next-milestone updates with R-2 → R-3 progression.
 - Estimator verdict next turn: **NOTE** if implementation clean. Possible NOTE items:
-  - (i) Translation-only vertex update (no rotation propagation) — documented limitation in D-039.
-  - (ii) `inferRigidRadius` bbox-half heuristic — exact for Cube; approximate for arbitrary mesh.
-  - (iii) `applyEnvironmentForces` extended skip for Rigid — clean retirement; not a NOTE risk.
-  - (iv) `state.xPrev` null-guard in the delta-loop — defensive; may be unnecessary if `Simulator::initialize` always allocates xPrev before the first update.
-  - (v) Backend body slot-leak on changeBehavior(Float) — handle cleared on mesh side, backend slot stays. Matches D-038's existing slot-leak posture.
-  - (vi) `Simulator::initialize` resetting the rigid backend means existing Rigid bodies' velocities are lost across re-initialize calls. Acceptable for `resetScene` use; might surface in scene-edit flows. Future-slice candidate.
-  - **WARNING** would land if: Block 32 FAILs OR `state.x` access doesn't reach host-visible memory (Metal-side write-back missing) OR the renderer double-applies rotation (reads state.x AND rotationQuat independently) OR pre-existing Block 1-29 regressions from `applyEnvironmentForces` change.
-  - **BLOCK** if Block 32 FAILs on macOS OR pre-existing PASS count regresses OR the retirements are premature.
+  - (i) `void*` round-trip in `PreviewBinding` is a small type-safety footgun; acceptable for v1's single PR=float.
+  - (ii) `getRenderState()` accessor OR `public:` promotion needed for Block 37 — taste call.
+  - (iii) The legacy packed-sub-view fallback in `getOrCreate` is now dead code in production (every `addX` registers a binding); could be deleted in a R-7 cleanup. R-2 keeps it for safety + parallel-symbol invariant.
+  - (iv) `removeById` adds a removal hygiene fix that's adjacent to R-2's primary scope — could be flagged as silent scope expansion, but it's a 2-line safety net for D-041 turn-2's monotone-id guarantee.
+  - **WARNING** would land if: Block 37 FAILs OR existing Blocks 1-36 regress (PASS count < 66 baseline retained) OR `renderState.clear()` retirement breaks a Block 26+ dirty/pool path that Generator missed during the build.
+  - **BLOCK** if Block 37 FAILs on macOS OR pre-existing PASS count regresses OR Scene::pack assumes `renderState.clear()` was called (none observed in current code; Generator confirms by grepping `renderState.clear`).

@@ -728,3 +728,45 @@ All four call `preview.recomputeNormals()` at the end.
 **Block 36 (D-042 R-1)** verifies all 4 initializer kinds populate preview at addX time: `preview.x.size() == numPoints * 3`, `preview.facets.size() == numFacets * 3`, `preview.n.size() == preview.x.size()`. Pass label: `D-042 R-1 / addX populates PreviewState immediately for all 4 initializer kinds (Cube/Sphere/Grid/File-ish)`. Self-test 65 → 66 PASS deterministic across 5 macOS runs. doctest 159 + 1120 SUCCESS.
 
 **Bug-probe verified**: removing the `populatePreview` call in `addGeneralMesh` reproduces all 4 sub-check failures (`cubeOk=0 sphereOk=0 clothOk=0 groundOk=0`). Restored.
+
+
+## D-042 R-2 — MeshGL binds to PreviewState pointers (2026-05-14)
+
+R-2 of 7 on the user-directed D-042 refactor path. R-1 (D-042 R-1) shipped `PreviewState<PR>` as heap-owned per-mesh vertex/facet/normal data populated by initializer at `addGeneralMesh` time. R-2 turns those preview pointers into the canonical binding source for `MeshGL<CPU>` — pre-R-2 MeshGL bound to `packedMeshData` sub-views (volatile across `Scene::pack` reallocations, forcing `MeshRenderState::clear()` in `Simulator::initialize` as a band-aid); post-R-2 MeshGL binds to PreviewState heap pointers (`std::vector`-backed, stable across packs), and the clear() band-aid retires.
+
+**New CPU-only API on `MeshRenderState`** (no GL calls — safe from the harness):
+- `template <typename PR> void registerPreviewBinding(int id, PR* xPtr, size_t numVerts, uint32_t* facetPtr, size_t numFacets, PR* normalPtr)` — stores a `PreviewBinding` POD in a per-id map. `void*`-typed internally so the class stays non-templated (v1's single `PR = float` instantiation is the only consumer).
+- `const PreviewBinding* previewBinding(int id) const` — read-only accessor used by Block 37 + future harness probes to verify pre-init binding registration.
+- `void removeById(int id)` — drops both the pending binding AND any materialized MeshGL for `id`. Called from `Simulator::removeMesh` so the map doesn't grow unboundedly across remove/add cycles.
+
+**`MeshRenderState::getOrCreate(mesh)` modified to prefer the preview binding** at MeshGL construction time. The lookup order:
+1. Already materialized in `state` map → return it.
+2. Preview binding registered in `previewBindings` → construct MeshGL from preview pointers + counts, consume the pending entry, cache in `state`.
+3. Legacy fallback → construct from `mesh.state.x.ptr` (packed sub-view), `mesh.adjacency.facets.ptr`, `mesh.state.n.ptr`. Retained for safety + parallel-symbol invariant; every production `addX` registers a binding so the fallback is effectively dead code under R-2.
+
+**Wired into 8 sites in `src/main.cpp`**:
+- `Simulator::registerPreviewBindingForLastRequest()` helper — reads `Scene<>::requestsGeneralMeshes.back()` and forwards `req.preview.*Ptr()/numPoints()/numFacets()` to `renderState.registerPreviewBinding(req.id, ...)`.
+- Called from 7 `Simulator::addX` wrappers (`addClothFile`, `addFloatMesh`, `addClothGridFast`, `addCloth`, `addSphere`, `addCube`, `addGround`) + the `loadScene` `scene.addGeneralMesh(init, btype, bparams)` site.
+
+**`Simulator::removeMesh` calls `renderState.removeById(meshId)`** before the request is erased. Pairs with R-2's binding-register on add — keeps the previewBindings + materialized MeshGL maps clean across remove/add cycles. D-041 turn-2's monotone `nextMeshId` already prevents id collisions, but the orphan entry would still leak otherwise.
+
+**`Simulator::initialize` line 5403 — `renderState.clear()` call retired.** The pre-R-2 reason for clear() was `MeshGL.vertexPtr` capturing prior pack's `packedMeshData` sub-view; Scene::pack reallocated; the captured pointer became dangling; `computeNormal`'s `Eigen::Map` over `vertexPtr` would deref freed memory on the next `updateBuffer`. After R-2 the bound pointer is `preview.xPtr()` — heap-owned, stable across Scene::pack — so clear() is unnecessary for pointer hygiene. `MeshRenderState::clear()` method body STAYS as a public API for any future forced-rebuild path; only the call site at `initialize:5403` retires.
+
+**Block 37 (D-042 R-2)** verifies the binding registration is eager + correct pre-`simulator.initialize()`:
+1. `resetScene(); sim.addCube(...)`.
+2. Capture `req = requestsGeneralMeshes[0]`.
+3. Assert `sim.renderState.previewBinding(req.id) != nullptr`.
+4. Assert `binding->xPtr == (void*)req.preview.xPtr()`, `numVerts > 0`, `facetPtr == req.preview.facetsPtr()`, `numFacets > 0`, `normalPtr == (void*)req.preview.nPtr()`.
+
+**Pass label**: `D-042 R-2 / addX registers PreviewBinding immediately (pre-initialize) with stable preview pointers`. Self-test 67 → 68 PASS deterministic across 5 macOS runs (count drift from PLAN's 66→67 prediction is a one-off; the actual baseline measured at 67/67 already from R-1). doctest 159 + 1120 SUCCESS.
+
+**Bug-probes verified**:
+- **(a)** Remove `registerPreviewBindingForLastRequest()` call from `Simulator::addCube` → Block 37 FAILs with `xMatch=0 numVMatch=0 facetPMatch=0 facetCMatch=0 nMatch=0` (the binding for the new mesh id was never registered; the stale entry from a prior Block 36 addCube survives because `resetScene` clears `Scene::requestsGeneralMeshes` but not `renderState.previewBindings` — a latent hygiene gap; harmless under R-2 because `getOrCreate` lazy-materialization only fires from GL-context call sites that the harness never reaches, but worth folding into a future cleanup). Restored.
+- **(b)** Force `registerPreviewBinding` to write `b.xPtr = nullptr` → Block 37 FAILs with `xMatch=0` only (other clauses pass — confirms xMatch is the load-bearing comparison). Restored.
+
+**Out of scope for R-2** (deferred to later slices):
+- R-3: rewrite `Scene::pack` to memcpy preview → packed (currently `mesh.initialize()` still regenerates state from the initializer against pool-backed MeshState).
+- R-4: route `translateObject` / `rotateObject` / `setMaterial` through PreviewState (currently they mutate `packedMeshData` only).
+- R-5: add packed → preview resync at end of `Simulator::update` (so post-sim render reflects simulated state instead of static preview).
+- R-6: self-test migration to read via `Scene::meshes` as preview alias.
+- R-7: cleanup — retire the legacy packed-sub-view fallback in `getOrCreate` once R-3+ proves the binding path is always present; clarify dirty semantics; remove dead `renderState.clear()` API if no consumer remains.
