@@ -444,3 +444,41 @@ Foundation for the Rigid behavior arc (B-1 → B-2 → B-3) per `docs/design/rig
 **Self-test baseline note**: Prior PROJECT_STATE.md / PLAN.md reported "57/57" after the BDD-006 fix-turn merged; actual measured baseline at commit `186578d` is **56**. The discrepancy is a counting off-by-one in the fix-turn's reported headline (the underlying clauses themselves PASS), not a regression. B-1 lands on the corrected baseline: 56 → 59 (+3 D-037 clauses).
 
 **Out of scope for B-1**: NO Simulator template parameter widening; NO `ExplicitSystem::update` Rigid-branch implementation (still no-op fall-through, BDD-006-RIGID-DISPATCH-PARKED stays in force); NO `GeneralMesh::rigidBodyHandle` field; NO `Simulator::addRigidBody` mutator; NO Bullet integration; NO actual physics (Null backend is kinematic by design). All of those land at B-2 / B-3. NO BDD-008 promotion — BDD-008 ("Rigid body falls and rests") needs real dynamics; matrix row stays `pending` with a B-1 progress note pointing at Block 30.
+
+## D-038 — EulerRigidPhysicsBackend (B-2′ pivot from Bullet) (2026-05-14)
+
+`EulerRigidPhysicsBackend` shipped as the second backend implementing D-037's contract. Pivoted from the original B-2 plan (Bullet 3.25 vendor): user authorized Bullet via AskUserQuestion (option a), but the Bash classifier denied `git submodule add` regardless because it reads the action surface, not the in-conversation answer. With the /goal Stop hook enforcing implementation + visible-gravity verification, pivoted to option (c) — a minimal Euler integrator backend — which is fully within permission scope.
+
+The branch (`feat/b-2-bullet-rigid-backend`) keeps its misnomer name; renaming would be process-noise. The commit message + this entry explain the pivot. Bullet remains the canonical eventual implementation per `docs/design/rigid_physics_backend.md` §B-2; a future slice (B-2.1) can add it as a third backend once a permission rule for the submodule add is in place.
+
+**Surface (single new header `include/EulerRigidPhysicsBackend.hpp`)**:
+- Class `EulerRigidPhysicsBackend` in `namespace ysim::physics` satisfying the 12-method D-037 contract.
+- Per-body storage `EulerBody { position, rotation, linear_velocity, angular_velocity, mass, friction, restitution, shape }` in `std::vector<EulerBody>`.
+- Semi-implicit Euler step: `v_new = v + a*h; x_new = x + v_new*h`. From rest with `g = (0, -9.81, 0)` and `h = 1/60` → first-step `Δy = -9.81/3600 ≈ -2.725 mm`.
+- Angular update via inlined `q_dot = 0.5 · Quat(0, ω) · q`, then `q_new = q + q_dot * h`, then normalize (with zero-norm fallback to identity).
+- Single y=0 ground plane via Sphere-only `if (position.y < radius) { position.y = radius; v.y = max(v.y, 0); }`. Perfect inelastic at the floor.
+- `mass = 0` → static body (skipped in step loop).
+- `applyForce` / `applyImpulse` → body-center impulse `Δv = F/m`; angular response NOT modeled (caller-supplied `at_world_point` ignored).
+- Out-of-range BodyHandle returns sentinel zeros / identity quat (CM-012 discipline — no exit/abort in helpers).
+
+**Explicit limitations** (B-2′ scope-outs; future Bullet B-2.1 closes):
+- NO general convex-vs-convex contact resolution (Sphere-only ground).
+- NO friction coefficient effect.
+- NO restitution (perfect inelastic floor).
+- NO angular response to contact.
+- NO arbitrary plane orientation (always y=0 horizontal).
+- NO Box/Plane shape integration (Box mass>0 will fall through the floor; mass=0 stays put).
+
+**PARALLEL-IMPL-LOCKSTEP**: the inline mini-Quat math in `step()` (`q_dot` derivation + normalize) duplicates `src/main.cpp`'s `operator*` and `quatNormalize` (D-019). Future Quat-semantic changes in main.cpp must mirror to the Euler backend header.
+
+**Block 30 + Block 31 placement**: both blocks now sit ABOVE `runSelfTest`'s Metal-less SKIP gate at `src/main.cpp:6164`. Block 30 (Null backend, 3 clauses) was relocated from ~9083 to ~6164 (folds Estimator turn 33 WARNING — pure-C++ contract surface IS now exercised on Linux verify.sh). Block 31 (Euler backend, 2 clauses) sits immediately after.
+
+**Mechanization (Block 31)**: 59 → 61 self-test PASS deterministic across 5 runs on macOS. Block 30 + Block 31 both run on Linux container (no Metal dep). Clause 1: sphere falls under gravity for one step; assert `dy ≈ -9.81/3600 within 1e-5` AND `v_y ≈ -9.81/60 within 1e-5` AND backend name == "Euler". Clause 2: sphere drops from y=2; after 120 steps `pos.y == 0.5` exact (radius clamp) AND `v_y >= 0`.
+
+**Bug-probes (load-bearing)**: (a) `step()` returns immediately → Clauses 1+2 FAIL (sphere doesn't move). (b) gravity term zeroed → both clauses FAIL (no acceleration). (c) Clause 1 setup `mass = 0` → Clause 1 FAILs (`mass <= 0 continue` in step). (d) ground clamp commented out → Clause 2 FAILs (sphere falls to `pos.y = -17.78`, `lv.y = -19.62`). All four probes verified + restored.
+
+**RIGID-BACKEND-PORTABILITY** (D-037) now load-bearing across two backends: Null + Euler. Future Bullet adds a third. The contract surface (`include/RigidPhysicsTypes.hpp` POD types + 12-method signature) MUST stay lockstep across all backends.
+
+**Self-test baseline note**: B-1 reported 56 (actual) baseline. After B-2′: 59 (B-1 +3) → 61 (B-2′ +2 = Block 31).
+
+**Out of scope for B-2′**: NO Bullet vendor (deferred to B-2.1); NO Simulator template-parameter widening (B-3); NO `ExplicitSystem::update` Rigid-branch implementation (B-3); NO `GeneralMesh::rigidBodyHandle` field (B-3); NO `Simulator::addRigidBody` mutator (B-3); NO general contact resolution; NO BDD-008 promotion. BDD-006-RIGID-DISPATCH-PARKED stays in force; B-3 retires it.
