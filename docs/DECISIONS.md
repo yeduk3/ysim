@@ -698,3 +698,33 @@ Net effect: `broadCollisions.objPair` now consistently stores INDICES across BVH
 **Why didn't earlier tests catch this?** Pre-D-041 turn-2, id == index, so writing id and reading as index was equivalent. D-041 turn-2's Block 34 verified ID uniqueness but didn't exercise the narrow-phase collision path. Block 35 closes that coverage hole.
 
 **Self-test**: 65/65 PASS deterministic across 5 macOS runs; doctest 159 + 1120 SUCCESS unchanged.
+
+## D-042 R-1 — PreviewState infrastructure (2026-05-14)
+
+User-directed refactor: decouple Scene's renderable mesh state from Simulator's packed simulation buffers. Add a per-mesh "preview" state populated at addX time so MeshGL can bind to a STABLE heap-owned pointer immediately — no need to wait for Scene::pack. Future slices (R-2..R-7) point MeshGL at preview, sync packed → preview each Simulator::update, and migrate edit operations.
+
+**This commit is R-1 of 7** — infrastructure only. Parallel symbol: existing path (initializer fills MeshState/MeshAdjacency via packedMeshData sub-views during Scene::pack) is UNCHANGED. PreviewState is populated alongside without altering downstream consumers. The infrastructure is verified by Block 36 (`addCube/addSphere/addCloth/addGround → preview.x/facets/n sizes match initializer params`) but not yet consumed by any renderer.
+
+**New file `include/PreviewState.hpp`**: `template <typename PR> struct PreviewState` with `std::vector<PR> x, n` + `std::vector<uint32_t> facets`. Heap-owned, pool-reset-immune. `recomputeNormals()` computes per-vertex normals via per-face cross-product averaging (smooth shading; handles degenerate triangles).
+
+**`GeneralMeshInitializer` gains a virtual `populatePreview(PreviewState<PR>&)`** — default no-op. Overridden in all 4 concrete subtypes:
+- `MeshCubeInitializer` — uses `primitive::cube()` geometry directly.
+- `MeshSphereInitializer` — `primitive::sphere()`.
+- `MeshGridInitializer` — mirrors the cloth/ground grid generation (PlaneDirection-aware, even/odd facet diagonal alternation) without the jiggle perturbation (visual rendering doesn't need it).
+- `MeshFileInitializer` — mirrors the `.obj` vertex/facet copy with scale + offset transform.
+
+All four call `preview.recomputeNormals()` at the end.
+
+**`Scene::RequestGeneralMesh` gains `PreviewState<PR> preview` field**. Filled by `addGeneralMesh` immediately after request emplacement via `req.initializer->populatePreview(req.preview)`.
+
+**Out of scope for R-1** (deferred to later slices):
+- MeshGL pointer re-bind (R-2).
+- `Scene::pack` consuming preview instead of running `mesh.initialize()` against pool-backed MeshState (R-3).
+- `translateObject` / `rotateObject` / `setMaterial` migration to preview-side (R-4).
+- `Simulator::update` packed → preview sync (R-5).
+- Self-test migration (R-6).
+- Dead-code cleanup + `dirty` semantic clarification (R-7).
+
+**Block 36 (D-042 R-1)** verifies all 4 initializer kinds populate preview at addX time: `preview.x.size() == numPoints * 3`, `preview.facets.size() == numFacets * 3`, `preview.n.size() == preview.x.size()`. Pass label: `D-042 R-1 / addX populates PreviewState immediately for all 4 initializer kinds (Cube/Sphere/Grid/File-ish)`. Self-test 65 → 66 PASS deterministic across 5 macOS runs. doctest 159 + 1120 SUCCESS.
+
+**Bug-probe verified**: removing the `populatePreview` call in `addGeneralMesh` reproduces all 4 sub-check failures (`cubeOk=0 sphereOk=0 clothOk=0 groundOk=0`). Restored.

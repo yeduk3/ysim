@@ -498,6 +498,7 @@ struct GlobalAutoAllocator {
 #include "NullRigidPhysicsBackend.hpp"
 #include "EulerRigidPhysicsBackend.hpp"
 #include "BulletRigidPhysicsBackend.hpp"
+#include "PreviewState.hpp"
 
 using Precision = float;
 
@@ -815,6 +816,15 @@ struct GeneralMeshInitializer {
     virtual ~GeneralMeshInitializer() = default;
     virtual void initialize(MeshState<BE, PR>& state, MeshAdjacency<BE, PR>& adjacency) = 0;
     virtual InitializerParams<PR>* getParams() = 0;
+
+    // D-042 R-1 (2026-05-14): populate a PreviewState directly from the
+    // initializer's parameters — no pool, no MeshState. Called at
+    // addGeneralMesh time so the Scene can render the mesh BEFORE pack.
+    // Default no-op: subtypes that haven't migrated yet still compile;
+    // their preview just stays empty and MeshGL will skip rendering them
+    // (R-2 wires MeshGL to PreviewState — until then this is parallel
+    // symbol infrastructure only).
+    virtual void populatePreview(PreviewState<PR>& /*preview*/) {}
 };
 //! Suppose that the positions and facets are given
 template <typename BE, typename PR>
@@ -1161,6 +1171,68 @@ struct MeshGridInitializer : GeneralMeshInitializer<BE, PR> {
         MeshAdjacencyInitializer<BE, PR>::initialize(state, adjacency);
     }
 
+    void populatePreview(PreviewState<PR>& preview) override {
+        // Mirror the grid generation above into preview's std::vector<>
+        // buffers. Match facet topology (even/odd diagonal alternation)
+        // so MeshGL renders the same triangulation the simulator sees
+        // post-pack. Jiggle is omitted from preview (it's a per-substep
+        // micro-perturbation; visual rendering doesn't need it and the
+        // simulator will re-apply on pack).
+        const PR halfSize = params.size1D / PR(2);
+        const PR length = params.size1D / PR(params.particleNum1D - 1);
+        const Index nPts = params.numPoints;
+        const Index nFacets = params.numFacets;
+        preview.x.assign(nPts * 3, PR(0));
+        for (int row = 0; row < params.particleNum1D; ++row) {
+            for (int col = 0; col < params.particleNum1D; ++col) {
+                const int base = (row * params.particleNum1D + col) * 3;
+                const PR px =  col * length - halfSize;
+                const PR py = -row * length + halfSize;
+                switch (params.dir) {
+                    case PlaneDirection::XYPlane:
+                        preview.x[base  ] = px + (PR)params.center.x;
+                        preview.x[base+1] = py + (PR)params.center.y;
+                        preview.x[base+2] = (PR)params.center.z;
+                        break;
+                    case PlaneDirection::YZPlane:
+                        preview.x[base  ] = (PR)params.center.x;
+                        preview.x[base+1] = px + (PR)params.center.y;
+                        preview.x[base+2] = -py + (PR)params.center.z;
+                        break;
+                    case PlaneDirection::XZPlane:
+                        preview.x[base  ] = px + (PR)params.center.x;
+                        preview.x[base+1] = (PR)params.center.y;
+                        preview.x[base+2] = -py + (PR)params.center.z;
+                        break;
+                    default: break;
+                }
+            }
+        }
+        preview.facets.assign(nFacets * 3, 0);
+        Index fIdx = 0;
+        auto addFacet = [&](uint32_t a, uint32_t b, uint32_t c) {
+            preview.facets[fIdx++] = a;
+            preview.facets[fIdx++] = b;
+            preview.facets[fIdx++] = c;
+        };
+        for (Index row = 0; row < params.particleNum1D - 1; ++row) {
+            for (Index col = 0; col < params.particleNum1D - 1; ++col) {
+                const uint32_t p00 = (uint32_t)(row * params.particleNum1D + col);
+                const uint32_t p10 = (uint32_t)(row * params.particleNum1D + col + 1);
+                const uint32_t p01 = (uint32_t)((row + 1) * params.particleNum1D + col);
+                const uint32_t p11 = (uint32_t)((row + 1) * params.particleNum1D + col + 1);
+                if (((row + col) & 1) == 0) {
+                    addFacet(p00, p01, p11);
+                    addFacet(p00, p11, p10);
+                } else {
+                    addFacet(p00, p01, p10);
+                    addFacet(p10, p01, p11);
+                }
+            }
+        }
+        preview.recomputeNormals();
+    }
+
     InitializerParams<PR>* getParams() override { return &params; }
 };
 
@@ -1223,6 +1295,26 @@ struct MeshFileInitializer : GeneralMeshInitializer<BE, PR> {
         MeshAdjacencyInitializer<BE, PR>::initialize(state, adjacency);
     }
 
+    void populatePreview(PreviewState<PR>& preview) override {
+        const Index nPts = (Index)params.numPoints;
+        const Index nFacets = (Index)params.numFacets;
+        preview.x.assign(nPts * 3, PR(0));
+        for (Index vid = 0; vid < nPts; ++vid) {
+            const Index vbase = vid * 3;
+            preview.x[vbase    ] = (PR)data.vertices[vid].x * params.scale + (PR)params.offset.x;
+            preview.x[vbase + 1] = (PR)data.vertices[vid].y * params.scale + (PR)params.offset.y;
+            preview.x[vbase + 2] = (PR)data.vertices[vid].z * params.scale + (PR)params.offset.z;
+        }
+        preview.facets.assign(nFacets * 3, 0);
+        for (Index fid = 0; fid < nFacets; ++fid) {
+            const Index fbase = fid * 3;
+            preview.facets[fbase    ] = (uint32_t)data.elements3[fid].x;
+            preview.facets[fbase + 1] = (uint32_t)data.elements3[fid].y;
+            preview.facets[fbase + 2] = (uint32_t)data.elements3[fid].z;
+        }
+        preview.recomputeNormals();
+    }
+
     InitializerParams<PR>* getParams() override { return &params; }
 };
 
@@ -1276,6 +1368,15 @@ struct MeshSphereInitializer : GeneralMeshInitializer<BE, PR> {
         MeshAdjacencyInitializer<BE, PR>::initialize(state, adjacency);
     }
 
+    void populatePreview(PreviewState<PR>& preview) override {
+        auto geom = primitive::sphere(
+            (float)params.size, (int)params.tessellation,
+            {params.center.x, params.center.y, params.center.z});
+        preview.x.assign(geom.positions.begin(), geom.positions.end());
+        preview.facets.assign(geom.facets.begin(), geom.facets.end());
+        preview.recomputeNormals();
+    }
+
     InitializerParams<PR>* getParams() override { return &params; }
 };
 
@@ -1325,6 +1426,15 @@ struct MeshCubeInitializer : GeneralMeshInitializer<BE, PR> {
         }
 
         MeshAdjacencyInitializer<BE, PR>::initialize(state, adjacency);
+    }
+
+    void populatePreview(PreviewState<PR>& preview) override {
+        auto geom = primitive::cube(
+            (float)params.size, (int)params.tessellation,
+            {params.center.x, params.center.y, params.center.z});
+        preview.x.assign(geom.positions.begin(), geom.positions.end());
+        preview.facets.assign(geom.facets.begin(), geom.facets.end());
+        preview.recomputeNormals();
     }
 
     InitializerParams<PR>* getParams() override { return &params; }
@@ -1846,6 +1956,12 @@ struct Scene {
         GeneralMeshInitializer<BE, PR>* initializer;
         BehaviorType behaviorType;
         BehaviorParams<PR> behaviorParams;
+        // D-042 R-1: heap-owned vertex/facet/normal preview, populated by
+        // initializer->populatePreview() at addGeneralMesh time. Stays
+        // alive across Scene::pack / pool-reset cycles. R-2 will point
+        // MeshGL here for stable pre-pack rendering; R-5 will sync the
+        // packedMeshData → preview after every Simulator::update.
+        PreviewState<PR> preview;
 
         RequestGeneralMesh(int id, int lifetimeId,
                            GeneralMeshInitializer<BE, PR> *initializer,
@@ -1872,6 +1988,15 @@ struct Scene {
         requestsGeneralMeshes.emplace_back(nextMeshId++, lifetimeMeshCount++,
                                            initializer, behaviorType, behaviorParams);
         numMeshes++;
+
+        // D-042 R-1: populate preview state directly from the initializer
+        // (heap-owned vector buffers). After this call, the new request's
+        // preview.x / preview.facets / preview.n are ready for renderer
+        // consumption — no need to wait for Scene::pack. Subtypes that
+        // haven't migrated yet hit the default no-op and leave preview
+        // empty (acceptable until R-2 makes preview load-bearing).
+        requestsGeneralMeshes.back().initializer->populatePreview(
+            requestsGeneralMeshes.back().preview);
 
         dirty = true;
 
@@ -9926,6 +10051,56 @@ static int runSelfTest() {
         }
 
         sim.pause = true;
+    }
+
+    // ---- Block 36: D-042 R-1 — preview populated at addX time. ------------
+    // After R-1 each addX call invokes initializer->populatePreview() to
+    // fill PreviewState.x / .facets / .n directly from the initializer's
+    // parameters (no pool, no MeshState, no Scene::pack). MeshGL can bind
+    // to these stable heap buffers — R-2 will wire that. Block 36 verifies
+    // that all 4 initializer kinds (Cube/Sphere/Grid/File) populate
+    // preview correctly: x.size > 0, facets.size > 0, n.size == x.size.
+    // The vertex count matches the initializer's numPoints (sanity check).
+    {
+        resetScene();
+        sim.addCube(tinym::vec3(0.0f, 0.0f, 0.0f), 2, 0.2f, 0.1f);   // id 0: MeshCubeInitializer
+        sim.addSphere(tinym::vec3(1.0f, 0.0f, 0.0f), 3, 0.2f);        // id 1: MeshSphereInitializer
+        sim.addCloth(/*pn1D=*/4, 0.5f,
+                     tinym::vec3(2.0f, 0.0f, 0.0f),
+                     1e3, 1e3, 1e3, 0.01f, 0.1f);                    // id 2: MeshGridInitializer
+        sim.addGround(PlaneDirection::XZPlane,
+                      tinym::vec3(0.0f, -1.0f, 0.0f), 1.0f);          // id 3: MeshGridInitializer
+
+        auto& reqs = Scene<Backend, Precision>::requestsGeneralMeshes;
+        bool sizeOk = reqs.size() == 4;
+
+        bool cubeOk = sizeOk
+            && reqs[0].preview.x.size() == reqs[0].initializer->getParams()->numPoints * 3
+            && reqs[0].preview.facets.size() == reqs[0].initializer->getParams()->numFacets * 3
+            && reqs[0].preview.n.size() == reqs[0].preview.x.size();
+        bool sphereOk = sizeOk
+            && reqs[1].preview.x.size() == reqs[1].initializer->getParams()->numPoints * 3
+            && reqs[1].preview.facets.size() == reqs[1].initializer->getParams()->numFacets * 3
+            && reqs[1].preview.n.size() == reqs[1].preview.x.size();
+        bool clothOk = sizeOk
+            && reqs[2].preview.x.size() == reqs[2].initializer->getParams()->numPoints * 3
+            && reqs[2].preview.facets.size() == reqs[2].initializer->getParams()->numFacets * 3
+            && reqs[2].preview.n.size() == reqs[2].preview.x.size();
+        bool groundOk = sizeOk
+            && reqs[3].preview.x.size() == reqs[3].initializer->getParams()->numPoints * 3
+            && reqs[3].preview.facets.size() == reqs[3].initializer->getParams()->numFacets * 3
+            && reqs[3].preview.n.size() == reqs[3].preview.x.size();
+
+        if (cubeOk && sphereOk && clothOk && groundOk) {
+            pass("D-042 R-1 / addX populates PreviewState immediately for all 4 initializer kinds (Cube/Sphere/Grid/File-ish)");
+        } else {
+            fail("D-042 R-1 / addX populates PreviewState immediately for all 4 initializer kinds (Cube/Sphere/Grid/File-ish)",
+                 "sizeOk=" + std::to_string((int)sizeOk)
+                 + " cubeOk=" + std::to_string((int)cubeOk)
+                 + " sphereOk=" + std::to_string((int)sphereOk)
+                 + " clothOk=" + std::to_string((int)clothOk)
+                 + " groundOk=" + std::to_string((int)groundOk));
+        }
     }
 
     if (failures == 0) {
