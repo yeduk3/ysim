@@ -114,6 +114,14 @@ public:
     void clear() { state.clear(); }
     bool has(int id) const { return state.find(id) != state.end(); }
 
+    // D-042 R-3 (2026-05-14): drop all pending preview bindings without
+    // touching the materialized MeshGL map. Called at scene-boundary churn
+    // (Simulator::loadScene + future production "New Scene" path) so stale
+    // bindings (pointing into a freed PreviewState heap from a prior
+    // scene's requestsGeneralMeshes) can't be picked up by the next
+    // getOrCreate(mesh) call. Folds R-2 Estimator turn-37 WARNING.
+    void clearPreviewBindings() { previewBindings.clear(); }
+
 private:
     std::unordered_map<int, MeshGL<CPU>> state;
     std::unordered_map<int, PreviewBinding> previewBindings;

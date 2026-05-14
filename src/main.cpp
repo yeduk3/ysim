@@ -2149,10 +2149,48 @@ struct Scene {
             meshes[i].adjacency.edges  = VectorBase<BE, Index>(packedMeshData.edges, packedMeshData.edgesOffsets[i]*2, (packedMeshData.edgesOffsets[i+1]-packedMeshData.edgesOffsets[i])*2);
 
             meshes[i].initialize();
+
+            // D-042 R-3 (2026-05-14): PreviewState is the source of truth
+            // for vertex/facet/normal data at pack time. The initializer's
+            // regen (mesh.initialize() above) populated state.x / state.n /
+            // adjacency.facets from the initializer's params; now override
+            // with preview data so any pre-pack edit to preview (R-4 will
+            // mutate preview in translateObject etc.) propagates through
+            // Scene::pack into the packed sub-views consumed by BroadPhase
+            // + ExplicitSystem. Size-guarded so a future initializer
+            // subtype without populatePreview (base class default no-op)
+            // falls back to the initializer's regen — parallel-symbol
+            // invariant.
+            {
+                const size_t expectedVerts  = (size_t)curNumPoints;
+                const size_t expectedFacets = (size_t)(packedMeshData.facetsOffsets[i+1]
+                                                       - packedMeshData.facetsOffsets[i]);
+                if (req.preview.numPoints() == expectedVerts
+                    && req.preview.x.size() >= expectedVerts * 3) {
+                    std::memcpy(meshes[i].state.x.ptr,
+                                req.preview.x.data(),
+                                expectedVerts * 3 * sizeof(PR));
+                }
+                if (req.preview.numPoints() == expectedVerts
+                    && req.preview.n.size() >= expectedVerts * 3) {
+                    std::memcpy(meshes[i].state.n.ptr,
+                                req.preview.n.data(),
+                                expectedVerts * 3 * sizeof(PR));
+                }
+                if (req.preview.numFacets() == expectedFacets
+                    && req.preview.facets.size() >= expectedFacets * 3) {
+                    std::memcpy(meshes[i].adjacency.facets.ptr,
+                                req.preview.facets.data(),
+                                expectedFacets * 3 * sizeof(uint32_t));
+                }
+            }
+
             // Seed xPrev with the initial position so the first substep's
             // swept-CCD narrow check (D-013) sees a degenerate segment
             // (xPrev == x) rather than dangling zeros, which would
-            // otherwise trigger spurious crossings.
+            // otherwise trigger spurious crossings. Sits AFTER the R-3
+            // memcpy so xPrev mirrors the post-preview x (not the
+            // initializer's pre-override regen).
             std::memcpy(meshes[i].state.xPrev.ptr,
                         meshes[i].state.x.ptr,
                         meshes[i].state.x.size * sizeof(PR));
@@ -5138,6 +5176,24 @@ struct Simulator {
                 mesh->state.xPrev.ptr[i*3+2] += delta.z;
             }
         }
+        // D-042 R-3 (2026-05-14): dual-write the translate delta into the
+        // request's PreviewState so the next Scene::pack memcpy (which
+        // overrides state.x with preview.x) sees the translated values
+        // rather than reverting to addX-time positions. R-3 memcpy
+        // contract requires preview to track every mutation that landed
+        // on state.x. (R-4 will make preview the primary mutation target
+        // with state.x derived; this slice's dual-write is the bridge.)
+        for (auto& req : Scene<BE, PR>::requestsGeneralMeshes) {
+            if (req.id == meshId) {
+                const size_t np = req.preview.numPoints();
+                for (size_t i = 0; i < np; ++i) {
+                    req.preview.x[i*3+0] += delta.x;
+                    req.preview.x[i*3+1] += delta.y;
+                    req.preview.x[i*3+2] += delta.z;
+                }
+                break;
+            }
+        }
         mesh->transformPosition = newPos;
         // Write back to the initializer's center/offset so a subsequent
         // Scene::pack() (triggered by create/import/load flows) rebuilds
@@ -6023,6 +6079,16 @@ struct Simulator {
         Scene<BE,PR>::dirty = true;
         pendingMaterials.clear();
         pendingRotations.clear();
+        // D-042 R-3 (2026-05-14) + turn-38 BLOCK fix-turn: drop both the
+        // materialized MeshGL cache AND the pending preview bindings.
+        // `getOrCreate(mesh)` checks `state` (materialized map) BEFORE the
+        // preview-binding map, so clearing previewBindings alone is not
+        // enough — same-process scene reload reuses `state[id]` from the
+        // prior scene with stale VAO/VBO counts + pointers into freed
+        // PreviewState heap. Both clears together is the safe sweep at
+        // scene-boundary churn. Closes R-2 Estimator turn-37 WARNING.
+        renderState.clearPreviewBindings();
+        renderState.clear();
 
         Scene<BE,PR>::environment.gravity = tinym::vec3(
             (float)r.value.environment.gravity[0],
@@ -10169,6 +10235,63 @@ static int runSelfTest() {
                  + " facetPMatch="   + std::to_string((int)facetPMatch)
                  + " facetCMatch="   + std::to_string((int)facetCMatch)
                  + " nMatch="        + std::to_string((int)nMatch));
+        }
+    }
+
+    // ---- Block 38: D-042 R-3 — Scene::pack memcpys preview to packed. -----
+    // R-3 makes PreviewState the source of truth for vertex/facet/normal
+    // data at pack time. The initializer's regen (mesh.initialize()) still
+    // runs (preserves adjacency derivation), but R-3's memcpy block
+    // overrides state.x / state.n / adjacency.facets with preview's data —
+    // so any future edit to preview (R-4) propagates through Scene::pack.
+    //
+    // Sentinel mechanic: addCube populates preview.x with the cube's
+    // natural geometry. We mutate preview.x[1] to 99.0f (distinct from
+    // the cube's natural y at vertex 0 for tess=2 cube at origin).
+    // sim.initialize() runs pack; pack's mesh.initialize() writes the
+    // initializer's natural value first, then R-3's memcpy overrides
+    // with 99.0f. Assertion checks that 99.0f survived into
+    // packedMeshData.x.
+    //
+    // Bug-probe: removing the R-3 memcpy block → packed.x[1] retains the
+    // initializer's natural value → assertion FAILs.
+    {
+        resetScene();
+        sim.addCube(tinym::vec3(0.0f, 0.0f, 0.0f), 2, 0.2f, 1.0f);
+
+        auto& reqs = Scene<Backend, Precision>::requestsGeneralMeshes;
+        bool oneReq = (reqs.size() == 1);
+        bool hasPreviewData = oneReq
+            && reqs[0].preview.x.size() >= 9
+            && reqs[0].preview.facets.size() >= 9
+            && reqs[0].preview.n.size() >= 9;
+
+        const Precision sentinelY = Precision(99.0f);
+        if (oneReq && reqs[0].preview.x.size() >= 9) {
+            reqs[0].preview.x[1] = sentinelY;
+        }
+
+        sim.initialize();
+
+        bool meshExists = !Scene<Backend, Precision>::meshes.empty();
+        Precision packedY = meshExists ? Scene<Backend, Precision>::meshes[0].state.x[1] : Precision(0);
+        bool packedHasSentinel = meshExists && (packedY == sentinelY);
+
+        bool countMatch = meshExists
+            && oneReq
+            && (Scene<Backend, Precision>::meshes[0].state.x.size / 3
+                == reqs[0].preview.numPoints());
+
+        if (oneReq && hasPreviewData && meshExists && packedHasSentinel && countMatch) {
+            pass("D-042 R-3 / Scene::pack memcpys preview x into packed sub-view (sentinel survives initializer regen)");
+        } else {
+            fail("D-042 R-3 / Scene::pack memcpys preview x into packed sub-view (sentinel survives initializer regen)",
+                 std::string("oneReq=") + std::to_string((int)oneReq)
+                 + " hasPreviewData=" + std::to_string((int)hasPreviewData)
+                 + " meshExists=" + std::to_string((int)meshExists)
+                 + " packedY=" + std::to_string(packedY)
+                 + " packedHasSentinel=" + std::to_string((int)packedHasSentinel)
+                 + " countMatch=" + std::to_string((int)countMatch));
         }
     }
 

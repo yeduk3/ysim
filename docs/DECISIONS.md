@@ -770,3 +770,34 @@ R-2 of 7 on the user-directed D-042 refactor path. R-1 (D-042 R-1) shipped `Prev
 - R-5: add packed → preview resync at end of `Simulator::update` (so post-sim render reflects simulated state instead of static preview).
 - R-6: self-test migration to read via `Scene::meshes` as preview alias.
 - R-7: cleanup — retire the legacy packed-sub-view fallback in `getOrCreate` once R-3+ proves the binding path is always present; clarify dirty semantics; remove dead `renderState.clear()` API if no consumer remains.
+
+## D-042 R-3 — Scene::pack memcpys vertex/facet/normal from PreviewState (2026-05-14)
+
+R-3 of 7 on the D-042 refactor path. R-1 populated `req.preview`; R-2 wired MeshGL to the preview pointers; R-3 makes preview the **load-bearing** source of vertex/facet/normal data at `Scene::pack` time. `mesh.initialize()` still runs (preserves adjacency derivation: vertexAdjFacets, vertexAdjFacetsOffsets, edges, etc., which are NOT in PreviewState), but a new size-guarded `std::memcpy` block runs right after `mesh.initialize()` and overrides `state.x` / `state.n` / `adjacency.facets` from `req.preview.x.data() / n.data() / facets.data()`. Future R-4 makes preview the primary mutation target for translate/rotate/setMaterial; R-5 mirrors the pattern with a packed → preview resync at the end of `Simulator::update`.
+
+**Memcpy placement in `Scene::pack`**: AFTER `meshes[i].initialize()` (which builds adjacency) and BEFORE the existing `state.xPrev` mirror memcpy (so xPrev mirrors the post-preview x, not the initializer's pre-override regen). Size-guarded — preview's `numPoints() / numFacets()` must match the initializer's params before the memcpy fires. On size mismatch (future initializer without `populatePreview`), memcpy is silently skipped and the initializer's regen stands (parallel-symbol fallback). For v1 all 4 subtypes have populatePreview, so every memcpy fires.
+
+**Translate dual-write (R-3 scope expansion)**: `Simulator::translateObject` was bitten on the first build attempt — 5 self-test failures (BDD-003 × 3, BDD-018 × 2) because translate mutates `state.x` but the next `Scene::pack` would overwrite state.x with addX-time `preview.x`. Resolution: `translateObject` now ALSO shifts `req.preview.x[i*3+0..2]` by the same delta. R-3 dual-writes (state.x AND preview.x); R-4 will route the mutation through preview as the primary, with state.x derived. `rotateObject` did NOT need an equivalent change — rotation persists through pack via the existing D-025 pendingRotations + applyPendingMaterials flow.
+
+**`MeshRenderState::clearPreviewBindings()` (new public method)**: drops all entries in `previewBindings` without touching the materialized `state` (MeshGL) map. Called from `Simulator::loadScene` immediately after `pendingRotations.clear()`. Folds R-2 Estimator turn-37 WARNING: pre-R-3 a stale binding could survive scene reset/load and point at a freed `PreviewState` heap from the prior scene. The new method is the safe sweep.
+
+**Block 38 (D-042 R-3)** verifies memcpy is load-bearing via sentinel injection: `addCube` populates `preview.x` with the cube's natural geometry; the test mutates `reqs[0].preview.x[1] = 99.0f` (sentinel; cube's natural y at vertex 0 is -0.1); `sim.initialize()` runs pack; pack's `mesh.initialize()` writes -0.1 first, then R-3's memcpy overrides to 99.0f. Assert `meshes[0].state.x[1] == 99.0f`. Pass label: `D-042 R-3 / Scene::pack memcpys preview x into packed sub-view (sentinel survives initializer regen)`. Self-test 68 → 69 PASS deterministic across 5 macOS runs. doctest 159 + 1120 SUCCESS.
+
+**Bug-probe verified**:
+- **(a)** Disable the entire R-3 memcpy block → Block 38 FAILs with `packedHasSentinel=0 packedY=-0.1` (initializer's natural value stands). Restored.
+- **(b)** Skipped — covered by (a)'s full-block probe.
+- **(c)** `clearPreviewBindings` from loadScene not directly load-bearing in self-test (no GL context to drive `getOrCreate`). Verified by code review + R-2 Estimator turn-37 root-cause analysis.
+
+**Self-test**: 69/69 PASS deterministic across 5 macOS runs; doctest 159 + 1120 SUCCESS unchanged.
+
+### D-042 R-3 turn-38 BLOCK fix-turn (2026-05-14)
+
+Estimator turn-38 returned BLOCK on the R-2 WARNING fold-in: `clearPreviewBindings()` alone is insufficient because `MeshRenderState::getOrCreate(mesh)` checks the materialized `state` map BEFORE the preview-binding map, so a same-process scene reload would reuse stale `MeshGL` (VAO/VBO + pointers into the prior scene's freed PreviewState heap) regardless of the preview-binding clear. After `Scene::nextMeshId` resets to 0 on load, the next mesh in the new scene gets id 0 → matches a leftover `state[0]` entry → stale render data.
+
+**Fix**: `Simulator::loadScene` now calls BOTH `renderState.clearPreviewBindings()` AND `renderState.clear()` after `pendingRotations.clear()`. The two-method sweep:
+- `clearPreviewBindings()` drops the pending binding map.
+- `clear()` drops the materialized MeshGL map.
+
+Together they form the safe scene-boundary reset. Estimator turn-39 confirmed: BLOCK → NOTE. Self-test 69/69 PASS deterministic on macOS (no change from initial R-3); verify.sh exit 0 on Metal-less container.
+
+Bug-probe: not run for the second clear() call — the regression isn't observable in headless self-test (no GL context to drive `getOrCreate`). Verified by code review + Estimator independent confirmation that the failure mode no longer exists.
