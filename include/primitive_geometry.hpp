@@ -12,6 +12,7 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <unordered_map>
 #include <vector>
 
 namespace primitive {
@@ -117,14 +118,22 @@ inline Geometry sphere(float size, int tessellation,
 // ---- Cube ------------------------------------------------------------------
 
 // Tessellation = number of cells per face edge. tessellation >= 1.
-// Faces are emitted independently (no vertex sharing across faces) — the
-// resulting mesh is a disconnected manifold, which is fine for v1: the
-// default Float behavior never runs cloth physics over the surface, and
-// the BVH/collision pipeline treats triangles uniformly regardless of
-// connectivity.
+//
+// 2026-05-15: cube() now welds coincident vertices across face seams so
+// the result is a single closed manifold. Pre-weld the 6 faces emitted
+// independently with no shared corners/edges; switching the mesh to
+// TriangularCloth produced 6 disconnected cloth patches that flew apart
+// under gravity because cloth springs (built from mesh.adjacency.edges)
+// could not cross face seams. The welded topology fixes that and the
+// vertex-count / edge-count formulae below are the post-weld counts.
+//
+// Welded counts (single closed polyhedron, Euler V - E + F = 2):
+//   V = 6t² + 2     (interior face verts + edge-midpoint verts + corners)
+//   F = 12t²        (unchanged — same triangle layout per face)
+//   E = V + F - 2 = 18t²
 inline int cubeVertexCount(int tessellation) {
     int t = tessellation < 1 ? 1 : tessellation;
-    return 6 * (t + 1) * (t + 1);
+    return 6 * t * t + 2;
 }
 
 inline int cubeFacetCount(int tessellation) {
@@ -132,12 +141,9 @@ inline int cubeFacetCount(int tessellation) {
     return 12 * t * t;
 }
 
-// Per face (planar grid disk): V - E + F = 1 ⇒ E = V + F - 1
-//                              = (t+1)^2 + 2*t^2 - 1 = 3*t^2 + 2*t.
-// Six independent faces ⇒ E_total = 6 * (3*t^2 + 2*t).
 inline int cubeEdgeCount(int tessellation) {
     int t = tessellation < 1 ? 1 : tessellation;
-    return 6 * (3 * t * t + 2 * t);
+    return 18 * t * t;
 }
 
 inline Geometry cube(float size, int tessellation,
@@ -204,6 +210,62 @@ inline Geometry cube(float size, int tessellation,
                 pushTri(p00, p11, p10);
             }
         }
+    }
+
+    // Weld coincident vertices across face seams so the cube is a single
+    // closed manifold. Without this, switching the mesh to TriangularCloth
+    // splits it into 6 free-falling patches because cloth springs cannot
+    // cross face seams. Quantize to 1e-5 of `size` so corners and shared
+    // edge vertices generated via different basis arithmetic still
+    // collapse to one key. Vertices are walked in emission order so the
+    // first occurrence keeps its slot — this preserves the invariant that
+    // vertex 0 is the +X face's (+h,-h,-h) corner (Block 39 in self-test).
+    {
+        const float quantScale = 1.0f / (size > 0.f ? size * 1e-5f : 1e-5f);
+        struct Key { int64_t x, y, z; };
+        struct KeyHash {
+            size_t operator()(const Key& k) const noexcept {
+                size_t h1 = std::hash<int64_t>{}(k.x);
+                size_t h2 = std::hash<int64_t>{}(k.y);
+                size_t h3 = std::hash<int64_t>{}(k.z);
+                return h1 ^ (h2 << 1) ^ (h3 << 2);
+            }
+        };
+        struct KeyEq {
+            bool operator()(const Key& a, const Key& b) const noexcept {
+                return a.x == b.x && a.y == b.y && a.z == b.z;
+            }
+        };
+        auto quantize = [&](float v) -> int64_t {
+            return (int64_t)std::llround((double)v * (double)quantScale);
+        };
+
+        const size_t inVerts = g.positions.size() / 3;
+        std::unordered_map<Key, Index, KeyHash, KeyEq> seen;
+        seen.reserve(inVerts);
+        std::vector<float> outPos;
+        outPos.reserve(g.positions.size());
+        std::vector<Index> remap(inVerts);
+
+        for (size_t i = 0; i < inVerts; ++i) {
+            const float x = g.positions[3 * i + 0];
+            const float y = g.positions[3 * i + 1];
+            const float z = g.positions[3 * i + 2];
+            Key k{quantize(x), quantize(y), quantize(z)};
+            auto it = seen.find(k);
+            if (it != seen.end()) {
+                remap[i] = it->second;
+            } else {
+                Index newIdx = (Index)(outPos.size() / 3);
+                outPos.push_back(x);
+                outPos.push_back(y);
+                outPos.push_back(z);
+                seen.emplace(k, newIdx);
+                remap[i] = newIdx;
+            }
+        }
+        for (auto& fi : g.facets) fi = remap[fi];
+        g.positions = std::move(outPos);
     }
 
     return g;
