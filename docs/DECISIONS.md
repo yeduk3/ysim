@@ -575,3 +575,24 @@ Non-grid Float meshes (imported `.obj` `FloatMesh`, etc.) are NOT auto-collidabl
 **Self-test**: 63/63 PASS deterministic on macOS (unchanged count; Block 33's ground precondition is what changed). doctest 159/159 + 1120/1120 SUCCESS.
 
 **Behavioral consequence**: user-authored scenes work as expected — cubes toggled to Rigid land on the floor the user explicitly installed via `addGround`. If a scene has NO ground, Rigid bodies fall forever (no virtual catch). This matches the user's intent: "씬 내에 있는 오브젝트만으로만 처리".
+
+### D-040 addendum 2 (2026-05-14, "reset-stuck" fix)
+
+**User-reported bug**: in a scene with rigid objects, hitting reset (any path that re-triggers `Simulator::initialize`, or re-loads from a save that captured fallen positions) and then resuming, the rigid objects remain stationary. User suspected a "ground setup tangle"; root cause is actually `mesh.transformPosition` carrying delta-loop accumulations across the sim lifecycle.
+
+**Root cause**: B-3's delta-loop in `Simulator::update` was updating `mesh.transformPosition.x/y/z += dp.x/y/z` each frame — conflating "live position during sim" with "authorial intent". Consequences:
+- On Save: `Simulator::toSnapshot` reads `mesh.transformPosition` for the cube's persisted position, so save captures the rested-on-floor position, not the authorial spawn.
+- On Load (or any re-`Simulator::initialize` that calls `Scene::pack` whose `dirty=false` fast path skips re-seeding `transformPosition`, OR even the slow path when the initializer's center wasn't refreshed): `ensureRigidBackendBody` reads `mesh.transformPosition` to seed `RigidInitial.position`, getting the rested floor position. A fresh Bullet body is created AT the floor with v=0; Bullet's contact solver settles it immediately; the cube appears stuck.
+
+**Fix** (this commit): REMOVE the `mesh.transformPosition.x/y/z += dp.x/y/z` block from `Simulator::update`'s rigid delta-loop. The remaining writes (`state.x`, `state.xPrev`) drive the cube's visible motion via the renderer. `transformPosition` now stays at the authorial spawn (seeded by `Scene::pack` from `initializer->params.center`; explicitly updated only by `Simulator::translateObject` per D-014/D-015, which also writes back to the initializer).
+
+**Behavioral consequences after fix**:
+- During Rigid sim: cube falls visibly (state.x updates each frame). Inspector's Position widget shows the authorial spawn (NOT the live falling position). User can still see the cube via the render; the Inspector number is a stable reference.
+- On Save (mid-sim or post-rest): persists the authorial spawn position, not the rested floor position. Load → cube re-spawns at original height → falls again on resume.
+- On re-`initialize` (any path): new Bullet body starts at authorial spawn → falls.
+
+**Trade-off**: Inspector's "Position" input no longer tracks live rigid-body motion. If a user wanted live position display, that's a future-slice candidate (separate `livePosition` field or read directly from `rigid_.getPosition` via a new accessor). Acceptable for v1 — the visible render conveys "where the cube is right now".
+
+**Self-test**: 63/63 PASS deterministic on macOS (Block 32 + 33 use `rigidLastBodyPos.y` for assertions, not `transformPosition`, so unaffected). doctest 159 + 1120 SUCCESS.
+
+**Related future cleanup**: B-3's delta-loop applies Δpos to vertices independently of the actual Bullet body's transform. A future rotation-correct vertex update would replace this with per-vertex local-offset + rotate; that would also be a natural place to track a separate `liveBodyPosition` field for Inspector display.

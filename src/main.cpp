@@ -5289,9 +5289,20 @@ struct Simulator {
                     xPrev[vi*3+2] += static_cast<PR>(dp.z);
                 }
             }
-            m.transformPosition.x += dp.x;
-            m.transformPosition.y += dp.y;
-            m.transformPosition.z += dp.z;
+            // D-040 addendum (2026-05-14, "reset-stuck" fix): DO NOT update
+            // mesh.transformPosition from the delta-loop. transformPosition
+            // is the authorial spawn position (seeded by Scene::pack from
+            // mesh.initializer->params.center; explicit edits go through
+            // Simulator::translateObject which writes back to the initializer
+            // per D-015). Carrying delta updates into transformPosition
+            // breaks re-initialize: on the next sim.initialize() the new
+            // Bullet body would start at the cube's last rested floor
+            // position (with v=0), Bullet's contact solver settles it
+            // immediately, and the cube appears frozen on resume. The
+            // visible motion of the rigid body comes from state.x writes
+            // above; Inspector's Position widget reads transformPosition
+            // and stays at the authorial spawn during sim (acceptable —
+            // the live position is shown by the render itself).
             m.rigidLastBodyPos = now;
         }
 
