@@ -650,3 +650,25 @@ The old D-036 "TriangularCloth → Float in-place; state.x preserved" contract i
 - ID-collision-proof addGM (numMeshes decoupling from id assignment).
 - Live-position Inspector display (translation-only delta loop already documented limitation per D-040 addendum 2).
 - E1/E2 from the "ground edge case audit" (mid-sim ground translate/rotate doesn't propagate to Bullet) — with D-041, `translateObject` and `rotateObject` now set dirty=true, so the next update rebuilds everything including the Bullet ground plane. **E1+E2 are implicitly fixed by D-041.**
+
+### D-041 turn-2 addendum (2026-05-14, "remove-mesh ID-collision" fix)
+
+**User-reported bug**: in main scene (cloth + Human + ground), Inspector → Delete Mesh on Human, then create a sphere via Mesh > Cube modal. After init: ground rendering corrupted (renders with sphere's vertex buffer or vice versa).
+
+**Root cause**: `addGeneralMesh` was using `id = numMeshes++` for mesh.id. `Simulator::removeMesh` decremented `numMeshes` to keep the `numMeshes == requestsGeneralMeshes.size()` pack invariant. Sequence:
+- Initial: cloth(0), Human(1), ground(2). numMeshes=3.
+- removeMesh(1) → requests=[cloth(0), ground(2)]. numMeshes=2.
+- addSphere → addGeneralMesh → id = numMeshes++ = 2 (collision with ground's id=2). requests=[cloth(0), ground(2), sphere(2)]. numMeshes=3.
+- `MeshRenderState` is `std::unordered_map<int, MeshGL<CPU>>` keyed by id. Two meshes with id=2 → `getOrCreate(mesh).find(id=2)` returns the SAME slot for both. First-encountered mesh's MeshGL gets emplaced; second mesh reuses it — vertex pointers, facets, etc. all point at the first mesh's data. Rendering corruption.
+
+**Fix**: decouple id-assignment from numMeshes. New `Scene<BE, PR>::nextMeshId` monotone counter; `addGeneralMesh` uses `nextMeshId++` for id (numMeshes still increments separately and remains the pack-invariant count). `nextMeshId` resets to 0 in:
+- `Simulator::loadScene`'s scene-reset block (so save→load round-trips assign ids 0, 1, 2, ... in load order — preserves D-018 jiggle-seed determinism across save/load).
+- `runSelfTest`'s `resetScene` lambda (so tests' deterministic id sequences are preserved across blocks).
+
+Within a session: ids monotone-increase forever. Remove + add never collides.
+
+**Block 34 (D-041 turn-2)** mechanizes the regression test: build a 3-mesh scene (cloth + cube + ground), removeMesh(middle), addSphere, pump 1 frame (D-041 dirty-init), assert all surviving meshes have UNIQUE IDs and the new sphere's id is strictly greater than any surviving id (3 vs 0, 2). Pass label: `D-041 turn-2 / removeMesh + addX preserves unique mesh IDs (no MeshRenderState collision)`. Self-test 63 → 64 PASS.
+
+**Note on the "cloth-vs-ground collision broken" complaint**: this was a UX surprise, not a separate bug. Pre-D-041, deleting Human while paused left cloth in its draped mid-fall state on Human + ground. After D-041 (any mutation forces re-init), the cloth resets to its initializer-derived spawn position (y=0.25). On resume, cloth falls fresh from spawn → collides with ground → drapes again. The user perceived "collision broken" because cloth appeared in mid-air after delete, but it was actually the dirty-init's intentional state reset. Documented in D-041 main entry's "Behavioral consequences" notes.
+
+**Self-test**: 64/64 PASS deterministic across 5 macOS runs; doctest 159+1120 SUCCESS unchanged.

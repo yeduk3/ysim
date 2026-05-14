@@ -1828,6 +1828,14 @@ struct Scene {
     // and is the D-018 RNG seed). Used by BroadPhase::build to gate
     // the Float-mesh skip — see CM-008 (graduated).
     inline static int lifetimeMeshCount = 0;
+    // D-041 turn-2 (2026-05-14): monotone counter for mesh.id, decoupled
+    // from numMeshes so removeMesh + subsequent addX does NOT collide on
+    // ids (numMeshes is decremented on remove; using it for ids let new
+    // meshes reuse a surviving mesh's id → MeshRenderState[id] keyed on
+    // the same slot → render corruption). Reset by resetScene + loadScene
+    // (alongside numMeshes) so save/load round-trips IDs starting at 0
+    // and self-tests keep their deterministic id sequence.
+    inline static int nextMeshId = 0;
 
     inline static std::vector<GeneralMesh<BE, PR>> meshes;
     inline static SceneEnvironment environment;
@@ -1855,8 +1863,15 @@ struct Scene {
         //meshes.emplace_back(initializer, behaviorType, behaviorParams);
         //meshes.back().id = numMeshes++;
 
-        requestsGeneralMeshes.emplace_back(numMeshes++, lifetimeMeshCount++,
+        // D-041 turn-2: id from nextMeshId (monotone within session;
+        // reset only at resetScene/loadScene boundary). Without this,
+        // removeMesh's numMeshes-- could let a subsequent addGeneralMesh
+        // reuse a surviving mesh's id, causing MeshRenderState collisions
+        // (two meshes share the same MeshGL cache slot → one renders
+        // with the other's vertex pointers).
+        requestsGeneralMeshes.emplace_back(nextMeshId++, lifetimeMeshCount++,
                                            initializer, behaviorType, behaviorParams);
+        numMeshes++;
 
         dirty = true;
 
@@ -5812,6 +5827,9 @@ struct Simulator {
         for (auto& r : Scene<BE,PR>::requestsGeneralMeshes) delete r.initializer;
         Scene<BE,PR>::requestsGeneralMeshes.clear();
         Scene<BE,PR>::numMeshes = 0;
+        // D-041 turn-2: reset id counter at the scene boundary so
+        // save/load round-trips assign ids 0, 1, 2, ... in load order.
+        Scene<BE,PR>::nextMeshId = 0;
         Scene<BE,PR>::dirty = true;
         pendingMaterials.clear();
         pendingRotations.clear();
@@ -6352,6 +6370,7 @@ static int runRefitBench(const BenchConfig& cfg) {
             delete r.initializer;
         Scene<Backend, Precision>::requestsGeneralMeshes.clear();
         Scene<Backend, Precision>::numMeshes = 0;
+        Scene<Backend, Precision>::nextMeshId = 0;
         Scene<Backend, Precision>::dirty = true;
         Scene<Backend, Precision>::environment = SceneEnvironment{};
     };
@@ -6452,6 +6471,7 @@ static int runSelfTest() {
             delete r.initializer;
         Scene<Backend, Precision>::requestsGeneralMeshes.clear();
         Scene<Backend, Precision>::numMeshes = 0;
+        Scene<Backend, Precision>::nextMeshId = 0;
         Scene<Backend, Precision>::dirty = true;
         Scene<Backend, Precision>::environment = SceneEnvironment{};
     };
@@ -9741,6 +9761,73 @@ static int runSelfTest() {
         }
 
         sim.pause = true;
+    }
+
+    // ---- Block 34: D-041 turn-2 — removeMesh + addX preserves unique IDs. -
+    // User-reported bug: in main scene (cloth + Human + ground), deleting
+    // Human then creating a sphere caused ground rendering to corrupt.
+    // Root cause was mesh.id collision because addGeneralMesh used
+    // numMeshes++ for id-assignment; after removeMesh decremented
+    // numMeshes, a subsequent addX could reuse a surviving mesh's id.
+    // MeshRenderState keys MeshGL by id → collision → shared GL slot →
+    // one mesh renders with the other's vertex pointers. D-041 turn-2
+    // adds Scene::nextMeshId (monotone within session; reset on resetScene
+    // / loadScene) decoupled from numMeshes.
+    {
+        resetScene();
+        // Mimic main scene structure: cloth + middle Float-import-like
+        // mesh + ground. Use Cube + Ground primitives so the test doesn't
+        // depend on an external .obj path.
+        sim.addCloth(/*particleNum1D=*/4, /*size1D=*/0.5f,
+                     tinym::vec3(0.0f, 0.5f, 0.0f),
+                     1e3, 1e3, 1e3, 0.01f, 0.1f);                 // id 0
+        sim.addCube(tinym::vec3(0.0f, 0.0f, 0.0f), 2, 0.2f, 0.1f); // id 1 (Human-like middle)
+        sim.addGround(PlaneDirection::XZPlane,
+                      tinym::vec3(0.0f, -1.0f, 0.0f), 5.0f);       // id 2
+        sim.initialize();
+
+        const int beforeIds[] = {0, 1, 2};
+        bool beforeOk =
+            Scene<Backend, Precision>::meshes.size() == 3 &&
+            Scene<Backend, Precision>::meshes[0].id == beforeIds[0] &&
+            Scene<Backend, Precision>::meshes[1].id == beforeIds[1] &&
+            Scene<Backend, Precision>::meshes[2].id == beforeIds[2];
+
+        // Remove the middle (id=1) — mirrors "Delete Human" from main.
+        sim.removeMesh(1);
+
+        // Add a new sphere — would collide with ground's id=2 under the
+        // numMeshes-based id-assignment. Under the fix, gets id=3.
+        sim.addSphere(tinym::vec3(2.0f, 0.0f, 0.0f), /*tess=*/3, /*size=*/0.2f);
+
+        // Trigger D-041 pre-pause init via 1 update tick. (sim.pause stays
+        // true; the dirty check fires before the pause-return.)
+        pumpFrames(sim, 1);
+
+        // After re-init: meshes should be [cloth(0), ground(2), sphere(3)].
+        bool sizeOk = Scene<Backend, Precision>::meshes.size() == 3;
+        bool clothOk  = sizeOk && Scene<Backend, Precision>::meshes[0].id == 0;
+        bool groundOk = sizeOk && Scene<Backend, Precision>::meshes[1].id == 2;
+        bool sphereOk = sizeOk && Scene<Backend, Precision>::meshes[2].id == 3;
+        bool uniqueOk = sizeOk &&
+            (Scene<Backend, Precision>::meshes[0].id !=
+             Scene<Backend, Precision>::meshes[1].id) &&
+            (Scene<Backend, Precision>::meshes[0].id !=
+             Scene<Backend, Precision>::meshes[2].id) &&
+            (Scene<Backend, Precision>::meshes[1].id !=
+             Scene<Backend, Precision>::meshes[2].id);
+
+        if (beforeOk && sizeOk && clothOk && groundOk && sphereOk && uniqueOk) {
+            pass("D-041 turn-2 / removeMesh + addX preserves unique mesh IDs (no MeshRenderState collision)");
+        } else {
+            fail("D-041 turn-2 / removeMesh + addX preserves unique mesh IDs (no MeshRenderState collision)",
+                 "beforeOk=" + std::to_string((int)beforeOk)
+                 + " sizeOk=" + std::to_string((int)sizeOk)
+                 + " clothOk(0)=" + std::to_string((int)clothOk)
+                 + " groundOk(2)=" + std::to_string((int)groundOk)
+                 + " sphereOk(3)=" + std::to_string((int)sphereOk)
+                 + " uniqueOk=" + std::to_string((int)uniqueOk));
+        }
     }
 
     if (failures == 0) {
