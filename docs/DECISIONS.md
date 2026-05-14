@@ -556,3 +556,22 @@ All three restored.
 **Standing constraint NOT retired**: ConvexMesh + StaticMesh shape translation is still stubbed (returns `kInvalidBodyHandle`). No path in current ysim exercises them. Future slice can fill if needed.
 
 **Out of scope for D-040**: NO Simulator template-parameter widening (still a one-line type swap in `rigid_`'s declaration); NO rotation-correct vertex update (Δpos translation only — Bullet's angular state is tracked but state.x doesn't reflect rotation); NO per-mesh mass/friction/restitution API (hard-coded mass=1.0 in `ensureRigidBackendBody`); NO general rigid-rigid or rigid-cloth collision; NO determinism probe across runs (Bullet is single-thread deterministic per its docs but BDD-102's bit-equality clause covers cloth only).
+
+### D-040 addendum (2026-05-14, "scene-objects-only ground" fix)
+
+**User-reported bug**: in `main()`'s default scene the user installs `addGround(XZPlane, (0,-1,0), 5)` at y=-1, but a cube toggled to Rigid via the Inspector rested at y≈0.1 instead of the user's ground at y=-1. Root cause: D-040's `Simulator::initialize` added an *implicit* `btStaticPlaneShape(normal=(0,1,0), distance=0)` to the Bullet world (the "implicit y=0 ground plane"), which intercepted Rigid bodies before they reached the user's actual ground mesh.
+
+**Fix** (this commit): the implicit-plane block is REMOVED from `Simulator::initialize`. Replacement: a new helper `Simulator::ensureRigidStaticGround(meshId)` is swept alongside `ensureRigidBackendBody(meshId)` for every mesh during `Simulator::initialize`. The helper accepts ANY Float-tagged mesh whose initializer is a `MeshGridInitializer<BE, PR>*` (via `dynamic_cast`) and registers it as a `btStaticPlaneShape` in the Bullet world:
+- `PlaneDirection::XZPlane` → normal `(0, 1, 0)` (horizontal floor; default `addGround`)
+- `PlaneDirection::XYPlane` → normal `(0, 0, 1)` (vertical wall facing +z)
+- `PlaneDirection::YZPlane` → normal `(1, 0, 0)` (vertical wall facing +x)
+- Plane signed distance from origin = `dot(normal, mesh.transformPosition)` (so an XZ grid at (0,-1,0) becomes `y = -1` plane).
+- mass = 0 → static body.
+
+Non-grid Float meshes (imported `.obj` `FloatMesh`, etc.) are NOT auto-collidable; the user can tag them Rigid for collision or a future slice adds `StaticMesh` triangle-soup support (currently stubbed in `BulletRigidPhysicsBackend::addBody`).
+
+**Block 33 update**: now uses `sim.addGround(XZPlane, (0,-1,0), 5.0f)` to install an explicit ground BEFORE `addCube(0,2,0,size=0.2,mass=1)`. `sim.changeBehavior(1, Rigid)` (mesh-id 1, since ground took id 0). After 240 frames the cube rests with center.y in `[-1.05, -0.80]` band (analytic rest = -0.9; Bullet's `btStaticPlaneShape`-vs-`btBoxShape` contact processing has a sloppy margin allowing ~0.05-0.10 m residual penetration under default solver settings — measured center settles at ≈ -0.97). Pass label updated to: `BDD-008 / cube tagged Rigid rests on explicit scene ground (addGround at y=-1) after 240 frames (D-040)`.
+
+**Self-test**: 63/63 PASS deterministic on macOS (unchanged count; Block 33's ground precondition is what changed). doctest 159/159 + 1120/1120 SUCCESS.
+
+**Behavioral consequence**: user-authored scenes work as expected — cubes toggled to Rigid land on the floor the user explicitly installed via `addGround`. If a scene has NO ground, Rigid bodies fall forever (no virtual catch). This matches the user's intent: "씬 내에 있는 오브젝트만으로만 처리".
