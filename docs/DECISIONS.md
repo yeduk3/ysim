@@ -822,3 +822,29 @@ Pass label: `D-042 R-4 / rotateObject writes preview.x (90° Y rotation reflects
 - **(a)** Disable the preview rotate loop → 4 simultaneous FAILs: Block 39 (`moved=0`), FR-004 UI rotated-state-survives-step, FR-004 rotateObject-survives-pack-rebuild, BDD-018 rotate-inspector-edit. Confirms the preview write is now the SOLE mechanism preserving rotation through pack (the prior pendingRotations stash from this site was retired). Restored.
 
 **Self-test**: 70/70 PASS deterministic across 5 macOS runs; doctest 159 + 1120 SUCCESS unchanged.
+
+## D-042 R-5 — Simulator::update resyncs packed→preview at end (2026-05-14)
+
+R-5 of 7. Closes the divergence between packed simulator state and per-request PreviewState by adding a one-way memcpy `state.x → preview.x` at the END of every `Simulator::update` call (after `frame++`, before the closing brace). Mirrors R-3's preview→packed memcpy in reverse. After R-5, preview is a true "current sim state" view — subsequent translate/rotate edits read from a preview that already includes simulated motion, and future preview-iterating renderers (R-6+ candidate) see correct post-sim geometry.
+
+**Resync placement**: very end of `Simulator::update` body at `src/main.cpp:~5815`. By placement at the bottom of the function, every prior step has already settled: pre-pause dirty re-init, applyEnvironmentForces, rigid_.step + Δpos delta-loop, full substep loop (cloth integrator + broad/narrow phase + constraint resolution).
+
+**Resync shape**: nested loop iterates `Scene::meshes` outer, finds matching `requestsGeneralMeshes[*]` by id, size-guarded `std::memcpy` from `mesh.state.x.ptr` → `req.preview.x.data()`. Skipped on size mismatch (parallel-symbol fallback for future no-preview initializers). `preview.n` is intentionally NOT recomputed here — current renderer reads `MeshGL`'s normals (refreshed via `updateBuffer`'s computeNormal call); preview.n staleness is an R-7 cleanup candidate.
+
+**Block 40 (D-042 R-5)** verifies via cloth-under-gravity:
+1. `addCloth(2, 0.5f, (0, 0.25, 0), ...)` — 4-particle TriangularCloth at y=0.25.
+2. `sim.initialize(); pre_y = reqs[0].preview.x[1]` (≈ 0.25 modulo jiggle).
+3. `sim.pause = false; for (30) sim.update();`.
+4. `post_y = reqs[0].preview.x[1]`; `state_y = meshes[0].state.x[1]`.
+5. Assert `post_y < 0.20` (fell ≥ 0.05m); `post_y < pre_y - 0.01` (preview actually moved); `|state_y - post_y| < 1e-5` (resync is byte-equal — confirms the resync IS the source).
+
+Pass label: `D-042 R-5 / Simulator::update resyncs packed state.x into preview.x (cloth falls in preview after 30 frames)`. Self-test 70 → 71 PASS deterministic across 5 macOS runs. doctest 159 + 1120 SUCCESS.
+
+**Bug-probe verified**:
+- **(a)** Disable the R-5 resync loop → Block 40 FAILs with `pre_y=0.25 post_y=0.25 state_y=-0.98 fellOk=0 movedOk=0 resyncOk=0`. Cloth fell hard (no ground in scene) but preview frozen at addX-time positions; resyncOk's |state_y - post_y| diff is now massive (~1.23). Restored.
+
+**Out of scope for R-5** (deferred):
+- R-6: self-test migration to read via Scene::meshes preview alias.
+- R-7: retire legacy regen + getOrCreate fallback; recompute preview.n in resync OR retire preview.n field.
+
+**Self-test**: 71/71 PASS deterministic across 5 macOS runs; doctest 159 + 1120 SUCCESS unchanged.

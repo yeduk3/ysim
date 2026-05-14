@@ -1,21 +1,21 @@
-# Resume — D-042 R-4 — rotateObject writes preview.x
+# Resume — D-042 R-5 — packed→preview resync at end of update
 
 ## Must remember
 
-- **R-4 RETIRED `pendingRotations[meshId] = newAbs;` from rotateObject.** Bug-probe (a) confirmed that disabling the new preview rotate causes 4 test FAILs — preview write is now the SOLE mechanism preserving rotation through Scene::pack. The applyPendingMaterials re-apply path would otherwise double-rotate (preview→packed by memcpy, then re-applied by rotateObject again).
-- **`loadScene`'s `pendingRotations[id] = q` stash is UNCHANGED.** That path runs once at the first post-load initialize, BEFORE preview has been rotated by user actions. Different lifecycle, no conflict.
-- **primitive::cube emits +X face FIRST** → vertex 0 lives at (+h, -h, -h), not (-h, -h, -h). PLAN sketch had wrong sign; Block 39 corrected mid-build.
-- **Block 39 must call `sim.initialize()` before `rotateObject`** so `findById` sees the mesh in `Scene::meshes`. Without initialize, rotateObject early-returns and preview is never touched.
-- **rotateObject's preview loop uses `delta` + `pivot` already computed for state.x.** PARALLEL-IMPL-LOCKSTEP via shared rotateVector — future rotation-pivot changes need both loops updated.
+- **R-5 resync is at the VERY END of Simulator::update.** After dirty-rebuild, applyEnvironmentForces, rigid Δpos, substep loop, AND `frame++`. Earlier placement would either miss substep state or run on stale buffers.
+- **Size-guarded memcpy.** If preview's numPoints != state's vertex count, silently skip — defensive for future no-preview initializer paths.
+- **preview.n is intentionally NOT recomputed in the resync.** Current renderer uses MeshGL's normals refreshed via updateBuffer. R-7 cleanup can decide whether to recompute preview.n or retire the field.
+- **Block 40 cloth scenario falls hard without ground.** post_y reaches ~-0.98 over 30 frames; assertion threshold 0.20 is well-conservative.
+- **Bug-probe (a) demonstrates load-bearingness through three assertion clauses:** `fellOk` (qualitative drop), `movedOk` (preview vs initial), `resyncOk` (preview vs state byte-equal). Disabling the resync fails all three.
 
 ## Last decisions + why
 
-- **D-042 R-4 entry in DECISIONS.md** — captures the preview write-back placement, the `pendingRotations` retirement decision, the bug-probe (a) result confirming load-bearingness, and the Block 39 sentinel-style verification.
-- **No new D-NNN beyond R-4 itself.** No BDD/FRD touched.
-- **Scope expansion**: `pendingRotations` stash removal — Generator-discovered during the build (BDD-018/FR-004 regression on first attempt). Necessary because applyPendingMaterials's re-apply would double-rotate after R-3+R-4.
+- **D-042 R-5 entry in DECISIONS.md** — captures the resync placement, size guard, preview.n staleness decision, Block 40 assertion shape, and bug-probe verification.
+- **No new D-NNN beyond R-5 itself.**
+- **No scope expansion** this slice. R-5 is purely additive.
 
 ## Next step you were about to take
 
-Hand back to `/slice` orchestrator. Codex Estimator runs next. After R-4 merges, the next slice is **R-5**: add packed → preview resync at end of `Simulator::update` so the post-sim-step packed state (with cloth/rigid motion accumulated) lands in preview before the next render/edit. R-5 closes the divergence loop in the other direction (R-3 was preview→packed at pack; R-5 is packed→preview at update end).
+Hand back to `/slice` orchestrator. Codex Estimator runs next. After R-5 merges, the final pre-cleanup slice is **R-6**: migrate self-test reads so blocks that currently access `Scene::meshes[i].state.x` can equivalently read `Scene::requestsGeneralMeshes[i].preview.x` after `sim.update()`. R-6 also establishes the `Scene::meshes` alias semantics promised in the original D-042 design (Scene::meshes as a view over PreviewState).
 
 See `PLAN.md` and `CURRENT_WORK.md` for slice scope + status.

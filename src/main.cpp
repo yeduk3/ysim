@@ -5812,6 +5812,31 @@ struct Simulator {
         system.acctime += system.h;
         frame++;
 
+        // D-042 R-5 (2026-05-14): resync packed state.x → per-request
+        // preview.x at the END of every update. After this point preview
+        // reflects the current simulated positions (cloth integrator
+        // output, rigid backend Δpos, narrow-phase constraint resolution);
+        // subsequent translate/rotate edits + future preview-iterating
+        // renderers see post-sim state. Mirrors R-3's preview→packed
+        // memcpy in reverse. Size-guarded — silently skipped on mismatch
+        // (defensive for future no-preview initializers). preview.n is
+        // intentionally NOT recomputed here — current renderer reads MeshGL
+        // normals (refreshed via updateBuffer); preview.n staleness is a
+        // documented R-7 cleanup candidate.
+        for (auto& mesh : Scene<BE, PR>::meshes) {
+            if (!mesh.state.x.ptr) continue;
+            const size_t stateVerts = (size_t)(mesh.state.x.size / 3);
+            for (auto& req : Scene<BE, PR>::requestsGeneralMeshes) {
+                if (req.id != mesh.id) continue;
+                if (req.preview.numPoints() != stateVerts) break;
+                if (req.preview.x.size() < stateVerts * 3) break;
+                std::memcpy(req.preview.x.data(),
+                            mesh.state.x.ptr,
+                            stateVerts * 3 * sizeof(PR));
+                break;
+            }
+        }
+
         //collisionPipeline.broadPhase.build(sceneObjects.squareClothes[0].x, sceneObjects.squareClothes[0].facet);
         //std::cout << "[Simulator Update] Finished update" << std::endl;
     }
@@ -10391,6 +10416,62 @@ static int runSelfTest() {
                  + " yOk=" + std::to_string((int)yOk)
                  + " zOk=" + std::to_string((int)zOk)
                  + " moved=" + std::to_string((int)moved));
+        }
+    }
+
+    // ---- Block 40: D-042 R-5 — Simulator::update resyncs packed→preview. -
+    // R-3 made Scene::pack memcpy preview→packed; R-4 made edits write
+    // preview; R-5 closes the loop with a packed→preview resync at the
+    // very end of Simulator::update. After the resync, preview reflects
+    // post-substep simulated positions (cloth integrator output, rigid
+    // Δpos, narrow-phase constraint resolution).
+    //
+    // Mechanic: addCloth at y=0.25 (TriangularCloth — gravity drops it).
+    // Initialize, unpause, pump 30 frames. Without the resync, preview.x
+    // stays frozen at addX-time positions while state.x falls under
+    // gravity. With the resync, preview.x[1] tracks state.x[1] down.
+    //
+    // Bug-probe: removing the R-5 resync loop → preview.x[1] stays ≈ 0.25;
+    // state.x[1] falls to ≈ 0.12; assertion FAILs on both `post_y < 0.20`
+    // and `|state_y - post_y| < 1e-5`.
+    {
+        resetScene();
+        sim.addCloth(/*particleNum1D=*/2, /*size1D=*/0.5f,
+                     tinym::vec3(0.0f, 0.25f, 0.0f),
+                     /*kstretch=*/1e3f, /*kshear=*/1e3f, /*kbend=*/1e3f,
+                     /*thickness=*/0.01f, /*mass=*/0.1f);
+        sim.initialize();
+
+        auto& reqs = Scene<Backend, Precision>::requestsGeneralMeshes;
+        bool oneReq = (reqs.size() == 1);
+        bool hasPreview = oneReq && reqs[0].preview.x.size() >= 3;
+
+        Precision pre_y = hasPreview ? reqs[0].preview.x[1] : Precision(0);
+
+        sim.pause = false;
+        for (int i = 0; i < 30; ++i) sim.update();
+
+        Precision post_y = hasPreview ? reqs[0].preview.x[1] : Precision(0);
+        bool meshExists = !Scene<Backend, Precision>::meshes.empty();
+        Precision state_y = meshExists ? Scene<Backend, Precision>::meshes[0].state.x[1] : Precision(0);
+
+        bool fellOk    = (post_y < Precision(0.20f));
+        bool movedOk   = (post_y < pre_y - Precision(0.01f));
+        bool resyncOk  = meshExists && (std::fabs(state_y - post_y) < Precision(1e-5f));
+
+        if (oneReq && hasPreview && meshExists && fellOk && movedOk && resyncOk) {
+            pass("D-042 R-5 / Simulator::update resyncs packed state.x into preview.x (cloth falls in preview after 30 frames)");
+        } else {
+            fail("D-042 R-5 / Simulator::update resyncs packed state.x into preview.x (cloth falls in preview after 30 frames)",
+                 std::string("oneReq=") + std::to_string((int)oneReq)
+                 + " hasPreview=" + std::to_string((int)hasPreview)
+                 + " meshExists=" + std::to_string((int)meshExists)
+                 + " pre_y=" + std::to_string(pre_y)
+                 + " post_y=" + std::to_string(post_y)
+                 + " state_y=" + std::to_string(state_y)
+                 + " fellOk=" + std::to_string((int)fellOk)
+                 + " movedOk=" + std::to_string((int)movedOk)
+                 + " resyncOk=" + std::to_string((int)resyncOk));
         }
     }
 
