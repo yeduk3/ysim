@@ -1,22 +1,21 @@
-# Estimation — 2026-05-14 turn 40
+# Estimation — 2026-05-14 turn 41
 
 Status: UPDATED
 
 ## Verdict
-WARNING
+NOTE
 
 ## BLOCK
 - None.
 
 ## WARNING
-- Scope drift vs plan: `src/main.cpp:5299` removes `pendingRotations[meshId] = newAbs;` even though `.agent/PLAN.md:109` said the D-025 pendingRotations re-apply flow would stay intact this slice. The code appears to need the change to avoid double-rotation, but this is no longer the narrow "preview write only" slice the plan described.
+- None.
 
 ## NOTE
-- `src/main.cpp:5236` still says the pack-roundtrip write-back is deferred to a later slice. That prose is now stale after the R-4 preview write-back landed.
-- `src/main.cpp:6246` still describes `rotateObject()` as writing into `pendingRotations`. The runtime path is fine, but the comment now reflects the pre-R-4 implementation.
+- `src/main.cpp:5826-5837` adds an `O(meshes × requestsGeneralMeshes)` resync scan each frame. It is fine for this slice, but a keyed lookup would be the first optimization if scene sizes grow.
 
 ## Test matrix delta
-- none: no behavior-id rows changed; the slice is infrastructure-only and the existing BDD-018 coverage stays intact.
+- none: no behavior-id rows changed; the slice is infrastructure-only and the existing BDD-003 / BDD-018 coverage stays pass.
 
 ## Verify output (summary)
-`./scripts/verify.sh` completed successfully. CMake configured and built the tree, with only third-party Bullet warnings. `ysim_tests` passed 159/159 assertions and `ysim_primitive_tests` passed 1120/1120 assertions. The self-test gate reported the Null/Euler backend checks as PASS and then hit the expected Metal-less SKIP on this host (`MTL::CreateSystemDefaultDevice()` returned null), so the new Metal-gated Block 39 was not exercised here.
+`./scripts/verify.sh` completed successfully. The tree configured and built cleanly aside from third-party Bullet warnings. `ysim_tests` passed 159/159 assertions and `ysim_primitive_tests` passed 1120/1120 assertions. On this host the self-test gate hit the expected Metal-less SKIP (`MTL::CreateSystemDefaultDevice()` returned null), so the new Metal-gated Block 40 was not exercised locally; the generator's five macOS self-test runs in `.agent/CURRENT_WORK.md` report 71/71 PASS.
