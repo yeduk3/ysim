@@ -4,6 +4,7 @@ add_executable(ysim
     metal_impl.cpp
     profiler_gui.cpp
     mesh_inspector_gui.cpp
+    BulletRigidPhysicsBackend.cpp
     ${CMAKE_SOURCE_DIR}/third_party/imgui/imgui.cpp
     ${CMAKE_SOURCE_DIR}/third_party/imgui/imgui_draw.cpp
     ${CMAKE_SOURCE_DIR}/third_party/imgui/imgui_tables.cpp
@@ -27,16 +28,21 @@ target_link_directories(ysim PRIVATE ${CMAKE_SOURCE_DIR}/lib)
 
 # 4. ysim 실행 파일에 모든 의존성 연결
 # ysim_core를 연결하는 순간, include 폴더 경로와 Eigen3 세팅이 ysim으로 자동 전파됩니다.
-target_link_libraries(ysim PRIVATE 
+target_link_libraries(ysim PRIVATE
     ysim_core     # 내 헤더 파일들과 Eigen3
     glfw          # lib 폴더 안에 있는 glfw
     glew          # lib 폴더 안에 있는 glew
     OpenGL::GL    # 시스템 OpenGL
+    # D-040: Bullet 3.25 rigid physics backend.
+    BulletDynamics
+    BulletCollision
+    LinearMath
 )
 
 target_include_directories(ysim PRIVATE
     ${CMAKE_SOURCE_DIR}/third_party/imgui
     ${CMAKE_SOURCE_DIR}/third_party/imgui/backends
+    ${CMAKE_SOURCE_DIR}/third_party/bullet3/src
 )
 
 if (GLFW_NATIVE_INCLUDE_DIR)

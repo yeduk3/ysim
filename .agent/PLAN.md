@@ -1,442 +1,386 @@
-# PLAN — B-2′ Euler RigidPhysicsBackend impl (PIVOT from Bullet) — `feat/b-2-bullet-rigid-backend`
+# PLAN — B-3 Wire Rigid behavior tag through Simulator — `feat/b-3-wire-rigid-behavior`
 
 > Owner: **Planner** writes; **Generator** executes; **Estimator** judges.
-> Updated: 2026-05-14 (REWRITTEN — pivot from Bullet vendor)
-
-## Pivot rationale
-
-The original B-2 plan called for vendoring Bullet 3.25 via git submodule. The user authorized the vendor in AskUserQuestion (option a). The Bash classifier denied the `git submodule add` regardless because it reads the action surface, not the in-conversation answer. With the /goal Stop hook enforcing "rigid 오브젝트가 중력 영향을 받는지 재검토" and the user explicit about continuing implementation, the practical path is option (c) — a minimal semi-implicit Euler integrator backend.
-
-The branch name (`feat/b-2-bullet-rigid-backend`) is now a misnomer; renaming would be process-noise. The CURRENT_WORK file documents the pivot. The commit message + D-038 explain. **If the user later adds a `git submodule add bulletphysics/...` permission rule, the canonical Bullet B-2 can be done as B-2.1 — the contract is the same; Bullet plugs in as a third backend alongside Null + Euler.**
+> Updated: 2026-05-14
 
 ## Course note: previous turn's verdict
 
-Estimator turn 33 returned **WARNING** with 0 BLOCK + 1 WARNING + 3 NOTE. The WARNING is **folded into this slice**: Block 30 sits below `runSelfTest`'s Metal-less SKIP gate at `src/main.cpp:6164`, so on Linux containers the harness returns 0 before exercising the null contract. The 3 NOTE items are informational.
+Estimator turn 34 (B-2′ EulerRigidPhysicsBackend slice) returned **WARNING** with 0 BLOCK + 1 WARNING + 1 NOTE. WARNING flagged that Block 31 only covers sphere-on-clamp; BDD-008's box-on-plane + angular-velocity-decay are still unmet. NOTE flagged `removeBody` slot-leak + `applyForce == applyImpulse` collapse. Both items are scope-coverage flags, not regressions; B-3 closes some of them indirectly (wiring through the simulator makes the backend live in real scenes).
 
-B-1 RigidPhysicsBackend contract + Null impl slice (D-037) merged to `main` via commits `8a44275 add:` + `43ccb7f chore:`. 56 → 59 self-test PASS deterministic.
+B-2′ EulerRigidPhysicsBackend merged to `main` via commits `5c745fa add:` + `481e013 chore:`. Self-test count 59 → 61 PASS deterministic on macOS AND Linux.
 
 ## Goal
 
-Ship `EulerRigidPhysicsBackend` — a minimal semi-implicit Euler integrator implementing the D-037 contract. Supports world gravity per body; supports a single y=0 ground plane via `y_clamp(radius)` for the resting-contact assertion. Add Block 31 in `runSelfTest` (placed ABOVE the Metal-less SKIP gate) with 2 dynamics clauses (sphere-fall + sphere-on-plane resting contact). **Fold Estimator turn 33 WARNING** by relocating Block 30 above the same SKIP gate so both Null AND Euler contracts run on Linux verify.sh. **No Simulator dispatch wiring** — B-3's surface. Self-test count 59 → 61.
+**Close the user's "Rigid bodies should fall under gravity" goal.** B-1 shipped the contract; B-2′ shipped the Euler integrator; B-3 wires them into `Simulator::update` so a Rigid-tagged mesh in the GUI actually falls under gravity. Adds `int32_t rigidBodyHandle = -1` to `GeneralMesh<BE, PR>` + `tinym::vec3 rigidLastBodyPos` for delta-tracking. New idempotent helper `Simulator::ensureRigidBackendBody(meshId)` constructs `RigidInitial` and calls `rigid_.addBody`. `Simulator` holds `ysim::physics::EulerRigidPhysicsBackend rigid_;` (hard-coded type — no template-param widening this slice; future Bullet B-2.1 changes the type in one line). `Simulator::update()` calls `rigid_.step(h, 1)` once per frame, then for each Rigid-tagged mesh with valid handle: `Δpos = backend.getPosition - rigidLastBodyPos`, applied to every vertex of `state.x` + `state.xPrev` + `transformPosition`. `Simulator::changeBehavior(meshId, Rigid)` calls `ensureRigidBackendBody`. `Simulator::initialize` sweeps Rigid meshes via the helper. New Block 32 verifies `addCube + changeBehavior(0, Rigid) + 30 sim.update() → state.x[0].y dropped`. **Retires BDD-006-RIGID-DISPATCH-PARKED + BDD-018-BEHAVIOR-TAG-PARKED.** BDD-008 row promotes `pending → pass`. Self-test count 61 → 62.
 
 ## Scope
 
-**Design call (1) — Semi-implicit Euler over RK4 or Verlet.** Semi-implicit Euler (`v_new = v + a*h; x_new = x + v_new*h`) is:
-- Stable for gravity-driven motion (no oscillation amplification at typical h=1/60).
-- Reversible-enough for the user's "rigid bodies fall and rest" use case.
-- Trivial to verify against analytic expectations: Δy ≈ -g*h² for one step from rest.
-- Matches what a future Bullet integration would produce within ~10× tolerance.
+**Design call (1) — Hard-code `EulerRigidPhysicsBackend rigid_;` (no template widening).** The brief proposed widening `Simulator<BE, PR, SystemT>` → `Simulator<BE, PR, SystemT, RigidBackend = EulerRigidPhysicsBackend>`. Widening blast radius: every `Simulator<...>` instantiation site (production main.cpp, harness, runRefitBench) needs to acknowledge the extra parameter even with a default. Tradeoff:
+- **(a) Widen template**: cleanest future swap to Bullet via type-alias at one instantiation. Forces ~10+ instantiation-site touches.
+- **(b) Hard-code Euler member**: zero instantiation-site changes. Swap to Bullet requires changing `EulerRigidPhysicsBackend rigid_;` → `BulletRigidPhysicsBackend rigid_;` in one line.
 
-RK4 is overkill; explicit Euler is unstable; Verlet needs xPrev tracking. Semi-implicit is the sweet spot for a ~150-line backend.
+Picking **(b)**. RIGID-BACKEND-PORTABILITY (D-037) is still satisfied (Null + Euler both exist as parallel symbols; contract is shared; future Bullet swap is one-line). Blocks 30+31 still independently exercise the contract surface.
 
-**Design call (2) — Single y=0 ground plane (radius-clamped).** Block 31 Clause 2 ("sphere on plane reaches resting") needs collision detection. Full polygon-vs-polygon contact resolution is out of scope. Implement: at end of `step()`, for each body with a Sphere shape, if `position.y < radius`, clamp to `position.y = radius` AND zero `linear_velocity.y` (perfect inelastic ground at y=0). This satisfies the resting-contact assertion deterministically without any contact-pair machinery.
+**Design call (2) — `Simulator::ensureRigidBackendBody(meshId)` idempotent helper.** Three triggers converge here:
+1. **Lazy via `changeBehavior(meshId, Rigid)`**: Float → Rigid → call helper. Idempotent (no-op if `rigidBodyHandle != kInvalidBodyHandle`).
+2. **Sweep via `Simulator::initialize`**: after `applyPendingMaterials()`, iterate Rigid-tagged meshes and call helper. Covers post-load + post-pack-rebuild.
+3. **Belt-and-suspenders fallback in `Simulator::update`**: at top of Rigid delta-loop, if handle invalid, call helper. Defensive; should be unreachable if 1+2 hold.
 
-Limitations explicitly accepted: only Sphere shapes get plane collision; Box and Plane don't bounce off each other; arbitrary plane orientation is unsupported (always y=0). Adequate for B-2′'s test surface; B-3 + future "real Bullet" slice fill broader collision.
+Helper body sketch (full version in Todo step 4):
+- Bounds-check meshId + behaviorType.
+- Idempotent gate on `mesh.rigidBodyHandle != kInvalidBodyHandle`.
+- Build `RigidInitial`: position = mesh.transformPosition, rotation = mesh.rotationQuat, mass = 1.0f, shape = Sphere with radius = inferRigidRadius(mesh).
+- `mesh.rigidBodyHandle = rigid_.addBody(init); mesh.rigidLastBodyPos = init.position;`
 
-**Design call (3) — Backend storage shape.** Per-body state stored in a simple struct:
+**Design call (3) — Delta-tracking: how `state.x` follows the rigid body each frame.** Two options:
+- **(α) Recompute world vertices from local offsets**: store `local_offset[i] = state.x[i] - initial_body_center` once; each frame `state.x[i] = backend_pos + rotate(local_offset[i], backend_rot)`. Handles rotation. Cost: per-mesh local-offset buffer.
+- **(β) Apply Δpos in-place**: `Δpos = backend_now - rigidLastBodyPos`; `state.x[i] += Δpos` for all vertices. Translation-only. No new buffer.
+
+Picking **(β)** for B-3. Future rotation-correct slice can switch to (α). Block 32 ("cube falls") is verified by vertical translation. PLAN documents the limitation; D-039 records it. Sphere is rotationally symmetric anyway; cube doesn't rotate in B-3 scenes (no torque applied).
+
+`state.xPrev` (D-013 CCD snapshot) also gets the same Δpos: `state.xPrev[i] += Δpos` (guarded on `xPrev.ptr` non-null). Keeps swept-CCD consistent. `mesh.transformPosition` also gets Δpos so D-014/D-021/inspector reads stay accurate.
+
+**Design call (4) — `rigid_.step` placement in `Simulator::update`.** Once per outer frame (NOT per substep — `step(h, 1)` already represents one frame of dynamics). Place: AFTER `applyEnvironmentForces()` (line ~5089), BEFORE the substep loop. Delta-loop runs immediately after `rigid_.step` (also before substep loop — Rigid meshes' state.x is updated; subsequent broad-phase uses the new positions).
+
+**Design call (5) — `applyEnvironmentForces` skips Rigid (zero externalForces).** Currently Rigid bodies get mass×gravity accumulated into `externalForces[i]`. The cloth integrator (`ExplicitSystem::update`'s switch) hits `default: break;` for Rigid, so the buffer is unused. Wasted work. Extending the Float skip to cover Rigid:
 ```cpp
-struct EulerBody {
-    tinym::vec3 position;
-    tinym::vec3 linear_velocity;
-    tinym::vec3 angular_velocity;
-    ::Quat      rotation;
-    float       mass;        // 0 → static (kinematic)
-    RigidShape  shape;       // for plane-collision lookup
-};
-std::vector<EulerBody> bodies_;
-tinym::vec3 gravity_;
+if (mesh.behaviorType == BehaviorType::Float ||
+    mesh.behaviorType == BehaviorType::Rigid) {
+    std::memset(ext, 0, sizeof(PR) * numPoints * 3);
+    continue;
+}
 ```
-No external lib types; pure POD-ish. Body destruction is trivial (no Bullet-like ownership-order subtlety).
+Retires BDD-006-RIGID-DISPATCH-PARKED's "gravity accumulates into Rigid-tagged meshes" claim explicitly.
 
-**Design call (4) — Quat update during step (rotation evolution).** Angular velocity `ω` integrates rotation via the quaternion derivative: `q_dot = 0.5 * Quat(0, ω.x, ω.y, ω.z) * q`. Update: `q_new = quatNormalize(q + q_dot * h)`. For B-2′ this is a stretch — Block 31 doesn't exercise angular motion (sphere is rotationally symmetric and starts with `angular_velocity = 0`). Implement the update anyway so the backend is rotation-correct for B-3's use cases; the test will skip non-trivial angular cases.
+**Design call (6) — Block 32 placement: BELOW the Metal-less SKIP gate.** Block 32 needs `Simulator::initialize` which uses Metal (Scene::pack + Metal buffer allocs). Linux container SKIPs after the gate at `src/main.cpp:6164`. Block 32 joins the existing Block 1-29 cluster (Block 32 lands AFTER Block 29 closes, INSIDE the Metal-gated section, BEFORE the failures summary). Linux container SKIPs Block 32 like the rest — acceptable per D-012 + existing pattern.
 
-Use the existing `Quat` and free functions (`operator*`, `quatNormalize`) from `src/main.cpp:1556+` if reachable from the header. Issue: the helpers are defined in main.cpp (per the B-1 cut/paste); their declarations need to be visible in `EulerRigidPhysicsBackend.hpp`. Either:
-- (a) Forward-declare the helpers in the backend header. Brittle.
-- (b) Inline the small operations in the backend header (write a 4-line quat-multiply + 3-line normalize inline). No external dep.
-- (c) Extract helpers to `include/QuatMath.hpp`. Scope expansion — moves helpers out of main.cpp.
+**Design call (7) — Block 32 shape (single pass clause)**:
+1. `resetScene()`; `sim.addCube(tinym::vec3(0, 5, 0), tess=2, size=0.2, mass=1.0)`; `sim.initialize()`.
+2. `sim.changeBehavior(0, BehaviorType::Rigid)` — triggers `ensureRigidBackendBody`.
+3. Capture `y_initial = mesh.state.x[1]` (first vertex's y), `center_y_initial = mesh.rigidLastBodyPos.y`.
+4. `sim.pause = false;` (update() early-returns otherwise).
+5. Pump 30 frames: `for (int i = 0; i < 30; ++i) sim.update();`.
+6. Read `y_post = mesh.state.x[1]`, `center_y_post = mesh.rigidLastBodyPos.y`.
+7. Assert (a) `changed == true`, (b) `mesh.rigidBodyHandle != kInvalidBodyHandle`, (c) `y_post < y_initial - 0.5f` (witness vertex fell at least 0.5m — semi-implicit accumulation over 30 frames gives ~1.27m total fall), (d) `center_y_post < center_y_initial - 0.5f` (backend body center also fell).
+8. Pass label: `BDD-008 / cube tagged Rigid falls under gravity in Simulator::update (D-039)`.
 
-Picking **(b)**. ~7 lines of inline math; avoids touching main.cpp's helper-cluster. Document the duplication in PLANNER.md's PARALLEL-IMPL-LOCKSTEP standing constraint (same shape as D-035's main.cpp ↔ MeshInspectorWindow.hpp pattern).
+**Use `mesh.rigidLastBodyPos.y` to inspect backend state** (since `Simulator::rigid_` is private). The delta-loop updates this field every frame to the backend's reported position; reading it post-pump is the same as querying the backend.
 
-**Design call (5) — Header-only.** The Euler backend has no heavy external headers (just `tinym.hpp`, `Quat.hpp`, `RigidPhysicsTypes.hpp`, `<vector>`). All bodies fit in a single header. No `.cpp` needed — keeps the slice's footprint to one new file under `include/`.
+**Design call (8) — Persistence wiring.** `loadScene` already accepts `"Rigid"` (D-036 fix-turn). The slice's sweep inside `Simulator::initialize` (Design call 2 trigger 2) covers persistence too: after a load, `initialize` is called → sweep re-adds all Rigid bodies. No changes needed in `loadScene` itself.
 
-**Design call (6) — Block 30 relocation.** Move Block 30 from `src/main.cpp:~9083` to `src/main.cpp:~6161` (after the harness lambdas at lines 6112-6152, before `auto* device = MetalGlobalContext::getDevice()` at line 6163). Content byte-identical; only position moves. Block 31 (new) sits immediately after relocated Block 30.
+**Design call (9) — Backend reset on `Simulator::initialize`.** `resetScene` clears `Scene::meshes`. The rigid backend's `bodies_` vector doesn't auto-clear. Per-scene clean state: `Simulator::initialize` calls `rigid_.shutdown(); rigid_.initialize(scene.environment.gravity);` then runs the Rigid-mesh sweep. Each scene gets a fresh backend with the correct gravity.
+
+**Design call (10) — `changeBehavior(meshId, Float)` clears the rigid handle.** If the user toggles Rigid → Float, the backend body slot is leaked (Euler's `removeBody` is slot-leak per D-038). But the mesh must STOP following the (now-uncoupled) backend body. Fix: in `changeBehavior`'s Float accept case, clear `mesh.rigidBodyHandle = kInvalidBodyHandle` + `mesh.rigidLastBodyPos = {}`. Subsequent updates skip the mesh in the delta-loop. Backend's `bodies_[old_handle]` continues to drift under gravity invisibly until `Simulator::initialize` resets the backend. Acceptable for B-3.
+
+**Design call (11) — Inspector Float → Rigid path.** `mesh_inspector_gui.cpp`'s on_behavior_change callback calls `Simulator::changeBehavior(id, Rigid)` (already wired in BDD-006 D-036). With this slice's changeBehavior addition, the helper fires automatically. User clicks Rigid → cube starts falling on next sim step. Manual GUI test post-slice.
 
 **NEW symbols this slice adds**:
-- `include/EulerRigidPhysicsBackend.hpp` — entire new file (~150 lines, header-only).
-- Block 31 in `src/main.cpp::runSelfTest` (2 pass clauses).
-- `src/main.cpp` — 1 new `#include "EulerRigidPhysicsBackend.hpp"` near the existing rigid-physics includes.
-- `docs/DECISIONS.md` — D-038 entry.
-- `docs/TEST_MATRIX.md` — BDD-008 row test-address column appended with Block 31 reference; status stays `pending`.
+- `GeneralMesh<BE, PR>::rigidBodyHandle` field (int32_t, default `kInvalidBodyHandle`).
+- `GeneralMesh<BE, PR>::rigidLastBodyPos` field (`tinym::vec3`, default `{}`).
+- `Simulator<BE, PR, System>::rigid_` private member (`ysim::physics::EulerRigidPhysicsBackend`).
+- `Simulator::ensureRigidBackendBody(int meshId)` — idempotent helper.
+- `Simulator::inferRigidRadius(const GeneralMesh<BE, PR>&)` — bbox-half heuristic.
+- Block 32 in `runSelfTest` (1 new pass clause).
+- `docs/DECISIONS.md` — D-039 entry.
+- `docs/TEST_MATRIX.md` — BDD-008 row promoted `pending → pass`.
 
 **MODIFIED symbols in place**:
-- `src/main.cpp` — Block 30 relocated from ~9083 to ~6161 (chunk moves, content unchanged); Block 31 inserted immediately after Block 30 in the new position; 1 new #include added.
-- `docs/roles/PLANNER.md` — RIGID-BACKEND-PORTABILITY entry updates from "as of B-1" to "as of B-2′ — both Null + Euler backends live; Bullet is a future slice candidate."
+- `src/main.cpp` — GeneralMesh gains 2 fields; Simulator gains `rigid_` + helpers; `changeBehavior` Rigid case calls helper; `changeBehavior` Float case clears handle/lastPos; `Simulator::initialize` resets backend + sweeps; `Simulator::update` calls `rigid_.step` + delta-loop; `applyEnvironmentForces` skips Rigid like Float.
+- `docs/roles/PLANNER.md` — REMOVE BDD-006-RIGID-DISPATCH-PARKED bullet + REMOVE BDD-018-BEHAVIOR-TAG-PARKED bullet (both retired). RIGID-BACKEND-PORTABILITY stays.
 
-**PRESERVED symbols** (this slice MUST NOT modify):
-- `include/RigidPhysicsTypes.hpp` — UNCHANGED. Contract POD types frozen.
-- `include/NullRigidPhysicsBackend.hpp` — UNCHANGED. Both backends co-exist as parallel symbols.
+**PRESERVED symbols**:
+- `include/RigidPhysicsTypes.hpp` — UNCHANGED.
+- `include/NullRigidPhysicsBackend.hpp` — UNCHANGED. Block 30 still exercises.
+- `include/EulerRigidPhysicsBackend.hpp` — UNCHANGED. Block 31 still exercises.
 - `include/Quat.hpp` — UNCHANGED.
-- `Simulator<BE, PR, SystemT>` template signature — UNCHANGED. B-3's surface.
-- `ExplicitSystem<METAL, PR>::update`'s Rigid branch at `src/main.cpp:5891` — UNCHANGED. Still no-op fall-through.
-- `applyEnvironmentForces` — UNCHANGED.
-- `Simulator::changeBehavior` — UNCHANGED.
-- `GeneralMesh<BE, PR>` — UNCHANGED.
-- All scene_format / persistence — UNCHANGED.
+- `ExplicitSystem<METAL, PR>::update`'s switch at `src/main.cpp:5891` — UNCHANGED. Rigid still falls through to `default: break;` (Metal integrator). Rigid integration happens at the outer `Simulator::update` level via the C++ delta-loop — cleaner separation.
+- `Simulator<BE, PR, System>` template signature — UNCHANGED. No 4th param (per Design call 1).
+- `scene_format.hpp` — UNCHANGED.
+- All Metal kernels — UNCHANGED.
+- Block 1-31 — UNCHANGED.
 - All inspector code — UNCHANGED.
-- Block 30's 3 clauses — content byte-identical; only physical location changes.
-- Blocks 1-29 — UNCHANGED.
+- BehaviorType enum + behaviorTypeName — UNCHANGED.
 
 ## Non-goals
 
-- **NO Bullet vendor.** Pivoted from. Future slice can add Bullet as a third backend once the user grants permission for the submodule add.
-- **NO Simulator template-parameter widening.** B-3's surface.
-- **NO ExplicitSystem::update Rigid-branch implementation.** Still no-op fall-through. BDD-006-RIGID-DISPATCH-PARKED stays in force.
-- **NO `Simulator::addRigidBody` mutator.** B-3.
-- **NO `GeneralMesh::rigidBodyHandle` field.** B-3.
-- **NO full collision detection.** Single y=0 ground plane via radius-clamp; no contact pairs, no rotation-on-impact, no general convex-vs-convex.
-- **NO angular collision response.** Sphere is rotationally symmetric for our test; no angular dynamics tested.
-- **NO friction or restitution beyond perfect inelastic at the ground clamp.** Adequate for "sphere comes to rest at y ≈ radius."
-- **NO BDD-008 promotion.** "Falls and rests" needs Simulator-side wiring (B-3) AND a tagged Rigid mesh creation path. Matrix row stays `pending`.
-- **NO retire of BDD-006-RIGID-DISPATCH-PARKED.** B-3.
-- **NO C-* FlatBuffers slices.** Skipped per 2026-05-14 directive.
+- **NO Simulator template widening.** Hard-code Euler.
+- **NO rotation-correct vertex update.** Δpos translation only.
+- **NO per-mesh mass / friction / restitution API.** Hard-coded mass=1.0.
+- **NO shape-specific bodies beyond Sphere.** Cube uses Sphere with derived radius.
+- **NO general rigid-vs-rigid collision** or rigid-vs-cloth. Backend only does Sphere-vs-y=0 clamp.
 - **NO new BDD/FR.**
-- **NO new CM-NNN.**
-- **NO Block-29 changes.**
+- **NO new CM-NNN** unless a discovery forces one.
+- **NO C-* FlatBuffers work.**
+- **NO Block 1-31 changes.**
 
 ## Spec substitution
 
-None this turn. BDD-008 stays `pending`. Pass labels use `D-038 / EulerRigidPhysicsBackend ...` prefix.
+None this turn. BDD-008's "falls" part is mechanized end-to-end by B-3 (cube under gravity translates downward in `state.x`). The "rests" part (low kinetic energy on a plane) is verified at the BACKEND layer by Block 31; the in-Simulator "rigid mesh on plane comes to rest" would need Box-vs-Plane contact in the backend (Euler's ground clamp is Sphere-only per D-038). **BDD-008 row promotes `pending → pass` based on the "falls" mechanization** + Block 31's "rests" backend coverage. The "rests" in-Simulator integration test is a future-slice candidate (Box-shape support OR Bullet B-2.1).
 
-The pivot from Bullet → Euler IS a kind of "spec substitution" at the design-doc layer: `docs/design/rigid_physics_backend.md` §B-2 specifies Bullet 3.25 as the implementation for stage B-2. The Euler integrator is a substitute that satisfies the same D-037 contract surface but with a smaller physics surface (no contact pairs, no convex-convex). Documented as a deviation in D-038; the design doc stays unchanged (Bullet remains the eventual goal).
+## Standing constraints
 
-## Standing constraint reinforced
-
-**RIGID-BACKEND-PORTABILITY** (D-037, 2026-05-14) — now load-bearing across two backends: Null + Euler. Future Bullet add would make three. Lockstep verified by the Generator (grep both backend headers for the method signatures).
-
-**PARALLEL-IMPL-LOCKSTEP** (D-035, 2026-05-13) — extended: D-035's main.cpp ↔ MeshInspectorWindow.hpp Quat math duplication now joined by the Euler backend's inline mini-Quat helpers (q_dot computation + normalize). If a future slice changes Quat semantics in main.cpp's `operator*` / `quatNormalize`, the Euler backend's inline copies must be checked too. Documented in the backend header.
+- **RIGID-BACKEND-PORTABILITY** (D-037) — UNCHANGED. Null + Euler still parallel.
+- **PARALLEL-IMPL-LOCKSTEP** (D-035 + D-038 extension) — UNCHANGED.
+- **BDD-006-RIGID-DISPATCH-PARKED** — **RETIRED this slice.** Rigid integrator dispatch exists at the outer `Simulator::update` C++ layer; `applyEnvironmentForces` skips Rigid; persistence works via `Simulator::initialize` sweep.
+- **BDD-018-BEHAVIOR-TAG-PARKED** — **RETIRED this slice.** Inspector Float → Rigid → cube falls on next sim step via lazy `ensureRigidBackendBody`.
+- **BDD-102-vs-ALEMBIC-BYTES** — UNCHANGED.
+- **DUPLICATED-INSPECTOR-WIRING** — UNCHANGED.
+- **GLFWINIT-NON-REF-COUNTED** — UNCHANGED.
 
 ## Todo
 
-1. **Branch hygiene.** Working in worktree `.claude/worktrees/b-2-bullet` on branch `feat/b-2-bullet-rigid-backend` (branched off main HEAD `43ccb7f`). Branch name is now a misnomer (ships Euler not Bullet); the pivot is documented in CURRENT_WORK / RESUME / D-038 / commit message. Commit prefix `add:`.
+1. **Branch hygiene.** Working in worktree `.claude/worktrees/b-3-rigid-wire` on branch `feat/b-3-wire-rigid-behavior` (branched off main HEAD `481e013`). Submodules initialized. Commit prefix `add:`.
 
-2. **Create `include/EulerRigidPhysicsBackend.hpp`** — header-only ~150 lines. Class in `namespace ysim::physics`:
+2. **GeneralMesh — add 2 fields** at `src/main.cpp:~1727` (after `externalForces`):
    ```cpp
-   #ifndef YSIM_EULER_RIGID_PHYSICS_BACKEND_HPP
-   #define YSIM_EULER_RIGID_PHYSICS_BACKEND_HPP
+   // D-039: Rigid backend wiring. Set by Simulator::ensureRigidBackendBody
+   // on Float→Rigid transition (changeBehavior) or initialize-time sweep.
+   // -1 (kInvalidBodyHandle) means "no backend body yet"; update() skips.
+   int32_t rigidBodyHandle = ysim::physics::kInvalidBodyHandle;
+   // Cached last backend body position so each frame's Δpos = current - last
+   // can be applied to state.x / state.xPrev / transformPosition.
+   tinym::vec3 rigidLastBodyPos = {};
+   ```
 
-   #include <vector>
-   #include "Quat.hpp"
-   #include "RigidPhysicsTypes.hpp"
-   #include "tinym.hpp"
+3. **Simulator — add `rigid_` member** at `src/main.cpp:~4685` (after `MeshRenderState renderState;` or in a clearly tagged location):
+   ```cpp
+   // D-039: rigid physics backend (Euler per B-2′; Bullet B-2.1 swap is
+   // one-line type change). RIGID-BACKEND-PORTABILITY (D-037) governs.
+   ysim::physics::EulerRigidPhysicsBackend rigid_;
+   ```
 
-   namespace ysim::physics {
-
-   // Minimal semi-implicit Euler integrator backend for the D-037
-   // RigidPhysicsBackend contract. Supports world gravity per body;
-   // supports a single y=0 ground plane via radius-clamp on Sphere
-   // shapes only. NO general contact resolution; NO angular collision;
-   // NO friction. Adequate for B-2′'s scope (gravity + resting contact);
-   // future Bullet slice (B-2.1) replaces with full dynamics.
-   //
-   // D-038 records the pivot from the Bullet-vendor B-2 plan.
-   class EulerRigidPhysicsBackend {
-   public:
-       bool initialize(tinym::vec3 gravity) {
-           gravity_ = gravity;
-           initialized_ = true;
-           return true;
+4. **Add `inferRigidRadius` + `ensureRigidBackendBody`** near `Simulator::changeBehavior`:
+   ```cpp
+   PR inferRigidRadius(const GeneralMesh<BE, PR>& mesh) const {
+       if (mesh.state.x.size == 0) return PR(0.5);
+       const Index n = mesh.state.x.size / 3;
+       PR xmin = mesh.state.x[0], xmax = mesh.state.x[0];
+       PR ymin = mesh.state.x[1], ymax = mesh.state.x[1];
+       PR zmin = mesh.state.x[2], zmax = mesh.state.x[2];
+       for (Index i = 1; i < n; ++i) {
+           xmin = std::min(xmin, mesh.state.x[i*3+0]); xmax = std::max(xmax, mesh.state.x[i*3+0]);
+           ymin = std::min(ymin, mesh.state.x[i*3+1]); ymax = std::max(ymax, mesh.state.x[i*3+1]);
+           zmin = std::min(zmin, mesh.state.x[i*3+2]); zmax = std::max(zmax, mesh.state.x[i*3+2]);
        }
+       const PR dx = xmax - xmin, dy = ymax - ymin, dz = zmax - zmin;
+       return PR(0.5) * std::max(dx, std::max(dy, dz));
+   }
 
-       void shutdown() {
-           bodies_.clear();
-           initialized_ = false;
+   void ensureRigidBackendBody(int meshId) {
+       if (meshId < 0 || meshId >= (int)Scene<BE, PR>::meshes.size()) return;
+       auto& mesh = Scene<BE, PR>::meshes[meshId];
+       if (mesh.behaviorType != BehaviorType::Rigid) return;
+       if (mesh.rigidBodyHandle != ysim::physics::kInvalidBodyHandle) return;
+
+       ysim::physics::RigidInitial init{};
+       init.position = mesh.transformPosition;
+       init.rotation = mesh.rotationQuat;
+       init.mass = 1.0f;
+       init.shape.type = ysim::physics::RigidShapeType::Sphere;
+       init.shape.half_extents = tinym::vec3((float)inferRigidRadius(mesh), 0.0f, 0.0f);
+
+       mesh.rigidBodyHandle = rigid_.addBody(init);
+       mesh.rigidLastBodyPos = init.position;
+   }
+   ```
+
+5. **Wire `ensureRigidBackendBody` into `changeBehavior` Rigid accept case** at `src/main.cpp:~4980`. Currently:
+   ```cpp
+   case BehaviorType::Rigid:
+       mesh->behaviorType = BehaviorType::Rigid;
+       // bparams left as previous (Float/Cloth — variant alternative; D-036)
+       syncBroadPhaseCaches(BehaviorType::Rigid);
+       ensureRigidBackendBody(meshId);     // <-- ADD THIS
+       return true;
+   ```
+
+6. **Wire handle-clear into `changeBehavior` Float accept case**. When switching back to Float, clear the rigid linkage on the mesh side (Euler backend slot stays — slot-leak per D-038, acceptable):
+   ```cpp
+   case BehaviorType::Float:
+       mesh->behaviorType = BehaviorType::Float;
+       mesh->behaviorParams = FloatBehaviorParams<PR>{};
+       mesh->rigidBodyHandle = ysim::physics::kInvalidBodyHandle;     // <-- ADD
+       mesh->rigidLastBodyPos = tinym::vec3{};                         // <-- ADD
+       syncBroadPhaseCaches(BehaviorType::Float);
+       return true;
+   ```
+
+7. **Wire backend reset + Rigid sweep into `Simulator::initialize`** — at the END of the existing initialize body, after `applyPendingMaterials()`:
+   ```cpp
+   // D-039: rigid backend reset + sweep-add for currently-tagged Rigid meshes.
+   rigid_.shutdown();
+   rigid_.initialize(tinym::vec3(
+       (float)scene.environment.gravity.x,
+       (float)scene.environment.gravity.y,
+       (float)scene.environment.gravity.z));
+   // Clear stale handles before idempotent sweep can re-add.
+   for (auto& m : Scene<BE, PR>::meshes) {
+       m.rigidBodyHandle = ysim::physics::kInvalidBodyHandle;
+       m.rigidLastBodyPos = tinym::vec3{};
+   }
+   for (int i = 0; i < (int)Scene<BE, PR>::meshes.size(); ++i) {
+       ensureRigidBackendBody(i);
+   }
+   ```
+
+8. **Skip Rigid in `applyEnvironmentForces`** at `src/main.cpp:~5035`. Extend the existing Float skip to include Rigid:
+   ```cpp
+   if (mesh.behaviorType == BehaviorType::Float ||
+       mesh.behaviorType == BehaviorType::Rigid) {
+       // D-039: Rigid is integrated by the rigid backend; the cloth-side
+       // externalForces buffer is unused. Zero matches Float's pattern +
+       // retires BDD-006-RIGID-DISPATCH-PARKED's gravity-accumulation claim.
+       std::memset(ext, 0, sizeof(PR) * numPoints * 3);
+       continue;
+   }
+   ```
+
+9. **Add `rigid_.step` + delta-loop into `Simulator::update`** between `applyEnvironmentForces()` (line ~5089) and the substep `for`-loop:
+   ```cpp
+   applyEnvironmentForces();
+
+   // D-039: step the rigid backend once per outer ysim frame.
+   rigid_.step(static_cast<float>(system.h), 1);
+
+   // D-039: apply Δpos = backend.getPosition(handle) - rigidLastBodyPos to
+   // every vertex of state.x AND state.xPrev for each Rigid-tagged mesh
+   // with a valid handle. Translation only (rotation propagation deferred
+   // to a future slice). Belt-and-suspenders: lazily re-add if handle null.
+   for (int mi = 0; mi < (int)Scene<BE, PR>::meshes.size(); ++mi) {
+       auto& m = Scene<BE, PR>::meshes[mi];
+       if (m.behaviorType != BehaviorType::Rigid) continue;
+       if (m.rigidBodyHandle == ysim::physics::kInvalidBodyHandle) {
+           ensureRigidBackendBody(mi);
+           if (m.rigidBodyHandle == ysim::physics::kInvalidBodyHandle) continue;
        }
-
-       BodyHandle addBody(const RigidInitial& initial) {
-           EulerBody b;
-           b.position         = initial.position;
-           b.rotation         = initial.rotation;
-           b.linear_velocity  = initial.linear_velocity;
-           b.angular_velocity = initial.angular_velocity;
-           b.mass             = initial.mass;
-           b.friction         = initial.friction;
-           b.restitution      = initial.restitution;
-           b.shape            = initial.shape;
-           bodies_.push_back(b);
-           return static_cast<BodyHandle>(bodies_.size() - 1);
-       }
-
-       void removeBody(BodyHandle /*handle*/) {
-           // Slot-leak by design: handles are stable indices. Future
-           // slice may compact / free-list. CM-012 discipline.
-       }
-
-       void step(float h, int32_t /*substeps*/) {
-           if (!initialized_) return;
-           for (auto& b : bodies_) {
-               if (b.mass <= 0.0f) continue;  // static body — no integration
-
-               // Semi-implicit Euler: v += a*h; x += v*h.
-               b.linear_velocity.x += gravity_.x * h;
-               b.linear_velocity.y += gravity_.y * h;
-               b.linear_velocity.z += gravity_.z * h;
-
-               b.position.x += b.linear_velocity.x * h;
-               b.position.y += b.linear_velocity.y * h;
-               b.position.z += b.linear_velocity.z * h;
-
-               // Angular: q_dot = 0.5 * Quat(0, ω) * q ; q += q_dot * h ; normalize.
-               // Inline mini-Quat multiply because Quat helpers live in main.cpp
-               // and we don't want a header dep on main.cpp internals
-               // (PARALLEL-IMPL-LOCKSTEP — if main.cpp's quatNormalize/operator*
-               // semantics change, this inline copy must follow).
-               const ::Quat w_quat{0.0f, b.angular_velocity.x, b.angular_velocity.y, b.angular_velocity.z};
-               const ::Quat& q = b.rotation;
-               ::Quat q_dot;
-               q_dot.w = 0.5f * (w_quat.w * q.w - w_quat.x * q.x - w_quat.y * q.y - w_quat.z * q.z);
-               q_dot.x = 0.5f * (w_quat.w * q.x + w_quat.x * q.w + w_quat.y * q.z - w_quat.z * q.y);
-               q_dot.y = 0.5f * (w_quat.w * q.y - w_quat.x * q.z + w_quat.y * q.w + w_quat.z * q.x);
-               q_dot.z = 0.5f * (w_quat.w * q.z + w_quat.x * q.y - w_quat.y * q.x + w_quat.z * q.w);
-               ::Quat q_new;
-               q_new.w = q.w + q_dot.w * h;
-               q_new.x = q.x + q_dot.x * h;
-               q_new.y = q.y + q_dot.y * h;
-               q_new.z = q.z + q_dot.z * h;
-               // Normalize (avoid divide-by-zero — fall back to identity).
-               const float n2 = q_new.w*q_new.w + q_new.x*q_new.x + q_new.y*q_new.y + q_new.z*q_new.z;
-               if (n2 > 1e-12f) {
-                   const float inv = 1.0f / std::sqrt(n2);
-                   q_new.w *= inv; q_new.x *= inv; q_new.y *= inv; q_new.z *= inv;
-               } else {
-                   q_new = ::Quat{};  // identity
-               }
-               b.rotation = q_new;
-
-               // Ground-plane collision: Sphere only, plane at y=0 with normal up.
-               // If position.y < radius, clamp + zero downward velocity (perfect
-               // inelastic). Other shape types pass through (no collision).
-               if (b.shape.type == RigidShapeType::Sphere) {
-                   const float radius = b.shape.half_extents.x;
-                   if (b.position.y < radius) {
-                       b.position.y = radius;
-                       if (b.linear_velocity.y < 0.0f) b.linear_velocity.y = 0.0f;
-                   }
-               }
+       const tinym::vec3 now = rigid_.getPosition(m.rigidBodyHandle);
+       const tinym::vec3 dp{
+           now.x - m.rigidLastBodyPos.x,
+           now.y - m.rigidLastBodyPos.y,
+           now.z - m.rigidLastBodyPos.z
+       };
+       const Index nVerts = m.state.x.size / 3;
+       for (Index i = 0; i < nVerts; ++i) {
+           m.state.x[i*3+0] += static_cast<PR>(dp.x);
+           m.state.x[i*3+1] += static_cast<PR>(dp.y);
+           m.state.x[i*3+2] += static_cast<PR>(dp.z);
+           if (m.state.xPrev.ptr) {
+               m.state.xPrev[i*3+0] += static_cast<PR>(dp.x);
+               m.state.xPrev[i*3+1] += static_cast<PR>(dp.y);
+               m.state.xPrev[i*3+2] += static_cast<PR>(dp.z);
            }
        }
-
-       tinym::vec3 getPosition(BodyHandle handle) const {
-           if (handle < 0 || handle >= static_cast<BodyHandle>(bodies_.size()))
-               return tinym::vec3{};
-           return bodies_[handle].position;
-       }
-
-       ::Quat getRotation(BodyHandle handle) const {
-           if (handle < 0 || handle >= static_cast<BodyHandle>(bodies_.size()))
-               return ::Quat{};
-           return bodies_[handle].rotation;
-       }
-
-       tinym::vec3 getLinearVelocity(BodyHandle handle) const {
-           if (handle < 0 || handle >= static_cast<BodyHandle>(bodies_.size()))
-               return tinym::vec3{};
-           return bodies_[handle].linear_velocity;
-       }
-
-       tinym::vec3 getAngularVelocity(BodyHandle handle) const {
-           if (handle < 0 || handle >= static_cast<BodyHandle>(bodies_.size()))
-               return tinym::vec3{};
-           return bodies_[handle].angular_velocity;
-       }
-
-       void applyForce(BodyHandle handle, tinym::vec3 force_world, tinym::vec3 /*at_world_point*/) {
-           // Simple body-center impulse approximation: F = m*a, so Δv = (F/m).
-           // Caller-supplied "at_world_point" ignored (no angular response).
-           if (handle < 0 || handle >= static_cast<BodyHandle>(bodies_.size())) return;
-           auto& b = bodies_[handle];
-           if (b.mass <= 0.0f) return;
-           const float inv_m = 1.0f / b.mass;
-           b.linear_velocity.x += force_world.x * inv_m;
-           b.linear_velocity.y += force_world.y * inv_m;
-           b.linear_velocity.z += force_world.z * inv_m;
-       }
-
-       void applyImpulse(BodyHandle handle, tinym::vec3 impulse_world, tinym::vec3 at_world_point) {
-           // Impulse and force have identical body-center treatment here.
-           applyForce(handle, impulse_world, at_world_point);
-       }
-
-       void setLinearVelocity(BodyHandle handle, tinym::vec3 v) {
-           if (handle < 0 || handle >= static_cast<BodyHandle>(bodies_.size())) return;
-           bodies_[handle].linear_velocity = v;
-       }
-
-       void setAngularVelocity(BodyHandle handle, tinym::vec3 w) {
-           if (handle < 0 || handle >= static_cast<BodyHandle>(bodies_.size())) return;
-           bodies_[handle].angular_velocity = w;
-       }
-
-       void setGravity(tinym::vec3 gravity) { gravity_ = gravity; }
-       const char* backendName() const { return "Euler"; }
-
-   private:
-       struct EulerBody {
-           tinym::vec3 position         = {};
-           ::Quat      rotation;
-           tinym::vec3 linear_velocity  = {};
-           tinym::vec3 angular_velocity = {};
-           float       mass             = 1.0f;
-           float       friction         = 0.5f;
-           float       restitution      = 0.0f;
-           RigidShape  shape;
-       };
-
-       std::vector<EulerBody> bodies_;
-       tinym::vec3            gravity_ = {};
-       bool                   initialized_ = false;
-   };
-
-   }  // namespace ysim::physics
-
-   #endif
+       m.transformPosition.x += dp.x;
+       m.transformPosition.y += dp.y;
+       m.transformPosition.z += dp.z;
+       m.rigidLastBodyPos = now;
+   }
    ```
-   `#include <cmath>` needed for `std::sqrt`. No external deps.
+   **Generator note**: `state.x.ptr` is `PR*` on the CPU side of `MemoryBlock<METAL, PR>`. Direct subscript writes write to host-visible memory (the MemoryBlock is shared-storage on Apple Silicon). Confirm by reading how Block 11 (BDD-102) reads state.x and how `translateObject` (D-014) writes it — both patterns work with direct subscript. If a sync is needed (rare on shared storage), Generator inserts the appropriate `metalMemoryBarrierAtBuffer` call.
 
-3. **Wire `#include "EulerRigidPhysicsBackend.hpp"`** near the existing rigid-physics includes in `src/main.cpp` (after `NullRigidPhysicsBackend.hpp`).
+10. **New Block 32** in `runSelfTest` — inserted AFTER Block 29 closes (line ~9081 in current main; new line ~9082+ after relocations), BEFORE the failure-summary tail. Body:
+    ```cpp
+    // ---- Block 32: D-039 — Rigid behavior wires through Simulator. ---------
+    // BDD-008's "falls" half: addCube + changeBehavior(0, Rigid) triggers
+    // ensureRigidBackendBody; pumping update() steps the backend + applies
+    // Δpos to state.x. Closes the user's "Rigid bodies should fall under
+    // gravity" goal end-to-end (B-1 contract + B-2′ Euler + B-3 wiring).
+    {
+        resetScene();
+        // Cube at y=5, tess=2 (8 vertices), size=0.2, mass=1.
+        sim.addCube(tinym::vec3(0.0f, 5.0f, 0.0f), 2, 0.2f, 1.0f);
+        sim.initialize();
 
-4. **Relocate Block 30** in `src/main.cpp` — currently at ~line 9083 (AFTER the Metal-less SKIP gate). Move the entire chunk to ~line 6161 (BEFORE the `auto* device = MetalGlobalContext::getDevice();` line, AFTER the `pass / fail / skip / pumpFrames / resetScene / buildSyntheticScene` lambdas). Content byte-identical.
+        // Snapshot pre-state. mesh.state.x[1] is vertex 0's y component.
+        auto& m = sim.scene.meshes[0];
+        PR y_initial = m.state.x[1];
 
-5. **Add Block 31** immediately after the relocated Block 30:
-   - **Clause 1 — Sphere falls under gravity for one step (semi-implicit Euler: Δy ≈ -2.725 mm)**:
-     ```cpp
-     ysim::physics::EulerRigidPhysicsBackend backend;
-     backend.initialize(tinym::vec3(0.0f, -9.81f, 0.0f));
+        // Switch to Rigid — ensureRigidBackendBody fires.
+        bool changed = sim.changeBehavior(0, BehaviorType::Rigid);
+        bool handleOk = (m.rigidBodyHandle != ysim::physics::kInvalidBodyHandle);
+        PR center_y_initial = m.rigidLastBodyPos.y;
 
-     ysim::physics::RigidInitial init{};
-     init.position         = tinym::vec3(0.0f, 5.0f, 0.0f);
-     init.rotation         = ::Quat{1.0f, 0.0f, 0.0f, 0.0f};
-     init.mass             = 1.0f;
-     init.shape.type       = ysim::physics::RigidShapeType::Sphere;
-     init.shape.half_extents = tinym::vec3(0.5f, 0.0f, 0.0f);  // radius
-     ysim::physics::BodyHandle h = backend.addBody(init);
-     bool handleOk = (h >= 0);
+        // Pump 30 frames. With g=-9.81 and h=1/60 semi-implicit:
+        // Δy_total ≈ -g*h^2*N*(N+1)/2 ≈ -1.27 m at N=30.
+        sim.pause = false;
+        for (int i = 0; i < 30; ++i) sim.update();
 
-     // Pre-step: position should match initial.
-     tinym::vec3 pre = backend.getPosition(h);
-     bool preOk = (std::abs(pre.y - 5.0f) < 1e-5f);
+        PR y_post = m.state.x[1];
+        PR center_y_post = m.rigidLastBodyPos.y;
 
-     backend.step(1.0f / 60.0f, 1);
+        bool vertexFellOk = (y_post < y_initial - PR(0.5));
+        bool centerFellOk = (center_y_post < center_y_initial - PR(0.5));
 
-     // Semi-implicit: v_new = -9.81/60; x_new = 5 + v_new/60 = 5 - 9.81/3600.
-     tinym::vec3 post = backend.getPosition(h);
-     float dy = post.y - 5.0f;
-     float expected_dy = -9.81f / 3600.0f;  // -0.002725 m
-     bool dyOk = (std::abs(dy - expected_dy) < 1e-5f);
+        if (changed && handleOk && vertexFellOk && centerFellOk) {
+            pass("BDD-008 / cube tagged Rigid falls under gravity in Simulator::update (D-039)");
+        } else {
+            fail("BDD-008 / cube tagged Rigid falls under gravity in Simulator::update (D-039)",
+                 "changed=" + std::to_string((int)changed)
+                 + " handleOk=" + std::to_string((int)handleOk)
+                 + " vertexFellOk=" + std::to_string((int)vertexFellOk)
+                 + " centerFellOk=" + std::to_string((int)centerFellOk)
+                 + " y_initial=" + std::to_string(y_initial)
+                 + " y_post=" + std::to_string(y_post)
+                 + " center_y_initial=" + std::to_string(center_y_initial)
+                 + " center_y_post=" + std::to_string(center_y_post));
+        }
+    }
+    ```
+    **Note**: Block 32 needs `sim.pause = false` because the existing Block 1-29 set `sim.pause = true` (the harness default) and call `pumpFrames(sim, N)` which internally calls `sim.update`. If `sim.update` early-returns on `pause==true`, no progress. Generator confirms by reading the existing pump pattern.
 
-     tinym::vec3 lv = backend.getLinearVelocity(h);
-     float expected_vy = -9.81f / 60.0f;     // -0.1635 m/s
-     bool vyOk = (std::abs(lv.y - expected_vy) < 1e-5f);
+11. **Build + verify deterministic.** `cmake -B build && cmake --build build && cd build && for i in 1..5; do ./src/ysim --self-test; done` — expect **62/62 PASS** each time.
 
-     if (handleOk && preOk && dyOk && vyOk) {
-         pass("D-038 / EulerRigidPhysicsBackend sphere falls under gravity for one step (semi-implicit Δy=-2.725mm)");
-     } else {
-         fail("D-038 / EulerRigidPhysicsBackend sphere falls under gravity for one step (semi-implicit Δy=-2.725mm)",
-              "handleOk=" + std::to_string((int)handleOk)
-              + " preOk=" + std::to_string((int)preOk)
-              + " dyOk=" + std::to_string((int)dyOk)
-              + " vyOk=" + std::to_string((int)vyOk)
-              + " dy=" + std::to_string(dy)
-              + " lv.y=" + std::to_string(lv.y));
-     }
-     ```
-   - **Clause 2 — Sphere reaches resting contact at y = radius via radius-clamp**:
-     ```cpp
-     ysim::physics::EulerRigidPhysicsBackend backend2;
-     backend2.initialize(tinym::vec3(0.0f, -9.81f, 0.0f));
+12. **`verify-light.sh` cross-check.** Expect doctest 159/159 + 1120/1120 SUCCESS unchanged.
 
-     // No plane body needed — Euler backend has built-in y=0 ground clamp
-     // for Sphere shapes. Drop sphere from y=2.
-     ysim::physics::RigidInitial sphere{};
-     sphere.position = tinym::vec3(0.0f, 2.0f, 0.0f);
-     sphere.mass = 1.0f;
-     sphere.shape.type = ysim::physics::RigidShapeType::Sphere;
-     sphere.shape.half_extents = tinym::vec3(0.5f, 0.0f, 0.0f);  // radius
-     ysim::physics::BodyHandle sphereH = backend2.addBody(sphere);
+13. **Bug-probes** (each FAIL after revert; restore after):
+    - **(a) Remove `rigid_.step()` call**: Block 32 FAIL (`vertexFellOk=0 centerFellOk=0`, dy=0). Restore.
+    - **(b) Remove `ensureRigidBackendBody(meshId)` call from changeBehavior's Rigid case**: Block 32 FAIL (`handleOk=0`). Restore.
+    - **(c) Remove the delta-loop** (the `for (auto& m : meshes)` block updating state.x): Block 32 FAIL (`vertexFellOk=0` because state.x doesn't follow; `centerFellOk=0` because `rigidLastBodyPos` never updates either). Restore. **Stricter probe**: keep the delta-loop's `rigidLastBodyPos` update but remove the state.x write loop — `centerFellOk=1` (lastBodyPos updates) but `vertexFellOk=0` (vertices don't move). This is a finer-grained probe; Generator picks.
+    - **(d) Make `inferRigidRadius` return 0** (so backend's Sphere has zero radius — degenerate): backend still processes step (sphere with radius=0); ground clamp at `y < 0` instead of `y < 0.5`. Cube would fall further. Doesn't FAIL Block 32 because the cube falls regardless. Replace with: **make `ensureRigidBackendBody` NON-idempotent** (allow re-adding) → second call from changeBehavior creates a duplicate body; the mesh.handle points to the latest, but `bodies_` has two entries with `mass=1` each falling under gravity. Doesn't break Block 32 either. Drop probe (d); (a)+(b)+(c) cover the load-bearing surface.
 
-     // Pump 120 steps. With radius-clamp, sphere reaches y=0.5 within
-     // ~60 steps (2.725mm/step × 60 = 16cm fall) and stays there.
-     for (int i = 0; i < 120; ++i) backend2.step(1.0f / 60.0f, 1);
+14. **Append D-039 to `docs/DECISIONS.md`** (Generator authors). Sketch:
+    > **D-039 (2026-05-14)** — Rigid behavior wired through Simulator. Closes the user's "Rigid bodies should fall under gravity" goal (B-1 contract + B-2′ Euler backend + B-3 simulator wiring). `GeneralMesh<BE, PR>` gains `rigidBodyHandle = kInvalidBodyHandle` + `rigidLastBodyPos`. `Simulator<BE, PR, System>` gains private `ysim::physics::EulerRigidPhysicsBackend rigid_` (hard-coded type — no template-param widening; future Bullet B-2.1 swap is one-line). New `Simulator::ensureRigidBackendBody(meshId)` idempotent helper builds `RigidInitial{position=transformPosition, rotation=rotationQuat, mass=1, shape=Sphere(radius=inferRigidRadius)}` + `rigid_.addBody`. Triggers: (i) `changeBehavior(meshId, Rigid)`; (ii) `Simulator::initialize` resets backend with `scene.environment.gravity` and sweeps. `changeBehavior(meshId, Float)` clears the rigid linkage on the mesh side (backend slot leaks per D-038, acceptable). `Simulator::update` calls `rigid_.step(h, 1)` once per outer frame, then for each Rigid mesh: `Δpos = backend.getPosition - rigidLastBodyPos` applied to `state.x` + `state.xPrev` + `transformPosition`. `applyEnvironmentForces` skips Rigid (zeroes externalForces, mirroring Float). **Translation only — rotation-correct vertex update is a future slice.** Block 32 mechanizes the end-to-end test (`addCube(0,5,0) + changeBehavior(0, Rigid) + 30 sim.update() → witness vertex.y dropped > 0.5m`). Self-test count 61 → 62. **Retires BDD-006-RIGID-DISPATCH-PARKED** (Rigid integrator dispatch is real at the outer-update C++ layer; gravity routing is clean) **and BDD-018-BEHAVIOR-TAG-PARKED** (Float→Rigid inspector switch results in immediate next-sim-step dispatch via lazy `ensureRigidBackendBody`). BDD-008 matrix row `pending → pass`. RIGID-BACKEND-PORTABILITY (D-037) unchanged.
 
-     tinym::vec3 pos = backend2.getPosition(sphereH);
-     tinym::vec3 lv2 = backend2.getLinearVelocity(sphereH);
-     bool restPosOk = (std::abs(pos.y - 0.5f) < 1e-5f);
-     bool restVelOk = (lv2.y >= 0.0f);  // y-velocity clamped non-negative at ground
+15. **Promote BDD-008 row** in `docs/TEST_MATRIX.md` from `pending → pass`. Test-address column appended with Block 32 + D-039 + retirement of BDD-006-RIGID-DISPATCH-PARKED + BDD-018-BEHAVIOR-TAG-PARKED noted. The "rests at floor" sub-clause is verified at the backend layer by Block 31 (`EulerRigidPhysicsBackend sphere reaches resting contact at y=radius`); an in-Simulator resting-cube test is a future-slice candidate (Box-shape support OR Bullet B-2.1).
 
-     if (restPosOk && restVelOk) {
-         pass("D-038 / EulerRigidPhysicsBackend sphere reaches resting contact at y=radius (y=0 ground clamp)");
-     } else {
-         fail("D-038 / EulerRigidPhysicsBackend sphere reaches resting contact at y=radius (y=0 ground clamp)",
-              "restPosOk=" + std::to_string((int)restPosOk)
-              + " restVelOk=" + std::to_string((int)restVelOk)
-              + " pos.y=" + std::to_string(pos.y)
-              + " lv.y=" + std::to_string(lv2.y));
-     }
-     ```
+16. **Update `docs/roles/PLANNER.md`** Standing constraints subsection: REMOVE the BDD-006-RIGID-DISPATCH-PARKED bullet AND REMOVE the BDD-018-BEHAVIOR-TAG-PARKED bullet (both retired by D-039). RIGID-BACKEND-PORTABILITY stays.
 
-6. **Build + verify deterministic.** `cmake --build build`. Then `./src/ysim --self-test` from `build/` **5 times in a row** — expect **61/61 PASS** every time (59 prior + 2 Block 31). Block 31 is pure C++ with deterministic float arithmetic; deterministic across runs.
+17. **Update `.agent/PROJECT_STATE.md`** (Planner-tier task during this planning pass):
+    - **Next milestone**: B-3 in flight; closes user's Rigid-gravity goal.
+    - **Recent scope changes**: append 2026-05-14 entry for B-3 plan.
+    - **Standing feature candidates**: drop B-3 (done after this slice); promote Source-file split / Alembic export / B-2.1 Bullet.
 
-7. **`verify-light.sh` cross-check.** Expect doctest 159/159 + 1120/1120 SUCCESS unchanged.
-
-8. **Bug-probes** (each must FAIL after the listed revert; restore after):
-   - **(a) EulerRigidPhysicsBackend::step does nothing**: comment out the `for (auto& b : bodies_) { ... }` loop body → Clauses 1+2 FAIL (`dy=0`, `restPosOk=0` because position stays at 2.0). Restore.
-   - **(b) Gravity term zeroed**: replace `gravity_.y * h` with `0.0f` in the velocity update → Clauses 1+2 FAIL (`dy=0`, sphere never falls). Restore.
-   - **(c) Mass = 0 (static body)**: in Clause 1 test setup, change `init.mass = 1.0f` → `init.mass = 0.0f` → Clause 1 FAILs (`dy=0`, body skipped by `if (mass <= 0) continue;`). Restore.
-   - **(d) Ground-plane clamp commented out**: comment out the `if (position.y < radius) { ... }` block → Clause 2 FAILs (`pos.y` continues falling past 0.5; after 120 steps it's well below 0). Restore.
-
-   All 4 bug-probes load-bearing on distinct code paths. After all restored: `--self-test` returns 61/61 PASS.
-
-9. **Append D-038 to `docs/DECISIONS.md`** (Generator authors). Body sketch:
-    > **D-038 (2026-05-14)** — `EulerRigidPhysicsBackend` shipped as second backend implementing D-037's contract. **Pivoted from the original Bullet-vendor B-2 plan**: user authorized Bullet via AskUserQuestion but the Bash classifier denies `git submodule add` regardless (the classifier reads the action surface, not the in-conversation answer). With the /goal Stop hook enforcing implementation + gravity verification, pivoted to a minimal Euler integrator (Option C from the slice's CURRENT_WORK menu). Single header `include/EulerRigidPhysicsBackend.hpp` (~180 lines). Semi-implicit Euler: `v_new = v + a*h; x_new = x + v_new*h`. Quat update via inline `q_dot = 0.5 * Quat(0, ω) * q` (PARALLEL-IMPL-LOCKSTEP — duplicated against main.cpp's Quat helpers). Single y=0 ground plane via Sphere-only `y_clamp(radius)` for the resting-contact assertion. Mass=0 → static (no integration). NO friction, NO restitution, NO general convex-vs-convex contact, NO angular collision. Bullet remains the canonical eventual implementation per `docs/design/rigid_physics_backend.md` §B-2; future slice can add it as a third backend (B-2.1) once permission is granted. Block 31 (2 clauses: sphere falls semi-implicit Δy=-2.725mm in one step; sphere reaches resting contact at y=radius after 120 steps). Block 30 relocated from src/main.cpp:~9083 to ~6161 (BEFORE Metal-less SKIP gate at 6164 — folds Estimator turn 33 WARNING; both Null and Euler contracts now run on Linux verify.sh). Self-test count 59 → 61. RIGID-BACKEND-PORTABILITY (D-037) now load-bearing across Null + Euler. NO Simulator dispatch wiring — B-3's surface; BDD-006-RIGID-DISPATCH-PARKED stays in force.
-
-10. **Update `docs/TEST_MATRIX.md`** BDD-008 row. Status stays `pending`. Append:
-    > `src/main.cpp::runSelfTest` Block 31 — two clauses PASS exercise `EulerRigidPhysicsBackend` (sphere falls under gravity for one step semi-implicit Δy=-2.725mm; sphere reaches resting contact at y=radius after 120 steps via y=0 ground clamp) per D-038. **Backend exists with deterministic gravity; Rigid behavior tag dispatch still parked under BDD-006-RIGID-DISPATCH-PARKED until B-3 wires Simulator integration.** Row promotes to `pass` when B-3 lands. Bullet backend (canonical B-2 per design doc) deferred to a future slice (B-2.1) once vendor permission is granted.
-
-11. **Update `docs/roles/PLANNER.md`** — RIGID-BACKEND-PORTABILITY entry's "As of B-1" → "As of B-2′" wording:
-    > **RIGID-BACKEND-PORTABILITY** (D-037, 2026-05-14; reinforced by D-038, 2026-05-14). Any change to the contract surface (`include/RigidPhysicsTypes.hpp` POD types OR the 12-method signature on backend classes) MUST update every backend implementation in the same commit. **As of B-2′: `NullRigidPhysicsBackend` (`include/NullRigidPhysicsBackend.hpp`) AND `EulerRigidPhysicsBackend` (`include/EulerRigidPhysicsBackend.hpp`) are both live; the constraint is load-bearing across two backends.** Bullet backend (`docs/design/rigid_physics_backend.md` §B-2) deferred to a future slice (B-2.1). Future Jolt / custom backends plug in by satisfying the contract.
-
-12. **Update `.agent/CURRENT_WORK.md` + `.agent/RESUME.md`** — Generator-tier task. Expected delta documented in CURRENT_WORK's "Pivot summary" already; finalize with metrics + bug-probe table.
+18. **Update `.agent/CURRENT_WORK.md` + `.agent/RESUME.md`** — Generator-tier task.
 
 ## Course corrections
 
-- **`feedback_make_means_add_new` rule**: NEW parallel backend (`EulerRigidPhysicsBackend`) co-exists with NullRigidPhysicsBackend; contract surface unchanged. Block 30 stays intact; Block 31 brand-new. Rule satisfied.
+- **`feedback_make_means_add_new` rule**: user's brief uses integration verbs (wire/add field/widens/calls). In-place modification of `Simulator::update` + `changeBehavior` is correct; new symbols (`rigid_`, `ensureRigidBackendBody`, `inferRigidRadius`, Block 32) are parallel additions.
 - **`project_flatbuffers_caching_skipped`**: stays in force.
-- **D-026 lifetimeId invariant**: N/A.
-- **PARALLEL-IMPL-LOCKSTEP**: extended this slice. Euler backend's inline Quat math (q_dot derivation + normalize) duplicates main.cpp's Quat helpers. If main.cpp's Quat semantics change, the Euler backend's inline copies must follow. Documented in the header comment.
-- **CM-012 utility-helper-exit trap**: Applies — `EulerRigidPhysicsBackend` methods must NOT `exit()` / `abort()`. Out-of-range BodyHandle returns sentinel zero / identity. Documented inline.
-- **D-037 invariant + RIGID-BACKEND-PORTABILITY**: B-2′ is the first parallel backend; Generator greps both `EulerRigidPhysicsBackend.hpp` + `NullRigidPhysicsBackend.hpp` to confirm 12-method signatures match.
-- **D-036 invariant + BDD-006-RIGID-DISPATCH-PARKED**: B-2′ does NOT retire. B-3 wires.
-- **PROBE-COVERAGE-EDGES per PLANNER §9**: Euler integrator domain edges:
-  - mass=0 (static body — bug-probe (c) covers; the `if (b.mass <= 0.0f) continue;` line is load-bearing).
-  - position at exactly radius (no clamping needed; sphere already at rest). Implicitly handled by `if (position.y < radius)` — strict less-than means at-radius is no-op. Good.
-  - very small h (numerical stability). Not exercised; Bullet would worry about this, Euler not so much.
-  - Quat with zero ω (no rotation). The q_dot multiply with all-zero ω produces q_dot=0; q_new=q before normalize; n2=1; q_new unchanged. Good.
-  - Quat normalization with near-zero norm. Handled by `if (n2 > 1e-12f)` fallback to identity. Bug-probe could verify but not load-bearing for Block 31.
+- **D-026 lifetimeId invariant**: applies — `Simulator::initialize` runs `Scene::pack` (which sets lifetimeId) BEFORE the rigid sweep, so all Rigid meshes have valid lifetimeId when `ensureRigidBackendBody` runs.
+- **PARALLEL-IMPL-LOCKSTEP**: applies indirectly — Euler backend's contract surface is unchanged this slice; Null + Euler still mirror.
+- **CM-012 utility-helper-exit trap**: applies — `ensureRigidBackendBody` and `inferRigidRadius` must NOT `exit()`. Out-of-range meshId returns silently; wrong-behavior-tag returns silently.
+- **D-013 swept-CCD invariant**: applies — `state.xPrev` gets the same Δpos as `state.x` (guarded on `xPrev.ptr` non-null) so the next frame's CCD snapshot is consistent.
+- **D-021 rotateVector**: would apply if rotation-correct vertex update were enabled (Design call 3α). B-3 translation-only doesn't use it.
+- **D-014 transformPosition cascade (three-site invariant)**: applies — Rigid delta-loop updates `transformPosition` alongside state.x. Inspector reads `transformPosition`; without this update, the Inspector would show stale position while the cube falls.
+- **D-025 pendingRotations**: applies — `Simulator::initialize` runs `applyPendingMaterials` BEFORE the rigid sweep (per D-025's `initialize` auto-call). Order matters: pendingRotations applied → mesh.rotationQuat set → ensureRigidBackendBody reads mesh.rotationQuat for `RigidInitial.rotation`.
+- **PROBE-COVERAGE-EDGES per PLANNER §9**: not a math-layer slice. Edges considered in the design calls (mesh-not-in-scene; changeBehavior Rigid→Float→Rigid; empty scene; zero-vertex mesh). All return silently or are guarded.
 
 ## Expected metrics
 
-- Self-test count: **59 → 61** (Block 31 gains 2 pass clauses; Block 30 keeps 3 clauses but relocates).
+- Self-test count: **61 → 62** (Block 32 gains 1 pass clause).
 - 5-run deterministic PASS on macOS dev host.
 - `verify-light.sh`: doctest **159/159 + 1120/1120 SUCCESS** unchanged.
-- Estimator's Linux Metal-less container: **61/61 PASS** (both Block 30 + Block 31 above the SKIP gate; both pure C++). **This is the actual fold of Estimator turn 33's WARNING.**
-- Expected matrix delta: `BDD-008` stays `pending`; test-address column appended.
-- Expected DECISIONS.md delta: D-038 added (pivot + Euler backend).
-- Expected PLANNER.md delta: RIGID-BACKEND-PORTABILITY entry text reads "as of B-2′ — both Null + Euler backends live; Bullet deferred to B-2.1."
-- Expected PROJECT_STATE.md delta: covered in earlier planning pass; Generator may need a small note about the Bullet → Euler pivot in the next-milestone section.
+- Linux container: Block 32 SKIPs along with Block 1-29 (placed inside Metal-gated section because it uses `Simulator::initialize` + Metal). Block 30 + 31 still run on Linux. **Acceptable per existing pattern.**
+- Expected matrix delta: BDD-008 `pending → pass`. BDD-018 row may gain a Block 32 cross-reference note (the Inspector-tag-switch dispatch becomes real).
+- Expected DECISIONS.md delta: D-039 added.
+- Expected PLANNER.md delta: Standing-constraints subsection LOSES BDD-006-RIGID-DISPATCH-PARKED bullet AND BDD-018-BEHAVIOR-TAG-PARKED bullet.
+- Expected PROJECT_STATE.md delta: next-milestone updates; user's Rigid-gravity goal closes (note explicitly).
 - Estimator verdict next turn: **NOTE** if implementation clean. Possible NOTE items:
-  - (i) The Bullet → Euler pivot itself — design-doc deviation, well-documented but worth flagging.
-  - (ii) Quat math duplicated between main.cpp helpers and the Euler backend header (PARALLEL-IMPL-LOCKSTEP item).
-  - (iii) Ground-plane is Sphere-only (Box doesn't bounce). Documented limitation.
-  - (iv) `applyImpulse == applyForce` (both treat impulse as body-center impulse) — physically wrong for body-with-inertia but acceptable for the test surface.
-  - (v) `removeBody`'s slot-leak — taste-level.
-  - **WARNING** would land if Block 31 FAILs OR Block 30 relocation breaks Block 1-29 OR RIGID-BACKEND-PORTABILITY signatures drift.
-  - **BLOCK** if Block 31's pass clauses ship without bug-probe verification OR pre-existing PASS count regresses.
+  - (i) Translation-only vertex update (no rotation propagation) — documented limitation in D-039.
+  - (ii) `inferRigidRadius` bbox-half heuristic — exact for Cube; approximate for arbitrary mesh.
+  - (iii) `applyEnvironmentForces` extended skip for Rigid — clean retirement; not a NOTE risk.
+  - (iv) `state.xPrev` null-guard in the delta-loop — defensive; may be unnecessary if `Simulator::initialize` always allocates xPrev before the first update.
+  - (v) Backend body slot-leak on changeBehavior(Float) — handle cleared on mesh side, backend slot stays. Matches D-038's existing slot-leak posture.
+  - (vi) `Simulator::initialize` resetting the rigid backend means existing Rigid bodies' velocities are lost across re-initialize calls. Acceptable for `resetScene` use; might surface in scene-edit flows. Future-slice candidate.
+  - **WARNING** would land if: Block 32 FAILs OR `state.x` access doesn't reach host-visible memory (Metal-side write-back missing) OR the renderer double-applies rotation (reads state.x AND rotationQuat independently) OR pre-existing Block 1-29 regressions from `applyEnvironmentForces` change.
+  - **BLOCK** if Block 32 FAILs on macOS OR pre-existing PASS count regresses OR the retirements are premature.

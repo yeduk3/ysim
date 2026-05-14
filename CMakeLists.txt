@@ -65,6 +65,26 @@ add_custom_target(MetalKernels ALL DEPENDS ${METAL_LIBRARY})
 # root set
 set(YSIM_PROJECT_ROOT_DIR "${PROJECT_SOURCE_DIR}")
 
+# Bullet 3.25 — D-040. Vendored under third_party/bullet3 as a git submodule.
+# Disable demos/extras/tests/Bullet3-experimental/shared/double-precision/
+# pybullet so the sub-project only builds the three modules ysim links:
+# BulletDynamics + BulletCollision + LinearMath.
+# Bullet 3.25's CMakeLists declares cmake_minimum_required(VERSION 2.x);
+# modern CMake (4.x) needs explicit policy compat to accept that.
+set(CMAKE_POLICY_VERSION_MINIMUM 3.5)
+set(BUILD_BULLET2_DEMOS    OFF CACHE BOOL "" FORCE)
+set(BUILD_CPU_DEMOS        OFF CACHE BOOL "" FORCE)
+set(BUILD_EXTRAS           OFF CACHE BOOL "" FORCE)
+set(BUILD_OPENGL3_DEMOS    OFF CACHE BOOL "" FORCE)
+set(BUILD_UNIT_TESTS       OFF CACHE BOOL "" FORCE)
+set(INSTALL_LIBS           OFF CACHE BOOL "" FORCE)
+set(USE_GRAPHICAL_BENCHMARK OFF CACHE BOOL "" FORCE)
+set(BUILD_SHARED_LIBS      OFF CACHE BOOL "" FORCE)
+set(BUILD_BULLET3          OFF CACHE BOOL "" FORCE)
+set(USE_DOUBLE_PRECISION   OFF CACHE BOOL "" FORCE)
+set(BUILD_PYBULLET         OFF CACHE BOOL "" FORCE)
+add_subdirectory(third_party/bullet3 EXCLUDE_FROM_ALL)
+
 # 4. src 폴더의 CMakeLists.txt 실행
 add_subdirectory(src)
 
