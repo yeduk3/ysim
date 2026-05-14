@@ -22,6 +22,29 @@ using Index = uint32_t;
 struct Geometry {
     std::vector<float> positions;   // 3 * numPoints, [x0,y0,z0, x1,y1,z1, ...]
     std::vector<Index> facets;      // 3 * numFacets, [a,b,c, a,b,c, ...]
+
+    // 2026-05-15 (A2 — render/physics topology split): optional secondary
+    // buffers carrying an UNWELDED rendering view of the same geometry.
+    // Currently populated by `cube()` only — the welded primary buffers
+    // hold a single closed manifold so cloth springs cross face seams,
+    // while the unwelded render buffers hold per-face vertex copies so
+    // each face's flat normal is preserved (no averaging across seams).
+    //
+    // Layout invariants when populated:
+    //   - renderPositions.size() % 3 == 0
+    //   - renderFacets.size()   % 3 == 0
+    //   - renderNormals.size()  == renderPositions.size()  (flat per-face)
+    //   - renderToPhysics.size() == renderPositions.size() / 3,
+    //         renderToPhysics[i] = welded vertex index that the unwelded
+    //         vertex `i` corresponds to. Used by the resync loop to push
+    //         physics state.x back into renderPositions each frame.
+    //
+    // Empty for sphere/grid/file initializers — the welded primary mesh is
+    // already a single manifold there, so renderer + physics share x/n/facets.
+    std::vector<float> renderPositions;
+    std::vector<Index> renderFacets;
+    std::vector<float> renderNormals;
+    std::vector<Index> renderToPhysics;
 };
 
 // ---- UV sphere -------------------------------------------------------------
@@ -186,6 +209,16 @@ inline Geometry cube(float size, int tessellation,
     for (int f = 0; f < 6; ++f) {
         const auto& F = faces[f];
         Index base = (Index)(g.positions.size() / 3);
+        // Outward face normal = normalize(u × v). Per face, all (t+1)² verts
+        // emitted below get this same normal so the unwelded render buffer
+        // shades flat per face (no averaging across seams in
+        // PreviewState::recomputeNormals since each unwelded vertex appears
+        // only in this face's triangles).
+        float nx = F.u[1] * F.v[2] - F.u[2] * F.v[1];
+        float ny = F.u[2] * F.v[0] - F.u[0] * F.v[2];
+        float nz = F.u[0] * F.v[1] - F.u[1] * F.v[0];
+        float nlen = std::sqrt(nx * nx + ny * ny + nz * nz);
+        if (nlen > 1e-20f) { nx /= nlen; ny /= nlen; nz /= nlen; }
         // (t+1) × (t+1) vertices on this face.
         for (int i = 0; i <= t; ++i) {
             float vi = (float)i / (float)t;
@@ -197,6 +230,9 @@ inline Geometry cube(float size, int tessellation,
                 g.positions.push_back(x);
                 g.positions.push_back(y);
                 g.positions.push_back(z);
+                g.renderNormals.push_back(nx);
+                g.renderNormals.push_back(ny);
+                g.renderNormals.push_back(nz);
             }
         }
         // 2 * t * t triangles on this face.
@@ -211,6 +247,16 @@ inline Geometry cube(float size, int tessellation,
             }
         }
     }
+
+    // Snapshot the unwelded mesh into the render-side buffers BEFORE the
+    // weld pass collapses positions. Render buffers carry per-face vertex
+    // copies so flat normals (already populated above) shade crisp cube
+    // edges; physics buffers (g.positions / g.facets) become a single
+    // closed manifold below so cloth springs can cross face seams. The
+    // renderToPhysics map (populated inside the weld pass) lets the per-
+    // frame resync push physics state.x back into renderPositions.
+    g.renderPositions = g.positions;
+    g.renderFacets    = g.facets;
 
     // Weld coincident vertices across face seams so the cube is a single
     // closed manifold. Without this, switching the mesh to TriangularCloth
@@ -266,6 +312,7 @@ inline Geometry cube(float size, int tessellation,
         }
         for (auto& fi : g.facets) fi = remap[fi];
         g.positions = std::move(outPos);
+        g.renderToPhysics = std::move(remap);
     }
 
     return g;

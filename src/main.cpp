@@ -1432,9 +1432,20 @@ struct MeshCubeInitializer : GeneralMeshInitializer<BE, PR> {
         auto geom = primitive::cube(
             (float)params.size, (int)params.tessellation,
             {params.center.x, params.center.y, params.center.z});
+        // Physics buffers: welded single-manifold (cloth springs cross seams).
         preview.x.assign(geom.positions.begin(), geom.positions.end());
         preview.facets.assign(geom.facets.begin(), geom.facets.end());
         preview.recomputeNormals();
+        // 2026-05-15 (A2 split): render buffers carry the unwelded per-face
+        // copies so MeshGL renders flat per-face normals (crisp cube edges).
+        // primitive::cube guarantees these are populated when called for the
+        // cube primitive; copying through PR (preview is template-PR) handles
+        // the float→double case for future CPU-double scenes.
+        preview.renderX.assign(geom.renderPositions.begin(), geom.renderPositions.end());
+        preview.renderFacets.assign(geom.renderFacets.begin(), geom.renderFacets.end());
+        preview.renderN.assign(geom.renderNormals.begin(), geom.renderNormals.end());
+        preview.renderToPhysics.assign(geom.renderToPhysics.begin(),
+                                       geom.renderToPhysics.end());
     }
 
     InitializerParams<PR>* getParams() override { return &params; }
@@ -5032,13 +5043,19 @@ struct Simulator {
     // pointers to MeshRenderState so MeshGL materializes from the stable
     // heap-owned PreviewState buffers (not the volatile packed sub-views).
     // CPU-only — safe to call from the harness without a GL context.
+    //
+    // 2026-05-15 (A2 split): when the initializer populated render-side
+    // buffers (currently cube only), bind MeshGL to those instead — gives
+    // flat per-face shading without averaging across welded seams.
+    // Sphere/grid/file initializers leave render buffers empty so the
+    // render*Ptr/numRender* accessors fall back to x/n/facets transparently.
     void registerPreviewBindingForLastRequest() {
         if (Scene<BE, PR>::requestsGeneralMeshes.empty()) return;
         auto& req = Scene<BE, PR>::requestsGeneralMeshes.back();
         renderState.registerPreviewBinding(req.id,
-            req.preview.xPtr(), req.preview.numPoints(),
-            req.preview.facetsPtr(), req.preview.numFacets(),
-            req.preview.nPtr());
+            req.preview.renderXPtr(), req.preview.numRenderPoints(),
+            req.preview.renderFacetsPtr(), req.preview.numRenderFacets(),
+            req.preview.renderNPtr());
     }
 
     void addClothFile(std::string prefix, std::string fileName, tinym::vec3 offset, PR scale, PR kstretch=1e5, PR kshear=1e5, PR kbend=3e5, PR thickness=0.001, PR mass=0.1) {
@@ -5871,6 +5888,11 @@ struct Simulator {
                 // cost is O(numFacets + numPoints) per mesh per frame,
                 // negligible for v1 scene sizes.
                 req.preview.recomputeNormals();
+                // 2026-05-15 (A2 split): if the mesh carries a separate
+                // render topology (cube), push welded positions back into
+                // the unwelded renderX via renderToPhysics, then refresh
+                // renderN. No-op for sphere/grid/file (hasRender=false).
+                req.preview.resyncRenderFromPhysics();
                 break;
             }
         }
@@ -10317,11 +10339,16 @@ static int runSelfTest() {
         auto& req = reqs[0];
         const auto* binding = sim.renderState.previewBinding(req.id);
         bool bindingExists = (binding != nullptr);
-        bool xMatch       = bindingExists && (binding->xPtr == (void*)req.preview.xPtr());
-        bool numVMatch    = bindingExists && (binding->numVerts == req.preview.numPoints()) && (binding->numVerts > 0);
-        bool facetPMatch  = bindingExists && (binding->facetPtr == req.preview.facetsPtr());
-        bool facetCMatch  = bindingExists && (binding->numFacets == req.preview.numFacets()) && (binding->numFacets > 0);
-        bool nMatch       = bindingExists && (binding->normalPtr == (void*)req.preview.nPtr());
+        // 2026-05-15 (A2 split): binding follows the render-side pointers so
+        // cube renders the unwelded per-face copy with flat normals. The
+        // render*Ptr() accessors fall back to physics x/n/facets when the
+        // initializer didn't populate the render topology (sphere/grid/file),
+        // so this single check covers both paths.
+        bool xMatch       = bindingExists && (binding->xPtr == (void*)req.preview.renderXPtr());
+        bool numVMatch    = bindingExists && (binding->numVerts == req.preview.numRenderPoints()) && (binding->numVerts > 0);
+        bool facetPMatch  = bindingExists && (binding->facetPtr == req.preview.renderFacetsPtr());
+        bool facetCMatch  = bindingExists && (binding->numFacets == req.preview.numRenderFacets()) && (binding->numFacets > 0);
+        bool nMatch       = bindingExists && (binding->normalPtr == (void*)req.preview.renderNPtr());
 
         if (oneReq && bindingExists && xMatch && numVMatch && facetPMatch && facetCMatch && nMatch) {
             pass("D-042 R-2 / addX registers PreviewBinding immediately (pre-initialize) with stable preview pointers");
