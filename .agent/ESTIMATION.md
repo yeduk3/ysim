@@ -1,4 +1,4 @@
-# Estimation — 2026-05-14 turn 33
+# Estimation — 2026-05-14 turn 34
 
 Status: UPDATED
 
@@ -6,18 +6,16 @@ Status: UPDATED
 WARNING
 
 ## BLOCK
-- None
+- none
 
 ## WARNING
-- src/main.cpp:6165, src/main.cpp:9083, docs/TEST_MATRIX.md:22 - `runSelfTest` still returns on the Metal-less host before Block 30, so the new Null backend clauses do not execute in the Linux `verify.sh` environment despite the slice's claim that they do; the BDD-008 row stays `pending`, leaving the new contract unverified on the host we actually ran.
+- docs/TEST_MATRIX.md:22, docs/specs/BDD.md:83-89, include/EulerRigidPhysicsBackend.hpp:108-116 — Block 31 only proves gravity/rest behavior for a sphere on a horizontal clamp. The matrix entry correctly stays pending, but this slice still does not satisfy BDD-008's box-on-plane acceptance wording or its angular-velocity-decay requirement, so it should not be read as BDD-008 closure.
 
 ## NOTE
-- include/Quat.hpp:1 - the Quat extraction is a clean boundary split; leaving the helper math in `src/main.cpp` is a reasonable future source-file-split cleanup.
-- include/RigidPhysicsTypes.hpp:1 - the POD contract shape is fine for B-1, but the raw mesh-buffer pointers remain caller-owned and need careful snapshotting in B-2.
-- src/main.cpp:9100 - Clause 3's stricter rotation and velocity checks are good signal; they are stronger than the bare B-1 example without being scope creep.
+- include/EulerRigidPhysicsBackend.hpp:56-60,145-161 — `removeBody` is a deliberate slot leak and `applyForce`/`applyImpulse` are collapsed to body-center velocity deltas. Fine for B-2′, but future work will need a follow-up if handle reuse or distinct force/impulse semantics matter.
 
 ## Test matrix delta
 - BDD-008: missing
 
 ## Verify output (summary)
-`./scripts/verify.sh` passed the build and unit-test gates: CMake configured and built successfully, `ysim_tests` passed 159/159 assertions, and `ysim_primitive_tests` passed 1120/1120 assertions. The Linux `ysim --self-test` run emitted the expected Metal-absent SKIP (`[self-test SKIP] metal-device: ...`) and exited 0 before reaching Block 30, so the new B-1 Null backend clauses were not exercised in this environment.
+`./scripts/verify.sh` completed successfully with exit 0. CMake configure/build succeeded, both doctest suites passed (`159/159` and `1120/1120`), and the new self-test clauses for D-037 and D-038 all passed. The expected `[self-test SKIP] metal-device` appeared on this non-Metal host after Blocks 30 and 31 had already run.
