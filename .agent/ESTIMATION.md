@@ -1,21 +1,24 @@
-# Estimation — 2026-05-14 turn-37
+# Estimation — 2026-05-14 turn-39
 
 Status: UPDATED
 
 ## Verdict
-WARNING
+NOTE
 
 ## BLOCK
-- None
+- None.
 
 ## WARNING
-- `src/main.cpp:6007` / `include/MeshRenderState.hpp:75` — `loadScene` and the reset helpers reset `Scene::nextMeshId` to 0, but the new R-2 render cache is never cleared there. Because `getOrCreate` returns an existing `MeshGL` before consulting a fresh preview binding, a scene reload/reset can reuse stale VAO/VBO sizes and pointers from the prior scene. The `renderState.clear()` retirement is safe for pack churn, but not for scene-boundary churn.
+- None.
 
 ## NOTE
-- `include/MeshRenderState.hpp:114` — `clear()` still only clears the cached `MeshGL` map and does not touch `previewBindings`. That is fine now that the call site is retired, but any future forced-rebuild path should not assume it is a full reset.
+- `src/main.cpp:6090` — the prior scene-boundary cache cleanup BLOCK is resolved: `loadScene` now clears both the materialized MeshGL cache and the pending preview bindings, so a same-process reload cannot reuse stale `MeshGL` pointers after `nextMeshId` resets.
+- `src/main.cpp:5186` — `translateObject` still dual-writes `preview.x` as a bridge to R-4; keep `state.x` and `preview.x` in lockstep when touching that mutation path.
+- `src/main.cpp:10171` — Block 38 proves the `x` memcpy is load-bearing; the `n` / `facets` copies remain covered by the same pack path but are not separately bug-probed.
 
 ## Test matrix delta
-- none
+- BDD-003: pass
+- BDD-018: pass
 
 ## Verify output (summary)
-`./scripts/verify.sh` exited 0. The repo configured and built successfully, with only upstream Bullet/CMake deprecation warnings in the log. Both doctest binaries passed (`159/159` and `1120/1120` assertions). On this host `./src/ysim --self-test` correctly emitted `[self-test SKIP] metal-device: MTL::CreateSystemDefaultDevice() returned null (non-macOS host or container without Metal)`, so the Metal-gated self-test block did not run here, but no failing tests were reported.
+`./scripts/verify.sh` exited 0. CMake configured and built successfully, doctest passed (`159/159` and `1120/1120` assertions), and `./src/ysim --self-test` hit the expected Metal-device SKIP on this host (`[self-test SKIP] metal-device: MTL::CreateSystemDefaultDevice() returned null`), so the Metal-gated self-test block did not run here. Code review of the diff shows the reload path now clears both render-state caches, which resolves the previously BLOCKed scene-boundary cleanup issue.
