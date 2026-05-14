@@ -5492,6 +5492,37 @@ struct Simulator {
     }
 
 
+    // D-042 R-8 (2026-05-15): user-facing "reset to addX-time geometry"
+    // entry point. Distinct from initialize() because post-D-042 the
+    // dirty-rebuild path (Simulator::update → if(dirty) initialize()) is
+    // expected to PRESERVE in-flight sim state through Scene::pack's R-3
+    // memcpy(preview → state.x); only an explicit user gesture (e.g., the
+    // "0" hotkey) should clobber preview back to initializer truth.
+    //
+    // Mechanism: repopulate each request's preview from its initializer.
+    // Translates have already write-backed center/offset into initializer
+    // params (see translateObject), so post-reset positions reflect those
+    // edits. Rotations are NOT preserved (R-4 retired the per-call
+    // pendingRotations stash); a future slice could re-apply
+    // mesh->rotationQuat after populatePreview if user feedback wants it.
+    //
+    // FUTURE DIRECTION: when a per-frame position cache (Alembic / ring
+    // buffer) ships, reset() should load frame[0] of the cache instead of
+    // re-running populatePreview — the cache is the authoritative "first
+    // frame" record while populatePreview is just an initializer-param
+    // regen that loses any pre-sim deformation. Until then this is the
+    // closest approximation.
+    void reset() {
+        for (auto& req : Scene<BE, PR>::requestsGeneralMeshes) {
+            if (!req.initializer) continue;
+            req.preview.x.clear();
+            req.preview.n.clear();
+            req.preview.facets.clear();
+            req.initializer->populatePreview(req.preview);
+        }
+        initialize();
+    }
+
     void initialize() {
         GlobalAutoAllocator<BE>::globalInitialize(1<<20);
         // D-041: rewind the global pool's bump markers BEFORE Scene::pack
@@ -10829,7 +10860,13 @@ int main(int argc, char** argv) {
         auto* debugCollisions = pack->debugCollisions;
 
         if(key == GLFW_KEY_0 && action == GLFW_PRESS) {
-            simulator->initialize();
+            // D-042 R-8: explicit reset — preview is repopulated from
+            // initializer truth before initialize() runs Scene::pack, so
+            // R-3's memcpy lands at addX-time geometry instead of the last
+            // frame's sim state. initialize() alone no longer suffices
+            // because R-5 resync has been continuously writing sim state
+            // back into preview.
+            simulator->reset();
         } else if(key == GLFW_KEY_9 && action == GLFW_PRESS) {
         } else if(key == GLFW_KEY_1 && action == GLFW_PRESS) {
             if(simulator->scene.meshes.size() > 0)
