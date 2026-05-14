@@ -5176,13 +5176,14 @@ struct Simulator {
                 mesh->state.xPrev.ptr[i*3+2] += delta.z;
             }
         }
-        // D-042 R-3 (2026-05-14): dual-write the translate delta into the
-        // request's PreviewState so the next Scene::pack memcpy (which
-        // overrides state.x with preview.x) sees the translated values
-        // rather than reverting to addX-time positions. R-3 memcpy
-        // contract requires preview to track every mutation that landed
-        // on state.x. (R-4 will make preview the primary mutation target
-        // with state.x derived; this slice's dual-write is the bridge.)
+        // D-042 R-3 (2026-05-14) + R-4 canonicalization: PreviewState is
+        // the source of truth for vertex positions; state.x mirrors
+        // preview through Scene::pack's memcpy block. translateObject
+        // writes BOTH (state.x for D-014's immediate-effect + D-023's
+        // BVH refit pose; preview.x so the next pack memcpy survives
+        // the translate). R-4's rotateObject preview write below uses
+        // the same pattern — canonical dual-write, no longer
+        // "transitional".
         for (auto& req : Scene<BE, PR>::requestsGeneralMeshes) {
             if (req.id == meshId) {
                 const size_t np = req.preview.numPoints();
@@ -5232,12 +5233,13 @@ struct Simulator {
     // does not see the rotate as a tunneling event. state.v is unchanged
     // — rotating does not reset velocity.
     //
-    // Pack-roundtrip — mirroring D-015 for translateObject — is NOT
-    // covered by this slice. Re-pack rebuilds state.x from the
-    // initializer's geometry, which loses the rotation effect on state.x.
-    // The rotate analog of D-015's write-back is deferred to its own
-    // slice with a Planner design call about auto-calling
-    // applyPendingMaterials() from Simulator::initialize().
+    // D-042 R-4 (2026-05-14): pack-roundtrip is now covered. The preview
+    // write-back below mirrors state.x's rotation into req.preview.x;
+    // Scene::pack's R-3 memcpy carries it into the rebuilt packed state.x.
+    // The per-call `pendingRotations[meshId] = newAbs;` stash is RETIRED
+    // here — re-applying via applyPendingMaterials would double-rotate
+    // since preview already carries the rotation. loadScene's separate
+    // deferred-at-load pendingRotations stash is unchanged.
     void rotateObject(int meshId, ::Quat newQuat) {
         auto* mesh = Scene<BE, PR>::findById(meshId);
         if (!mesh) return;
@@ -5266,16 +5268,46 @@ struct Simulator {
                 mesh->state.xPrev.ptr[i*3+2] = prev_rot.z;
             }
         }
+        // D-042 R-4 (2026-05-14): rotate the per-request PreviewState
+        // by the same delta around the same pivot so preview tracks
+        // rotation eagerly. Mirrors R-3's translateObject preview
+        // dual-write. Pre-R-4 rotation persisted through Scene::pack
+        // via D-025 pendingRotations re-apply only; R-4 adds eager
+        // preview tracking so pre-init rendering + future R-5 packed
+        // → preview resync don't need a "rotation hasn't synced yet"
+        // special-case branch. The R-4 retirement of the per-call
+        // pendingRotations stash means this loop is now the SOLE
+        // mechanism preserving rotation through Scene::pack.
+        for (auto& req : Scene<BE, PR>::requestsGeneralMeshes) {
+            if (req.id == meshId) {
+                const size_t np = req.preview.numPoints();
+                for (size_t i = 0; i < np; ++i) {
+                    tinym::vec3 p(req.preview.x[i*3+0],
+                                  req.preview.x[i*3+1],
+                                  req.preview.x[i*3+2]);
+                    tinym::vec3 p_rot = pivot + rotateVector(delta, p - pivot);
+                    req.preview.x[i*3+0] = p_rot.x;
+                    req.preview.x[i*3+1] = p_rot.y;
+                    req.preview.x[i*3+2] = p_rot.z;
+                }
+                break;
+            }
+        }
         mesh->rotationQuat = newAbs;
         // D-023: refit the BVH so click-pick reads the rotated pose
         // immediately, even on a paused sim before the next sim.update().
         collisionPipeline.broadPhase.refit();
-        // D-025: stash the absolute rotation in pendingRotations so a
-        // subsequent Scene::pack() (triggered by addCube/addCloth/etc.)
-        // can re-apply it during initialize()'s auto-applyPendingMaterials
-        // step. Without this, re-pack rebuilds state.x from the
-        // initializer's geometry and the rotation is silently lost.
-        pendingRotations[meshId] = newAbs;
+        // D-025 / D-042 R-4 (2026-05-14): the pre-R-4 pattern
+        // `pendingRotations[meshId] = newAbs;` is RETIRED here. R-4's
+        // preview write-back above already lands the rotation in
+        // PreviewState, and Scene::pack's R-3 memcpy carries it into
+        // packed state.x at the next re-init. The applyPendingMaterials
+        // re-apply path would now double-rotate (preview → packed by
+        // memcpy → re-applied by rotateObject again), so we no longer
+        // stash from this call site. loadScene's separate
+        // `pendingRotations[id] = q` stash for deferred-at-load
+        // rotations is UNCHANGED — that path applies the saved rotation
+        // exactly once at the first post-load initialize.
         // D-041: mark scene dirty (see translateObject; same rationale).
         Scene<BE, PR>::dirty = true;
     }
@@ -6212,10 +6244,12 @@ struct Simulator {
     std::unordered_map<int, ::Quat> pendingRotations;
 
     void applyPendingMaterials() {
-        // Snapshot rotation entries before the loop. rotateObject() itself
-        // writes pendingRotations[id] = newAbs (D-025), so iterating the
-        // map directly while calling rotateObject inside would mutate the
-        // container under the iterator. Snapshot, apply, then clear.
+        // Snapshot rotation entries before the loop. As of D-042 R-4,
+        // `rotateObject()` no longer self-populates `pendingRotations`
+        // (that was the pre-R-4 D-025 write-back), but loadScene still
+        // stashes per-mesh rotations from the saved snapshot. Snapshot,
+        // apply, then clear — keeps the iterator-stability guard intact
+        // in case a future code path re-introduces a self-stash.
         std::vector<std::pair<int, ::Quat>> rotations;
         rotations.reserve(pendingRotations.size());
         for (auto& kv : pendingRotations) rotations.push_back(kv);
@@ -6224,10 +6258,12 @@ struct Simulator {
             auto mit = pendingMaterials.find(m.id);
             if (mit != pendingMaterials.end()) m.material = mit->second;
         }
-        // D-025: re-apply rotation by calling rotateObject so fresh state.x
-        // (just rebuilt by Scene::pack) gets rotated around the pivot, not
-        // just the rotationQuat field set. Without this, the rotation
-        // effect on state.x is silently lost on every re-pack.
+        // D-025 / D-042 R-4: re-apply load-deferred rotations by calling
+        // rotateObject so fresh state.x (just rebuilt by Scene::pack) AND
+        // req.preview.x both pick up the rotation around the pivot. After
+        // R-4, the only entries in `pendingRotations` come from loadScene's
+        // saved-snapshot stash; user-action rotateObject calls handle
+        // pack-survival via the preview write-back inline.
         for (auto& kv : rotations) {
             rotateObject(kv.first, kv.second);
         }
@@ -10292,6 +10328,69 @@ static int runSelfTest() {
                  + " packedY=" + std::to_string(packedY)
                  + " packedHasSentinel=" + std::to_string((int)packedHasSentinel)
                  + " countMatch=" + std::to_string((int)countMatch));
+        }
+    }
+
+    // ---- Block 39: D-042 R-4 — rotateObject writes preview.x. -------------
+    // R-3 made Scene::pack memcpy preview→packed; R-4 makes rotateObject
+    // dual-write state.x AND preview.x so preview stays consistent with
+    // the rotated state across pack rebuild + pre-init rendering.
+    // Mirrors R-3's translate dual-write pattern.
+    //
+    // Mechanic: addCube places vertex 0 at (-h, -h, -h) = (-0.1, -0.1, -0.1)
+    // for tess=2, size=0.2 cube at origin. 90° Y rotation around the cube's
+    // transformPosition pivot (also origin) maps (x, y, z) → (z, y, -x), so
+    // vertex 0 → (-0.1, -0.1, 0.1). Assert preview.x[0..2] within 1e-4.
+    //
+    // Bug-probe: removing the R-4 preview write loop → preview.x unchanged
+    // from addX time → assertion FAILs.
+    {
+        resetScene();
+        sim.addCube(tinym::vec3(0.0f, 0.0f, 0.0f), 2, 0.2f, 1.0f);
+        sim.initialize();  // populates Scene::meshes so findById succeeds.
+
+        auto& reqs = Scene<Backend, Precision>::requestsGeneralMeshes;
+        bool oneReq = (reqs.size() == 1);
+        bool hasPreview = oneReq && reqs[0].preview.x.size() >= 3;
+
+        Precision pre_x = hasPreview ? reqs[0].preview.x[0] : Precision(0);
+        Precision pre_y = hasPreview ? reqs[0].preview.x[1] : Precision(0);
+        Precision pre_z = hasPreview ? reqs[0].preview.x[2] : Precision(0);
+
+        ::Quat q90;
+        q90.w = std::cos(0.78539816339f);  // π/4
+        q90.x = 0.0f;
+        q90.y = std::sin(0.78539816339f);
+        q90.z = 0.0f;
+        sim.rotateObject(0, q90);
+
+        Precision post_x = hasPreview ? reqs[0].preview.x[0] : Precision(0);
+        Precision post_y = hasPreview ? reqs[0].preview.x[1] : Precision(0);
+        Precision post_z = hasPreview ? reqs[0].preview.x[2] : Precision(0);
+
+        // primitive::cube's +X face is emitted first, so vertex 0 lives at
+        // the (+h, -h, -h) corner = (0.1, -0.1, -0.1) for size=0.2 at origin.
+        // 90° Y rotation around origin maps (x, y, z) → (z, y, -x), so
+        // vertex 0 → (-0.1, -0.1, -0.1).
+        const Precision tol = Precision(1e-4f);
+        bool xOk = std::fabs(post_x - Precision(-0.1f)) < tol;
+        bool yOk = std::fabs(post_y - Precision(-0.1f)) < tol;
+        bool zOk = std::fabs(post_z - Precision(-0.1f)) < tol;
+        bool moved = std::fabs(post_x - pre_x) > tol
+                     || std::fabs(post_z - pre_z) > tol;
+
+        if (oneReq && hasPreview && xOk && yOk && zOk && moved) {
+            pass("D-042 R-4 / rotateObject writes preview.x (90° Y rotation reflects in preview)");
+        } else {
+            fail("D-042 R-4 / rotateObject writes preview.x (90° Y rotation reflects in preview)",
+                 std::string("oneReq=") + std::to_string((int)oneReq)
+                 + " hasPreview=" + std::to_string((int)hasPreview)
+                 + " pre_v0=(" + std::to_string(pre_x) + "," + std::to_string(pre_y) + "," + std::to_string(pre_z) + ")"
+                 + " post_v0=(" + std::to_string(post_x) + "," + std::to_string(post_y) + "," + std::to_string(post_z) + ")"
+                 + " xOk=" + std::to_string((int)xOk)
+                 + " yOk=" + std::to_string((int)yOk)
+                 + " zOk=" + std::to_string((int)zOk)
+                 + " moved=" + std::to_string((int)moved));
         }
     }
 

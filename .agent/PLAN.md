@@ -1,139 +1,237 @@
-# PLAN — D-042 R-3: Scene::pack memcpys from PreviewState — `feat/d-042-r-3-pack-memcpy-preview`
+# PLAN — D-042 R-4: edits route through PreviewState — `feat/d-042-r-4-edits-through-preview`
 
 > Owner: **Planner** writes; **Generator** executes; **Estimator** judges.
 > Updated: 2026-05-14
 
 ## Course note: previous turn's verdict
 
-Estimator turn 37 (D-042 R-2 — MeshGL ↔ PreviewState binding) returned **WARNING** with 0 BLOCK + 1 WARNING + 1 NOTE. WARNING flagged stale `previewBindings` at scene-reset/loadScene boundaries (nextMeshId resets to 0 but renderState doesn't clear). NOTE: `MeshRenderState::clear()` clears only materialized state, not bindings. Both fold into R-3 — adding `clearPreviewBindings()` + wiring it into the load/reset paths.
+Estimator turn 38 returned **BLOCK** on the R-3 turn-37 WARNING fold-in; turn 39 (BLOCK fix-turn) returned **NOTE**: BLOCK item closed by adding `renderState.clear()` alongside `clearPreviewBindings()` in `Simulator::loadScene`. NOTEs flagged the translate dual-write as a "bridge to R-4" and Block 38's coverage gap on the n/facets memcpy branches.
 
-R-2 merged to `main` via commits `cf5555f add:` + `97d35f7 chore:`. Self-test 67 → 68 PASS deterministic on macOS (Linux Metal SKIP unchanged).
+R-3 merged to `main` via commits `c1bc127 add:` + `a88b312 chore:`. Self-test 68 → 69 PASS deterministic on macOS.
 
 ## Goal
 
-**Make `Scene::pack` populate the packed vertex/facet/normal sub-views by `memcpy` from the per-request `PreviewState`** instead of relying solely on the legacy `mesh.initialize()` regen-from-initializer path. This is R-3 of the 7-slice D-042 refactor and the first slice where preview is **load-bearing** for the simulator's runtime data (R-1 + R-2 added preview + binding but `Scene::pack` still re-ran the initializer to fill packed buffers). Post-R-3: `mesh.initialize()` still runs (preserves the adjacency-derivation path: vertexAdjFacets, vertexAdjFacetsOffsets, edges, etc.), but the vertex/facet/normal data is overwritten by `memcpy` from `req.preview.x.data() / facets.data() / n.data()`. Future R-4 mutates preview directly for translateObject/rotateObject/setMaterial; R-5 mirrors the pattern in reverse (packed → preview sync at end of `Simulator::update`).
-
-Also folds the R-2 Estimator WARNING by adding `MeshRenderState::clearPreviewBindings()` + calling it from `Simulator::loadScene`. (The harness `resetScene` lambdas don't need it — no GL context — but the production load path is real.)
-
-Block 38 verifies the memcpy is load-bearing by mutating `preview.x[1]` to a sentinel value (99.0f) BEFORE `sim.initialize()`, then asserting the post-pack `meshes[0].state.x[1] == 99.0f`. Without the memcpy block, `state.x[1]` reflects the initializer's regenerated geometry (-0.1f for a tess=2 cube at origin), so the sentinel doesn't survive. Self-test count 68 → 69.
+**Add `rotateObject` preview write-back to mirror R-3's `translateObject` dual-write pattern**, completing the "edits land in preview eagerly" half of R-4. `setMaterial` is preserved as-is (preview holds geometry only — not material). The translate dual-write from R-3 is documented as the canonical pattern (no longer transitional). Block 39 verifies rotateObject's preview write by rotating a cube 90° around Y and asserting that `preview.x` for vertex 0 reflects the rotated position. Self-test count 69 → 70.
 
 ## Scope
 
-**Design call (1) — Memcpy AFTER `mesh.initialize()`, not as a replacement.** `GeneralMesh::initialize()` calls `initializer->initialize(state, adjacency)` which builds:
-- `state.x` (vertex positions) — REPLICATED by `preview.x` in R-1.
-- `adjacency.facets` — REPLICATED by `preview.facets` in R-1.
-- `state.n` (normals) — REPLICATED by `preview.n` in R-1.
-- `adjacency.edges`, `vertexAdjFacets`, `vertexAdjFacetsOffsets`, `vertexAdjEdges`, `vertexAdjEdgesOffsets` — **NOT** in preview. Derived from the initializer's regenerated geometry. Required by `Scene::pack`'s post-init loop at lines ~2160-2185 (the cross-mesh offset stitching).
+**Design call (1) — Narrow scope: only `rotateObject` gets a new preview write.** Per the user brief:
+- `translateObject` — R-3 already dual-writes (state.x AND preview.x by the same delta). No code change this slice; comment-only update to mark it canonical.
+- `rotateObject` — NEW preview dual-write added. Mirrors the existing state.x rotation around pivot.
+- `setMaterial` — UNCHANGED. Preview is geometry-only; material persistence already handled by `pendingMaterials` + `Scene::dirty` flag.
 
-The cleanest R-3 keeps `mesh.initialize()` running (so adjacency derivation works unchanged) and adds memcpy after it. The memcpy overrides the initializer's regenerated x/n/facets with preview's data. For v1 the two are byte-equivalent (populatePreview mirrors the initializer's geometry algorithm exactly), so the override is a no-op overlay UNLESS preview is mutated between addX and `sim.initialize()` — which is exactly what Block 38 exercises to prove the memcpy is load-bearing.
-
-**Design call (2) — Memcpy guarded on size match.** Preview's vertex/facet/normal sizes are populated by `populatePreview` at addX time. The packed sub-view sizes are derived from `initializer->getParams()->numPoints/numFacets`. For v1 these match exactly. To defend against an initializer subtype that defines populatePreview as a default no-op (the base `GeneralMeshInitializer::populatePreview` returns immediately), the memcpy block guards on size match before writing. On size mismatch (future no-preview initializer), the memcpy is silently skipped and the initializer's regen stands — the parallel-symbol invariant. For v1 all 4 subtypes have populatePreview, so every memcpy fires.
-
-**Design call (3) — Memcpy placement inside Scene::pack's per-mesh loop.** Insert AFTER `meshes[i].initialize()` (line ~2151) and BEFORE the existing `std::memcpy(state.xPrev.ptr, state.x.ptr, ...)` (line ~2156, so xPrev mirrors the post-preview x, not the regenerated x). The vertex adjacency stitching at lines ~2160-2165 reads the mesh's locally-computed adjacency tables — already correct from initialize. memcpy block sits cleanly between these.
-
-**Design call (4) — `MeshRenderState::clearPreviewBindings()` API.** New public method (R-2 WARNING fold-in):
+**Design call (2) — `rotateObject` preview math.** The existing state.x rotation at `src/main.cpp:5251-5258` computes `p_rot = pivot + rotateVector(delta, p_curr - pivot)` per vertex. R-4's preview write mirrors this exactly:
 ```cpp
-void clearPreviewBindings() { previewBindings.clear(); }
+// After the existing state.x rotation loop, before the existing
+// rotationQuat assignment.
+for (auto& req : Scene<BE, PR>::requestsGeneralMeshes) {
+    if (req.id == meshId) {
+        const size_t np = req.preview.numPoints();
+        for (size_t i = 0; i < np; ++i) {
+            tinym::vec3 p(req.preview.x[i*3+0],
+                          req.preview.x[i*3+1],
+                          req.preview.x[i*3+2]);
+            tinym::vec3 p_rot = pivot + rotateVector(delta, p - pivot);
+            req.preview.x[i*3+0] = p_rot.x;
+            req.preview.x[i*3+1] = p_rot.y;
+            req.preview.x[i*3+2] = p_rot.z;
+        }
+        break;
+    }
+}
 ```
-Wired into `Simulator::loadScene` AFTER `pendingRotations.clear();` at ~line 6025. Harness `resetScene` lambdas (at lines 6557, 6658) are NOT updated — those lambdas don't have `sim` capture and the harness has no GL context, so stale `previewBindings` are inert. Acceptable for R-3 scope.
 
-**Design call (5) — Block 38 shape.** Verify memcpy is load-bearing via sentinel injection:
-1. `resetScene()`; `sim.addCube(tinym::vec3(0, 0, 0), 2, 0.2f, 1.0f)`.
-2. Capture `req = requestsGeneralMeshes[0]`; assert preview has ≥ 9 floats in x/n + 9 facet indices.
-3. Mutate `reqs[0].preview.x[1] = 99.0f` (sentinel — distinct from cube's natural y=-0.1).
-4. `sim.initialize()` — triggers `Scene::pack` → `mesh.initialize()` writes initializer's -0.1 → memcpy from preview overrides to 99.0f.
-5. Assert `meshes[0].state.x[1] == 99.0f` (sentinel survived). Without memcpy: `state.x[1] == -0.1f` (assertion FAILs).
-6. Assert `state.x.size / 3 == preview.numPoints()` (count integrity).
+The `delta` quaternion + `pivot` vec3 are already computed by the state.x rotation block. The preview write reuses both.
 
-Pass label: `D-042 R-3 / Scene::pack memcpys preview x into packed sub-view (sentinel survives initializer regen)`.
+**Design call (3) — Why preview write-back is needed for rotate at all.** Pre-R-4, rotate persistence through Scene::pack worked via D-025's pendingRotations + applyPendingMaterials (re-applied AFTER pack to state.x). Post-R-3, Scene::pack memcpys preview→packed, so state.x post-pack reflects preview.x. The D-025 re-apply then runs on the post-memcpy state.x.
 
-**Design call (6) — Block 38 placement: INSIDE the Metal-gated section, AFTER Block 37.** Block 38 uses `sim.initialize()` which requires Metal device + buffer allocation. Linux container SKIPs along with Blocks 1-29 + 32-37. Same pattern as the prior preview/binding blocks. Acceptable per D-012.
+So pre-R-4 with R-3 alone: rotate's D-025 flow still works (rotation re-applies after pack to preview-sourced state.x). **Existing 69/69 PASS confirms this.**
+
+R-4's preview write-back is **defensive** — it ensures preview tracks rotation eagerly so:
+- Pre-init rendering (R-2 binding path) reflects the rotated mesh.
+- Future R-5 (packed→preview resync) doesn't need a special "rotate hasn't synced yet" branch.
+- The PreviewState's "source of truth" claim is fully consistent for both translate and rotate.
+
+**Design call (4) — Block 39 shape.** Verify rotate's preview write via a known-result rotation:
+1. `resetScene()`; `sim.addCube(tinym::vec3(0,0,0), 2, 0.2f, 1.0f)` — cube at origin, tess=2 → first vertex at (-0.1, -0.1, -0.1).
+2. Capture `pre_v0 = (reqs[0].preview.x[0], reqs[0].preview.x[1], reqs[0].preview.x[2])` → expected (-0.1, -0.1, -0.1).
+3. Construct 90° Y rotation: `::Quat q90; q90.w = cos(π/4); q90.x = 0; q90.y = sin(π/4); q90.z = 0;`.
+4. `sim.rotateObject(0, q90)` — pivot = transformPosition (origin); rotates preview.x.
+5. Capture `post_v0 = (reqs[0].preview.x[0], reqs[0].preview.x[1], reqs[0].preview.x[2])`.
+6. Expected after 90° Y rotation around origin of (-0.1, -0.1, -0.1):
+   - Y stays: -0.1
+   - 90° Y: (x, z) → (z, -x) per the standard right-hand rule, so (-0.1, -0.1) → (-0.1, 0.1).
+   - Result: (-0.1, -0.1, 0.1).
+7. Assert each component within 1e-4 tolerance.
+
+Pass label: `D-042 R-4 / rotateObject writes preview.x (90° Y rotation reflects in preview)`.
+
+**Design call (5) — Block 39 placement: INSIDE the Metal-gated section, AFTER Block 38.** Block 39 uses `sim.addCube` → Metal allocation. Same SKIP pattern as Block 36/37/38. Acceptable.
+
+**Design call (6) — Verify the 90° Y rotation matrix.** The standard right-hand-rule Y rotation by θ:
+```
+[ cos θ   0   sin θ ]
+[   0     1    0    ]
+[-sin θ   0   cos θ ]
+```
+For θ=90°: (x, y, z) → (z, y, -x).
+
+For vertex (-0.1, -0.1, -0.1):
+- new_x = z = -0.1
+- new_y = y = -0.1
+- new_z = -x = 0.1
+
+So expected post-rotate: **(-0.1, -0.1, 0.1)**.
+
+**Design call (7) — Tolerance for floating-point comparison.** Use `1e-4f` for each component. Quaternion construction from cos/sin of π/4 introduces ~1e-7 error; rotateVector multiplication compounds slightly. 1e-4 is conservative without being permissive.
 
 **NEW symbols this slice adds**:
-- `MeshRenderState::clearPreviewBindings()` method.
-- Block 38 in `runSelfTest` (1 new pass clause).
-- `docs/DECISIONS.md` — D-042 R-3 entry.
+- Block 39 in `runSelfTest` (1 new pass clause).
+- `docs/DECISIONS.md` — D-042 R-4 entry.
 
 **MODIFIED symbols in place**:
-- `include/MeshRenderState.hpp` — adds `clearPreviewBindings`.
-- `src/main.cpp` — Scene::pack gains the post-initialize memcpy block (Design calls 1+2+3). `Simulator::loadScene` calls `renderState.clearPreviewBindings()`.
+- `src/main.cpp` — `Simulator::rotateObject` gains the preview write-back loop (mirrors the existing state.x rotation). Comment note added to `translateObject` marking the dual-write as canonical (no longer transitional per R-3's "bridge" framing).
 - `.agent/PROJECT_STATE.md` — next-milestone updates.
 
 **PRESERVED symbols** (parallel-symbol invariant):
-- `GeneralMeshInitializer::initialize` and all 4 overrides — UNCHANGED. The initializer regen path stays callable; R-3's memcpy overlays its output.
-- `GeneralMesh::initialize` — UNCHANGED. Still calls `initializer->initialize(state, adjacency)` for adjacency derivation.
-- `Scene::pack`'s sub-view allocation pattern — UNCHANGED. Same offsets, same `VectorBase` constructions.
+- `Simulator::translateObject` body — UNCHANGED (R-3's dual-write stays; only the comment is refreshed).
+- `Simulator::setMaterial` — UNCHANGED.
+- `Simulator::rotateObject` other-than-the-new-preview-loop — UNCHANGED. D-025 pendingRotations flow stays.
+- `MeshRenderState` (all R-2 + R-3 API) — UNCHANGED.
 - `PreviewState<PR>` — UNCHANGED.
-- `MeshRenderState::registerPreviewBinding` / `previewBinding` / `removeById` / `getOrCreate` / `clear` / `has` — UNCHANGED.
-- `Simulator::loadScene` other-than-the-one-new-call — UNCHANGED.
-- `resetScene` lambdas in `runSelfTest` / `runRefitBench` — UNCHANGED (no GL context → stale bindings inert).
+- `Scene::pack`'s R-3 memcpy block — UNCHANGED.
 - All Metal kernels, BVH, narrow-phase — UNCHANGED.
-- Block 1-37 — UNCHANGED.
+- Block 1-38 — UNCHANGED.
 
 ## Non-goals
 
-- **NO replacement of `mesh.initialize()` with adjacency-only path.** That's a future cleanup (R-7 candidate); R-3 keeps initialize() running for adjacency, overrides x/n/facets only.
-- **NO mutation of `translateObject` / `rotateObject` / `setMaterial` to write into PreviewState.** That's R-4.
+- **NO change to `setMaterial`.** Preview is geometry-only.
+- **NO removal of D-025 pendingRotations re-apply flow.** That's a future R-7 cleanup candidate (rotate could become preview-primary once R-5 lands the packed→preview resync).
+- **NO change to `translateObject` body.** R-3 already covers the dual-write.
 - **NO packed → preview resync at end of `Simulator::update`.** That's R-5.
 - **NO self-test migration to read via Scene::meshes preview alias.** That's R-6.
-- **NO retirement of the legacy `getOrCreate` packed-sub-view fallback.** That's R-7.
-- **NO update to harness `resetScene` lambdas.** Acceptable per Design call (4); they have no GL context.
 - **NO new BDD/FRD/CM.**
-- **NO C-* FlatBuffers work.**
 
 ## Spec substitution
 
-None this turn. R-3 is infrastructure work on the D-042 architectural-refactor path.
+None. R-4 is infrastructure work.
 
 ## Standing constraints
 
 - **RIGID-BACKEND-PORTABILITY** (D-037) — UNCHANGED.
 - **PARALLEL-IMPL-LOCKSTEP** (D-035 + D-038) — UNCHANGED.
-- **BDD-102-vs-ALEMBIC-BYTES** — UNCHANGED.
-- **DUPLICATED-INSPECTOR-WIRING** — UNCHANGED.
-- **GLFWINIT-NON-REF-COUNTED** — UNCHANGED.
+- **D-021 rotateVector / Quat math invariants** — APPLIES. The preview write uses the same `rotateVector(delta, ...)` helper as state.x. If a future slice changes the rotation pivot convention or the quaternion ordering, both call sites need the change.
 
 ## Todo
 
-1. **Branch hygiene.** Working in worktree `.claude/worktrees/r3-pack-memcpy` on branch `feat/d-042-r-3-pack-memcpy-preview` (branched off main HEAD `97d35f7`). Submodules already initialized. Commit prefix `add:`.
+1. **Branch hygiene.** Working in worktree `.claude/worktrees/r4-edits-through-preview` on branch `feat/d-042-r-4-edits-through-preview` (branched off main HEAD `a88b312`). Submodules already initialized. Commit prefix `add:`.
 
-2. **`include/MeshRenderState.hpp` — add `clearPreviewBindings()`** alongside the existing `clear()` method.
+2. **`src/main.cpp` — `Simulator::rotateObject` preview write-back.** Insert AFTER the existing state.x rotation loop (after `mesh->state.xPrev.ptr[i*3+2] = prev_rot.z;` closing the loop) and BEFORE the `mesh->rotationQuat = newAbs;` assignment. Body per Design call (2).
 
-3. **`src/main.cpp` — Scene::pack memcpy block** inserted AFTER `meshes[i].initialize()` and BEFORE the existing `xPrev` mirror memcpy. Body uses size guard + 3 conditional memcpys (x, n, facets) per Design call (2).
+3. **`src/main.cpp` — `Simulator::translateObject` comment refresh.** The R-3 dual-write comment block currently says "R-3 dual-writes; R-4 will make preview the primary mutation target with state.x derived." Update wording to reflect R-4 reality: preview is canonical for both translate (R-3) and rotate (R-4); the state.x update stays for D-014's immediate-effect and D-023's BVH refit.
 
-4. **`src/main.cpp` — `Simulator::loadScene` calls `renderState.clearPreviewBindings()`** after `pendingRotations.clear();`.
+4. **New Block 39** in `runSelfTest` — inserted INSIDE the Metal-gated section, AFTER Block 38 (D-042 R-3). Body per Design call (4):
+   ```cpp
+   // ---- Block 39: D-042 R-4 — rotateObject writes preview.x. -------------
+   // R-3 made Scene::pack memcpy preview→packed; R-4 makes rotateObject
+   // dual-write state.x AND preview.x so the preview stays consistent
+   // with the rotated state across pack rebuild + pre-init rendering.
+   // Mirrors R-3's translate dual-write pattern.
+   //
+   // Mechanic: addCube places vertex 0 at (-h, -h, -h) = (-0.1, -0.1, -0.1)
+   // for tess=2, size=0.2 cube at origin. 90° Y rotation around the cube's
+   // transformPosition pivot (also origin) maps (x, y, z) → (z, y, -x), so
+   // vertex 0 → (-0.1, -0.1, 0.1). Assert preview.x[0..2] within 1e-4.
+   //
+   // Bug-probe: removing the R-4 preview write loop → preview.x is
+   // unchanged from addX time → assertion FAILs.
+   {
+       resetScene();
+       sim.addCube(tinym::vec3(0.0f, 0.0f, 0.0f), 2, 0.2f, 1.0f);
 
-5. **New Block 38** in `runSelfTest` — inserted INSIDE the Metal-gated section AFTER Block 37. Sentinel injection (preview.x[1] = 99.0f) verifies memcpy survives initializer regen.
+       auto& reqs = Scene<Backend, Precision>::requestsGeneralMeshes;
+       bool oneReq = (reqs.size() == 1);
+       bool hasPreview = oneReq && reqs[0].preview.x.size() >= 3;
 
-6. **Build + verify deterministic.** `cmake --build build && cd build && for i in 1 2 3 4 5; do ./src/ysim --self-test; done` — expect **69/69 PASS** each time.
+       Precision pre_x = hasPreview ? reqs[0].preview.x[0] : Precision(0);
+       Precision pre_y = hasPreview ? reqs[0].preview.x[1] : Precision(0);
+       Precision pre_z = hasPreview ? reqs[0].preview.x[2] : Precision(0);
 
-7. **`verify-light.sh` cross-check.** Expect doctest 159/159 + 1120/1120 SUCCESS unchanged.
+       ::Quat q90;
+       q90.w = std::cos(0.78539816339f);  // π/4
+       q90.x = 0.0f;
+       q90.y = std::sin(0.78539816339f);
+       q90.z = 0.0f;
+       sim.rotateObject(0, q90);
 
-8. **Bug-probes** (each FAIL after revert; restore after):
-   - **(a) Comment out the entire memcpy block in Scene::pack**: Block 38 FAILs (`packedHasSentinel=0`).
-   - **(b) Skip only the `state.x` memcpy (keep `state.n` + `facets`)**: Block 38 FAILs (same — `packedHasSentinel=0`). Confirms the x branch is load-bearing.
-   - **(c) `clearPreviewBindings` from `loadScene`**: harder to verify load-bearingness in self-test. Document the gap; the WARNING fold-in is verified by code-review only.
+       Precision post_x = hasPreview ? reqs[0].preview.x[0] : Precision(0);
+       Precision post_y = hasPreview ? reqs[0].preview.x[1] : Precision(0);
+       Precision post_z = hasPreview ? reqs[0].preview.x[2] : Precision(0);
 
-9. **Append D-042 R-3 to `docs/DECISIONS.md`**.
+       // Expected after 90° Y rotation of (-h, -h, -h) around origin:
+       //   new_x = z = -h, new_y = y = -h, new_z = -x = +h
+       // For h = 0.1: expected (-0.1, -0.1, 0.1).
+       const Precision tol = Precision(1e-4f);
+       bool xOk = std::fabs(post_x - Precision(-0.1f)) < tol;
+       bool yOk = std::fabs(post_y - Precision(-0.1f)) < tol;
+       bool zOk = std::fabs(post_z - Precision( 0.1f)) < tol;
+       bool moved = std::fabs(post_x - pre_x) > tol
+                    || std::fabs(post_z - pre_z) > tol;
 
-10. **Update `.agent/PROJECT_STATE.md`**: next-milestone updates R-3 → R-4.
+       if (oneReq && hasPreview && xOk && yOk && zOk && moved) {
+           pass("D-042 R-4 / rotateObject writes preview.x (90° Y rotation reflects in preview)");
+       } else {
+           fail("D-042 R-4 / rotateObject writes preview.x (90° Y rotation reflects in preview)",
+                std::string("oneReq=") + std::to_string((int)oneReq)
+                + " hasPreview=" + std::to_string((int)hasPreview)
+                + " pre_v0=(" + std::to_string(pre_x) + "," + std::to_string(pre_y) + "," + std::to_string(pre_z) + ")"
+                + " post_v0=(" + std::to_string(post_x) + "," + std::to_string(post_y) + "," + std::to_string(post_z) + ")"
+                + " xOk=" + std::to_string((int)xOk)
+                + " yOk=" + std::to_string((int)yOk)
+                + " zOk=" + std::to_string((int)zOk)
+                + " moved=" + std::to_string((int)moved));
+       }
+   }
+   ```
 
-11. **Update `.agent/CURRENT_WORK.md` + `.agent/RESUME.md`** — Generator-tier task.
+5. **Build + verify deterministic.** `cmake --build build && cd build && for i in 1 2 3 4 5; do ./src/ysim --self-test; done` — expect **70/70 PASS** each time.
+
+6. **`verify-light.sh` cross-check.** Expect doctest 159/159 + 1120/1120 SUCCESS unchanged.
+
+7. **Bug-probes** (each FAIL after revert; restore after):
+   - **(a) Comment out the rotateObject preview write loop**: Block 39 FAILs (post_v0 == pre_v0, `moved=0`). Restore.
+   - **(b) Skip the preview pivot subtraction (use `p_rot = rotateVector(delta, p)` without subtracting/adding pivot)**: Block 39 FAILs because the cube is at origin so pivot=(0,0,0); the rotation would be equivalent. Skip (b) — degenerate test case.
+
+8. **Append D-042 R-4 to `docs/DECISIONS.md`**.
+
+9. **Update `.agent/PROJECT_STATE.md`**: next-milestone updates R-4 → R-5.
+
+10. **Update `.agent/CURRENT_WORK.md` + `.agent/RESUME.md`** — Generator-tier task.
 
 ## Course corrections
 
-- **`feedback_make_means_add_new` rule**: user's brief uses "rewrite Scene::pack" — explicit rewrite verb, in-place modification of the existing pack body is correct. The legacy initialize() regen path stays callable (size-guarded fallback).
+- **`feedback_make_means_add_new` rule**: user's brief uses "route through PreviewState" — integration verb, in-place modification of `rotateObject` is correct. The new code is a parallel addition (the existing state.x rotation stays; preview write is added next to it).
 - **`project_flatbuffers_caching_skipped`**: stays in force.
-- **D-026 lifetimeId invariant**: applies — `Scene::pack` sets `meshes[i].lifetimeId = req.lifetimeId` BEFORE the memcpy block.
-- **D-041 nextMeshId monotone**: applies — preview's id-keyed binding is unaffected; memcpy operates on `requestsGeneralMeshes[i]` by index, not id.
-- **D-021 transformPosition cascade**: applies — Scene::pack seeds `meshes[i].transformPosition` from the initializer's center/offset BEFORE memcpy.
-- **CM-012 utility-helper-exit trap**: applies — `clearPreviewBindings()` does not call `exit()` / `abort()`.
-- **PROBE-COVERAGE-EDGES per PLANNER §9**: not a math-layer slice. Edges considered: empty preview, size mismatch, multiple meshes, sentinel distinct from natural values.
+- **D-021 rotateVector invariant**: applies — preview write uses the same `rotateVector(delta, ...)` helper as state.x. PARALLEL-IMPL-LOCKSTEP across the two loops.
+- **D-025 pendingRotations**: applies — UNCHANGED. The flow still re-applies pendingRotations to state.x after Scene::pack. Preview's eager rotation is additional defense, not a replacement.
+- **CM-012 utility-helper-exit trap**: applies — no new exit-able utilities.
+- **PROBE-COVERAGE-EDGES per PLANNER §9**: this is a math-touching slice (rotateVector). Edges considered:
+  - 90° Y rotation around origin — Block 39's case.
+  - Identity rotation (delta = identity quat) — preview write is a no-op (rotateVector returns input). Acceptable; verified implicitly by the dual-write fanning into state.x's existing-passing tests.
+  - Non-origin pivot — not exercised by Block 39 (cube at origin); the math is symmetric and the state.x loop already handles it. Documented gap.
+  - Sequential rotations — not exercised; preview tracks each individually. Documented gap.
 
 ## Expected metrics
 
-- Self-test count: **68 → 69**.
+- Self-test count: **69 → 70**.
 - 5-run deterministic PASS on macOS dev host.
 - `verify-light.sh`: doctest 159/159 + 1120/1120 SUCCESS unchanged.
-- Linux container: Block 38 SKIPs.
-- Estimator verdict next turn: **NOTE** if implementation clean. Possible NOTE items: memcpy is no-op overlay for v1; initialize() still does redundant work; clearPreviewBindings not in harness lambdas.
+- Linux container: Block 39 SKIPs along with Blocks 1-29 + 32-38.
+- Expected matrix delta: none (R-4 is infrastructure).
+- Expected DECISIONS.md delta: D-042 R-4 entry added.
+- Estimator verdict next turn: **NOTE** if implementation clean. Possible NOTEs:
+  - (i) Non-origin pivot not exercised by Block 39.
+  - (ii) Sequential rotations not exercised.
+  - (iii) `setMaterial` no-op for R-4 is correct but worth noting as a documented decision.
+  - **WARNING** would land if: Block 39 FAILs OR existing Blocks 1-38 regress OR the preview rotation diverges from state.x by more than FP noise (lockstep break).
+  - **BLOCK** if Block 39 FAILs on macOS OR pre-existing PASS count regresses OR D-025 pendingRotations re-apply path breaks (silent revert of preview rotation by re-apply over state.x).

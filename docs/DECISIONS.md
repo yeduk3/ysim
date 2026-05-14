@@ -801,3 +801,24 @@ Estimator turn-38 returned BLOCK on the R-2 WARNING fold-in: `clearPreviewBindin
 Together they form the safe scene-boundary reset. Estimator turn-39 confirmed: BLOCK → NOTE. Self-test 69/69 PASS deterministic on macOS (no change from initial R-3); verify.sh exit 0 on Metal-less container.
 
 Bug-probe: not run for the second clear() call — the regression isn't observable in headless self-test (no GL context to drive `getOrCreate`). Verified by code review + Estimator independent confirmation that the failure mode no longer exists.
+
+## D-042 R-4 — rotateObject writes preview.x; pendingRotations stash retired in rotateObject (2026-05-14)
+
+R-4 of 7. Completes R-3's preview-as-source-of-truth pattern for the rotation half. `Simulator::rotateObject` now writes preview.x in parallel with state.x (mirrors R-3's translateObject dual-write). The per-call `pendingRotations[meshId] = newAbs;` stash IS RETIRED from this site — preview rotation + R-3 pack memcpy together preserve rotation through Scene::pack reallocations. The applyPendingMaterials re-apply path would otherwise double-rotate (state.x already rotated by memcpy from preview, then re-rotated by re-apply). `loadScene`'s separate `pendingRotations[id] = q` stash for deferred-at-load rotations is UNCHANGED — that path runs once at the first post-load initialize before preview is rotated.
+
+**`translateObject` comment refresh** from R-3's "transitional bridge" framing to R-4's "canonical": preview is the source of truth; state.x mirrors via Scene::pack memcpy; translateObject writes both eagerly for D-014 immediate-effect + D-023 BVH refit pose.
+
+**`setMaterial` UNCHANGED** — preview is geometry-only; material persistence is already handled by `pendingMaterials` + `Scene::dirty`.
+
+**Block 39 (D-042 R-4)** verifies the rotate write-back:
+1. `addCube(origin, tess=2, size=0.2, mass=1)` → vertex 0 at (0.1, -0.1, -0.1) (primitive::cube's +X face is emitted first).
+2. `sim.initialize()` populates Scene::meshes so findById succeeds.
+3. `sim.rotateObject(0, q90)` with q90 = (cos π/4, 0, sin π/4, 0) → 90° Y rotation.
+4. Assert preview.x[0..2] ≈ (-0.1, -0.1, -0.1) within 1e-4 tolerance (90° Y maps (x, y, z) → (z, y, -x); (0.1, -0.1, -0.1) → (-0.1, -0.1, -0.1)).
+
+Pass label: `D-042 R-4 / rotateObject writes preview.x (90° Y rotation reflects in preview)`. Self-test 69 → 70 PASS deterministic across 5 macOS runs. doctest 159 + 1120 SUCCESS.
+
+**Bug-probe verified**:
+- **(a)** Disable the preview rotate loop → 4 simultaneous FAILs: Block 39 (`moved=0`), FR-004 UI rotated-state-survives-step, FR-004 rotateObject-survives-pack-rebuild, BDD-018 rotate-inspector-edit. Confirms the preview write is now the SOLE mechanism preserving rotation through pack (the prior pendingRotations stash from this site was retired). Restored.
+
+**Self-test**: 70/70 PASS deterministic across 5 macOS runs; doctest 159 + 1120 SUCCESS unchanged.
