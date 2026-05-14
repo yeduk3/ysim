@@ -1,4 +1,4 @@
-# Estimation — 2026-05-14 turn 34
+# Estimation — 2026-05-14 turn-36
 
 Status: UPDATED
 
@@ -9,13 +9,13 @@ WARNING
 - none
 
 ## WARNING
-- docs/TEST_MATRIX.md:22, docs/specs/BDD.md:83-89, include/EulerRigidPhysicsBackend.hpp:108-116 — Block 31 only proves gravity/rest behavior for a sphere on a horizontal clamp. The matrix entry correctly stays pending, but this slice still does not satisfy BDD-008's box-on-plane acceptance wording or its angular-velocity-decay requirement, so it should not be read as BDD-008 closure.
+- `docs/TESTS.md:83-85` / `src/main.cpp:9545-9562` — Block 33 treats the "rest" clause as a position-delta proxy (`|Δy| < 0.001`) after a fixed 240-frame run, but the BDD wording requires the box to advance until kinetic energy stays below threshold for a sustained window and for angular velocity to have decayed. The new `pass` label is plausible, but the assertion is weaker than the spec it claims to close.
 
 ## NOTE
-- include/EulerRigidPhysicsBackend.hpp:56-60,145-161 — `removeBody` is a deliberate slot leak and `applyForce`/`applyImpulse` are collapsed to body-center velocity deltas. Fine for B-2′, but future work will need a follow-up if handle reuse or distinct force/impulse semantics matter.
+- `src/main.cpp:5231-5266` — the rigid delta-loop is translation-only, so Bullet rotation is not propagated back into `state.x`. That is acceptable for the current cube-only slice, but asymmetric rigid shapes will need a follow-up rotation path.
 
 ## Test matrix delta
-- BDD-008: missing
+- BDD-008: pass
 
 ## Verify output (summary)
-`./scripts/verify.sh` completed successfully with exit 0. CMake configure/build succeeded, both doctest suites passed (`159/159` and `1120/1120`), and the new self-test clauses for D-037 and D-038 all passed. The expected `[self-test SKIP] metal-device` appeared on this non-Metal host after Blocks 30 and 31 had already run.
+`./scripts/verify.sh` completed successfully on this host. CMake configured and built the vendored Bullet subproject plus `ysim`; both doctest binaries passed (`159/159` and `1120/1120` assertions). The self-test ran the D-037 Null clauses and D-038 Euler clauses, then hit the expected `[self-test SKIP] metal-device` on this non-Metal host before Blocks 32 and 33, so the new Bullet-backed end-to-end assertions were not exercised in this local run.
