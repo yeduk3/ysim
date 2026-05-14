@@ -672,3 +672,29 @@ Within a session: ids monotone-increase forever. Remove + add never collides.
 **Note on the "cloth-vs-ground collision broken" complaint**: this was a UX surprise, not a separate bug. Pre-D-041, deleting Human while paused left cloth in its draped mid-fall state on Human + ground. After D-041 (any mutation forces re-init), the cloth resets to its initializer-derived spawn position (y=0.25). On resume, cloth falls fresh from spawn → collides with ground → drapes again. The user perceived "collision broken" because cloth appeared in mid-air after delete, but it was actually the dirty-init's intentional state reset. Documented in D-041 main entry's "Behavioral consequences" notes.
 
 **Self-test**: 64/64 PASS deterministic across 5 macOS runs; doctest 159+1120 SUCCESS unchanged.
+
+### D-041 turn-3 addendum (2026-05-14, "BVH broad-pair stores id, narrow uses index" fix)
+
+**User-reported bug**: in main scene with cloth + Human + ground, deleting Human via Inspector caused cloth-vs-ground narrow phase to stop firing. Broad phase still detected the pair (the AABB intersection happened) but narrow-collision counter stayed at 0. Adding a Rigid sphere after delete didn't restore narrow contacts either.
+
+**Root cause**: schism between two coordinate spaces — mesh **id** (stable across remove+add per D-026 / D-041 turn-2) vs mesh **array index** (positional). The BVH broad-phase path stored mesh.id in `broadCollisions.objPair` via the chain:
+
+- `BroadPhase::detectCollisions` calls `objTrees[t].queryPoints(queryTree.objid, margin)` — passes the QUERY tree's `objid` (= mesh.id) and the TARGET tree's `objid` (also mesh.id) into the kernel's `QueryPointsParams.{qObjId, tObjId}`.
+- `src/metal/bvh.metal`'s `query_points` kernel writes `broadCollisions[idx].objPair = {qParams.qObjId, qParams.tObjId}` — both IDs.
+- `src/metal/bruteforce.metal`'s `narrow_pt_tri` reads `scenePackedPositionsOffsets[objPair.x]` and `scenePackedPositionsOffsets[objPair.y]` to compute query/target vertex base offsets. That `scenePackedPositionsOffsets` array (= `packedMeshData.statesOffsets`) is INDEX-keyed (one entry per mesh in array order, plus end marker).
+
+Pre-D-041 turn-2, mesh.id == array index by construction (`addGeneralMesh` used `numMeshes++` for id), so writing id and reading as index coincidentally produced correct offsets. D-041 turn-2 decoupled id from index (introduced `nextMeshId` for monotone id-assignment so removeMesh + addX doesn't collide). After the user's "Delete Human" step in the main scene, ground's mesh.id=2 sat at array index 1; the narrow kernel reading `scenePackedPositionsOffsets[2]` got the "end of buffer" sentinel (size N+1, [N] = total points) — vertex reads dereferenced past ground's data and produced zero contacts.
+
+The SpatialHashing path was already correct (`runBroadPhase` writes `objPair = uint2(objA, objB)` where `objA/objB = faceObj[face]`, and `faceObj` is built via `for(obj=0; obj<numMeshes; ++obj) for(f in obj's facets) faceObj[f] = obj;` — index-keyed). The BVH path was the lone misalignment.
+
+**Fix (D-041 turn-3)**: TRI_LBVH gains a new `int objIndex = -1` field, distinct from `objid` (mesh.id). `BroadPhase::build` sets `objTrees[i].objIndex = i` on both the build and skip-rebuild paths (objid stays = mesh.id, preserved across remove+add for D-026 lifetime gating; objIndex tracks array position which CAN change on remove). `BVH::queryPoints(Index qIndex, ...)` now takes a query INDEX (not id), looks up the mesh via `Scene::meshes[qIndex]`, and writes INDICES (qIndex, this->objIndex) into the kernel params. `BroadPhase::detectCollisions` passes the loop counter `q` (index) instead of `queryTree.objid`. `checkSelfCollisions` uses `this->objIndex`.
+
+Net effect: `broadCollisions.objPair` now consistently stores INDICES across BVH AND SpatialHashing paths. Narrow kernel reads correct offsets regardless of mesh.id ≠ array index.
+
+**Block 35 (D-041 turn-3)** mechanizes the regression: build cloth + cube + ground (3-mesh, mimics main scene's cloth + Human + ground), removeMesh(middle=cube), pump 30 frames, assert `cumulativeNarrowCollisions > 0` AND verify `meshes[1].id (== 2) != index 1` (preconditional check — confirms the test exercises the id≠index condition that triggered the bug, not a degenerate scenario). Pass label: `D-041 turn-3 / narrow-phase fires for cloth-vs-ground after middle-mesh removal (id != index)`. Self-test 64 → 65 PASS deterministic across 5 macOS runs.
+
+**Bug-probe verified**: reverting `qIndex, objIndex` to `qmesh.id, objid` in `BVH::queryPoints` reproduces `cumNarrow=0` (the exact user-reported failure mode). Restored.
+
+**Why didn't earlier tests catch this?** Pre-D-041 turn-2, id == index, so writing id and reading as index was equivalent. D-041 turn-2's Block 34 verified ID uniqueness but didn't exercise the narrow-phase collision path. Block 35 closes that coverage hole.
+
+**Self-test**: 65/65 PASS deterministic across 5 macOS runs; doctest 159 + 1120 SUCCESS unchanged.

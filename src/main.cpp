@@ -3329,7 +3329,18 @@ struct BVH<BE, PR, BVHMODE::LINEAR, PRIMITIVE> {
     // hybrid value (1..log2(N)-1) for measurement/debug.
     int bottomUpHybridDepth = 30;
 
-    int objid; // who made this tree
+    int objid; // who made this tree (mesh.id; stable across remove+add)
+    // D-041 turn-3 (2026-05-14): mesh INDEX into Scene::meshes — what
+    // gets written into broadCollisions.objPair so the Metal narrow
+    // kernel can use it as a statesOffsets[] subscript. Distinct from
+    // objid (mesh.id) because D-041 turn-2 decoupled id from index;
+    // after a removeMesh + add cycle, mesh.id ≠ array index. The narrow
+    // kernel reads scenePackedPositionsOffsets[objPair.x/y] as offsets;
+    // writing mesh.id (the prior semantic) would mis-index into the
+    // offsets array and produce zero contacts post-remove. Set by
+    // BroadPhase::build alongside objid. SpatialHashing's faceObj[]
+    // already wrote index; this aligns the BVH path with that semantic.
+    int objIndex = -1;
     // D-026: cached at build() time from mesh->lifetimeId so
     // BroadPhase::build's Float-mesh skip can verify the slot still
     // refers to the same mesh. Distinct from objid (which is mesh.id
@@ -4109,15 +4120,27 @@ struct BVH<BE, PR, BVHMODE::LINEAR, PRIMITIVE> {
         qFlag[0].stackOverflow = 0;
         qFlag[0].collisionOverflow = 0;
     }
-    void queryPoints(Index qObjId, PR queryMargin) {
-        auto* qmesh = Scene<METAL, PR>::findById(qObjId);
-        auto& qpos = qmesh->state.x;
+    // D-041 turn-3 (2026-05-14): qObjId / tObjId in QueryPointsParams (which
+    // the kernel writes into broadCollisions.objPair) are mesh INDICES
+    // into Scene::meshes, NOT mesh.id. The narrow kernel uses them as
+    // scenePackedPositionsOffsets[] subscripts; that array is indexed by
+    // position (0..numMeshes-1). Callers pass `qIndex` (their loop counter
+    // in BroadPhase::detectCollisions). The target index lives on the
+    // tree itself as `this->objIndex` (also set by BroadPhase::build).
+    // Pre-D-041, mesh.id == array index always, so the prior signature
+    // worked by coincidence; after D-041 turn-2 decoupled id from index
+    // the prior signature produced empty narrow-phase output after any
+    // mesh removal (a stable mesh's id ≠ its new index).
+    void queryPoints(Index qIndex, PR queryMargin) {
+        if (qIndex < 0 || qIndex >= (Index)Scene<METAL, PR>::meshes.size()) return;
+        auto& qmesh = Scene<METAL, PR>::meshes[qIndex];
+        auto& qpos = qmesh.state.x;
         Index qnumPoints = qpos.size/3;
         //auto& constraints = qmesh->constraints;
         typename Scene<METAL, PR>::PackedCollisionData& packedCol = Scene<METAL, PR>::packedCollisionData;
         QueryPointsParams qParams = {
-            queryMargin, qnumPoints, qObjId, (Index)objid, /*constraints.maxNumCollisions*/ packedCol.maxNumCollisions,
-            (Index)qmesh->behaviorType, (Index)objBehavior, (Index)qmesh->shapeType, (Index)objShape
+            queryMargin, qnumPoints, qIndex, (Index)objIndex, /*constraints.maxNumCollisions*/ packedCol.maxNumCollisions,
+            (Index)qmesh.behaviorType, (Index)objBehavior, (Index)qmesh.shapeType, (Index)objShape
         };
         //auto& broadCols = constraints.broadCollisions;
         //auto& numBroadCols = constraints.numBroadCollisions;
@@ -4136,7 +4159,8 @@ struct BVH<BE, PR, BVHMODE::LINEAR, PRIMITIVE> {
         //auto* qmesh = Scene<METAL, PR>::findById(objid); // self query.
         //qmesh->constraints.numBroadCollisions[0] = 0; // clear the previous collisions.
 
-        queryPoints(objid, queryMargin);
+        // D-041 turn-3: self-pair uses this tree's INDEX (not mesh.id).
+        queryPoints(objIndex, queryMargin);
     }
     void queryEnd() {
         MetalGlobalContext::commitAndWait();
@@ -4275,8 +4299,15 @@ struct BVH<BE, PR, BVHMODE::SCENE, BVHPRIMITIVE::OBJECT> {
             // both old and new are Float — see CM-008 (graduated).
             if(objTrees[i].tree.ptr
                && objTrees[i].objBehavior == BehaviorType::Float
-               && objTrees[i].builtForLifetimeId == scene.meshes[i].lifetimeId) continue;
+               && objTrees[i].builtForLifetimeId == scene.meshes[i].lifetimeId) {
+                // D-041 turn-3: even on skip, refresh objIndex — the same
+                // mesh.id can sit at a different array INDEX after a
+                // removeMesh + add. Index is the kernel's offsets[] key.
+                objTrees[i].objIndex = (int)i;
+                continue;
+            }
             objTrees[i].build(scene.meshes[i]);
+            objTrees[i].objIndex = (int)i;  // D-041 turn-3
             Index pbase = i*6;
             positions[pbase  ] = objTrees[i].tree[0].min.x;
             positions[pbase+1] = objTrees[i].tree[0].min.y;
@@ -4383,7 +4414,11 @@ struct BVH<BE, PR, BVHMODE::SCENE, BVHPRIMITIVE::OBJECT> {
                 auto& ta = objTrees[t].tree[0].aabb;
                 bool hit = ta.intersect(qa);
                 if(hit) {
-                    objTrees[t].queryPoints(queryTree.objid, margin);
+                    // D-041 turn-3: pass query INDEX (q, not queryTree.objid)
+                    // so broadCollisions.objPair stores indices that the
+                    // narrow kernel can directly use as statesOffsets[]
+                    // subscripts.
+                    objTrees[t].queryPoints(q, margin);
                     checked.insert({a, b});
                 }
             }
@@ -9828,6 +9863,69 @@ static int runSelfTest() {
                  + " sphereOk(3)=" + std::to_string((int)sphereOk)
                  + " uniqueOk=" + std::to_string((int)uniqueOk));
         }
+    }
+
+    // ---- Block 35: D-041 turn-3 — narrow-phase after middle-mesh removal. -
+    // User-reported bug: in main scene (cloth + Human + ground), deleting
+    // Human caused cloth-vs-ground narrow phase to stop firing even though
+    // broad phase still detected the pair. Root cause was `BVH::queryPoints`
+    // writing `objPair = (mesh.id, mesh.id)` into broadCollisions; the
+    // Metal `narrow_pt_tri` kernel reads `scenePackedPositionsOffsets
+    // [objPair.x/y]` which is INDEX-keyed. Pre-D-041 id == array index so
+    // the bug was hidden; D-041 turn-2 decoupled id from index, and after
+    // a middle-mesh remove the surviving meshes have id ≠ index.
+    // Fix (turn-3): TRI_LBVH gains `objIndex` (alongside `objid`); broad
+    // phase writes INDEX into objPair. SpatialHashing path already used
+    // index via faceObj[]; this aligns the BVH path with that semantic.
+    {
+        resetScene();
+        // Place cloth just above ground (gap ≈ 0.1 m at cloth-bottom)
+        // so 10 outer frames is enough to make contact under gravity.
+        sim.addCloth(/*particleNum1D=*/4, /*size1D=*/0.5f,
+                     tinym::vec3(0.0f, -0.5f, 0.0f),
+                     1e3, 1e3, 1e3, 0.01f, 0.1f);                  // id 0 (TriangularCloth)
+        sim.addCube(tinym::vec3(2.0f, 0.0f, 0.0f), 2, 0.2f, 0.1f);  // id 1 (Float; mimics "Human" middle mesh)
+        sim.addGround(PlaneDirection::XZPlane,
+                      tinym::vec3(0.0f, -1.0f, 0.0f), 2.0f);        // id 2 (Float-grid ground)
+        sim.initialize();
+
+        // Delete the middle mesh — this is the user's "Delete Human" step.
+        sim.removeMesh(1);
+
+        // After remove: cloth.id=0 sits at index 0, ground.id=2 at index 1.
+        // Pre-D-041-turn-3 the BVH would write objPair=(0,2); the narrow
+        // kernel would index scenePackedPositionsOffsets[2] which is the
+        // "end" sentinel (one past ground's data) → zero contacts.
+        auto& packedCol = Scene<Backend, Precision>::packedCollisionData;
+        packedCol.cumulativeNarrowCollisions = 0;
+        sim.pause = false;
+
+        // Pump enough frames for cloth to fall from y=-0.5 onto ground at
+        // y=-1. With h=1/60 + cloth-side subStep=60 + cloth-bottom 0.25 m
+        // above ground, 30 outer frames easily clears the gap.
+        for (int i = 0; i < 30; ++i) sim.update();
+
+        size_t cumNarrow = packedCol.cumulativeNarrowCollisions;
+        bool clothId  = Scene<Backend, Precision>::meshes[0].id == 0;
+        bool groundId = Scene<Backend, Precision>::meshes[1].id == 2;
+        // id != index for ground — that's the very condition that
+        // triggered the bug. Verify it's present, otherwise the test
+        // is degenerate (not actually exercising the regression).
+        bool indexNeqId = (groundId &&
+            Scene<Backend, Precision>::meshes[1].id !=
+            (int)1 /* its array index */);
+
+        if (clothId && groundId && indexNeqId && cumNarrow > 0) {
+            pass("D-041 turn-3 / narrow-phase fires for cloth-vs-ground after middle-mesh removal (id != index)");
+        } else {
+            fail("D-041 turn-3 / narrow-phase fires for cloth-vs-ground after middle-mesh removal (id != index)",
+                 "clothId(0)=" + std::to_string((int)clothId)
+                 + " groundId(2)=" + std::to_string((int)groundId)
+                 + " indexNeqId=" + std::to_string((int)indexNeqId)
+                 + " cumNarrow=" + std::to_string(cumNarrow));
+        }
+
+        sim.pause = true;
     }
 
     if (failures == 0) {
