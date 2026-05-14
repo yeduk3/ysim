@@ -10475,6 +10475,61 @@ static int runSelfTest() {
         }
     }
 
+    // ---- Block 41: D-042 R-6 — preview ≡ state.x round-trip invariant. ----
+    // R-3 memcpys preview→packed at Scene::pack; R-4 keeps preview in sync
+    // with state.x during edits (dual-write); R-5 memcpys state.x→preview
+    // at update end. After R-3+R-4+R-5, per-mesh preview.x and packed
+    // state.x are byte-equal at every observable boundary. Block 41
+    // codifies that invariant so any future slice that breaks it FAILs
+    // noisily. Future blocks can equivalently read either side — the BC
+    // alias property the D-042 design promised.
+    //
+    // Bug-probe: corrupting the resync write (e.g., write state.x[0]+0.01f
+    // into preview.x[0]) breaks byte-equality on frame 1 — memcmp != 0.
+    {
+        resetScene();
+        sim.addCloth(/*particleNum1D=*/2, /*size1D=*/0.5f,
+                     tinym::vec3(0.0f, 0.25f, 0.0f),
+                     /*kstretch=*/1e3f, /*kshear=*/1e3f, /*kbend=*/1e3f,
+                     /*thickness=*/0.01f, /*mass=*/0.1f);
+        sim.initialize();
+
+        auto& reqs = Scene<Backend, Precision>::requestsGeneralMeshes;
+        bool oneReq = (reqs.size() == 1);
+        bool meshExists = !Scene<Backend, Precision>::meshes.empty();
+
+        sim.pause = false;
+
+        int frameMismatch = -1;
+        int eqAllFrames = 0;
+        if (oneReq && meshExists) {
+            auto& m = Scene<Backend, Precision>::meshes[0];
+            for (int f = 0; f < 5; ++f) {
+                sim.update();
+                const size_t bytes = (size_t)(m.state.x.size) * sizeof(Precision);
+                if (reqs[0].preview.x.size() * sizeof(Precision) != bytes) {
+                    frameMismatch = f;
+                    break;
+                }
+                if (std::memcmp(m.state.x.ptr, reqs[0].preview.x.data(), bytes) != 0) {
+                    frameMismatch = f;
+                    break;
+                }
+                eqAllFrames++;
+            }
+        }
+
+        if (oneReq && meshExists && frameMismatch < 0 && eqAllFrames == 5) {
+            pass("D-042 R-6 / state.x = preview.x byte-equal after every Simulator::update (5-frame cloth round-trip)");
+        } else {
+            fail("D-042 R-6 / state.x = preview.x byte-equal after every Simulator::update (5-frame cloth round-trip)",
+                 std::string("oneReq=") + std::to_string((int)oneReq)
+                 + " meshExists=" + std::to_string((int)meshExists)
+                 + " frameMismatch=" + std::to_string(frameMismatch)
+                 + " eqAllFrames=" + std::to_string(eqAllFrames));
+        }
+    }
+
     if (failures == 0) {
         std::cerr << "[self-test] all checks passed\n";
         return 0;

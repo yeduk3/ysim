@@ -848,3 +848,31 @@ Pass label: `D-042 R-5 / Simulator::update resyncs packed state.x into preview.x
 - R-7: retire legacy regen + getOrCreate fallback; recompute preview.n in resync OR retire preview.n field.
 
 **Self-test**: 71/71 PASS deterministic across 5 macOS runs; doctest 159 + 1120 SUCCESS unchanged.
+
+## D-042 R-6 — preview ≡ state.x byte-equal invariant pinned by Block 41 (2026-05-14)
+
+R-6 of 7. Pure additive, test-only slice. Block 41 codifies the R-3+R-4+R-5 round-trip invariant: after every `Simulator::update`, per-mesh `preview.x` and packed `state.x` are byte-equal. The invariant is the BC alias property the original D-042 design promised — future blocks (and downstream consumer code) can equivalently read either side.
+
+The invariant chain:
+- R-3: `Scene::pack` memcpys `preview.x → state.x` (preview is source).
+- R-4: `translateObject` / `rotateObject` dual-write to both (edits stay synced).
+- R-5: `Simulator::update` memcpys `state.x → preview.x` at the end (sim-step results land in preview).
+
+Combined, every observable boundary has preview ≡ state.x. Block 41 mechanizes the assertion across 5 frames of cloth-under-gravity via `std::memcmp` (bit-strict equality — stricter than the spec's "view the same data" wording, per ESTIMATOR.md "stricter-than-spec assertions are valuable signal").
+
+**Block 41 (D-042 R-6)** body:
+1. `resetScene(); addCloth(2, 0.5f, (0, 0.25, 0), ...); sim.initialize(); sim.pause = false;`.
+2. For 5 frames: `sim.update()`, assert `memcmp(meshes[0].state.x.ptr, reqs[0].preview.x.data(), nverts*3*sizeof(PR)) == 0`.
+3. Track `frameMismatch` (first failing frame; -1 if all pass) + `eqAllFrames` counter.
+
+Pass label: `D-042 R-6 / state.x = preview.x byte-equal after every Simulator::update (5-frame cloth round-trip)`. Self-test 71 → 72 PASS deterministic across 5 macOS runs. doctest 159 + 1120 SUCCESS.
+
+**Bug-probe verified**:
+- **(a)** Corrupt the R-5 resync to write `state.x.ptr[0] + 0.01f` into `preview.x[0]` → Block 41 FAILs (`frameMismatch=0 eqAllFrames=0`). The corruption ALSO breaks BDD-003 translate-survives-pack + BDD-018 translate/rotate-inspector + BDD-006 changeBehavior (because the corrupted preview value gets memcpy'd to state.x on the next pack, propagating the +0.01 offset across all subsequent reads). Confirms the byte-equality invariant is load-bearing across the entire test suite. Restored.
+
+**Self-test**: 72/72 PASS deterministic across 5 macOS runs; doctest 159 + 1120 SUCCESS.
+
+**Out of scope for R-6** (deferred to R-7):
+- Stale comment cleanups (post-D-042 comments referring to legacy regen as "the way" instead of "the fallback").
+- Decision: recompute preview.n in resync vs. retire preview.n field.
+- Retirement of getOrCreate's legacy packed-sub-view fallback (now dead code).
