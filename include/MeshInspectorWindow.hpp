@@ -205,6 +205,14 @@ struct MeshInspectorTarget {
     int current_behavior_index = -1;
     bool grid_eligible = false;
     std::function<bool(int /*meshId*/, int /*newBehaviorIndex*/)> on_behavior_change;
+
+    // D-041: remove the currently-selected mesh from the scene. Production
+    // wires this to Simulator::removeMesh which erases the request, frees
+    // the initializer, decrements numMeshes, and marks dirty so the next
+    // Simulator::update re-initializes. The widget renders a Delete button
+    // next to other transform/material controls; clicking fires this
+    // callback with the selected mesh id.
+    std::function<void(int /*meshId*/)> on_delete;
 };
 
 void drawMeshInspectorWindow(

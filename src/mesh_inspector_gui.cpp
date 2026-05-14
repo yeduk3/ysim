@@ -180,6 +180,23 @@ void drawMeshInspectorWindow(
         }
     }
 
+    // D-041: Delete button — removes the mesh from the scene via
+    // Simulator::removeMesh (marks dirty; next Simulator::update
+    // re-initializes). Wraps in PushStyleColor for visual cue +
+    // confirms via status_message.
+    if (target.on_delete) {
+        ImGui::Spacing();
+        ImGui::Separator();
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.65f, 0.18f, 0.18f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.80f, 0.25f, 0.25f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.55f, 0.10f, 0.10f, 1.0f));
+        if (ImGui::Button("Delete Mesh")) {
+            target.on_delete(target.mesh_id);
+            state.status_message = "Mesh deleted.";
+        }
+        ImGui::PopStyleColor(3);
+    }
+
     if (!state.status_message.empty()) {
         ImGui::Spacing();
         ImGui::TextDisabled("%s", state.status_message.c_str());

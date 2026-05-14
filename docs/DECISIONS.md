@@ -596,3 +596,57 @@ Non-grid Float meshes (imported `.obj` `FloatMesh`, etc.) are NOT auto-collidabl
 **Self-test**: 63/63 PASS deterministic on macOS (Block 32 + 33 use `rigidLastBodyPos.y` for assertions, not `transformPosition`, so unaffected). doctest 159 + 1120 SUCCESS.
 
 **Related future cleanup**: B-3's delta-loop applies Δpos to vertices independently of the actual Bullet body's transform. A future rotation-correct vertex update would replace this with per-vertex local-offset + rotate; that would also be a natural place to track a separate `liveBodyPosition` field for Inspector display.
+
+## D-041 — Dirty discipline + pool reuse + Inspector remove (2026-05-14)
+
+**User directive**: scene mutations (add / position-change / behavior-change / remove) must set `Scene::dirty = true`. `Simulator::update` must check dirty even when paused and run `initialize()` first. Memory pool must reuse existing allocations across initialize calls (no forward growth).
+
+### 1. Memory pool reuse — leak fix
+
+**Bug**: `DynamicByteMemoryPool` is a bump allocator that grows by adding pools when full; it never reclaims. Every `Simulator::initialize` ran `Scene::pack` + `BroadPhase::build` + `shBroadPhase.build` which allocated fresh `VectorBase` instances from the bump-front. The old allocations were abandoned. Over many init cycles (each add/translate/behavior/remove now triggers one), pool capacity grew unboundedly.
+
+**Fix**: `DynamicByteMemoryPool::resetMarkers()` sets `marker = 0` on every sub-pool (keeps backing buffers alive). `GlobalAutoAllocator::reset()` proxies to it. `Simulator::initialize` calls `GlobalAutoAllocator<BE>::reset()` BEFORE `Scene::pack` and also forces `Scene::dirty = true` so pack does a FULL rebuild (the soft-reset path at `Scene::pack:1909` skips reallocation and would leave stale pointers after reset; forcing dirty=true guarantees full rebuild + safe pool reuse). All downstream pool consumers (`packedMeshData`, BVH buffers, SpatialHashing buffers) refresh their pointers via the rebuild — no external pointers persist across initialize.
+
+### 2. Dirty discipline — mutation sites
+
+Set `Scene<BE, PR>::dirty = true` at:
+- `addGeneralMesh` (already in place; line 1844).
+- `loadScene` (already in place).
+- `translateObject` (NEW per D-041).
+- `rotateObject` (NEW per D-041).
+- `changeBehavior` (NEW per D-041, via `markDirtyAndAccept` lambda at every accept case).
+- `setMaterial` (NEW per D-041).
+- `removeMesh` (NEW per D-041).
+
+**`changeBehavior` also syncs to request**: previously only mutated `mesh->behaviorType` / `behaviorParams`. With D-041 the next dirty-init triggers `Scene::pack` which rebuilds meshes from `requestsGeneralMeshes`. Without syncing, the tag would revert to the request's original on every pack — silently undoing the user's toggle. The new `markDirtyAndAccept` lambda walks requests and writes `r.behaviorType + r.behaviorParams` for the matching mesh.id.
+
+### 3. `Simulator::update` pre-pause dirty check
+
+At the very top of `Simulator::update`, BEFORE the `if (pause) return;` gate:
+```cpp
+if (Scene<BE, PR>::dirty) initialize();
+```
+This makes any mutation visible on the very next frame even when paused — the user can edit a paused scene in the Inspector and see all derived state (BVH, rigid backend bodies, broadphase caches) catch up before the simulation runs.
+
+### 4. `Simulator::removeMesh` API + Inspector Delete button
+
+New `Simulator::removeMesh(int meshId)` erases the matching `requestsGeneralMeshes` entry, frees its initializer, decrements `Scene::numMeshes` (preserves `numMeshes == requestsGeneralMeshes.size()` pack-invariant), drops `pendingMaterials[meshId]` / `pendingRotations[meshId]`, clears `selectedObj` if it pointed at the removed mesh, and sets `dirty = true`.
+
+**ID-collision caveat**: `addGeneralMesh` uses `id = numMeshes++`. After remove + a subsequent addX, the new mesh's id could match a surviving mesh's id (since removed was not necessarily the topmost). Live collision affects `findById`'s first-match semantics until the next `saveScene → loadScene` cycle re-monotonizes IDs in load order. Acceptable for v1; future slice can decouple id-assignment from numMeshes.
+
+**Inspector**: `MeshInspectorTarget::on_delete` callback added. `mesh_inspector_gui.cpp` renders a red "Delete Mesh" button at the bottom of the Inspector. Production wires `on_delete = [&](int id){ simulator.removeMesh(id); }`.
+
+### Block 29 Clause 2 assertion update
+
+The old D-036 "TriangularCloth → Float in-place; state.x preserved" contract is invalidated by D-041 (behavior change is one of the three dirty-triggering mutations). Updated assertion: verify (i) tag transitions correctly AND (ii) AFTER the dirty-init rebuild, an additional 1-frame Float pump leaves state.x stable (no force application). Pass label renamed: `BDD-006 / TriangularCloth → Float in-place; tag + Float pipeline (D-041 re-init then stable)`.
+
+### Self-test
+
+63/63 PASS deterministic across 5 macOS runs. doctest 159/159 + 1120/1120 SUCCESS unchanged.
+
+### Out of scope
+
+- Per-mesh mass/friction/restitution Inspector controls (still hardcoded mass=1 for Rigid in `ensureRigidBackendBody`).
+- ID-collision-proof addGM (numMeshes decoupling from id assignment).
+- Live-position Inspector display (translation-only delta loop already documented limitation per D-040 addendum 2).
+- E1/E2 from the "ground edge case audit" (mid-sim ground translate/rotate doesn't propagate to Bullet) — with D-041, `translateObject` and `rotateObject` now set dirty=true, so the next update rebuilds everything including the Bullet ground plane. **E1+E2 are implicitly fixed by D-041.**

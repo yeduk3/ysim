@@ -428,6 +428,18 @@ struct DynamicByteMemoryPool {
         return ret;
     }
     void clear() { poolList.clear(); }
+
+    // D-041 (2026-05-14): rewind all sub-pool markers to 0 so the next
+    // bump allocations reuse the existing backing buffers. The pool list
+    // is NOT freed — Bullet/Metal buffers stay live, just the marker
+    // resets. Safe IFF all VectorBase<*> consumers refresh their pointers
+    // via Scene::pack + BroadPhase::build etc. on the next initialize
+    // (current invariant). Before this, every Simulator::initialize
+    // bump-allocated fresh space and never reclaimed the old — adding
+    // a cube and re-initializing N times grew the pool roughly N×.
+    void resetMarkers() {
+        for (auto& p : poolList) p.marker = 0;
+    }
 };
 
 template <typename BE>
@@ -457,9 +469,14 @@ struct GlobalAutoAllocator {
 
     static void globalInitialize(size_t N) {
         if(globalInitialized) return;
-        globalPool = DynamicMemoryAllocator<BE>(N); 
+        globalPool = DynamicMemoryAllocator<BE>(N);
         globalInitialized = true;
     }
+
+    // D-041: rewind the global pool so the next set of Scene::pack +
+    // BroadPhase::build allocations reuse the existing backing buffers
+    // instead of leaking forward. Call at the TOP of Simulator::initialize.
+    static void reset() { globalPool.pool.resetMarkers(); }
 
     template <typename PR>
     static MemoryBlock<BE, PR> alloc(size_t count) { return globalPool.template alloc<PR>(count); }
@@ -4948,6 +4965,11 @@ struct Simulator {
         // (BroadPhase::refit at src/main.cpp:3961 — single call covers both
         // levels).
         collisionPipeline.broadPhase.refit();
+        // D-041: mark scene dirty so Simulator::update's pre-pause dirty
+        // check triggers a full re-initialize on the next frame. This
+        // makes Rigid bodies (and other state) catch up to the translate
+        // without requiring a manual sim.initialize() call.
+        Scene<BE, PR>::dirty = true;
     }
 
     // FR-004 / D-021: set the named mesh's absolute orientation to newQuat.
@@ -5002,6 +5024,8 @@ struct Simulator {
         // step. Without this, re-pack rebuilds state.x from the
         // initializer's geometry and the rotation is silently lost.
         pendingRotations[meshId] = newAbs;
+        // D-041: mark scene dirty (see translateObject; same rationale).
+        Scene<BE, PR>::dirty = true;
     }
 
     // D-027: edit-time material mutator. Mirrors translateObject (D-014) and
@@ -5014,6 +5038,41 @@ struct Simulator {
         if (!mesh) return;
         mesh->material = mat;
         pendingMaterials[meshId] = mat;
+        // D-041: material edit marks scene dirty (per user directive —
+        // "behavior parameter 수정" reads broadly). Next frame's
+        // Simulator::update dirty-check re-initializes so the renderer
+        // and any downstream consumers pick the change up via the
+        // applyPendingMaterials path inside initialize.
+        Scene<BE, PR>::dirty = true;
+    }
+
+    // D-041: removeMesh erases the matching request, frees its
+    // initializer, decrements numMeshes (preserves Scene::pack's
+    // numMeshes == requestsGeneralMeshes.size() invariant), and marks
+    // dirty so Simulator::update's pre-pause check rebuilds the scene
+    // on the next frame. Also drops pendingMaterials/Rotations for the
+    // removed id and clears selectedObj if it pointed at the doomed
+    // mesh.
+    //
+    // ID-collision caveat: addGeneralMesh uses `id = numMeshes++` for
+    // ID generation. After remove + a subsequent addX call, the new
+    // mesh's id could match a surviving mesh's id (since the removed
+    // mesh may not have been the topmost). Live collision affects
+    // findById's first-match semantics until the next saveScene →
+    // loadScene cycle re-monotonizes IDs in load order. Acceptable
+    // for v1; future slice could decouple id-assignment from numMeshes.
+    void removeMesh(int meshId) {
+        auto& reqs = Scene<BE, PR>::requestsGeneralMeshes;
+        auto it = std::find_if(reqs.begin(), reqs.end(),
+            [meshId](const auto& r) { return r.id == meshId; });
+        if (it == reqs.end()) return;
+        delete it->initializer;
+        reqs.erase(it);
+        if (Scene<BE, PR>::numMeshes > 0) Scene<BE, PR>::numMeshes--;
+        pendingMaterials.erase(meshId);
+        pendingRotations.erase(meshId);
+        if (selectedObj == meshId) selectedObj = -1;
+        Scene<BE, PR>::dirty = true;
     }
 
     // BDD-006 / D-036: in-place behavior switch. Preserves mesh.id +
@@ -5059,6 +5118,25 @@ struct Simulator {
             if (Scene<BE, PR>::meshes.empty()) return -1;
             return (int)(mesh - &Scene<BE, PR>::meshes[0]);
         };
+        // D-041: any accepted behavior transition marks scene dirty so
+        // Simulator::update's pre-pause dirty-check re-initializes on
+        // the next frame (full pack-rebuild + rigid backend reset).
+        // Also sync mesh.behaviorType + behaviorParams to the matching
+        // requestsGeneralMeshes entry so the next Scene::pack rebuilds
+        // the mesh with the NEW tag (without this, pack reverts to the
+        // request's original Float / Cloth tag and the user's toggle
+        // is silently lost across the dirty-triggered pack rebuild).
+        auto markDirtyAndAccept = [&]() {
+            for (auto& r : Scene<BE, PR>::requestsGeneralMeshes) {
+                if (r.id == mesh->id) {
+                    r.behaviorType   = mesh->behaviorType;
+                    r.behaviorParams = mesh->behaviorParams;
+                    break;
+                }
+            }
+            Scene<BE, PR>::dirty = true;
+            return true;
+        };
         switch (newType) {
             case BehaviorType::Float:
                 mesh->behaviorType = BehaviorType::Float;
@@ -5069,14 +5147,14 @@ struct Simulator {
                 mesh->rigidBodyHandle = ysim::physics::kInvalidBodyHandle;
                 mesh->rigidLastBodyPos = tinym::vec3{};
                 syncBroadPhaseCaches(BehaviorType::Float);
-                return true;
+                return markDirtyAndAccept();
             case BehaviorType::TriangularCloth:
                 mesh->behaviorType = BehaviorType::TriangularCloth;
                 mesh->behaviorParams = ClothBehaviorParams<PR>{
                     PR(1e5), PR(1e5), PR(3e5), PR(0.01)
                 };
                 syncBroadPhaseCaches(BehaviorType::TriangularCloth);
-                return true;
+                return markDirtyAndAccept();
             case BehaviorType::FastGridCloth: {
                 // Only valid on a square-regular grid topology. The
                 // sole initializer that produces one is
@@ -5096,7 +5174,7 @@ struct Simulator {
                     PR(1e5), PR(1e5), PR(3e5), PR(0.001)
                 };
                 syncBroadPhaseCaches(BehaviorType::FastGridCloth);
-                return true;
+                return markDirtyAndAccept();
             }
             case BehaviorType::Rigid:
                 // D-039: Rigid integrator dispatch now real at the outer
@@ -5109,7 +5187,7 @@ struct Simulator {
                 // variant's alternative, for Rigid-tagged meshes).
                 syncBroadPhaseCaches(BehaviorType::Rigid);
                 ensureRigidBackendBody(meshIdOf());
-                return true;
+                return markDirtyAndAccept();
             case BehaviorType::Elastic:
             case BehaviorType::Fluid:
             case BehaviorType::Generator:
@@ -5127,6 +5205,21 @@ struct Simulator {
 
     void initialize() {
         GlobalAutoAllocator<BE>::globalInitialize(1<<20);
+        // D-041: rewind the global pool's bump markers BEFORE Scene::pack
+        // reallocates all packedMeshData buffers. The pool's backing
+        // memory (Metal buffers / CPU heap) stays live; only marker=0
+        // resets so the next set of VectorBase allocations reuses the
+        // existing capacity. Without this, every initialize leaked the
+        // prior pack's allocations forward, growing the pool unboundedly.
+        //
+        // Force Scene::dirty=true so pack does a FULL rebuild (the soft-
+        // reset path at Scene::pack:1909 would skip reallocation, leaving
+        // packedMeshData with stale pointers that BroadPhase::build below
+        // would overwrite via its own pool allocations). Safe overall
+        // because Scene::pack + BroadPhase::build + shBroadPhase.build
+        // refresh every VectorBase that downstream consumers see.
+        GlobalAutoAllocator<BE>::reset();
+        Scene<BE, PR>::dirty = true;
         std::cout << "[Simulator Init] Memory pool allocated" << std::endl;
 
         Scene<BE, PR>::pack();
@@ -5218,6 +5311,15 @@ struct Simulator {
     }
 
     void update() {
+        // D-041: dirty-check BEFORE pause gate so any mutation (add /
+        // translate / rotate / behavior / material / remove) gets a
+        // full re-initialize on the very next frame even when paused.
+        // initialize() forces dirty=true → Scene::pack does full rebuild
+        // → pool markers reset → fresh allocations. Without this the
+        // user could mutate state while paused (e.g., move a mesh in
+        // the Inspector) and not see the change reflected in collision
+        // / rigid-body / cloth pipelines until they unpaused.
+        if (Scene<BE, PR>::dirty) initialize();
         if(pause) return;
         //std::cout << "[Simulator Update] Start update" << std::endl;
         
@@ -9282,28 +9384,44 @@ static int runSelfTest() {
             }
         }
 
-        // --- Clause 2: TriangularCloth → Float dispatch (state.x preserved) ---
-        // Continue from clause 1's scene (cloth mid-fall) — switch back to
-        // Float and confirm gravity no longer applies (state.x stable).
+        // --- Clause 2: TriangularCloth → Float dispatch (D-041 re-init) ---
+        // Continue from clause 1's scene (cloth mid-fall). Switch back to
+        // Float and confirm: (i) tag transitions correctly, (ii) the new
+        // D-041 dirty discipline re-initializes the scene on the next
+        // update so the cloth resets to its initializer-derived spawn
+        // positions (state.x reset; state.v zeroed). The OLD D-036 "state.x
+        // preserved" contract is intentionally invalidated by D-041 —
+        // behavior change is one of the three operations that now forces
+        // a full pack rebuild. Stability of the cloth POST-rebuild (Float
+        // pipeline applies no forces) is verified by snapshotting the
+        // post-rebuild state and re-pumping.
         {
             const int bhMeshId = 0;
             auto* mPre = Scene<Backend, Precision>::findById(bhMeshId);
             if (!mPre) {
-                fail("BDD-006 / TriangularCloth → Float in-place; tag + Float pipeline (state.x preserved)",
+                fail("BDD-006 / TriangularCloth → Float in-place; tag + Float pipeline (D-041 re-init then stable)",
                      "mesh id=0 missing — clause 1 scaffold broken");
             } else if (mPre->behaviorType != BehaviorType::TriangularCloth) {
-                fail("BDD-006 / TriangularCloth → Float in-place; tag + Float pipeline (state.x preserved)",
+                fail("BDD-006 / TriangularCloth → Float in-place; tag + Float pipeline (D-041 re-init then stable)",
                      "pre-state not TriangularCloth — clause 1 left scene in wrong state");
             } else {
-                const Index nv = mPre->state.x.size / 3;
-                std::vector<float> snapshot(nv * 3);
-                std::memcpy(snapshot.data(), mPre->state.x.ptr, sizeof(float) * nv * 3);
-
                 bool ok = sim.changeBehavior(bhMeshId, BehaviorType::Float);
+
+                // Pump 1 frame — this triggers D-041's dirty-init path
+                // (changeBehavior set dirty=true; update sees it and runs
+                // Simulator::initialize before the pause-check). State.x
+                // is rebuilt from the initializer's spawn geometry.
+                pumpFrames(sim, 1);
                 auto* mPost = Scene<Backend, Precision>::findById(bhMeshId);
                 bool tagOk = mPost && (mPost->behaviorType == BehaviorType::Float);
 
-                // Pump 1 frame as Float — state.x stable.
+                // Now snapshot the POST-rebuild state.x and pump another
+                // frame as Float — should be perfectly stable because
+                // Float applies no forces (no integrator step for Float).
+                const Index nv = mPost->state.x.size / 3;
+                std::vector<float> snapshot(nv * 3);
+                std::memcpy(snapshot.data(), mPost->state.x.ptr, sizeof(float) * nv * 3);
+
                 pumpFrames(sim, 1);
                 auto* mAfter = Scene<Backend, Precision>::findById(bhMeshId);
                 bool stable = true;
@@ -9316,13 +9434,13 @@ static int runSelfTest() {
                 }
 
                 if (ok && tagOk && stable) {
-                    pass("BDD-006 / TriangularCloth → Float in-place; tag + Float pipeline (state.x preserved)");
+                    pass("BDD-006 / TriangularCloth → Float in-place; tag + Float pipeline (D-041 re-init then stable)");
                 } else {
-                    fail("BDD-006 / TriangularCloth → Float in-place; tag + Float pipeline (state.x preserved)",
+                    fail("BDD-006 / TriangularCloth → Float in-place; tag + Float pipeline (D-041 re-init then stable)",
                          "changeBehavior=" + std::to_string((int)ok)
                          + " tagOk=" + std::to_string((int)tagOk)
-                         + " state.x stable=" + std::to_string((int)stable)
-                         + " (expected state.x unchanged under Float pipeline)");
+                         + " stable=" + std::to_string((int)stable)
+                         + " (expected: D-041 reinit then 1 Float frame leaves state.x unchanged)");
                 }
             }
         }
@@ -9952,6 +10070,10 @@ int main(int argc, char** argv) {
                     };
                     if (newIndex < 0 || newIndex > 3) return false;
                     return simulator.changeBehavior(id, kIndexToType[newIndex]);
+                };
+                // D-041: wire Delete button → Simulator::removeMesh.
+                target.on_delete = [&simulator](int id) {
+                    simulator.removeMesh(id);
                 };
             }
             return target;
