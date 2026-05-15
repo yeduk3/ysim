@@ -48,7 +48,7 @@ void drawMeshInspectorWindow(
         ImGui::TextUnformatted("물체 추가");
         ImGui::Spacing();
         const ImVec2 btn(-FLT_MIN, 0);
-        if (ImGui::Button("정사각형 추가...", btn) && target.on_request_add_cube) {
+        if (ImGui::Button("정육면체 추가...", btn) && target.on_request_add_cube) {
             target.on_request_add_cube();
         }
         if (ImGui::Button("구 추가...", btn) && target.on_request_add_sphere) {

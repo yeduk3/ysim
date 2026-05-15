@@ -11300,7 +11300,7 @@ int main(int argc, char** argv) {
         if (openLoadModal) ImGui::OpenPopup("씬 불러오기");
         if (openImportModal) ImGui::OpenPopup("OBJ 파일 가져오기");
         if (openSphereModal) ImGui::OpenPopup("구 생성");
-        if (openCubeModal) ImGui::OpenPopup("정사각형 생성");
+        if (openCubeModal) ImGui::OpenPopup("정육면체 생성");
         if (ImGui::BeginPopupModal("씬 저장하기", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
             ImGui::InputText("경로", scenePathBuf, sizeof(scenePathBuf));
             if (ImGui::Button("저장")) {
@@ -11382,7 +11382,7 @@ int main(int argc, char** argv) {
                                           (Precision)0.1, BehaviorType::Rigid);
                     }
                     simulator.initialize();
-                    sceneIOStatus = std::string(isSphere ? "구 생성됨" : "정사각형 생성됨");
+                    sceneIOStatus = std::string(isSphere ? "구 생성됨" : "정육면체 생성됨");
                     ImGui::CloseCurrentPopup();
                 }
                 ImGui::SameLine();
@@ -11391,7 +11391,7 @@ int main(int argc, char** argv) {
             }
         };
         primitiveModal("구 생성", true);
-        primitiveModal("정사각형 생성", false);
+        primitiveModal("정육면체 생성", false);
 
         if (collectProfileFrame) {
             auto scope = frameProfiler.scoped("physics_total");
