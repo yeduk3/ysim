@@ -137,12 +137,11 @@ inline void quatWxyzToEulerXYZDeg(const float wxyz[4], float outXyzDeg[3]) {
 struct MeshInspectorWindowState {
     bool open = true;
     std::string status_message;
-    // D-035: inspector rotation input mode. 0 = Quat (raw 4-float; the
-    // pre-D-035 default), 1 = Euler XYZ (degrees, intrinsic Tait-Bryan),
-    // 2 = Axis-Angle (axis vec3 + angle in degrees). Per-window state;
-    // canonical storage is still Quat on the mesh — Euler/AxisAngle are
-    // display-time conversions only. See D-035 for convention details.
-    int rotation_input_mode = 0;
+    // D-035: pre-existing rotation_input_mode (Quat / Euler / Axis-Angle)
+    // dropped from the right-panel UI; Euler XYZ (deg) is the only mode
+    // surfaced now. Field preserved as a no-op placeholder so the struct
+    // layout stays binary-compatible for any other consumer.
+    int rotation_input_mode = 1;
 };
 
 struct MeshInspectorTarget {
@@ -213,6 +212,27 @@ struct MeshInspectorTarget {
     // next to other transform/material controls; clicking fires this
     // callback with the selected mesh id.
     std::function<void(int /*meshId*/)> on_delete;
+
+    // Per-object environment-force gates. Pointers alias
+    // GeneralMesh::applyGravity / applyWind; widget checkboxes mutate in
+    // place. Both must be set together to enable the row.
+    // The on_env_toggle_change callback fires AFTER the in-place mutation
+    // so production can propagate the new value to the RequestGeneralMesh
+    // mirror — without that, Simulator::reset() (which rebuilds meshes
+    // from requests via Scene::pack) would clobber the user's toggle
+    // back to its default. Optional.
+    bool* apply_gravity = nullptr;
+    bool* apply_wind = nullptr;
+    std::function<void(int /*meshId*/, bool /*applyGravity*/, bool /*applyWind*/)>
+        on_env_toggle_change;
+
+    // No-selection branch: when mesh_id < 0 the right panel renders these
+    // three Add-Object buttons instead of the per-mesh editors. Callbacks
+    // are owned by main.cpp; they open the same Sphere / Cube / Import
+    // modals that used to live behind the Create + File menus.
+    std::function<void()> on_request_add_cube;
+    std::function<void()> on_request_add_sphere;
+    std::function<void()> on_request_add_import;
 };
 
 void drawMeshInspectorWindow(

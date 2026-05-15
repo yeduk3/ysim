@@ -61,6 +61,11 @@ public:
     void setAngularVelocity(BodyHandle handle, tinym::vec3 w);
 
     void setGravity(tinym::vec3 gravity);
+    // Per-body gravity override. Used by the per-mesh Apply Gravity
+    // toggle so a Rigid floor / ceiling can opt out of Bullet's global
+    // gravity without affecting the rest of the scene. Out-of-range
+    // handles are no-ops (CM-012).
+    void setBodyGravity(BodyHandle handle, tinym::vec3 gravity);
     const char* backendName() const;
 
 private:

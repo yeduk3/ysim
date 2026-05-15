@@ -73,11 +73,18 @@ struct Object {
     Transform transform;
     Material material;
     Behavior behavior;
+    // Per-object environment-force gates (UI toggles). Optional in JSON
+    // for backward compat — older snapshots default to "receive both".
+    bool applyGravity = true;
+    bool applyWind = true;
 };
 
 struct Environment {
     Vec3 gravity{0.0, -9.81, 0.0};
     Vec3 wind{0.0, 0.0, 0.0};
+    // UI viewport clear color. Optional in JSON for backward compat with
+    // pre-existing scenes (default mirrors SceneEnvironment::backgroundColor).
+    Vec3 backgroundColor{0.05, 0.05, 0.08};
 };
 
 struct LoadError {
@@ -257,6 +264,8 @@ inline nlohmann::json toJson(const Object& o) {
     j["transform"] = toJson(o.transform);
     j["material"] = toJson(o.material);
     j["behavior"] = toJson(o.behavior);
+    j["apply_gravity"] = o.applyGravity;
+    j["apply_wind"] = o.applyWind;
     return j;
 }
 
@@ -264,6 +273,7 @@ inline nlohmann::json toJson(const Environment& e) {
     nlohmann::json j;
     j["gravity"] = detail::vec3ToJson(e.gravity);
     j["wind"] = detail::vec3ToJson(e.wind);
+    j["background_color"] = detail::vec3ToJson(e.backgroundColor);
     return j;
 }
 
@@ -432,6 +442,14 @@ inline Result<Object> objectFromJson(const nlohmann::json& j, int idx,
     auto br = behaviorFromJson(*bj, idx);
     if (!br.ok) return R::fail(br.error.message);
     o.behavior = std::move(br.value);
+    // apply_gravity / apply_wind are optional (backward compat with v1
+    // snapshots that pre-date the per-object force-gate toggles).
+    if (auto it = j.find("apply_gravity"); it != j.end() && it->is_boolean()) {
+        o.applyGravity = it->get<bool>();
+    }
+    if (auto it = j.find("apply_wind"); it != j.end() && it->is_boolean()) {
+        o.applyWind = it->get<bool>();
+    }
     return R::success(std::move(o));
 }
 
@@ -444,6 +462,11 @@ inline Result<Environment> environmentFromJson(const nlohmann::json& j) {
         return R::fail(err);
     auto w = j.find("wind");
     if (w != j.end() && !detail::readVec3(*w, e.wind, err, "environment.wind"))
+        return R::fail(err);
+    // background_color is optional for backward compat.
+    auto bg = j.find("background_color");
+    if (bg != j.end() && !detail::readVec3(*bg, e.backgroundColor, err,
+                                           "environment.background_color"))
         return R::fail(err);
     return R::success(e);
 }

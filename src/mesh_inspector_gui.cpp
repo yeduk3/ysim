@@ -4,195 +4,189 @@
 
 namespace mesh_inspector {
 
+// Behavior combo for the right-panel: only two user-visible choices —
+// 옷감 (Cloth) and 강체 (Rigid). The dropdown index passed back to
+// on_behavior_change is the canonical 4-entry index defined by
+// production:
+//   0 = Float, 1 = TriangularCloth, 2 = FastGridCloth, 3 = Rigid.
+// "옷감" auto-picks FastGridCloth when the mesh has a square-regular
+// grid topology (target.grid_eligible), else TriangularCloth.
+static int clothBehaviorIndex(bool gridEligible) {
+    return gridEligible ? 2 : 1;
+}
+
+// Map the canonical 4-entry index back to a 2-entry combo position:
+//   옷감 = 0 (both TriangularCloth and FastGridCloth collapse here)
+//   강체 = 1
+//   anything else (Float, etc.) → -1 = "(미설정)"
+static int simpleComboFromCanonical(int canonical) {
+    if (canonical == 1 || canonical == 2) return 0;
+    if (canonical == 3) return 1;
+    return -1;
+}
+
 void drawMeshInspectorWindow(
     MeshInspectorWindowState& state,
     const MeshInspectorTarget& target
 ) {
     if (!state.open) return;
 
-    ImGui::SetNextWindowSize(ImVec2(360, 220), ImGuiCond_FirstUseEver);
-    if (!ImGui::Begin("Mesh Inspector", &state.open)) {
+    if (!ImGui::Begin("물체", nullptr,
+                      ImGuiWindowFlags_NoMove |
+                      ImGuiWindowFlags_NoResize |
+                      ImGuiWindowFlags_NoCollapse |
+                      ImGuiWindowFlags_NoSavedSettings)) {
         ImGui::End();
         return;
     }
 
-    ImGui::TextUnformatted("Selected mesh controls");
-
+    // No-selection branch: surface the three Add-Object buttons (they
+    // open the same modals that used to hang off the File / Create menus).
     if (target.mesh_id < 0 || target.base_color == nullptr) {
+        ImGui::TextDisabled("선택된 물체가 없습니다.");
         ImGui::Separator();
-        ImGui::TextDisabled("No mesh is currently selected.");
-        ImGui::TextDisabled("Click a mesh in the viewport to edit its color.");
+        ImGui::TextUnformatted("물체 추가");
+        ImGui::Spacing();
+        const ImVec2 btn(-FLT_MIN, 0);
+        if (ImGui::Button("정사각형 추가...", btn) && target.on_request_add_cube) {
+            target.on_request_add_cube();
+        }
+        if (ImGui::Button("구 추가...", btn) && target.on_request_add_sphere) {
+            target.on_request_add_sphere();
+        }
+        if (ImGui::Button("OBJ 파일 추가...", btn) && target.on_request_add_import) {
+            target.on_request_add_import();
+        }
         ImGui::End();
         return;
     }
 
+    ImGui::Text("물체 ID: %d", target.mesh_id);
+    if (target.shape_label) ImGui::Text("형상: %s", target.shape_label);
     ImGui::Separator();
-    ImGui::Text("Mesh ID: %d", target.mesh_id);
-    if (target.behavior_label) ImGui::Text("Behavior: %s", target.behavior_label);
-    if (target.shape_label) ImGui::Text("Shape: %s", target.shape_label);
 
-    // FR-006 / BDD-006 / D-036: behavior-tag editing dropdown.
-    // 4 entries — Float / TriangularCloth / FastGridCloth / Rigid;
-    // reserved-not-shipped (Elastic / Fluid / Generator) absent.
-    // FastGridCloth is disabled unless target.grid_eligible (square-
-    // regular grid topology); Rigid is selectable but dispatch is
-    // parked under BDD-006-RIGID-DISPATCH-PARKED until slice B-3.
+    // ─── Material (옷감 / 강체) ─────────────────────────────────────
     if (target.current_behavior_index >= 0 && target.on_behavior_change) {
-        if (ImGui::CollapsingHeader("Behavior", ImGuiTreeNodeFlags_DefaultOpen)) {
-            static const char* kBehaviorLabels[] = {
-                "Float", "Triangular Cloth", "Fast Grid Cloth", "Rigid"
-            };
-            int idx = target.current_behavior_index;
-            const char* preview = (idx >= 0 && idx < 4) ? kBehaviorLabels[idx] : "(unknown)";
-            if (ImGui::BeginCombo("Behavior##editable", preview)) {
-                for (int i = 0; i < 4; ++i) {
-                    // FastGridCloth (index 2) requires a square-regular grid.
-                    bool selectable = (i != 2) || target.grid_eligible;
-                    bool isSelected = (idx == i);
-                    ImGui::BeginDisabled(!selectable);
-                    if (ImGui::Selectable(kBehaviorLabels[i], isSelected) && selectable) {
-                        bool ok = target.on_behavior_change(target.mesh_id, i);
-                        if (ok) {
-                            state.status_message = std::string("Behavior set to ")
-                                                 + kBehaviorLabels[i] + ".";
-                        } else {
-                            state.status_message = std::string(kBehaviorLabels[i])
-                                + " rejected (invalid for this shape).";
-                        }
-                    }
-                    if (isSelected) ImGui::SetItemDefaultFocus();
-                    ImGui::EndDisabled();
-                }
-                ImGui::EndCombo();
+        static const char* kSimpleLabels[] = { "옷감", "강체" };
+        int simpleIdx = simpleComboFromCanonical(target.current_behavior_index);
+        const char* preview = (simpleIdx >= 0) ? kSimpleLabels[simpleIdx] : "(미설정)";
+        if (ImGui::BeginCombo("소재", preview)) {
+            // 옷감 row
+            bool clothSelected = (simpleIdx == 0);
+            if (ImGui::Selectable(kSimpleLabels[0], clothSelected)) {
+                int newCanonical = clothBehaviorIndex(target.grid_eligible);
+                bool ok = target.on_behavior_change(target.mesh_id, newCanonical);
+                state.status_message = ok
+                    ? std::string("소재가 옷감으로 변경됨.")
+                    : std::string("옷감 변경이 거부됨.");
             }
+            if (clothSelected) ImGui::SetItemDefaultFocus();
+            // 강체 row
+            bool rigidSelected = (simpleIdx == 1);
+            if (ImGui::Selectable(kSimpleLabels[1], rigidSelected)) {
+                bool ok = target.on_behavior_change(target.mesh_id, 3);
+                state.status_message = ok
+                    ? std::string("소재가 강체로 변경됨.")
+                    : std::string("강체 변경이 거부됨.");
+            }
+            if (rigidSelected) ImGui::SetItemDefaultFocus();
+            ImGui::EndCombo();
         }
     }
 
-    if (ImGui::CollapsingHeader("Appearance", ImGuiTreeNodeFlags_DefaultOpen)) {
-        // D-027: material edits write through *target.base_color / metallic /
-        // ... in place for live preview (renderer reads mesh.material.*
-        // every frame), then fire on_material_edit so Simulator::setMaterial
-        // also writes pendingMaterials[id] for re-pack survival via D-025.
-        bool haveMaterial = target.metallic && target.roughness
-                         && target.specular_weight && target.emission_color
-                         && target.on_material_edit;
-
-        auto fireMaterialEdit = [&]() {
-            if (!haveMaterial) return;
-            target.on_material_edit(target.mesh_id,
-                                    *target.base_color,
-                                    *target.metallic,
-                                    *target.roughness,
-                                    *target.specular_weight,
-                                    *target.emission_color);
-        };
-
-        if (ImGui::ColorEdit3("Base Color", target.base_color->v)) fireMaterialEdit();
-
-        if (haveMaterial) {
-            if (ImGui::SliderFloat("Metallic", target.metallic, 0.0f, 1.0f))         fireMaterialEdit();
-            if (ImGui::SliderFloat("Roughness", target.roughness, 0.0f, 1.0f))       fireMaterialEdit();
-            if (ImGui::SliderFloat("Specular Weight", target.specular_weight, 0.0f, 1.0f)) fireMaterialEdit();
-            if (ImGui::ColorEdit3("Emission", target.emission_color->v))             fireMaterialEdit();
+    // ─── Transform: position (Vec3 input, commit-on-deactivate) ───────
+    if (target.transform_position && target.on_translate) {
+        float p[3] = { target.transform_position->x,
+                       target.transform_position->y,
+                       target.transform_position->z };
+        ImGui::InputFloat3("위치", p);
+        if (ImGui::IsItemDeactivatedAfterEdit()) {
+            target.on_translate(target.mesh_id,
+                                tinym::vec3(p[0], p[1], p[2]));
+            state.status_message = "위치가 갱신됨.";
         }
+    }
 
-        if (ImGui::Button("Reset Color")) {
+    // ─── Rotation: Euler XYZ (degrees) ────────────────────────────────
+    if (target.rotation_wxyz && target.on_rotate) {
+        const float currWxyz[4] = {
+            target.rotation_wxyz[0], target.rotation_wxyz[1],
+            target.rotation_wxyz[2], target.rotation_wxyz[3]
+        };
+        float xyzDeg[3];
+        quatWxyzToEulerXYZDeg(currWxyz, xyzDeg);
+        ImGui::InputFloat3("회전 (도)", xyzDeg);
+        if (ImGui::IsItemDeactivatedAfterEdit()) {
+            float newWxyz[4];
+            eulerXYZDegToQuatWxyz(xyzDeg, newWxyz);
+            target.on_rotate(target.mesh_id,
+                             newWxyz[0], newWxyz[1], newWxyz[2], newWxyz[3]);
+            state.status_message = "회전이 갱신됨.";
+        }
+    }
+
+    // ─── 외관 (v1 OpenPBR subset) ─────────────────────────────────────
+    // 모든 위젯은 in-place로 mesh.material.*을 갱신하고 on_material_edit
+    // 콜백을 통해 Simulator::setMaterial로 라우팅되어 pendingMaterials
+    // 까지 써둠 → Scene::pack 재구성 시 재적용 (D-025 / D-027).
+    bool haveMaterial = target.metallic && target.roughness
+                     && target.specular_weight && target.emission_color
+                     && target.on_material_edit;
+    auto fireMaterialEdit = [&]() {
+        if (!haveMaterial) return;
+        target.on_material_edit(target.mesh_id,
+                                *target.base_color,
+                                *target.metallic,
+                                *target.roughness,
+                                *target.specular_weight,
+                                *target.emission_color);
+    };
+    if (ImGui::CollapsingHeader("외관", ImGuiTreeNodeFlags_DefaultOpen)) {
+        if (ImGui::ColorEdit3("기본 색상", target.base_color->v)) fireMaterialEdit();
+        if (haveMaterial) {
+            if (ImGui::SliderFloat("금속성", target.metallic, 0.0f, 1.0f, "%.2f"))
+                fireMaterialEdit();
+            if (ImGui::SliderFloat("거칠기", target.roughness, 0.0f, 1.0f, "%.2f"))
+                fireMaterialEdit();
+            if (ImGui::SliderFloat("스페큘러", target.specular_weight, 0.0f, 1.0f, "%.2f"))
+                fireMaterialEdit();
+            if (ImGui::ColorEdit3("발광 색상", target.emission_color->v))
+                fireMaterialEdit();
+        }
+        if (ImGui::Button("기본 색상 초기화", ImVec2(-FLT_MIN, 0))) {
             *target.base_color = tinym::vec3(1.0f);
             fireMaterialEdit();
-            state.status_message = "Base color reset to white.";
+            state.status_message = "기본 색상이 흰색으로 초기화됨.";
         }
     }
 
-    if (target.transform_position && target.on_translate) {
-        if (ImGui::CollapsingHeader("Transform", ImGuiTreeNodeFlags_DefaultOpen)) {
-            float p[3] = { target.transform_position->x,
-                           target.transform_position->y,
-                           target.transform_position->z };
-            ImGui::InputFloat3("Position", p);
-            // IsItemDeactivatedAfterEdit fires once on commit (Enter / Tab /
-            // focus loss), not per keystroke — keeps state.x mutation off the
-            // typing critical path.
-            if (ImGui::IsItemDeactivatedAfterEdit()) {
-                target.on_translate(target.mesh_id,
-                                    tinym::vec3(p[0], p[1], p[2]));
-                state.status_message = "Position updated.";
-            }
-        }
+    // ─── Per-object environment-force toggles ─────────────────────────
+    // Checkbox writes through the aliased GeneralMesh field for live
+    // effect; the on_env_toggle_change callback mirrors the new value
+    // into the request side so it survives Simulator::reset().
+    auto fireEnvToggle = [&]() {
+        if (!target.on_env_toggle_change) return;
+        bool g = target.apply_gravity ? *target.apply_gravity : true;
+        bool w = target.apply_wind    ? *target.apply_wind    : true;
+        target.on_env_toggle_change(target.mesh_id, g, w);
+    };
+    if (target.apply_gravity) {
+        if (ImGui::Checkbox("중력 적용", target.apply_gravity)) fireEnvToggle();
+    }
+    if (target.apply_wind) {
+        if (ImGui::Checkbox("바람 적용", target.apply_wind)) fireEnvToggle();
     }
 
-    if (target.rotation_wxyz && target.on_rotate) {
-        if (ImGui::CollapsingHeader("Rotation", ImGuiTreeNodeFlags_DefaultOpen)) {
-            // D-035: mode toggle selects how the rotation is shown / edited.
-            // Canonical storage is still Quat on the mesh; Euler XYZ and
-            // Axis-Angle are display-time conversions via the helpers in
-            // MeshInspectorWindow.hpp. Mode state is per-window
-            // (state.rotation_input_mode); the mesh's `*target.rotation_wxyz`
-            // is the source of truth that all three widgets read from.
-            ImGui::Combo("Mode", &state.rotation_input_mode,
-                         "Quat\0Euler XYZ (deg)\0Axis-Angle (deg)\0\0");
-
-            const float currWxyz[4] = {
-                target.rotation_wxyz[0], target.rotation_wxyz[1],
-                target.rotation_wxyz[2], target.rotation_wxyz[3]
-            };
-
-            if (state.rotation_input_mode == 0) {
-                // Quat mode — direct 4-float edit, pre-D-035 default.
-                float q[4] = { currWxyz[0], currWxyz[1], currWxyz[2], currWxyz[3] };
-                ImGui::InputFloat4("Quat (w,x,y,z)", q);
-                if (ImGui::IsItemDeactivatedAfterEdit()) {
-                    target.on_rotate(target.mesh_id, q[0], q[1], q[2], q[3]);
-                    state.status_message = "Rotation updated (quat).";
-                }
-            } else if (state.rotation_input_mode == 1) {
-                // Euler XYZ mode — display radians-derived degrees;
-                // on commit convert back to wxyz.
-                float xyzDeg[3];
-                quatWxyzToEulerXYZDeg(currWxyz, xyzDeg);
-                ImGui::InputFloat3("Euler XYZ (deg)", xyzDeg);
-                if (ImGui::IsItemDeactivatedAfterEdit()) {
-                    float newWxyz[4];
-                    eulerXYZDegToQuatWxyz(xyzDeg, newWxyz);
-                    target.on_rotate(target.mesh_id,
-                                     newWxyz[0], newWxyz[1], newWxyz[2], newWxyz[3]);
-                    state.status_message = "Rotation updated (Euler XYZ deg).";
-                }
-            } else {
-                // Axis-Angle mode — axis (vec3) + angle (degrees).
-                // Edits to either widget commit a fresh wxyz on commit.
-                float axis[3];
-                float angleDeg = 0.0f;
-                quatWxyzToAxisAngleDeg(currWxyz, axis, angleDeg);
-                bool axisCommit = false;
-                bool angleCommit = false;
-                ImGui::InputFloat3("Axis (x,y,z)", axis);
-                if (ImGui::IsItemDeactivatedAfterEdit()) axisCommit = true;
-                ImGui::InputFloat("Angle (deg)", &angleDeg);
-                if (ImGui::IsItemDeactivatedAfterEdit()) angleCommit = true;
-                if (axisCommit || angleCommit) {
-                    float newWxyz[4];
-                    axisAngleDegToQuatWxyz(axis, angleDeg, newWxyz);
-                    target.on_rotate(target.mesh_id,
-                                     newWxyz[0], newWxyz[1], newWxyz[2], newWxyz[3]);
-                    state.status_message = "Rotation updated (axis-angle).";
-                }
-            }
-        }
-    }
-
-    // D-041: Delete button — removes the mesh from the scene via
-    // Simulator::removeMesh (marks dirty; next Simulator::update
-    // re-initializes). Wraps in PushStyleColor for visual cue +
-    // confirms via status_message.
+    // ─── Delete ───────────────────────────────────────────────────────
     if (target.on_delete) {
         ImGui::Spacing();
         ImGui::Separator();
         ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.65f, 0.18f, 0.18f, 1.0f));
         ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.80f, 0.25f, 0.25f, 1.0f));
         ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.55f, 0.10f, 0.10f, 1.0f));
-        if (ImGui::Button("Delete Mesh")) {
+        if (ImGui::Button("제거", ImVec2(-FLT_MIN, 0))) {
             target.on_delete(target.mesh_id);
-            state.status_message = "Mesh deleted.";
+            state.status_message = "물체가 제거됨.";
         }
         ImGui::PopStyleColor(3);
     }

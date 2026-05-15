@@ -199,6 +199,13 @@ void BulletRigidPhysicsBackend::setGravity(tinym::vec3 gravity) {
     if (world_) world_->setGravity(btVector3(gravity.x, gravity.y, gravity.z));
 }
 
+void BulletRigidPhysicsBackend::setBodyGravity(BodyHandle handle, tinym::vec3 gravity) {
+    if (handle < 0 || handle >= static_cast<BodyHandle>(bodies_.size())) return;
+    auto& slot = bodies_[handle];
+    if (!slot.body) return;
+    slot.body->setGravity(btVector3(gravity.x, gravity.y, gravity.z));
+}
+
 const char* BulletRigidPhysicsBackend::backendName() const {
     return "Bullet";
 }

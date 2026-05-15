@@ -31,7 +31,11 @@ inline std::string makeDefaultProfileExportPath() {
 }
 
 struct ProfilerWindowState {
-    bool open = true;
+    // Default hidden — the profiler window is opt-in via the "보기"
+    // menu's "프로파일러 윈도우 열기" item. drawProfilerWindow
+    // early-returns when this is false, so leaving the call site
+    // unconditional costs nothing.
+    bool open = false;
     float history_seconds = 3.0f;
     int selected_section = 0;
     std::string export_path = makeDefaultProfileExportPath();

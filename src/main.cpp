@@ -1864,6 +1864,13 @@ struct GeneralMesh {
     Constraints<BE, PR> constraints;
     ExternalForces<BE, PR> externalForces;
 
+    // Per-object environment-force gates (UI-driven; default = receive both).
+    // Honored by Simulator::applyEnvironmentForces — clearing applyGravity
+    // omits the per-particle gravity term; clearing applyWind omits the
+    // wind term (cloth only). Persisted via scene_format::Object.
+    bool applyGravity = true;
+    bool applyWind = true;
+
     // D-039: Rigid backend wiring. Set by Simulator::ensureRigidBackendBody
     // on Float→Rigid transition (changeBehavior) or initialize-time sweep.
     // kInvalidBodyHandle (-1) means "no backend body yet"; update() skips.
@@ -1891,7 +1898,9 @@ struct GeneralMesh {
           rotationQuat(other.rotationQuat),
           transformPosition(other.transformPosition),
           constraints(std::move(other.constraints)),
-          externalForces(std::move(other.externalForces))
+          externalForces(std::move(other.externalForces)),
+          applyGravity(other.applyGravity),
+          applyWind(other.applyWind)
     {
         other.initializer = nullptr;
     }
@@ -1939,6 +1948,10 @@ struct SceneEnvironment {
     // save/load.
     tinym::vec3 lightColor = tinym::vec3(1.0f, 1.0f, 1.0f);
     float       lightIntensity = 1.6f;
+    // Viewport clear color. Read by the render loop each frame and pushed
+    // through glClearColor; mirrored into scene_format::Environment so
+    // saveScene/loadScene round-trip the choice.
+    tinym::vec3 backgroundColor = tinym::vec3(0.05f, 0.05f, 0.08f);
 };
 
 template <typename BE, typename PR>
@@ -1967,6 +1980,14 @@ struct Scene {
         GeneralMeshInitializer<BE, PR>* initializer;
         BehaviorType behaviorType;
         BehaviorParams<PR> behaviorParams;
+        // Mirror of GeneralMesh.applyGravity / applyWind kept on the
+        // request so per-mesh environment-force toggles survive
+        // Scene::pack rebuilds (initialize / reset / loadScene). pack
+        // copies these into the realized mesh; the inspector callback
+        // writes here in addition to the live mesh field. Both default
+        // true (matches GeneralMesh defaults).
+        bool applyGravity = true;
+        bool applyWind = true;
         // D-042 R-1: heap-owned vertex/facet/normal preview, populated by
         // initializer->populatePreview() at addGeneralMesh time. Stays
         // alive across Scene::pack / pool-reset cycles. R-2 will point
@@ -2133,6 +2154,11 @@ struct Scene {
             meshes.emplace_back(req.initializer, req.behaviorType, req.behaviorParams);
             meshes[i].id = req.id;
             meshes[i].lifetimeId = req.lifetimeId;  // D-026
+            // Carry per-mesh environment-force toggles through pack so
+            // reset / load / changeBehavior rebuilds preserve the user's
+            // Apply Gravity / Apply Wind selections.
+            meshes[i].applyGravity = req.applyGravity;
+            meshes[i].applyWind    = req.applyWind;
             // Seed transformPosition from the initializer's center/offset so
             // BDD-003's translate path computes deltas against the author
             // intent, not against (0,0,0). Mirrors the dynamic_cast cascade
@@ -5026,7 +5052,11 @@ struct Simulator {
         ysim::physics::RigidInitial init{};
         init.position = mesh.transformPosition;
         init.rotation = mesh.rotationQuat;
-        init.mass     = 1.0f;
+        // Apply Gravity=false → Bullet static body (mass=0): it never
+        // falls, never receives impulses, but still serves as a
+        // collider that dynamic bodies bounce off — i.e. "Float-like"
+        // per user request. Apply Gravity=true → dynamic (mass=1).
+        init.mass     = mesh.applyGravity ? 1.0f : 0.0f;
         init.shape.type = inferRigidShapeType(mesh);
         const float halfExtent = (float)inferRigidRadius(mesh);
         if (init.shape.type == ysim::physics::RigidShapeType::Box) {
@@ -5037,6 +5067,21 @@ struct Simulator {
 
         mesh.rigidBodyHandle = rigid_.addBody(init);
         mesh.rigidLastBodyPos = init.position;
+    }
+
+    // Drop the existing Bullet body for a mesh and re-provision it from
+    // scratch. Used when a state change (e.g. Apply Gravity toggle on a
+    // Rigid mesh) flips the required Bullet mass between dynamic and
+    // static — Bullet does not support changing a body's mass cleanly
+    // in place, so we recycle the slot.
+    void recreateRigidBackendBody(int meshIdx) {
+        if (meshIdx < 0 || meshIdx >= (int)Scene<BE, PR>::meshes.size()) return;
+        auto& mesh = Scene<BE, PR>::meshes[meshIdx];
+        if (mesh.rigidBodyHandle != ysim::physics::kInvalidBodyHandle) {
+            rigid_.removeBody(mesh.rigidBodyHandle);
+            mesh.rigidBodyHandle = ysim::physics::kInvalidBodyHandle;
+        }
+        ensureRigidBackendBody(meshIdx);
     }
 
     // D-042 R-2: after every scene.addGeneralMesh, publish the R-1 preview
@@ -5082,14 +5127,27 @@ struct Simulator {
     // ObjData (loadObject is graceful on open-fail) and queue a zero-vertex
     // mesh, violating BDD-002's "no partial-add" clause.
     bool importMesh(const std::string& prefix, const std::string& fileName,
-                    PR scale, PR mass = PR(0.1), std::string* error = nullptr) {
+                    PR scale, PR mass = PR(0.1), std::string* error = nullptr,
+                    BehaviorType behavior = BehaviorType::Float) {
         std::string fullPath = prefix.empty() ? fileName : (prefix + "/" + fileName);
         std::ifstream probe(fullPath);
         if (!probe.good()) {
             if (error) *error = "file not found: " + fullPath;
             return false;
         }
-        addFloatMesh(prefix, fileName, tinym::vec3(0), scale, mass);
+        // UI add-OBJ path passes BehaviorType::Rigid; self-tests use the
+        // Float default. Behavior variants other than Cloth use the Float
+        // params struct as a placeholder (D-036 — Rigid dispatch reads
+        // behaviorType, not the variant alternative).
+        BehaviorParams<PR> params = (behavior == BehaviorType::TriangularCloth)
+            ? BehaviorParams<PR>{ClothBehaviorParams<PR>{PR(1e5), PR(1e5), PR(3e5), PR(0.01)}}
+            : BehaviorParams<PR>{FloatBehaviorParams<PR>{}};
+        scene.addGeneralMesh(
+            new MeshFileInitializer<BE, PR>(
+                {prefix, fileName, tinym::vec3(0), scale, mass}),
+            behavior,
+            params);
+        registerPreviewBindingForLastRequest();
         return true;
     }
     void addClothGridFast(Index particleNum1D = 200, PR size1D = 100, PR kstretch=1e5, PR kshear=1e5, PR kbend=3e5, PR thickness=0.001, PR mass=0.1) {
@@ -5138,20 +5196,22 @@ struct Simulator {
         );
         registerPreviewBindingForLastRequest();
     };
-    void addSphere(tinym::vec3 center, Index tessellation, PR size, PR mass=PR(0.1)) {
+    void addSphere(tinym::vec3 center, Index tessellation, PR size, PR mass=PR(0.1),
+                   BehaviorType behavior=BehaviorType::Float) {
         scene.addGeneralMesh(
             new MeshSphereInitializer<BE,PR>(MeshSphereInitializerParams<PR>(
                 center, tessellation, size, mass)),
-            BehaviorType::Float,
+            behavior,
             FloatBehaviorParams<PR>{});
         registerPreviewBindingForLastRequest();
     }
 
-    void addCube(tinym::vec3 center, Index tessellation, PR size, PR mass=PR(0.1)) {
+    void addCube(tinym::vec3 center, Index tessellation, PR size, PR mass=PR(0.1),
+                 BehaviorType behavior=BehaviorType::Float) {
         scene.addGeneralMesh(
             new MeshCubeInitializer<BE,PR>(MeshCubeInitializerParams<PR>(
                 center, tessellation, size, mass)),
-            BehaviorType::Float,
+            behavior,
             FloatBehaviorParams<PR>{});
         registerPreviewBindingForLastRequest();
     }
@@ -5636,13 +5696,24 @@ struct Simulator {
             const bool windSusceptible =
                 (mesh.behaviorType == BehaviorType::TriangularCloth ||
                  mesh.behaviorType == BehaviorType::FastGridCloth);
+            // Per-mesh UI toggles gate gravity / wind contributions. When
+            // both are cleared the buffer is zeroed (same shape as the
+            // Float/Rigid early-return above).
+            const bool gravityOn = mesh.applyGravity;
+            const bool windOn    = mesh.applyWind && windSusceptible;
             for (Index p = 0; p < numPoints; ++p) {
                 Index b = p * 3;
                 PR mp = mass ? mass[b] : PR(1);
-                ext[b    ] = (PR)env.gravity.x * mp;
-                ext[b + 1] = (PR)env.gravity.y * mp;
-                ext[b + 2] = (PR)env.gravity.z * mp;
-                if (windSusceptible) {
+                if (gravityOn) {
+                    ext[b    ] = (PR)env.gravity.x * mp;
+                    ext[b + 1] = (PR)env.gravity.y * mp;
+                    ext[b + 2] = (PR)env.gravity.z * mp;
+                } else {
+                    ext[b    ] = PR(0);
+                    ext[b + 1] = PR(0);
+                    ext[b + 2] = PR(0);
+                }
+                if (windOn) {
                     ext[b    ] += (PR)env.wind.x;
                     ext[b + 1] += (PR)env.wind.y;
                     ext[b + 2] += (PR)env.wind.z;
@@ -5691,10 +5762,35 @@ struct Simulator {
         // via the Environment widget mutate Scene::environment.gravity
         // directly. Push that to the rigid backend each frame so live
         // gravity changes propagate. Cheap (per-frame btVector3 copy).
+        // Per-mesh Apply Gravity for Rigid bodies is handled at body-
+        // creation time via mass=0 (static, "Float-like") vs mass=1
+        // (dynamic). See ensureRigidBackendBody.
         rigid_.setGravity(tinym::vec3(
             (float)Scene<BE, PR>::environment.gravity.x,
             (float)Scene<BE, PR>::environment.gravity.y,
             (float)Scene<BE, PR>::environment.gravity.z));
+
+        // Wind force on Rigid bodies. The cloth-side path adds wind into
+        // the per-particle externalForces buffer (applyEnvironmentForces);
+        // Bullet-driven Rigid bodies bypass that buffer, so we route wind
+        // through applyForce instead. at_world_point = body position →
+        // zero lever arm → no torque (matches cloth's "uniform push" feel).
+        // Gated on mesh.applyWind, mirroring the cloth gate. Static Rigid
+        // (mass=0, gravity-off) silently ignores the force per Bullet's
+        // own contract. Bullet clears queued forces after each step, so
+        // re-applying every frame is correct.
+        const tinym::vec3 windForce(
+            (float)Scene<BE, PR>::environment.wind.x,
+            (float)Scene<BE, PR>::environment.wind.y,
+            (float)Scene<BE, PR>::environment.wind.z);
+        if (windForce.x != 0.0f || windForce.y != 0.0f || windForce.z != 0.0f) {
+            for (auto& m : Scene<BE, PR>::meshes) {
+                if (m.behaviorType != BehaviorType::Rigid) continue;
+                if (!m.applyWind) continue;
+                if (m.rigidBodyHandle == ysim::physics::kInvalidBodyHandle) continue;
+                rigid_.applyForce(m.rigidBodyHandle, windForce, m.transformPosition);
+            }
+        }
 
         // D-039: step the rigid backend once per outer ysim frame. Bullet's
         // stepSimulation(h, 1, h) takes exactly one substep of h.
@@ -6067,15 +6163,22 @@ struct Simulator {
         s.environment.wind = {Scene<BE,PR>::environment.wind.x,
                                Scene<BE,PR>::environment.wind.y,
                                Scene<BE,PR>::environment.wind.z};
+        s.environment.backgroundColor = {
+            Scene<BE,PR>::environment.backgroundColor.x,
+            Scene<BE,PR>::environment.backgroundColor.y,
+            Scene<BE,PR>::environment.backgroundColor.z};
 
         auto encodeOne = [&](int id, GeneralMeshInitializer<BE,PR>* init,
                               BehaviorType btype, const BehaviorParams<PR>& bparams,
                               const ::Material& mat, const ::Quat& rot,
                               const tinym::vec3* transformOverride,
-                              const std::string& name) {
+                              const std::string& name,
+                              bool applyGravity, bool applyWind) {
             Object o;
             o.id = id;
             o.name = name;
+            o.applyGravity = applyGravity;
+            o.applyWind = applyWind;
             o.material.baseColor = {mat.baseColor.x, mat.baseColor.y, mat.baseColor.z};
             o.material.metallic = mat.metallic;
             o.material.roughness = mat.roughness;
@@ -6155,7 +6258,8 @@ struct Simulator {
                 encodeOne(m.id, m.initializer, m.behaviorType, m.behaviorParams,
                           m.material, m.rotationQuat,
                           &m.transformPosition,
-                          "object_" + std::to_string(m.id));
+                          "object_" + std::to_string(m.id),
+                          m.applyGravity, m.applyWind);
             }
         } else {
             for (auto& r : Scene<BE,PR>::requestsGeneralMeshes) {
@@ -6166,7 +6270,8 @@ struct Simulator {
                 encodeOne(r.id, r.initializer, r.behaviorType, r.behaviorParams,
                           defaultMat, defaultRot,
                           nullptr,
-                          "object_" + std::to_string(r.id));
+                          "object_" + std::to_string(r.id),
+                          r.applyGravity, r.applyWind);
             }
         }
         return s;
@@ -6215,6 +6320,10 @@ struct Simulator {
             (float)r.value.environment.wind[0],
             (float)r.value.environment.wind[1],
             (float)r.value.environment.wind[2]);
+        Scene<BE,PR>::environment.backgroundColor = tinym::vec3(
+            (float)r.value.environment.backgroundColor[0],
+            (float)r.value.environment.backgroundColor[1],
+            (float)r.value.environment.backgroundColor[2]);
 
         const std::string sceneDir = scene_format::sceneDir(path);
         for (auto& o : r.value.objects) {
@@ -6319,6 +6428,12 @@ struct Simulator {
                     q.y = (float)o.transform.rotation[2];
                     q.z = (float)o.transform.rotation[3];
                     pendingRotations[meshId] = q;
+                    // Write env-force toggles directly into the request
+                    // (RequestGeneralMesh.applyGravity / applyWind). pack()
+                    // will carry them into the realized mesh next
+                    // initialize, and they survive reset() identically.
+                    Scene<BE,PR>::requestsGeneralMeshes[idx].applyGravity = o.applyGravity;
+                    Scene<BE,PR>::requestsGeneralMeshes[idx].applyWind    = o.applyWind;
                 }
             }
         }
@@ -10746,7 +10861,7 @@ int main(int argc, char** argv) {
     //simulator.addClothGridFast(100, 1, kstretch, kshear, kbend, thickness, mass);
     //for(int i = 0; i < 1; i++) 
     //    simulator.addCloth(particleNum1D, size1D, tinym::vec3(0, 0.15+(float)i*0.05f, 0), kstretch, kshear, kbend, thickness, mass);
-    simulator.addCloth(100, 1, tinym::vec3(0, 0.25, 0), kstretch, kshear, kbend, thickness, mass);
+    simulator.addCloth(50, 1, tinym::vec3(0, 0.25, 0), kstretch, kshear, kbend, thickness, mass);
     //simulator.addClothFile("src/assets", "teapot.obj", {0,0,0} 15, 1e4, 0, 2e4, thickness mass);
     //simulator.addClothFile("src/assets", "horse-gallop-01.obj", {0,0,0}, 80, 1e4, 0, 2e4, thickness mass);
     //simulator.addFloatMesh("src/assets", "horse-gallop-01.obj", {0, -1, 0}, 1.2);
@@ -10807,6 +10922,34 @@ int main(int argc, char** argv) {
     ImGui::StyleColorsDark();
     ImGuiIO& io = ImGui::GetIO();
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+
+    // 1.2× UI 스케일 — 폰트, 위젯 스페이싱, 좌/우 패널 폭이 모두 같은
+    // 배율을 공유해야 비례가 맞는다. panelW (메뉴/패널 레이아웃)도
+    // 이 상수를 곱해 산출한다.
+    constexpr float kUiScale = 1.2f;
+
+    // Korean glyph support. ImGui's default font is ASCII-only — Hangul
+    // shows as ▯ without this. Load AppleGothic.ttf (ships with macOS)
+    // and pass GetGlyphRangesKorean() so the atlas includes Hangul +
+    // common CJK punctuation in addition to ASCII. Must run BEFORE
+    // ImGui_ImplOpenGL3_Init so the backend builds its font texture
+    // from the merged atlas. Falls back to the default font if the
+    // system file is missing (no Hangul, but the UI still renders).
+    {
+        const char* kKoreanFontPath =
+            "/System/Library/Fonts/Supplemental/AppleGothic.ttf";
+        ImFontConfig cfg;
+        cfg.OversampleH = 2;
+        cfg.OversampleV = 1;
+        ImFont* korean = io.Fonts->AddFontFromFileTTF(
+            kKoreanFontPath, 15.0f * kUiScale, &cfg,
+            io.Fonts->GetGlyphRangesKorean());
+        if (!korean) io.Fonts->AddFontDefault();
+    }
+    // 폰트 사이즈와 같은 배율로 padding/spacing/rounding을 확대.
+    // ScaleAllSizes는 폰트와 독립이라 따로 호출해야 비례가 보존됨.
+    ImGui::GetStyle().ScaleAllSizes(kUiScale);
+
     ImGui_ImplGlfw_InitForOpenGL(yglwindow->getGLFWWindow(), false);
 #ifdef __APPLE__
     ImGui_ImplOpenGL3_Init("#version 410");
@@ -10944,6 +11087,16 @@ int main(int argc, char** argv) {
         profiler::ProfilerFrameGate frameGate(frameProfiler, collectProfileFrame,
                                               simulator.frame, currentTime);
 
+        // Per-frame modal-open flags. Reset every frame; flipped to true by
+        // either the File menu (Save/Load) or the right-panel Add-Object
+        // buttons (Cube/Sphere/Import). Checked at the bottom of the ImGui
+        // section and routed to ImGui::OpenPopup in one place.
+        bool openSaveModal = false;
+        bool openLoadModal = false;
+        bool openImportModal = false;
+        bool openSphereModal = false;
+        bool openCubeModal = false;
+
         auto buildSelectedMeshTarget = [&]() {
             mesh_inspector::MeshInspectorTarget target;
             if (auto* selectedMesh = Scene<Backend, Precision>::findById(simulator.selectedObj)) {
@@ -11009,7 +11162,43 @@ int main(int argc, char** argv) {
                 target.on_delete = [&simulator](int id) {
                     simulator.removeMesh(id);
                 };
+                // Per-object environment-force toggles (UI checkboxes alias
+                // GeneralMesh.applyGravity / applyWind directly).
+                target.apply_gravity = &selectedMesh->applyGravity;
+                target.apply_wind    = &selectedMesh->applyWind;
+                // Mirror the toggle into the matching request so
+                // Simulator::reset() (which re-realizes meshes from
+                // requests via Scene::pack) preserves the user's choice.
+                // For Rigid meshes, also recreate the Bullet body so the
+                // new applyGravity choice maps to mass=0 (static, Float-
+                // like) or mass=1 (dynamic). Cloth gating already takes
+                // effect on the next applyEnvironmentForces frame, so
+                // no further work is needed for non-Rigid meshes.
+                target.on_env_toggle_change = [&simulator](int id, bool g, bool w) {
+                    for (auto& r : Scene<Backend, Precision>::requestsGeneralMeshes) {
+                        if (r.id == id) {
+                            r.applyGravity = g;
+                            r.applyWind    = w;
+                            break;
+                        }
+                    }
+                    auto& meshes = Scene<Backend, Precision>::meshes;
+                    for (int idx = 0; idx < (int)meshes.size(); ++idx) {
+                        if (meshes[idx].id != id) continue;
+                        if (meshes[idx].behaviorType == BehaviorType::Rigid) {
+                            simulator.recreateRigidBackendBody(idx);
+                        }
+                        break;
+                    }
+                };
             }
+            // Add-Object callbacks are wired regardless of selection — they
+            // are only rendered when the no-selection branch fires inside
+            // drawMeshInspectorWindow, but setting them unconditionally
+            // keeps the call site free of selection-aware branches.
+            target.on_request_add_cube   = [&openCubeModal]()   { openCubeModal   = true; };
+            target.on_request_add_sphere = [&openSphereModal]() { openSphereModal = true; };
+            target.on_request_add_import = [&openImportModal]() { openImportModal = true; };
             return target;
         };
 
@@ -11017,8 +11206,9 @@ int main(int argc, char** argv) {
         ImGui_ImplGlfw_NewFrame();
         ImGui::NewFrame();
 
-        // File menu — Save Scene / Load Scene (BDD-014/015/016) + Import Mesh (BDD-002)
-        // Create menu — Sphere / Cube primitives (BDD-001)
+        // Persistent UI state shared between menu bar, panel buttons, and
+        // the Save / Load / Cube / Sphere / Import modals. Statics so the
+        // text fields retain their contents across frames.
         static char scenePathBuf[512] = "scene.ysim.json";
         static char importPathBuf[512] = "src/assets/Human.obj";
         static float importScale = 1.0f;
@@ -11026,71 +11216,130 @@ int main(int argc, char** argv) {
         static float primSize = 1.0f;
         static int primTess = 16;
         static float primPos[3] = {0.f, 0.f, 0.f};
-        bool openSaveModal = false;
-        bool openLoadModal = false;
-        bool openImportModal = false;
-        bool openSphereModal = false;
-        bool openCubeModal = false;
+
+        // ─── Main menu bar ────────────────────────────────────────────
+        // Only File → Save Scene / Load Scene survives. Import + the
+        // Create menu moved into the right-side Object panel's
+        // no-selection branch.
         if (ImGui::BeginMainMenuBar()) {
-            if (ImGui::BeginMenu("File")) {
-                if (ImGui::MenuItem("Save Scene...")) openSaveModal = true;
-                if (ImGui::MenuItem("Load Scene...")) openLoadModal = true;
-                ImGui::Separator();
-                if (ImGui::MenuItem("Import Mesh...")) openImportModal = true;
+            if (ImGui::BeginMenu("파일")) {
+                if (ImGui::MenuItem("씬 저장하기...")) openSaveModal = true;
+                if (ImGui::MenuItem("씬 불러오기...")) openLoadModal = true;
                 ImGui::EndMenu();
             }
-            if (ImGui::BeginMenu("Create")) {
-                if (ImGui::MenuItem("Sphere...")) openSphereModal = true;
-                if (ImGui::MenuItem("Cube...")) openCubeModal = true;
+            if (ImGui::BeginMenu("보기")) {
+                if (ImGui::MenuItem("프로파일러 윈도우 열기")) {
+                    profilerWindowState.open = true;
+                }
                 ImGui::EndMenu();
             }
             ImGui::EndMainMenuBar();
         }
-        if (openSaveModal) ImGui::OpenPopup("Save Scene");
-        if (openLoadModal) ImGui::OpenPopup("Load Scene");
-        if (openImportModal) ImGui::OpenPopup("Import Mesh");
-        if (openSphereModal) ImGui::OpenPopup("Create Sphere");
-        if (openCubeModal) ImGui::OpenPopup("Create Cube");
-        if (ImGui::BeginPopupModal("Save Scene", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
-            ImGui::InputText("Path", scenePathBuf, sizeof(scenePathBuf));
-            if (ImGui::Button("Save")) {
+
+        // ─── Layout geometry ──────────────────────────────────────────
+        // Both side panels are pinned: left edge → Scene panel pivoted at
+        // (0, 0.5); right edge → Object panel pivoted at (1, 0.5). The
+        // menu bar's height is added to the top inset so neither panel
+        // sits under it. ImGuiCond_Always + NoMove + NoResize make the
+        // pinning hard (the user cannot drag or resize them).
+        const ImGuiViewport* vp = ImGui::GetMainViewport();
+        const float menuH = ImGui::GetFrameHeight();
+        // 패널 폭은 UI 스케일과 비례. 위젯이 1.2배 커졌으므로 폭도
+        // 같은 비율로 늘려야 라벨이 잘리지 않음 (300 * 1.2 = 360).
+        const float panelW = 300.0f * kUiScale;
+        const float panelH = vp->WorkSize.y - menuH - 20.0f;
+        const float yCenter = vp->WorkPos.y + menuH + (vp->WorkSize.y - menuH) * 0.5f;
+
+        // ─── Scene panel (left, fixed) ────────────────────────────────
+        ImGui::SetNextWindowPos(ImVec2(vp->WorkPos.x, yCenter),
+                                ImGuiCond_Always, ImVec2(0.0f, 0.5f));
+        ImGui::SetNextWindowSize(ImVec2(panelW, panelH), ImGuiCond_Always);
+        if (ImGui::Begin("씬", nullptr,
+                         ImGuiWindowFlags_NoMove |
+                         ImGuiWindowFlags_NoResize |
+                         ImGuiWindowFlags_NoCollapse |
+                         ImGuiWindowFlags_NoSavedSettings)) {
+            auto& env = Scene<Backend, Precision>::environment;
+            float gravity[3] = {(float)env.gravity.x, (float)env.gravity.y, (float)env.gravity.z};
+            float wind[3]    = {(float)env.wind.x,    (float)env.wind.y,    (float)env.wind.z};
+            if (ImGui::InputFloat3("중력", gravity)) {
+                env.gravity = tinym::vec3(gravity[0], gravity[1], gravity[2]);
+            }
+            if (ImGui::InputFloat3("바람", wind)) {
+                env.wind = tinym::vec3(wind[0], wind[1], wind[2]);
+            }
+            ImGui::Spacing();
+            ImGui::ColorEdit3("조명 색상", env.lightColor.v);
+            ImGui::SliderFloat("조명 세기", &env.lightIntensity,
+                               0.0f, 10.0f, "%.2f");
+            ImGui::Spacing();
+            ImGui::ColorEdit3("배경 색상", env.backgroundColor.v);
+
+            if (!sceneIOStatus.empty()) {
+                ImGui::Spacing();
+                ImGui::Separator();
+                ImGui::TextDisabled("씬 입출력");
+                ImGui::TextWrapped("%s", sceneIOStatus.c_str());
+            }
+        }
+        ImGui::End();
+
+        // ─── Object panel (right, fixed) ──────────────────────────────
+        // Pin position/size BEFORE drawMeshInspectorWindow's Begin call.
+        ImGui::SetNextWindowPos(ImVec2(vp->WorkPos.x + vp->WorkSize.x, yCenter),
+                                ImGuiCond_Always, ImVec2(1.0f, 0.5f));
+        ImGui::SetNextWindowSize(ImVec2(panelW, panelH), ImGuiCond_Always);
+        mesh_inspector::drawMeshInspectorWindow(
+            meshInspectorWindowState, buildSelectedMeshTarget());
+
+        // ─── Modal popups ─────────────────────────────────────────────
+        // Triggered by either the File menu (Save/Load) or the right
+        // panel's add-object buttons (Sphere/Cube/Import). Centralized
+        // here so OpenPopup → BeginPopupModal stay co-located.
+        if (openSaveModal) ImGui::OpenPopup("씬 저장하기");
+        if (openLoadModal) ImGui::OpenPopup("씬 불러오기");
+        if (openImportModal) ImGui::OpenPopup("OBJ 파일 가져오기");
+        if (openSphereModal) ImGui::OpenPopup("구 생성");
+        if (openCubeModal) ImGui::OpenPopup("정사각형 생성");
+        if (ImGui::BeginPopupModal("씬 저장하기", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+            ImGui::InputText("경로", scenePathBuf, sizeof(scenePathBuf));
+            if (ImGui::Button("저장")) {
                 std::string err;
                 if (simulator.saveScene(scenePathBuf, &err)) {
-                    sceneIOStatus = std::string("saved: ") + scenePathBuf;
+                    sceneIOStatus = std::string("저장됨: ") + scenePathBuf;
                 } else {
-                    sceneIOStatus = std::string("save failed: ") + err;
+                    sceneIOStatus = std::string("저장 실패: ") + err;
                 }
                 ImGui::CloseCurrentPopup();
             }
             ImGui::SameLine();
-            if (ImGui::Button("Cancel")) ImGui::CloseCurrentPopup();
+            if (ImGui::Button("취소")) ImGui::CloseCurrentPopup();
             ImGui::EndPopup();
         }
-        if (ImGui::BeginPopupModal("Load Scene", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
-            ImGui::InputText("Path", scenePathBuf, sizeof(scenePathBuf));
-            if (ImGui::Button("Load")) {
+        if (ImGui::BeginPopupModal("씬 불러오기", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+            ImGui::InputText("경로", scenePathBuf, sizeof(scenePathBuf));
+            if (ImGui::Button("불러오기")) {
                 auto r = simulator.loadScene(scenePathBuf);
                 if (r.ok) {
-                    sceneIOStatus = std::string("loaded: ") + scenePathBuf;
+                    sceneIOStatus = std::string("불러옴: ") + scenePathBuf;
                     for (const auto& w : r.value.warnings.messages) {
-                        sceneIOStatus += "\nwarning: " + w;
+                        sceneIOStatus += "\n경고: " + w;
                     }
                     simulator.initialize();
                     simulator.applyPendingMaterials();
                 } else {
-                    sceneIOStatus = std::string("load failed: ") + r.error.message;
+                    sceneIOStatus = std::string("불러오기 실패: ") + r.error.message;
                 }
                 ImGui::CloseCurrentPopup();
             }
             ImGui::SameLine();
-            if (ImGui::Button("Cancel")) ImGui::CloseCurrentPopup();
+            if (ImGui::Button("취소")) ImGui::CloseCurrentPopup();
             ImGui::EndPopup();
         }
-        if (ImGui::BeginPopupModal("Import Mesh", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
-            ImGui::InputText("Path", importPathBuf, sizeof(importPathBuf));
-            ImGui::InputFloat("Scale", &importScale);
-            ImGui::TextUnformatted("Behavior: Float (BDD-006 will allow choosing later)");
-            if (ImGui::Button("Import")) {
+        if (ImGui::BeginPopupModal("OBJ 파일 가져오기", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+            ImGui::InputText("경로", importPathBuf, sizeof(importPathBuf));
+            ImGui::InputFloat("배율", &importScale);
+            if (ImGui::Button("가져오기")) {
                 std::string path = importPathBuf;
                 std::string prefix, file;
                 auto slash = path.find_last_of('/');
@@ -11101,78 +11350,48 @@ int main(int argc, char** argv) {
                     file = path;
                 }
                 std::string err;
-                if (simulator.importMesh(prefix, file, (Precision)importScale, Precision(0.1), &err)) {
+                if (simulator.importMesh(prefix, file, (Precision)importScale, Precision(0.1), &err, BehaviorType::Rigid)) {
                     simulator.initialize();
                     simulator.applyPendingMaterials();
-                    sceneIOStatus = std::string("imported: ") + path;
+                    sceneIOStatus = std::string("가져옴: ") + path;
                 } else {
-                    sceneIOStatus = std::string("import failed: ") + err;
+                    sceneIOStatus = std::string("가져오기 실패: ") + err;
                 }
                 ImGui::CloseCurrentPopup();
             }
             ImGui::SameLine();
-            if (ImGui::Button("Cancel")) ImGui::CloseCurrentPopup();
+            if (ImGui::Button("취소")) ImGui::CloseCurrentPopup();
             ImGui::EndPopup();
         }
         auto primitiveModal = [&](const char* title, bool isSphere) {
             if (ImGui::BeginPopupModal(title, nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
-                ImGui::InputFloat("Size", &primSize);
-                ImGui::InputInt("Tessellation", &primTess);
-                ImGui::InputFloat3("Position", primPos);
-                if (ImGui::Button("Create")) {
+                ImGui::InputFloat("크기", &primSize);
+                ImGui::InputInt("분할 수", &primTess);
+                ImGui::InputFloat3("위치", primPos);
+                if (ImGui::Button("생성")) {
                     int t = primTess;
                     if (isSphere) {
                         if (t < 3) t = 3;
                         simulator.addSphere(tinym::vec3(primPos[0], primPos[1], primPos[2]),
-                                            (Index)t, (Precision)primSize);
+                                            (Index)t, (Precision)primSize,
+                                            (Precision)0.1, BehaviorType::Rigid);
                     } else {
                         if (t < 1) t = 1;
                         simulator.addCube(tinym::vec3(primPos[0], primPos[1], primPos[2]),
-                                          (Index)t, (Precision)primSize);
+                                          (Index)t, (Precision)primSize,
+                                          (Precision)0.1, BehaviorType::Rigid);
                     }
                     simulator.initialize();
-                    sceneIOStatus = std::string(isSphere ? "created sphere" : "created cube");
+                    sceneIOStatus = std::string(isSphere ? "구 생성됨" : "정사각형 생성됨");
                     ImGui::CloseCurrentPopup();
                 }
                 ImGui::SameLine();
-                if (ImGui::Button("Cancel")) ImGui::CloseCurrentPopup();
+                if (ImGui::Button("취소")) ImGui::CloseCurrentPopup();
                 ImGui::EndPopup();
             }
         };
-        primitiveModal("Create Sphere", true);
-        primitiveModal("Create Cube", false);
-
-        if (!sceneIOStatus.empty()) {
-            ImGui::Begin("Scene I/O");
-            ImGui::TextWrapped("%s", sceneIOStatus.c_str());
-            ImGui::End();
-        }
-
-        // Environment panel — gravity / wind live edits land in
-        // Scene::environment immediately; the per-frame applyEnvironmentForces
-        // call picks them up next frame (FR-018 live-edit semantics).
-        {
-            auto& env = Scene<Backend, Precision>::environment;
-            float gravity[3] = {(float)env.gravity.x, (float)env.gravity.y, (float)env.gravity.z};
-            float wind[3]    = {(float)env.wind.x,    (float)env.wind.y,    (float)env.wind.z};
-            ImGui::Begin("Environment");
-            if (ImGui::InputFloat3("Gravity", gravity)) {
-                env.gravity = tinym::vec3(gravity[0], gravity[1], gravity[2]);
-            }
-            if (ImGui::InputFloat3("Wind", wind)) {
-                env.wind = tinym::vec3(wind[0], wind[1], wind[2]);
-            }
-            // D-028 follow-on: scene-global PBR preview light controls.
-            // lightColor is the tint (default white); lightIntensity is
-            // the scalar magnitude. The shader receives the product as
-            // direct radiance — see SceneEnvironment doc-comment.
-            ImGui::Separator();
-            ImGui::TextDisabled("Lighting (preview shader)");
-            ImGui::ColorEdit3("Light Color", env.lightColor.v);
-            ImGui::SliderFloat("Light Intensity", &env.lightIntensity,
-                               0.0f, 10.0f, "%.2f");
-            ImGui::End();
-        }
+        primitiveModal("구 생성", true);
+        primitiveModal("정사각형 생성", false);
 
         if (collectProfileFrame) {
             auto scope = frameProfiler.scoped("physics_total");
@@ -11187,7 +11406,10 @@ int main(int argc, char** argv) {
 
             shader.use();
             glViewport(0, 0, yglwindow->width(), yglwindow->height());
-            glClearColor(0, 0, 0, 0);
+            {
+                const auto& bg = Scene<Backend, Precision>::environment.backgroundColor;
+                glClearColor(bg.x, bg.y, bg.z, 1.0f);
+            }
             glEnable(GL_DEPTH_TEST);
             glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
@@ -11230,7 +11452,10 @@ int main(int argc, char** argv) {
         } else {
             shader.use();
             glViewport(0, 0, yglwindow->width(), yglwindow->height());
-            glClearColor(0, 0, 0, 0);
+            {
+                const auto& bg = Scene<Backend, Precision>::environment.backgroundColor;
+                glClearColor(bg.x, bg.y, bg.z, 1.0f);
+            }
             glEnable(GL_DEPTH_TEST);
             glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
@@ -11267,6 +11492,9 @@ int main(int argc, char** argv) {
             simulator.showDebugLines(V, P);
         }
 
+        // mesh_inspector::drawMeshInspectorWindow already ran above as the
+        // right-side Object panel. Only the profiler window is drawn here
+        // at end-of-frame (it owns its own toggle / floating placement).
         if (collectProfileFrame) {
             auto imguiScope = frameProfiler.scoped("imgui_draw");
             profiler::drawProfilerWindow(
@@ -11278,7 +11506,6 @@ int main(int argc, char** argv) {
                 &debugCollisions,
                 &meshInspectorWindowState.open
             );
-            mesh_inspector::drawMeshInspectorWindow(meshInspectorWindowState, buildSelectedMeshTarget());
             ImGui::Render();
             ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
         } else {
@@ -11291,7 +11518,6 @@ int main(int argc, char** argv) {
                 &debugCollisions,
                 &meshInspectorWindowState.open
             );
-            mesh_inspector::drawMeshInspectorWindow(meshInspectorWindowState, buildSelectedMeshTarget());
             ImGui::Render();
             ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
         }
