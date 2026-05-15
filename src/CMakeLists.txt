@@ -84,6 +84,16 @@ configure_file(
     ${CMAKE_BINARY_DIR}/line.frag
     COPYONLY
 )
+configure_file(
+    ${CMAKE_SOURCE_DIR}/src/shader/id.vert
+    ${CMAKE_BINARY_DIR}/id.vert
+    COPYONLY
+)
+configure_file(
+    ${CMAKE_SOURCE_DIR}/src/shader/id.frag
+    ${CMAKE_BINARY_DIR}/id.frag
+    COPYONLY
+)
 add_custom_command(TARGET ysim POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_directory
             ${CMAKE_SOURCE_DIR}/assets

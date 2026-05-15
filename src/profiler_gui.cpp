@@ -30,7 +30,8 @@ void drawProfilerWindow(
     bool* debug_each_boxes,
     bool* debug_scene_box,
     bool* debug_collisions,
-    bool* mesh_inspector_open
+    bool* mesh_inspector_open,
+    SceneCounts scene_counts
 ) {
     if (!state.open) return;
 
@@ -54,6 +55,12 @@ void drawProfilerWindow(
     } else {
         ImGui::TextDisabled("No frame samples yet");
     }
+
+    ImGui::Separator();
+    ImGui::Text("Scene: %d meshes / %d points / %d triangles",
+                scene_counts.meshes,
+                scene_counts.points,
+                scene_counts.triangles);
 
     ImGui::Separator();
     ImGui::SliderFloat("History Seconds", &state.history_seconds, 1.0f, 6.0f, "%.1f");

@@ -42,6 +42,15 @@ struct ProfilerWindowState {
     std::string status_message;
 };
 
+// Scene aggregate counts shown alongside FPS/frame time. Producer
+// (main.cpp) sums GeneralMesh::state.x and adjacency.facets over
+// Scene::meshes once per frame and passes the totals in.
+struct SceneCounts {
+    int meshes = 0;
+    int points = 0;
+    int triangles = 0;
+};
+
 void drawProfilerWindow(
     ProfilerWindowState& state,
     FrameProfiler& profiler,
@@ -49,7 +58,8 @@ void drawProfilerWindow(
     bool* debug_each_boxes,
     bool* debug_scene_box,
     bool* debug_collisions,
-    bool* mesh_inspector_open
+    bool* mesh_inspector_open,
+    SceneCounts scene_counts = {}
 );
 
 } // namespace profiler

@@ -158,6 +158,18 @@ struct MeshGL<CPU> {
 
         glDrawElements(GL_TRIANGLES, facetNum*3, GL_UNSIGNED_INT, 0);
     }
+
+    // ID-pass draw: writes `meshId` into the R32I color attachment of
+    // the currently-bound framebuffer. Uses the same VAO (position
+    // attribute at location 0) — id.vert ignores the normal attribute
+    // at location 1 even though it's bound. The caller is responsible
+    // for binding the id framebuffer, clearing it, and setting M/V/P.
+    void drawIdOnly(Program& shader, int meshId) {
+        shader.setUniform("uMeshId", meshId);
+        glBindVertexArray(vao);
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, facetBuffer);
+        glDrawElements(GL_TRIANGLES, facetNum*3, GL_UNSIGNED_INT, 0);
+    }
 };
 
 #endif  // YSIM_MESH_GL_HPP

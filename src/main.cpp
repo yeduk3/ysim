@@ -4954,6 +4954,12 @@ struct Simulator {
 
     // object select
     int selectedObj = -1;
+    // Hover state, written by the cursor callback after sampling the id
+    // FBO (glReadPixels into the R32I color attachment). -1 means
+    // "cursor outside any mesh" — outline pass treats negative ids as
+    // no-match. Click selection still uses the BVH ray cast at
+    // mouseButtonCallback time; hover is purely visual.
+    int hoveredObj = -1;
 
     // Renderer-side per-mesh GL state (D-011). D-042 R-2: MeshGL now binds
     // to PreviewState heap pointers published via registerPreviewBinding at
@@ -6024,6 +6030,16 @@ struct Simulator {
 
         if(selectedObj >= 0) {
             // Reserved for a future selected-mesh overlay pass.
+        }
+    }
+
+    // ID-pass driver: paints the R32I attachment of the caller's idFbo
+    // with each mesh's GeneralMesh::id. Used by the per-pixel hover
+    // test (cursor → glReadPixels) and by the outline detection in the
+    // main shader's pass-2 fragment stage.
+    void drawIds(Program& idShader) {
+        for(auto& mesh : scene.meshes) {
+            renderState.getOrCreate(mesh).drawIdOnly(idShader, mesh.id);
         }
     }
 
@@ -10904,6 +10920,57 @@ int main(int argc, char** argv) {
         std::exit(1);
     }
 
+    // ID-pass shader for hover/outline. id.vert reuses position attrib;
+    // id.frag writes meshId to an R32I attachment. Failure is non-fatal
+    // — outline visuals just disappear, scene still renders.
+    Program idShader;
+    idShader.loadShader("id.vert", "id.frag");
+    const bool idShaderOk = idShader.programID != 0;
+
+    // Offscreen R32I framebuffer that the id pass writes to, sampled
+    // both by the cursor callback (hover read-back) and by shader.frag
+    // (5×5 neighborhood outline test). Built inline rather than via the
+    // Framebuffer helper because integer textures need GL_NEAREST
+    // filtering and the helper assumes GL_LINEAR + RGBA channel layout.
+    GLuint idFbo = 0, idTex = 0, idDepth = 0;
+    int idFboW = 0, idFboH = 0;
+    auto ensureIdFbo = [&](int w, int h) {
+        if (!idShaderOk) return;
+        if (idFbo != 0 && w == idFboW && h == idFboH) return;
+        if (idTex)   { glDeleteTextures(1, &idTex);             idTex = 0; }
+        if (idDepth) { glDeleteRenderbuffers(1, &idDepth);      idDepth = 0; }
+        if (idFbo)   { glDeleteFramebuffers(1, &idFbo);         idFbo = 0; }
+        idFboW = w; idFboH = h;
+        glGenFramebuffers(1, &idFbo);
+        glBindFramebuffer(GL_FRAMEBUFFER, idFbo);
+        glGenTextures(1, &idTex);
+        glBindTexture(GL_TEXTURE_2D, idTex);
+        // RGBA32F so .r can carry the mesh id as a float and .g can
+        // carry window-space depth. R32I was rejected once the depth
+        // channel joined — integer-only textures can't represent the
+        // [0, 1] depth value without an awkward bit-cast. Sampler in
+        // the main shader is sampler2D (float) accordingly.
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA32F, w, h, 0,
+                     GL_RGBA, GL_FLOAT, nullptr);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                               GL_TEXTURE_2D, idTex, 0);
+        glGenRenderbuffers(1, &idDepth);
+        glBindRenderbuffer(GL_RENDERBUFFER, idDepth);
+        glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT24, w, h);
+        glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT,
+                                  GL_RENDERBUFFER, idDepth);
+        GLenum drawBuf = GL_COLOR_ATTACHMENT0;
+        glDrawBuffers(1, &drawBuf);
+        if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+            std::cerr << "[ysim] id-pass FBO incomplete\n";
+        }
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    };
+
 
     bool debugEachBoxes = false;
     bool debugSceneBox = false;
@@ -10963,16 +11030,61 @@ int main(int argc, char** argv) {
         bool* debugSceneBox;
         bool* debugCollisions;
         profiler::FrameProfiler* frameProfiler;
+        // Hover-readback pointers: cursor callback reads from *idFbo via
+        // glReadPixels at the cursor position, mapped through the
+        // window→framebuffer DPI ratio. Values are owned by main and
+        // updated each frame in ensureIdFbo / render.
+        GLuint* idFbo;
+        int* idFboW;
+        int* idFboH;
     };
-    CallbacksDataPack pack = {&simulator, &debugEachBoxes, &debugSceneBox, &debugCollisions, &frameProfiler};
+    CallbacksDataPack pack = {&simulator, &debugEachBoxes, &debugSceneBox,
+                              &debugCollisions, &frameProfiler,
+                              &idFbo, &idFboW, &idFboH};
 
     //glfwSetWindowUserPointer(window->getGLFWWindow(), &system);
     glfwSetWindowUserPointer(yglwindow->getGLFWWindow(), &(pack));
 
     auto cursorCallback = [](GLFWwindow* window, double xpos, double ypos) {
         ImGui_ImplGlfw_CursorPosCallback(window, xpos, ypos);
-        if (ImGui::GetIO().WantCaptureMouse) return;
+        auto* pack = static_cast<CallbacksDataPack*>(glfwGetWindowUserPointer(window));
+        auto* sim = pack->simulator;
+        if (ImGui::GetIO().WantCaptureMouse) {
+            sim->hoveredObj = -1;
+            return;
+        }
         YGL::cursorPosCallback(window, xpos, ypos);
+
+        // Hover read-back: sample the id FBO at the cursor pixel and
+        // store the result on simulator.hoveredObj. The id FBO holds
+        // last-frame's geometry — 1-frame latency is acceptable for
+        // hover UX. DPI-aware: cursor pos is in window pixels while the
+        // FBO is sized to framebuffer pixels, so scale by the ratio.
+        if (*pack->idFbo == 0 || *pack->idFboW == 0 || *pack->idFboH == 0) return;
+        int winW = 0, winH = 0;
+        glfwGetWindowSize(window, &winW, &winH);
+        if (winW <= 0 || winH <= 0) return;
+        const float fx = (float)*pack->idFboW / (float)winW;
+        const float fy = (float)*pack->idFboH / (float)winH;
+        const int px = (int)(xpos * fx);
+        // GL's origin is bottom-left; GLFW's cursor is top-left.
+        const int py = (int)((winH - ypos) * fy);
+        if (px < 0 || py < 0 || px >= *pack->idFboW || py >= *pack->idFboH) {
+            sim->hoveredObj = -1;
+            return;
+        }
+        GLint readBufBackup = 0;
+        glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &readBufBackup);
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, *pack->idFbo);
+        glReadBuffer(GL_COLOR_ATTACHMENT0);
+        // RGBA32F read-back. Only .r (the mesh id) is used here; depth
+        // (.g) drives the outline pass via the shader sampler, not the
+        // cursor logic. Cast the float id back to an integer; negative
+        // sentinel (-1.0) passes through cleanly as int.
+        float sampled[4] = {-1.0f, 1.0f, 0.0f, 0.0f};
+        glReadPixels(px, py, 1, 1, GL_RGBA, GL_FLOAT, sampled);
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)readBufBackup);
+        sim->hoveredObj = (int)sampled[0];
     };
     auto scrollCallbackWrapped = [](GLFWwindow* window, double xoffset, double yoffset) {
         ImGui_ImplGlfw_ScrollCallback(window, xoffset, yoffset);
@@ -10981,45 +11093,55 @@ int main(int argc, char** argv) {
     };
     auto mouseButtonCallback = [](GLFWwindow* window, int button, int action, int mods) {
         ImGui_ImplGlfw_MouseButtonCallback(window, button, action, mods);
-        if (ImGui::GetIO().WantCaptureMouse) return;
-        if(button == GLFW_MOUSE_BUTTON_LEFT && action == GLFW_PRESS) {
-            auto* pack = static_cast<CallbacksDataPack*>(glfwGetWindowUserPointer(window));
-            auto* simulator = pack->simulator;
 
-            // pixel position에서 model space로 변환
-            // ray를 bvh에 태워서 체크 (별도의 ray 객체 생성 후 intersection test)
-            double x, y;
-            glfwGetCursorPos(window, &x, &y);
-            tinym::vec3 npp = camera.unProjectPerspective(window, x, y, -1);
-            tinym::vec3 fpp = camera.unProjectPerspective(window, x, y,  1);
-            //std::cout << npp << " to " << fpp << std::endl;
+        // 선택 트리거는 "클릭을 뗐을 때" (RELEASE). 단, 카메라 회전
+        // 드래그 끝에서 의도치 않게 선택되는 걸 막기 위해 click vs
+        // drag 구분: PRESS 시 커서 위치를 기록하고, RELEASE 시 동일
+        // 위치 ±5px 이내일 때만 click으로 판정해 ray cast로 진행.
+        // 5px 이상 이동했으면 drag로 간주하고 선택 동작 생략.
+        static double pressX = 0.0, pressY = 0.0;
+        static bool pressOnScene = false;
+        constexpr double kClickRadiusPx = 5.0;
 
-            Ray ray;
-            ray.origin = npp;
-            ray.dir = (fpp-npp).normalize();
+        if (button != GLFW_MOUSE_BUTTON_LEFT) return;
 
-            simulator->clearDebugLines();
-            simulator->addDebugLines(ray.origin, fpp);
-
-            simulator->scene.rayTracedData.numClickRayCollisions[0] = 0;
-            simulator->collisionPipeline.broadPhase.queryClickRay(ray);
-
-            
-            Index numRayCols = simulator->scene.rayTracedData.numClickRayCollisions[0];
-            if(numRayCols == 0) {
-                simulator->selectedObj = -1;
+        if (action == GLFW_PRESS) {
+            if (ImGui::GetIO().WantCaptureMouse) {
+                pressOnScene = false;
                 return;
             }
-            auto& rayCols = simulator->scene.rayTracedData.clickRayCollisions;
+            glfwGetCursorPos(window, &pressX, &pressY);
+            pressOnScene = true;
+            return;
+        }
 
-            Index closestObj = rayCols[0].obj;
-            float tmin = rayCols[0].tmin;
-            for(int i = 1; i < numRayCols; ++i) if(rayCols[i].tmin < tmin) {
-                closestObj = rayCols[i].obj;
-                tmin = rayCols[i].tmin;
-            }
-            simulator->selectedObj = closestObj;
-            std::cout << "ClosestObj: " << closestObj << std::endl;
+        // GLFW_RELEASE
+        if (!pressOnScene) return;
+        pressOnScene = false;
+        if (ImGui::GetIO().WantCaptureMouse) return;
+
+        double rx = 0.0, ry = 0.0;
+        glfwGetCursorPos(window, &rx, &ry);
+        const double dx = rx - pressX;
+        const double dy = ry - pressY;
+        if (dx*dx + dy*dy > kClickRadiusPx * kClickRadiusPx) return;
+
+        auto* pack = static_cast<CallbacksDataPack*>(glfwGetWindowUserPointer(window));
+        auto* simulator = pack->simulator;
+
+        // 클릭 선택을 BVH ray cast 대신 hover 결과(=ID 버퍼 샘플)로
+        // 위임. 이유: 렌더링/호버는 MeshGL → PreviewState 경로라 회전
+        // 직후에도 100% 정확하지만, BVH는 Scene::packedMeshData를
+        // 가리키는 별도의 positions view를 들고 있어 broadPhase.refit
+        // 타이밍/GPU sync 문제로 회전 직후 클릭 픽킹이 stale해질 수
+        // 있음. ID 버퍼는 이미 매 프레임 preview 상태로 다시 그려지고
+        // 커서 콜백이 cursor 위치의 id를 simulator.hoveredObj에 캐시
+        // 해두므로, click-release 시 그 값을 그대로 selectedObj에 옮기면
+        // 시각(preview) ↔ 호버 ↔ 선택이 같은 데이터 소스를 공유한다.
+        simulator->clearDebugLines();
+        simulator->selectedObj = simulator->hoveredObj;
+        if (simulator->selectedObj >= 0) {
+            std::cout << "ClosestObj: " << simulator->selectedObj << std::endl;
         }
     };
     auto charCallback = [](GLFWwindow* window, unsigned int c) {
@@ -11401,6 +11523,55 @@ int main(int argc, char** argv) {
         }
         simulator.uploadMeshes();
 
+        // ─── Pass 1: id buffer (offscreen) ────────────────────────────
+        // Paints each mesh's id into idTex (R32I). Sampled later by
+        // shader.frag's outline check and (asynchronously, last-frame
+        // value) by the cursor callback's glReadPixels. Skipped if the
+        // id shader failed to load — outline becomes invisible but the
+        // scene still renders normally.
+        const int idW = yglwindow->width();
+        const int idH = yglwindow->height();
+        if (idShaderOk && idW > 0 && idH > 0) {
+            ensureIdFbo(idW, idH);
+            glBindFramebuffer(GL_FRAMEBUFFER, idFbo);
+            glViewport(0, 0, idW, idH);
+            // RGBA32F clear via the float API. .r = -1.0 marks "no
+            // object", .g = 1.0 pushes background depth to the far
+            // plane so outline tests against it always exceed the
+            // depth threshold (= silhouette against far plane is
+            // suppressed by design).
+            const GLfloat clearVec[4] = {-1.0f, 1.0f, 0.0f, 0.0f};
+            glClearBufferfv(GL_COLOR, 0, clearVec);
+            glClear(GL_DEPTH_BUFFER_BIT);
+            glEnable(GL_DEPTH_TEST);
+            idShader.use();
+            tinym::mat4 Mid(1);
+            tinym::mat4 Vid = camera.lookAt();
+            tinym::mat4 Pid = camera.perspective(yglwindow->aspect(), 0.1f, 1000.f);
+            idShader.setUniform("M", Mid);
+            idShader.setUniform("V", Vid);
+            idShader.setUniform("P", Pid);
+            simulator.drawIds(idShader);
+            glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        }
+
+        // Outline-uniform application helper, shared by both render
+        // branches below. Binds idTex to texture unit 1 (unit 0 is
+        // free for any future material texture). hoveredId/selectedId
+        // are forwarded straight from Simulator state.
+        auto applyOutlineUniforms = [&]() {
+            if (!idShaderOk) {
+                shader.setUniform("hoveredId", -1);
+                shader.setUniform("selectedId", -1);
+                return;
+            }
+            glActiveTexture(GL_TEXTURE1);
+            glBindTexture(GL_TEXTURE_2D, idTex);
+            shader.setUniform("idBuffer", 1);
+            shader.setUniform("hoveredId",  simulator.hoveredObj);
+            shader.setUniform("selectedId", simulator.selectedObj);
+        };
+
         if (collectProfileFrame) {
             auto scope = frameProfiler.scoped("render_total");
 
@@ -11430,6 +11601,7 @@ int main(int argc, char** argv) {
             shader.setUniform("lightColor",
                 Scene<Backend, Precision>::environment.lightColor
                 * Scene<Backend, Precision>::environment.lightIntensity);
+            applyOutlineUniforms();
 
             {
                 auto drawScope = frameProfiler.scoped("scene_draw");
@@ -11476,6 +11648,7 @@ int main(int argc, char** argv) {
             shader.setUniform("lightColor",
                 Scene<Backend, Precision>::environment.lightColor
                 * Scene<Backend, Precision>::environment.lightIntensity);
+            applyOutlineUniforms();
 
             simulator.draw(shader);
 
@@ -11495,6 +11668,15 @@ int main(int argc, char** argv) {
         // mesh_inspector::drawMeshInspectorWindow already ran above as the
         // right-side Object panel. Only the profiler window is drawn here
         // at end-of-frame (it owns its own toggle / floating placement).
+        // 씬 카운트(meshes / points / triangles) — 프로파일러 표시용.
+        // packedMeshData가 아닌 realized GeneralMesh 컬렉션을 쓰는 이유:
+        // 사용자가 본 화면에 실제 떠 있는 메시만 집계하기 위함이다.
+        profiler::SceneCounts sceneCounts;
+        sceneCounts.meshes = (int)Scene<Backend, Precision>::meshes.size();
+        for (const auto& m : Scene<Backend, Precision>::meshes) {
+            sceneCounts.points    += (int)(m.state.x.size / 3);
+            sceneCounts.triangles += (int)(m.adjacency.facets.size / 3);
+        }
         if (collectProfileFrame) {
             auto imguiScope = frameProfiler.scoped("imgui_draw");
             profiler::drawProfilerWindow(
@@ -11504,7 +11686,8 @@ int main(int argc, char** argv) {
                 &debugEachBoxes,
                 &debugSceneBox,
                 &debugCollisions,
-                &meshInspectorWindowState.open
+                &meshInspectorWindowState.open,
+                sceneCounts
             );
             ImGui::Render();
             ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
@@ -11516,7 +11699,8 @@ int main(int argc, char** argv) {
                 &debugEachBoxes,
                 &debugSceneBox,
                 &debugCollisions,
-                &meshInspectorWindowState.open
+                &meshInspectorWindowState.open,
+                sceneCounts
             );
             ImGui::Render();
             ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
