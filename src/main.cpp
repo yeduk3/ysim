@@ -5909,10 +5909,10 @@ struct Simulator {
         if (profiler) {
             auto scope = profiler->scoped("mesh_upload");
             for(auto& mesh : scene.meshes)
-                renderState.getOrCreate(mesh).updateBuffer(mesh.state.x.ptr);
+                renderState.getOrCreate(mesh).updateBuffer();
         } else {
             for(auto& mesh : scene.meshes)
-                renderState.getOrCreate(mesh).updateBuffer(mesh.state.x.ptr);
+                renderState.getOrCreate(mesh).updateBuffer();
         }
     }
 
@@ -9111,6 +9111,12 @@ static int runSelfTest() {
                 }
                 float cubeNormals[24 * 3] = {0};
                 MeshGL<CPU> cubeMesh(24, cubeVerts, 12, cubeIdx, cubeNormals);
+                // 2026-05-15 (A2 split): MeshGL ctor no longer auto-calls
+                // computeNormal — the production path now owns normalPtr
+                // contents externally. BDD-005's hand-built cube relies on
+                // winding-derived per-face normals so we invoke explicitly.
+                cubeMesh.computeNormal();
+                cubeMesh.updateBuffer();
 
                 // FBO setup via existing Framebuffer struct. Note:
                 // Framebuffer::attachTexture2D(int, GLint, ...) only

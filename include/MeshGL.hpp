@@ -60,7 +60,13 @@ struct MeshGL<CPU> {
                      facetPtr,
                      GL_STATIC_DRAW);
 
-        computeNormal();
+        // 2026-05-15 (A2 split): computeNormal() removed. Pre-A2 it
+        // overwrote normalPtr with winding-derived vertex normals (cross
+        // (v1-v0, v2-v0) per triangle); for primitive::cube that produces
+        // INWARD normals (the emit-order winding gives -outward) AND
+        // undoes the flat per-face normals stored in preview.renderN.
+        // PreviewState::recomputeNormals + ::recomputeRenderNormals now
+        // keep normalPtr current; MeshGL just uploads what's there.
 
         glGenBuffers(1, &normalBuffer);
         glBindBuffer(GL_ARRAY_BUFFER, normalBuffer);
@@ -115,13 +121,17 @@ struct MeshGL<CPU> {
         }
     }
 
-    void updateBuffer(float* newVertexPtr) {
-        vertexPtr = newVertexPtr;
+    // 2026-05-15 (A2 split): re-upload the buffers from the pointers
+    // stored at ctor time (set by MeshRenderState::registerPreviewBinding
+    // to preview.renderXPtr / renderNPtr — preview owns these vectors,
+    // their data() is stable across in-place value mutations from R-5
+    // resync). The caller must keep normalPtr current — PreviewState's
+    // recomputeNormals + recomputeRenderNormals do that every frame in
+    // Simulator::update's R-5 resync. No more in-MeshGL recomputation
+    // (which would clobber the flat per-face normals from cube).
+    void updateBuffer() {
         glBindBuffer(GL_ARRAY_BUFFER, vertexBuffer);
-        glBufferSubData(GL_ARRAY_BUFFER, 0, vertexNum * sizeof(float) * 3, newVertexPtr);
-
-        computeNormal();
-
+        glBufferSubData(GL_ARRAY_BUFFER, 0, vertexNum * sizeof(float) * 3, vertexPtr);
         glBindBuffer(GL_ARRAY_BUFFER, normalBuffer);
         glBufferSubData(GL_ARRAY_BUFFER, 0, vertexNum * sizeof(float) * 3, normalPtr);
     }
