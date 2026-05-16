@@ -170,6 +170,31 @@ struct MeshGL<CPU> {
         glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, facetBuffer);
         glDrawElements(GL_TRIANGLES, facetNum*3, GL_UNSIGNED_INT, 0);
     }
+
+    // Vertex-id pass: one GL_POINTS per render vertex; idpoint.frag
+    // writes (meshId, depth, gl_VertexID) into the RGBA32F attachment.
+    // Host sets glPointSize + depth func before calling. Same VAO as
+    // draw() — position attribute at location 0; idpoint.vert ignores
+    // the normal attribute.
+    void drawPointsIdOnly(Program& shader, int meshId) {
+        shader.setUniform("uMeshId", meshId);
+        glBindVertexArray(vao);
+        glDrawArrays(GL_POINTS, 0, (GLsizei)vertexNum);
+    }
+
+    // On-screen overlay: every render vertex as a flat-colored point
+    // (caller sets uColor + glPointSize).
+    void drawPoints(Program& shader) {
+        glBindVertexArray(vao);
+        glDrawArrays(GL_POINTS, 0, (GLsizei)vertexNum);
+    }
+
+    // On-screen overlay: a single render vertex (hover / select dot).
+    void drawOnePoint(Program& shader, int vid) {
+        if (vid < 0 || (size_t)vid >= vertexNum) return;
+        glBindVertexArray(vao);
+        glDrawArrays(GL_POINTS, vid, 1);
+    }
 };
 
 #endif  // YSIM_MESH_GL_HPP

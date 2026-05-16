@@ -66,6 +66,13 @@ struct Behavior {
     nlohmann::json params = nlohmann::json::object();
 };
 
+// A pinned vertex: physics-vertex index + the world position it is
+// held at. Persisted per object as the "fixed_particles" array.
+struct FixedParticle {
+    int vid = 0;
+    Vec3 pos{0, 0, 0};
+};
+
 struct Object {
     int id = 0;
     std::string name;
@@ -77,6 +84,12 @@ struct Object {
     // for backward compat — older snapshots default to "receive both".
     bool applyGravity = true;
     bool applyWind = true;
+    // "팽팽함" — uniform multiplier on simulated cloth stiffness.
+    // Optional in JSON (default 1.0 for older snapshots / non-cloth).
+    double clothStiffnessScale = 1.0;
+    // Point-selection panel constraints. Optional in JSON — older
+    // snapshots simply have no pinned vertices.
+    std::vector<FixedParticle> fixedParticles;
 };
 
 struct Environment {
@@ -266,6 +279,17 @@ inline nlohmann::json toJson(const Object& o) {
     j["behavior"] = toJson(o.behavior);
     j["apply_gravity"] = o.applyGravity;
     j["apply_wind"] = o.applyWind;
+    j["cloth_stiffness_scale"] = o.clothStiffnessScale;
+    if (!o.fixedParticles.empty()) {
+        nlohmann::json fp = nlohmann::json::array();
+        for (const auto& f : o.fixedParticles) {
+            nlohmann::json e;
+            e["vid"] = f.vid;
+            e["pos"] = detail::vec3ToJson(f.pos);
+            fp.push_back(std::move(e));
+        }
+        j["fixed_particles"] = std::move(fp);
+    }
     return j;
 }
 
@@ -449,6 +473,28 @@ inline Result<Object> objectFromJson(const nlohmann::json& j, int idx,
     }
     if (auto it = j.find("apply_wind"); it != j.end() && it->is_boolean()) {
         o.applyWind = it->get<bool>();
+    }
+    if (auto it = j.find("cloth_stiffness_scale");
+        it != j.end() && it->is_number()) {
+        o.clothStiffnessScale = it->get<double>();
+    }
+    // fixed_particles is optional (backward compat). Malformed entries
+    // are skipped rather than failing the whole load.
+    if (auto it = j.find("fixed_particles");
+        it != j.end() && it->is_array()) {
+        for (const auto& e : *it) {
+            FixedParticle f;
+            if (auto v = e.find("vid");
+                v != e.end() && v->is_number_integer())
+                f.vid = v->get<int>();
+            else
+                continue;
+            auto p = e.find("pos");
+            if (p == e.end()) continue;
+            std::string perr;
+            if (!detail::readVec3(*p, f.pos, perr, path)) continue;
+            o.fixedParticles.push_back(f);
+        }
     }
     return R::success(std::move(o));
 }

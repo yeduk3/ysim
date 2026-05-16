@@ -1566,6 +1566,25 @@ enum struct ShapeType : Index {
     Plane,
 };
 
+// Picking mode. Object: id-buffer triangle pass → whole-mesh hover/
+// select + outline. Point: id-buffer GL_POINTS pass → per-vertex
+// hover/select with on-screen dots. Exactly one off-screen id pass
+// runs per frame, branched on this (requirement 3).
+enum struct SelectionMode : int {
+    Object,
+    Point,
+};
+
+// A pinned vertex constraint. `vid` is the PHYSICS vertex index within
+// its mesh (constraints.fixedParticles[vid] = 0). `pos` is the world
+// position the vertex is held at. Stored on RequestGeneralMesh (so it
+// survives Scene::pack — like applyGravity/rotationQuat mirrors) and
+// round-tripped through scene_format as a per-object constraint list.
+struct FixedVertex {
+    uint32_t vid;
+    tinym::vec3 pos;
+};
+
 const char* behaviorTypeName(BehaviorType behaviorType) {
     switch (behaviorType) {
         case BehaviorType::TriangularCloth: return "TriangularCloth";
@@ -1699,7 +1718,16 @@ struct TriangularClothBehavior<METAL, PR> {
         MetalGlobalContext::setBuffer(mesh.externalForces.externalForces, offset++);
         //simulation parameters 8-9
         MetalGlobalContext::setBytes(simParams, offset++);
-        MetalGlobalContext::setBytes(std::get<ClothBehaviorParams<PR>>(mesh.behaviorParams), offset++);
+        {
+            // "팽팽함": scale a COPY of the cloth stiffness so the
+            // stored base params stay intact; only the simulated
+            // stretch/shear/bend are multiplied.
+            ClothBehaviorParams<PR> cp =
+                std::get<ClothBehaviorParams<PR>>(mesh.behaviorParams);
+            PR s = mesh.clothStiffnessScale;
+            cp.stretch *= s; cp.shear *= s; cp.bend *= s;
+            MetalGlobalContext::setBytes(cp, offset++);
+        }
         // adjacency 10-11
         MetalGlobalContext::setBuffer(mesh.adjacency.edges, offset++);
         MetalGlobalContext::setBuffer(mesh.adjacency.facets, offset++);
@@ -1756,7 +1784,14 @@ struct FastGridClothBehavior<METAL, PR> {
         MetalGlobalContext::setBuffer(mesh.externalForces.externalForces, offset++);
         //simulation parameters 8-9
         MetalGlobalContext::setBytes(simParams, offset++);
-        MetalGlobalContext::setBytes(std::get<FastGridClothBehaviorParams<PR>>(mesh.behaviorParams), offset++);
+        {
+            // "팽팽함": scale the k* stiffness (NOT the rest lengths).
+            FastGridClothBehaviorParams<PR> fp =
+                std::get<FastGridClothBehaviorParams<PR>>(mesh.behaviorParams);
+            PR s = mesh.clothStiffnessScale;
+            fp.kstretch *= s; fp.kshear *= s; fp.kbend *= s;
+            MetalGlobalContext::setBytes(fp, offset++);
+        }
         //// adjacency 10-11
         //MetalGlobalContext::setBuffer(mesh.adjacency.edges, offset++);
         //MetalGlobalContext::setBuffer(mesh.adjacency.facets, offset++);
@@ -1963,6 +1998,12 @@ struct GeneralMesh {
     // preview memcpy, this preserves the stored factor the inspector
     // shows and scaleObject composes its delta against). Default unit.
     tinym::vec3 scale = tinym::vec3(1.0f, 1.0f, 1.0f);
+    // "팽팽함" — uniform multiplier applied to the cloth stiffness
+    // (TriangularCloth stretch/shear/bend, FastGridCloth k*) at kernel
+    // upload time. Base behaviorParams stay untouched; this scales the
+    // SIMULATED stiffness. Default 1. Mirrored on RequestGeneralMesh so
+    // it survives Scene::pack; round-trips through scene_format.
+    PR clothStiffnessScale = PR(1);
     Constraints<BE, PR> constraints;
     ExternalForces<BE, PR> externalForces;
 
@@ -2000,6 +2041,7 @@ struct GeneralMesh {
           rotationQuat(other.rotationQuat),
           transformPosition(other.transformPosition),
           scale(other.scale),
+          clothStiffnessScale(other.clothStiffnessScale),
           constraints(std::move(other.constraints)),
           externalForces(std::move(other.externalForces)),
           applyGravity(other.applyGravity),
@@ -2107,6 +2149,16 @@ struct Scene {
         // rotationQuat above. pack copies this onto the realized mesh;
         // scaleObject writes here in addition to the live mesh field.
         tinym::vec3 scale = tinym::vec3(1.0f, 1.0f, 1.0f);
+        // Mirror of GeneralMesh.clothStiffnessScale ("팽팽함") so the
+        // multiplier survives Scene::pack rebuilds. Default 1.
+        PR clothStiffnessScale = PR(1);
+        // Pinned-vertex constraints (point-selection panel). Source of
+        // truth for which vertices are fixed and where: Scene::pack
+        // re-applies these into constraints.fixedParticles + state.x +
+        // preview every rebuild, and scene_format round-trips them.
+        // setVertexFixed / translateVertexTo keep this in sync with the
+        // live mesh. vid is the PHYSICS vertex index.
+        std::vector<FixedVertex> fixedVertices;
         // D-042 R-1: heap-owned vertex/facet/normal preview, populated by
         // initializer->populatePreview() at addGeneralMesh time. Stays
         // alive across Scene::pack / pool-reset cycles. R-2 will point
@@ -2300,6 +2352,7 @@ struct Scene {
             // the inspector keeps showing it and scaleObject composes its
             // next delta against the true current scale (not unit).
             meshes[i].scale = req.scale;
+            meshes[i].clothStiffnessScale = req.clothStiffnessScale;
             // Seed transformPosition from the initializer's center/offset so
             // BDD-003's translate path computes deltas against the author
             // intent, not against (0,0,0). Mirrors the dynamic_cast cascade
@@ -2408,6 +2461,42 @@ struct Scene {
             std::memcpy(meshes[i].state.xPrev.ptr,
                         meshes[i].state.x.ptr,
                         meshes[i].state.x.size * sizeof(PR));
+
+            // Re-apply pinned-vertex constraints from the request (the
+            // source of truth). Runs LAST so the pinned position wins
+            // over preview/jiggle/recompute: write the held position
+            // into state.x + xPrev, set the fixedParticles mask to 0,
+            // and mirror into preview (physics + any render copies) so
+            // the rendered dot + the next pack's R-3 memcpy agree. This
+            // is what makes a pin survive Scene::pack AND loadScene
+            // (loadScene rebuilds preview flat from the initializer; the
+            // request list restores both the pin and its location).
+            for (const auto& fv : req.fixedVertices) {
+                if ((Index)fv.vid >= (Index)curNumPoints) continue;
+                Index b = (Index)fv.vid * 3;
+                meshes[i].state.x.ptr[b+0] = (PR)fv.pos.x;
+                meshes[i].state.x.ptr[b+1] = (PR)fv.pos.y;
+                meshes[i].state.x.ptr[b+2] = (PR)fv.pos.z;
+                meshes[i].state.xPrev.ptr[b+0] = (PR)fv.pos.x;
+                meshes[i].state.xPrev.ptr[b+1] = (PR)fv.pos.y;
+                meshes[i].state.xPrev.ptr[b+2] = (PR)fv.pos.z;
+                if (meshes[i].constraints.fixedParticles.ptr
+                    && (Index)fv.vid < meshes[i].constraints.fixedParticles.size)
+                    meshes[i].constraints.fixedParticles[fv.vid] = PR(0);
+                if (fv.vid * 3 + 2 < req.preview.x.size()) {
+                    req.preview.x[b+0] = (PR)fv.pos.x;
+                    req.preview.x[b+1] = (PR)fv.pos.y;
+                    req.preview.x[b+2] = (PR)fv.pos.z;
+                }
+                if (req.preview.hasRender()) {
+                    for (size_t rv = 0; rv < req.preview.renderToPhysics.size(); ++rv)
+                        if (req.preview.renderToPhysics[rv] == fv.vid) {
+                            req.preview.renderX[rv*3+0] = (PR)fv.pos.x;
+                            req.preview.renderX[rv*3+1] = (PR)fv.pos.y;
+                            req.preview.renderX[rv*3+2] = (PR)fv.pos.z;
+                        }
+                }
+            }
 
             for(int j = 0; j < curNumPoints; ++j) {
                 packedMeshData.vertexAdjFacetsOffsets[prevNumPoints+j+1] = meshes[i].adjacency.vertexAdjFacetsOffsets[j+1]+numVertexAdjFacets;
@@ -5138,6 +5227,19 @@ struct Simulator {
     // mouseButtonCallback time; hover is purely visual.
     int hoveredObj = -1;
 
+    // Active picking mode + per-vertex hover/select state (point mode).
+    // hovered*/selected*Vert are render-vertex indices; *VertObj is the
+    // owning compacted mesh id. -1 = none. Written by the cursor / mouse
+    // callbacks after sampling the point id pass (.r = obj, .b = vert).
+    SelectionMode selectionMode = SelectionMode::Object;
+    int hoveredVert = -1, hoveredVertObj = -1;
+    int selectedVert = -1, selectedVertObj = -1;
+    // Point panel "reference another point" mode: when true, the next
+    // viewport vertex click is consumed as a position source — its
+    // world pos is copied into the selected vertex (instead of changing
+    // the selection). Auto-cancelled on leaving Point mode (req 3).
+    bool pointRefPickActive = false;
+
     // Renderer-side per-mesh GL state (D-011). D-042 R-2: MeshGL now binds
     // to PreviewState heap pointers published via registerPreviewBinding at
     // addX time; the prior clear()-on-initialize band-aid retires because
@@ -5668,6 +5770,133 @@ struct Simulator {
         // D-041 parity with translate/rotate: mark dirty so the next
         // update's pre-pause check rebuilds (Rigid backend etc. catch up).
         Scene<BE, PR>::dirty = true;
+    }
+
+    // ── Point-selection vertex ops ────────────────────────────────────
+    // Render-vertex (gl_VertexID over the bound MeshGL buffer = preview
+    // renderXPtr) → physics-vertex index. For grid/sphere/file the two
+    // are identical (no welding split); cube uses renderToPhysics.
+    static Index renderToPhysicsVid(
+            typename Scene<BE, PR>::RequestGeneralMesh& req, int rv) {
+        if (rv < 0) return (Index)-1;
+        if (req.preview.hasRender()) {
+            if ((size_t)rv < req.preview.renderToPhysics.size())
+                return (Index)req.preview.renderToPhysics[rv];
+            return (Index)-1;
+        }
+        return (Index)rv;
+    }
+
+    typename Scene<BE, PR>::RequestGeneralMesh* findRequest(int id) {
+        for (auto& r : Scene<BE, PR>::requestsGeneralMeshes)
+            if (r.id == id) return &r;
+        return nullptr;
+    }
+
+    // Current world position of a (object, render-vertex) pair, read
+    // from the live packed state.x. Returns false if the pair is
+    // invalid (mesh gone, vertex out of range).
+    bool vertexWorldPos(int objId, int renderVert, tinym::vec3& out) {
+        auto* mesh = Scene<BE, PR>::findById(objId);
+        auto* req  = findRequest(objId);
+        if (!mesh || !req || !mesh->state.x.ptr) return false;
+        Index pvid = renderToPhysicsVid(*req, renderVert);
+        if (pvid == (Index)-1 || pvid*3+2 >= (Index)mesh->state.x.size)
+            return false;
+        out = tinym::vec3((float)mesh->state.x.ptr[pvid*3+0],
+                          (float)mesh->state.x.ptr[pvid*3+1],
+                          (float)mesh->state.x.ptr[pvid*3+2]);
+        return true;
+    }
+
+    bool isVertexFixed(int objId, int renderVert) {
+        auto* mesh = Scene<BE, PR>::findById(objId);
+        auto* req  = findRequest(objId);
+        if (!mesh || !req || !mesh->constraints.fixedParticles.ptr) return false;
+        Index pvid = renderToPhysicsVid(*req, renderVert);
+        if (pvid == (Index)-1
+            || pvid >= (Index)mesh->constraints.fixedParticles.size) return false;
+        return mesh->constraints.fixedParticles[pvid] == PR(0);
+    }
+
+    // Pin / unpin a vertex. Mutates the live constraint mask AND mirrors
+    // into RequestGeneralMesh::fixedVertices (the pack-surviving, scene-
+    // persisted source of truth). A pin records the vertex's CURRENT
+    // world position so the constraint round-trips through save/load.
+    void setVertexFixed(int objId, int renderVert, bool fixed) {
+        auto* mesh = Scene<BE, PR>::findById(objId);
+        auto* req  = findRequest(objId);
+        if (!mesh || !req || !mesh->constraints.fixedParticles.ptr) return;
+        Index pvid = renderToPhysicsVid(*req, renderVert);
+        if (pvid == (Index)-1
+            || pvid >= (Index)mesh->constraints.fixedParticles.size) return;
+
+        auto it = std::find_if(req->fixedVertices.begin(),
+                               req->fixedVertices.end(),
+                               [pvid](const FixedVertex& f){ return f.vid == pvid; });
+        if (fixed) {
+            mesh->constraints.fixedParticles[pvid] = PR(0);
+            tinym::vec3 p;
+            if (!vertexWorldPos(objId, renderVert, p)) return;
+            if (it == req->fixedVertices.end())
+                req->fixedVertices.push_back(FixedVertex{(uint32_t)pvid, p});
+            else
+                it->pos = p;
+        } else {
+            mesh->constraints.fixedParticles[pvid] = PR(1);
+            if (it != req->fixedVertices.end())
+                req->fixedVertices.erase(it);
+        }
+    }
+
+    // Move a single vertex to an absolute world position. Mirrors
+    // translateObject's dual-write (state.x + state.xPrev + preview) but
+    // for ONE vertex. Deliberately does NOT mark the scene dirty: a
+    // re-pack would recompute rest lengths from the deformed preview
+    // (the user's "rest == preview" invariant) which is fine for a
+    // pinned corner but undesirable mid-edit; broadPhase.refit() keeps
+    // picking correct without a full reinit. If the vertex is pinned,
+    // its stored constraint position is updated so the pin holds here.
+    void translateVertexTo(int objId, int renderVert, tinym::vec3 newPos) {
+        auto* mesh = Scene<BE, PR>::findById(objId);
+        auto* req  = findRequest(objId);
+        if (!mesh || !req || !mesh->state.x.ptr) return;
+        Index pvid = renderToPhysicsVid(*req, renderVert);
+        if (pvid == (Index)-1 || pvid*3+2 >= (Index)mesh->state.x.size) return;
+
+        Index b = pvid*3;
+        tinym::vec3 cur((float)mesh->state.x.ptr[b+0],
+                        (float)mesh->state.x.ptr[b+1],
+                        (float)mesh->state.x.ptr[b+2]);
+        tinym::vec3 d = newPos - cur;
+
+        mesh->state.x.ptr[b+0] = (PR)newPos.x;
+        mesh->state.x.ptr[b+1] = (PR)newPos.y;
+        mesh->state.x.ptr[b+2] = (PR)newPos.z;
+        if (mesh->state.xPrev.ptr) {
+            mesh->state.xPrev.ptr[b+0] += (PR)d.x;
+            mesh->state.xPrev.ptr[b+1] += (PR)d.y;
+            mesh->state.xPrev.ptr[b+2] += (PR)d.z;
+        }
+
+        if (b+2 < (Index)req->preview.x.size()) {
+            req->preview.x[b+0] = (PR)newPos.x;
+            req->preview.x[b+1] = (PR)newPos.y;
+            req->preview.x[b+2] = (PR)newPos.z;
+        }
+        if (req->preview.hasRender()) {
+            for (size_t rv = 0; rv < req->preview.renderToPhysics.size(); ++rv)
+                if (req->preview.renderToPhysics[rv] == pvid) {
+                    req->preview.renderX[rv*3+0] = (PR)newPos.x;
+                    req->preview.renderX[rv*3+1] = (PR)newPos.y;
+                    req->preview.renderX[rv*3+2] = (PR)newPos.z;
+                }
+        }
+
+        for (auto& fv : req->fixedVertices)
+            if (fv.vid == pvid) { fv.pos = newPos; break; }
+
+        collisionPipeline.broadPhase.refit();
     }
 
     // D-027: edit-time material mutator. Mirrors translateObject (D-014) and
@@ -6401,6 +6630,72 @@ struct Simulator {
         }
     }
 
+    // Point-id pass driver (point selection mode). Caller binds the id
+    // FBO, runs a depth-only triangle pre-pass, sets glPointSize +
+    // GL_LEQUAL, then calls this. mesh.id == compacted slot so the .r
+    // channel doubles as a statesOffsets / findById key.
+    void drawPointIds(Program& pointIdShader) {
+        for(auto& mesh : scene.meshes) {
+            renderState.getOrCreate(mesh).drawPointsIdOnly(pointIdShader, mesh.id);
+        }
+    }
+
+    // On-screen overlay: every selectable vertex as a black dot, then
+    // the hovered vertex (light yellow) and selected vertex (yellow).
+    // Caller sets M/V/P on pointShader and enables depth test.
+    void drawSelectablePoints(Program& pointShader) {
+        constexpr float kDot = 15.0f;
+        // 1. Every selectable vertex → black.
+        pointShader.setUniform("uColor", tinym::vec3(0.0f, 0.0f, 0.0f));
+        glPointSize(kDot);
+        for(auto& mesh : scene.meshes)
+            renderState.getOrCreate(mesh).drawPoints(pointShader);
+
+        // The next overlays sit exactly on a black dot → LEQUAL so they
+        // win the depth tie and paint on top.
+        glDepthFunc(GL_LEQUAL);
+
+        // 2. Constrained (pinned) vertices → red, replacing the black
+        // dot. fixedVertices lives on the request (physics vid); map to
+        // render vertices (identity for grid/sphere/file, renderToPhysics
+        // for cube) and redraw each in red.
+        pointShader.setUniform("uColor", tinym::vec3(0.9f, 0.1f, 0.1f));
+        glPointSize(kDot);
+        for (auto& mesh : scene.meshes) {
+            auto* req = findRequest(mesh.id);
+            if (!req || req->fixedVertices.empty()) continue;
+            auto& gl = renderState.getOrCreate(mesh);
+            for (const auto& fv : req->fixedVertices) {
+                if (req->preview.hasRender()) {
+                    for (size_t rv = 0; rv < req->preview.renderToPhysics.size(); ++rv)
+                        if (req->preview.renderToPhysics[rv] == fv.vid)
+                            gl.drawOnePoint(pointShader, (int)rv);
+                } else {
+                    gl.drawOnePoint(pointShader, (int)fv.vid);
+                }
+            }
+        }
+
+        // 3. Hover (light yellow) then 4. select (yellow), drawn last so
+        // they win over both black and red.
+        if (hoveredVertObj >= 0 && hoveredVert >= 0) {
+            if (auto* m = Scene<BE, PR>::findById(hoveredVertObj)) {
+                pointShader.setUniform("uColor", tinym::vec3(1.0f, 1.0f, 0.55f));
+                glPointSize(kDot + 4.0f);
+                renderState.getOrCreate(*m).drawOnePoint(pointShader, hoveredVert);
+            }
+        }
+        if (selectedVertObj >= 0 && selectedVert >= 0) {
+            if (auto* m = Scene<BE, PR>::findById(selectedVertObj)) {
+                pointShader.setUniform("uColor", tinym::vec3(1.0f, 0.8f, 0.0f));
+                glPointSize(kDot + 6.0f);
+                renderState.getOrCreate(*m).drawOnePoint(pointShader, selectedVert);
+            }
+        }
+        glDepthFunc(GL_LESS);
+        glPointSize(1.0f);
+    }
+
     void debugEachBoxes(tinym::mat4& V, tinym::mat4& P) {
         if(! debugLineShader.programID) debugLineShader.loadShader("line.vert", "line.frag");
         debugLineShader.use();
@@ -6557,12 +6852,14 @@ struct Simulator {
                               const ::Material& mat, const ::Quat& rot,
                               const tinym::vec3* transformOverride,
                               const std::string& name,
-                              bool applyGravity, bool applyWind) {
+                              bool applyGravity, bool applyWind,
+                              double clothStiffnessScale) {
             Object o;
             o.id = id;
             o.name = name;
             o.applyGravity = applyGravity;
             o.applyWind = applyWind;
+            o.clothStiffnessScale = clothStiffnessScale;
             o.material.baseColor = {mat.baseColor.x, mat.baseColor.y, mat.baseColor.z};
             o.material.metallic = mat.metallic;
             o.material.roughness = mat.roughness;
@@ -6643,7 +6940,8 @@ struct Simulator {
                           m.material, m.rotationQuat,
                           &m.transformPosition,
                           "object_" + std::to_string(m.id),
-                          m.applyGravity, m.applyWind);
+                          m.applyGravity, m.applyWind,
+                          (double)m.clothStiffnessScale);
             }
         } else {
             for (auto& r : Scene<BE,PR>::requestsGeneralMeshes) {
@@ -6655,7 +6953,22 @@ struct Simulator {
                           defaultMat, defaultRot,
                           nullptr,
                           "object_" + std::to_string(r.id),
-                          r.applyGravity, r.applyWind);
+                          r.applyGravity, r.applyWind,
+                          (double)r.clothStiffnessScale);
+            }
+        }
+        // Pinned-vertex constraints live on the request (source of
+        // truth, survives pack). Match by id and copy onto the snapshot.
+        for (auto& o : s.objects) {
+            for (auto& r : Scene<BE,PR>::requestsGeneralMeshes) {
+                if (r.id != o.id) continue;
+                for (const auto& fv : r.fixedVertices) {
+                    scene_format::FixedParticle f;
+                    f.vid = (int)fv.vid;
+                    f.pos = {fv.pos.x, fv.pos.y, fv.pos.z};
+                    o.fixedParticles.push_back(f);
+                }
+                break;
             }
         }
         return s;
@@ -6818,6 +7131,21 @@ struct Simulator {
                     // initialize, and they survive reset() identically.
                     Scene<BE,PR>::requestsGeneralMeshes[idx].applyGravity = o.applyGravity;
                     Scene<BE,PR>::requestsGeneralMeshes[idx].applyWind    = o.applyWind;
+                    Scene<BE,PR>::requestsGeneralMeshes[idx].clothStiffnessScale =
+                        (PR)o.clothStiffnessScale;
+                    // Pinned-vertex constraints. Scene::pack re-applies
+                    // these into constraints + state.x + preview, so the
+                    // pin AND its location are restored on load.
+                    auto& reqFV = Scene<BE,PR>::requestsGeneralMeshes[idx].fixedVertices;
+                    reqFV.clear();
+                    for (const auto& f : o.fixedParticles) {
+                        FixedVertex fv;
+                        fv.vid = (uint32_t)f.vid;
+                        fv.pos = tinym::vec3((float)f.pos[0],
+                                             (float)f.pos[1],
+                                             (float)f.pos[2]);
+                        reqFV.push_back(fv);
+                    }
                 }
             }
         }
@@ -11311,6 +11639,17 @@ int main(int argc, char** argv) {
     idShader.loadShader("id.vert", "id.frag");
     const bool idShaderOk = idShader.programID != 0;
 
+    // Point-selection shaders. idpoint.* writes (meshId, depth,
+    // vertexId) for GL_POINTS into the same id FBO; point.* draws the
+    // on-screen selectable/hover/select dots. Non-fatal if missing —
+    // point mode just won't highlight.
+    Program idPointShader;
+    idPointShader.loadShader("idpoint.vert", "idpoint.frag");
+    const bool idPointShaderOk = idPointShader.programID != 0;
+    Program pointShader;
+    pointShader.loadShader("point.vert", "point.frag");
+    const bool pointShaderOk = pointShader.programID != 0;
+
     // Offscreen R32I framebuffer that the id pass writes to, sampled
     // both by the cursor callback (hover read-back) and by shader.frag
     // (5×5 neighborhood outline test). Built inline rather than via the
@@ -11435,6 +11774,8 @@ int main(int argc, char** argv) {
         auto* sim = pack->simulator;
         if (ImGui::GetIO().WantCaptureMouse) {
             sim->hoveredObj = -1;
+            sim->hoveredVert = -1;
+            sim->hoveredVertObj = -1;
             return;
         }
         YGL::cursorPosCallback(window, xpos, ypos);
@@ -11455,6 +11796,8 @@ int main(int argc, char** argv) {
         const int py = (int)((winH - ypos) * fy);
         if (px < 0 || py < 0 || px >= *pack->idFboW || py >= *pack->idFboH) {
             sim->hoveredObj = -1;
+            sim->hoveredVert = -1;
+            sim->hoveredVertObj = -1;
             return;
         }
         GLint readBufBackup = 0;
@@ -11465,10 +11808,21 @@ int main(int argc, char** argv) {
         // (.g) drives the outline pass via the shader sampler, not the
         // cursor logic. Cast the float id back to an integer; negative
         // sentinel (-1.0) passes through cleanly as int.
-        float sampled[4] = {-1.0f, 1.0f, 0.0f, 0.0f};
+        float sampled[4] = {-1.0f, 1.0f, -1.0f, 0.0f};
         glReadPixels(px, py, 1, 1, GL_RGBA, GL_FLOAT, sampled);
         glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)readBufBackup);
         sim->hoveredObj = (int)sampled[0];
+        if (sim->selectionMode == SelectionMode::Point) {
+            // .b = render-vertex id where a point landed; -1 sentinel
+            // on background / triangle-interior (depth pre-pass ran
+            // with color masked, so only point fragments wrote .b).
+            int vid = (int)sampled[2];
+            sim->hoveredVert = vid;
+            sim->hoveredVertObj = (vid >= 0) ? (int)sampled[0] : -1;
+        } else {
+            sim->hoveredVert = -1;
+            sim->hoveredVertObj = -1;
+        }
     };
     auto scrollCallbackWrapped = [](GLFWwindow* window, double xoffset, double yoffset) {
         ImGui_ImplGlfw_ScrollCallback(window, xoffset, yoffset);
@@ -11523,9 +11877,43 @@ int main(int argc, char** argv) {
         // 해두므로, click-release 시 그 값을 그대로 selectedObj에 옮기면
         // 시각(preview) ↔ 호버 ↔ 선택이 같은 데이터 소스를 공유한다.
         simulator->clearDebugLines();
-        simulator->selectedObj = simulator->hoveredObj;
-        if (simulator->selectedObj >= 0) {
-            std::cout << "ClosestObj: " << simulator->selectedObj << std::endl;
+        if (simulator->selectionMode == SelectionMode::Point) {
+            if (simulator->pointRefPickActive) {
+                // Reference-pick: the clicked vertex is a position
+                // SOURCE. Copy its world pos into the already-selected
+                // vertex, keep the selection unchanged, exit ref mode.
+                tinym::vec3 refPos;
+                if (simulator->selectedVert >= 0
+                    && simulator->selectedVertObj >= 0
+                    && simulator->hoveredVert >= 0
+                    && simulator->hoveredVertObj >= 0
+                    && simulator->vertexWorldPos(simulator->hoveredVertObj,
+                                                 simulator->hoveredVert, refPos)) {
+                    simulator->translateVertexTo(simulator->selectedVertObj,
+                                                 simulator->selectedVert, refPos);
+                    std::cout << "RefCopied: ("
+                              << refPos.x << ", " << refPos.y << ", "
+                              << refPos.z << ") -> obj "
+                              << simulator->selectedVertObj << " vert "
+                              << simulator->selectedVert << std::endl;
+                }
+                simulator->pointRefPickActive = false;
+            } else {
+                simulator->selectedVert    = simulator->hoveredVert;
+                simulator->selectedVertObj = simulator->hoveredVertObj;
+                // Also surface the owning mesh in the inspector.
+                if (simulator->selectedVertObj >= 0)
+                    simulator->selectedObj = simulator->selectedVertObj;
+                if (simulator->selectedVert >= 0) {
+                    std::cout << "SelectedVert: obj " << simulator->selectedVertObj
+                              << " vert " << simulator->selectedVert << std::endl;
+                }
+            }
+        } else {
+            simulator->selectedObj = simulator->hoveredObj;
+            if (simulator->selectedObj >= 0) {
+                std::cout << "ClosestObj: " << simulator->selectedObj << std::endl;
+            }
         }
     };
     auto charCallback = [](GLFWwindow* window, unsigned int c) {
@@ -11606,6 +11994,45 @@ int main(int argc, char** argv) {
 
         auto buildSelectedMeshTarget = [&]() {
             mesh_inspector::MeshInspectorTarget target;
+
+            // Point selection mode: a selected vertex → point panel; no
+            // selected vertex → fall through with mesh_id=-1 so the same
+            // "nothing selected" add-buttons panel renders.
+            if (simulator.selectionMode == SelectionMode::Point) {
+                tinym::vec3 wp;
+                if (simulator.selectedVert >= 0
+                    && simulator.selectedVertObj >= 0
+                    && simulator.vertexWorldPos(simulator.selectedVertObj,
+                                                simulator.selectedVert, wp)) {
+                    target.point_panel = true;
+                    target.point_obj  = simulator.selectedVertObj;
+                    target.point_vert = simulator.selectedVert;
+                    target.point_fixed = simulator.isVertexFixed(
+                        simulator.selectedVertObj, simulator.selectedVert);
+                    target.point_position[0] = wp.x;
+                    target.point_position[1] = wp.y;
+                    target.point_position[2] = wp.z;
+                    target.point_ref_active = simulator.pointRefPickActive;
+                    int o = simulator.selectedVertObj, v = simulator.selectedVert;
+                    target.on_point_set_fixed = [&simulator, o, v](bool f) {
+                        simulator.setVertexFixed(o, v, f);
+                    };
+                    target.on_point_move = [&simulator, o, v](float x, float y, float z) {
+                        simulator.translateVertexTo(o, v, tinym::vec3(x, y, z));
+                    };
+                    target.on_point_ref_toggle = [&simulator]() {
+                        simulator.pointRefPickActive = !simulator.pointRefPickActive;
+                    };
+                }
+                // No vertex selected → mesh_id stays -1 so the same
+                // add-buttons panel shows; wire those callbacks too.
+                target.on_request_add_cube   = [&openCubeModal]()   { openCubeModal   = true; };
+                target.on_request_add_sphere = [&openSphereModal]() { openSphereModal = true; };
+                target.on_request_add_plane  = [&openPlaneModal]()  { openPlaneModal  = true; };
+                target.on_request_add_import = [&openImportModal]() { openImportModal = true; };
+                return target;
+            }
+
             if (auto* selectedMesh = Scene<Backend, Precision>::findById(simulator.selectedObj)) {
                 target.mesh_id = selectedMesh->id;
                 target.behavior_label = behaviorTypeName(selectedMesh->behaviorType);
@@ -11623,6 +12050,19 @@ int main(int argc, char** argv) {
                 target.on_scale = [&simulator](int id, tinym::vec3 s) {
                     simulator.scaleObject(id, s);
                 };
+                // "팽팽함" — only meaningful for cloth behaviors; left
+                // null otherwise so the slider stays hidden.
+                if (selectedMesh->behaviorType == BehaviorType::TriangularCloth
+                 || selectedMesh->behaviorType == BehaviorType::FastGridCloth) {
+                    target.cloth_stiffness_scale = &selectedMesh->clothStiffnessScale;
+                    target.on_cloth_stiffness_scale =
+                        [&simulator](int id, float v) {
+                            if (auto* m = Scene<Backend, Precision>::findById(id))
+                                m->clothStiffnessScale = (Precision)v;
+                            if (auto* r = simulator.findRequest(id))
+                                r->clothStiffnessScale = (Precision)v;
+                        };
+                }
                 // D-027: material inspector path. base_color is set above;
                 // wire the other 4 material fields + the commit callback so
                 // each widget change routes through Simulator::setMaterial
@@ -11775,6 +12215,32 @@ int main(int argc, char** argv) {
                          ImGuiWindowFlags_NoResize |
                          ImGuiWindowFlags_NoCollapse |
                          ImGuiWindowFlags_NoSavedSettings)) {
+            // ── Selection mode toggle (object vs vertex picking) ──────
+            ImGui::TextUnformatted("선택 모드");
+            {
+                const ImVec4 activeCol(0.20f, 0.55f, 0.95f, 1.0f);
+                bool objMode = simulator.selectionMode == SelectionMode::Object;
+                bool ptMode  = simulator.selectionMode == SelectionMode::Point;
+                if (objMode) ImGui::PushStyleColor(ImGuiCol_Button, activeCol);
+                if (ImGui::Button("오브젝트 선택")) {
+                    simulator.selectionMode = SelectionMode::Object;
+                    simulator.hoveredVert = simulator.selectedVert = -1;
+                    simulator.hoveredVertObj = simulator.selectedVertObj = -1;
+                    // req 3: leaving Point mode cancels reference-pick.
+                    simulator.pointRefPickActive = false;
+                }
+                if (objMode) ImGui::PopStyleColor();
+                ImGui::SameLine();
+                if (ptMode) ImGui::PushStyleColor(ImGuiCol_Button, activeCol);
+                if (ImGui::Button("점 선택")) {
+                    simulator.selectionMode = SelectionMode::Point;
+                    simulator.hoveredObj = -1;
+                }
+                if (ptMode) ImGui::PopStyleColor();
+            }
+            ImGui::Separator();
+            ImGui::Spacing();
+
             auto& env = Scene<Backend, Precision>::environment;
             float gravity[3] = {(float)env.gravity.x, (float)env.gravity.y, (float)env.gravity.z};
             float wind[3]    = {(float)env.wind.x,    (float)env.wind.y,    (float)env.wind.z};
@@ -11951,29 +12417,62 @@ int main(int argc, char** argv) {
         // value) by the cursor callback's glReadPixels. Skipped if the
         // id shader failed to load — outline becomes invisible but the
         // scene still renders normally.
+        // Exactly ONE off-screen id pass runs, branched on the active
+        // SelectionMode (requirement 3):
+        //  · Object: triangle pass → .r = meshId, .g = depth. Drives
+        //    the whole-mesh hover/outline (unchanged behavior).
+        //  · Point: depth-only triangle pre-pass (glColorMask off, so
+        //    non-point pixels keep the clear .r=-1/.b=-1 sentinel) then
+        //    a GL_POINTS pass (size 9, GL_LEQUAL) → .r = meshId,
+        //    .g = depth, .b = vertexId. The depth pre-pass makes the
+        //    point pass occlusion-correct ("보이는 것만").
         const int idW = yglwindow->width();
         const int idH = yglwindow->height();
+        const bool pointMode = (simulator.selectionMode == SelectionMode::Point);
         if (idShaderOk && idW > 0 && idH > 0) {
             ensureIdFbo(idW, idH);
             glBindFramebuffer(GL_FRAMEBUFFER, idFbo);
             glViewport(0, 0, idW, idH);
-            // RGBA32F clear via the float API. .r = -1.0 marks "no
-            // object", .g = 1.0 pushes background depth to the far
-            // plane so outline tests against it always exceed the
-            // depth threshold (= silhouette against far plane is
-            // suppressed by design).
-            const GLfloat clearVec[4] = {-1.0f, 1.0f, 0.0f, 0.0f};
-            glClearBufferfv(GL_COLOR, 0, clearVec);
+            const GLfloat clearObj[4]   = {-1.0f, 1.0f,  0.0f, 0.0f};
+            const GLfloat clearPoint[4] = {-1.0f, 1.0f, -1.0f, 0.0f};
+            glClearBufferfv(GL_COLOR, 0, pointMode ? clearPoint : clearObj);
             glClear(GL_DEPTH_BUFFER_BIT);
             glEnable(GL_DEPTH_TEST);
-            idShader.use();
             tinym::mat4 Mid(1);
             tinym::mat4 Vid = camera.lookAt();
             tinym::mat4 Pid = camera.perspective(yglwindow->aspect(), 0.1f, 1000.f);
-            idShader.setUniform("M", Mid);
-            idShader.setUniform("V", Vid);
-            idShader.setUniform("P", Pid);
-            simulator.drawIds(idShader);
+            if (pointMode && idPointShaderOk) {
+                // Depth-only triangle pre-pass: occlude back-facing /
+                // hidden vertices without touching the color channels.
+                glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
+                idShader.use();
+                idShader.setUniform("M", Mid);
+                idShader.setUniform("V", Vid);
+                idShader.setUniform("P", Pid);
+                simulator.drawIds(idShader);
+                glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+                // Visible-vertex point pass. Points lie exactly on the
+                // surface depth → GL_LEQUAL so they are not culled by
+                // their own triangles.
+                idPointShader.use();
+                idPointShader.setUniform("M", Mid);
+                idPointShader.setUniform("V", Vid);
+                idPointShader.setUniform("P", Pid);
+                // Match the on-screen dot size (drawSelectablePoints
+                // kDot=15) so the pick hit-area lines up with what the
+                // user sees.
+                glPointSize(15.0f);
+                glDepthFunc(GL_LEQUAL);
+                simulator.drawPointIds(idPointShader);
+                glDepthFunc(GL_LESS);
+                glPointSize(1.0f);
+            } else {
+                idShader.use();
+                idShader.setUniform("M", Mid);
+                idShader.setUniform("V", Vid);
+                idShader.setUniform("P", Pid);
+                simulator.drawIds(idShader);
+            }
             glBindFramebuffer(GL_FRAMEBUFFER, 0);
         }
 
@@ -11990,8 +12489,33 @@ int main(int argc, char** argv) {
             glActiveTexture(GL_TEXTURE1);
             glBindTexture(GL_TEXTURE_2D, idTex);
             shader.setUniform("idBuffer", 1);
-            shader.setUniform("hoveredId",  simulator.hoveredObj);
-            shader.setUniform("selectedId", simulator.selectedObj);
+            // Whole-mesh outline only in Object mode. In Point mode the
+            // id buffer holds vertex ids, not a mesh-silhouette field,
+            // so suppress the outline and let the point overlay carry
+            // the hover/select feedback instead.
+            if (pointMode) {
+                shader.setUniform("hoveredId", -1);
+                shader.setUniform("selectedId", -1);
+            } else {
+                shader.setUniform("hoveredId",  simulator.hoveredObj);
+                shader.setUniform("selectedId", simulator.selectedObj);
+            }
+        };
+
+        // Point-overlay helper (shared by both render branches). Drawn
+        // AFTER the lit mesh so the dots read on top; depth-tested so
+        // dots on hidden geometry are occluded by the solid surface.
+        auto drawPointOverlay = [&](const tinym::mat4& Vp,
+                                    const tinym::mat4& Pp) {
+            if (!pointMode || !pointShaderOk) return;
+            pointShader.use();
+            tinym::mat4 Mp(1);
+            pointShader.setUniform("M", Mp);
+            pointShader.setUniform("V", Vp);
+            pointShader.setUniform("P", Pp);
+            glEnable(GL_DEPTH_TEST);
+            simulator.drawSelectablePoints(pointShader);
+            shader.use();
         };
 
         if (collectProfileFrame) {
@@ -12028,6 +12552,7 @@ int main(int argc, char** argv) {
             {
                 auto drawScope = frameProfiler.scoped("scene_draw");
                 simulator.draw(shader);
+                drawPointOverlay(V, P);
             }
 
             {
@@ -12073,6 +12598,7 @@ int main(int argc, char** argv) {
             applyOutlineUniforms();
 
             simulator.draw(shader);
+            drawPointOverlay(V, P);
 
             if(debugEachBoxes) {
                 simulator.debugEachBoxes(V, P);

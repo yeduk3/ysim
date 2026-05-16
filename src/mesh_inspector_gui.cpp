@@ -2,6 +2,8 @@
 
 #include "imgui.h"
 
+#include <cmath>
+
 namespace mesh_inspector {
 
 // Behavior combo for the right-panel: only two user-visible choices —
@@ -36,6 +38,56 @@ void drawMeshInspectorWindow(
                       ImGuiWindowFlags_NoResize |
                       ImGuiWindowFlags_NoCollapse |
                       ImGuiWindowFlags_NoSavedSettings)) {
+        ImGui::End();
+        return;
+    }
+
+    // Point panel: replaces the object editors when a vertex is
+    // selected in Point selection mode. Per-vertex pin toggle, manual
+    // position, and "reference another point" position-copy.
+    if (target.point_panel) {
+        ImGui::Text("점 선택: 물체 %d / 정점 %d",
+                    target.point_obj, target.point_vert);
+        ImGui::Separator();
+        ImGui::Spacing();
+
+        bool fixed = target.point_fixed;
+        if (ImGui::Checkbox("점 고정", &fixed) && target.on_point_set_fixed) {
+            target.on_point_set_fixed(fixed);
+            state.status_message = fixed ? "점이 고정됨." : "점 고정 해제됨.";
+        }
+
+        ImGui::Spacing();
+        float p[3] = { target.point_position[0],
+                       target.point_position[1],
+                       target.point_position[2] };
+        ImGui::InputFloat3("위치", p);
+        if (ImGui::IsItemDeactivatedAfterEdit() && target.on_point_move) {
+            target.on_point_move(p[0], p[1], p[2]);
+            state.status_message = "점 위치가 갱신됨.";
+        }
+
+        ImGui::Spacing();
+        {
+            const ImVec4 activeCol(0.20f, 0.55f, 0.95f, 1.0f);
+            if (target.point_ref_active)
+                ImGui::PushStyleColor(ImGuiCol_Button, activeCol);
+            if (ImGui::Button(target.point_ref_active
+                                  ? "참조점 선택 중... (취소)"
+                                  : "다른 점 위치 참조")
+                && target.on_point_ref_toggle) {
+                target.on_point_ref_toggle();
+            }
+            if (target.point_ref_active) ImGui::PopStyleColor();
+            ImGui::TextDisabled(
+                "버튼을 누른 뒤 다른 점을 클릭하면\n그 점의 위치를 이 점에 복사합니다.");
+        }
+
+        if (!state.status_message.empty()) {
+            ImGui::Spacing();
+            ImGui::Separator();
+            ImGui::TextWrapped("%s", state.status_message.c_str());
+        }
         ImGui::End();
         return;
     }
@@ -136,6 +188,25 @@ void drawMeshInspectorWindow(
             target.on_scale(target.mesh_id, tinym::vec3(s[0], s[1], s[2]));
             state.status_message = "스케일이 갱신됨.";
         }
+    }
+
+    // ─── 팽팽함 (cloth-only stiffness multiplier) ─────────────────────
+    // Slider exposes the exponent k ∈ [-2, 2]; the stored multiplier is
+    // 10^k (so k=0 → 1×, k=2 → 100×, k=-2 → 0.01×). The mesh field /
+    // kernel still consume the plain multiplier — only the UI is in
+    // log space (a decade per unit feels right for stiffness).
+    if (target.cloth_stiffness_scale && target.on_cloth_stiffness_scale) {
+        float scale = *target.cloth_stiffness_scale;
+        float k = (scale > 0.0f) ? std::log10(scale) : 0.0f;
+        if (k < -2.0f) k = -2.0f;
+        if (k >  2.0f) k =  2.0f;
+        if (ImGui::SliderFloat("팽팽함", &k, -2.0f, 2.0f, "10^%.2f")) {
+            float newScale = std::pow(10.0f, k);
+            *target.cloth_stiffness_scale = newScale;
+            target.on_cloth_stiffness_scale(target.mesh_id, newScale);
+        }
+        if (ImGui::IsItemDeactivatedAfterEdit())
+            state.status_message = "팽팽함이 갱신됨.";
     }
 
     // ─── 외관 (v1 OpenPBR subset) ─────────────────────────────────────

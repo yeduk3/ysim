@@ -173,6 +173,12 @@ struct MeshInspectorTarget {
     // Both must be set together to enable the InputFloat3 row.
     tinym::vec3* scale = nullptr;
     std::function<void(int, tinym::vec3)> on_scale;
+    // "팽팽함" — cloth-only uniform stiffness multiplier. Non-null only
+    // when the selected mesh is a cloth behavior; the slider is hidden
+    // otherwise. Reads the live value via the pointer; commits through
+    // the callback (which writes the live mesh + request mirror).
+    float* cloth_stiffness_scale = nullptr;
+    std::function<void(int, float)> on_cloth_stiffness_scale;
     // FR-005 / D-027 inspector material path. The 4 scalar/vec3 pointers
     // read the mesh's material fields (D-005's v1 OpenPBR subset: base_color,
     // metallic, roughness, specular_weight, emission_color). Widgets mutate
@@ -242,6 +248,24 @@ struct MeshInspectorTarget {
     std::function<void()> on_request_add_sphere;
     std::function<void()> on_request_add_plane;
     std::function<void()> on_request_add_import;
+
+    // ── Point panel ──────────────────────────────────────────────────
+    // When point_panel is true the inspector renders the per-vertex
+    // panel (pin toggle, position, reference-copy) for the selected
+    // (point_obj, point_vert) and ignores the object editors. When it
+    // is false the existing object / no-selection logic applies. In
+    // Point selection mode with NO vertex selected, production builds a
+    // target with point_panel=false AND mesh_id=-1 so the same
+    // "nothing selected" add-buttons panel shows.
+    bool point_panel = false;
+    int point_obj = -1;
+    int point_vert = -1;
+    bool point_fixed = false;          // current pinned state (read each frame)
+    float point_position[3] = {0, 0, 0};  // current world pos (read each frame)
+    bool point_ref_active = false;     // reference-pick mode on?
+    std::function<void(bool)> on_point_set_fixed;
+    std::function<void(float, float, float)> on_point_move;
+    std::function<void()> on_point_ref_toggle;
 };
 
 void drawMeshInspectorWindow(

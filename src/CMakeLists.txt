@@ -94,6 +94,26 @@ configure_file(
     ${CMAKE_BINARY_DIR}/id.frag
     COPYONLY
 )
+configure_file(
+    ${CMAKE_SOURCE_DIR}/src/shader/idpoint.vert
+    ${CMAKE_BINARY_DIR}/idpoint.vert
+    COPYONLY
+)
+configure_file(
+    ${CMAKE_SOURCE_DIR}/src/shader/idpoint.frag
+    ${CMAKE_BINARY_DIR}/idpoint.frag
+    COPYONLY
+)
+configure_file(
+    ${CMAKE_SOURCE_DIR}/src/shader/point.vert
+    ${CMAKE_BINARY_DIR}/point.vert
+    COPYONLY
+)
+configure_file(
+    ${CMAKE_SOURCE_DIR}/src/shader/point.frag
+    ${CMAKE_BINARY_DIR}/point.frag
+    COPYONLY
+)
 add_custom_command(TARGET ysim POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_directory
             ${CMAKE_SOURCE_DIR}/assets
