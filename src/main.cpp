@@ -1645,6 +1645,19 @@ struct FixedVertex {
     tinym::vec3 pos;
 };
 
+// A reference-point coincidence constraint (point-selection panel).
+// Expressed via IndexPair per the design: the vertex `vertexPair.query`
+// of the object whose id is `objPair.query` (the FOLLOWER) must track the
+// position of vertex `vertexPair.target` of the object `objPair.target`
+// (the LEADER) every integration step. `.query`/`.target` of vertexPair
+// are PHYSICS vertex ids (same space as FixedVertex::vid). Stored in a
+// Scene-static list that survives Scene::pack/reset and round-trips
+// through scene_format.
+struct ReferencePointConstraint {
+    IndexPair objPair;
+    IndexPair vertexPair;
+};
+
 const char* behaviorTypeName(BehaviorType behaviorType) {
     switch (behaviorType) {
         case BehaviorType::TriangularCloth: return "TriangularCloth";
@@ -2236,6 +2249,11 @@ struct Scene {
     };
 
     inline static std::vector<RequestGeneralMesh> requestsGeneralMeshes;
+    // Reference-point coincidence constraints (point panel). Scene-static
+    // so it survives Scene::pack and Simulator::reset (neither clears it);
+    // loadScene rebuilds the scene and explicitly restores this from the
+    // snapshot. The integrator enforces query↔target position coincidence.
+    inline static std::vector<ReferencePointConstraint> referenceConstraints;
     inline static bool dirty = true;
 
     void addGeneralMesh(GeneralMeshInitializer<BE, PR>* initializer, BehaviorType behaviorType, BehaviorParams<PR> behaviorParams) {
@@ -5923,6 +5941,69 @@ struct Simulator {
         }
     }
 
+    // Register a reference-point coincidence constraint: the follower
+    // vertex (followerObj, followerRenderVert) must track the leader
+    // vertex (leaderObj, leaderRenderVert). render→physics-vid mapped on
+    // both ends. At most one constraint per follower vertex — a repeat
+    // pick of the same follower replaces its leader. A no-op (and the
+    // existing constraint, if any, is removed) when follower == leader.
+    //
+    // Auto-snap: the FIRST constraint between an ordered object pair
+    // (followerObj→leaderObj, distinct objects) also translates the
+    // whole follower object by (leaderPos − followerPos) so the two
+    // reference points coincide immediately. The 2nd+ constraint
+    // between the same pair only adds the per-vertex lock (no whole-
+    // object move — those points are pulled together by the integrator).
+    // Returns true on success.
+    bool setReferenceConstraint(int followerObj, int followerRenderVert,
+                                int leaderObj,   int leaderRenderVert) {
+        auto* fReq = findRequest(followerObj);
+        auto* lReq = findRequest(leaderObj);
+        if (!fReq || !lReq) return false;
+        Index fv = renderToPhysicsVid(*fReq, followerRenderVert);
+        Index lv = renderToPhysicsVid(*lReq, leaderRenderVert);
+        if (fv == (Index)-1 || lv == (Index)-1) return false;
+
+        // World positions BEFORE any mutation, for the auto-snap delta.
+        tinym::vec3 fPos, lPos;
+        bool havePos = vertexWorldPos(followerObj, followerRenderVert, fPos)
+                     && vertexWorldPos(leaderObj,  leaderRenderVert,  lPos);
+
+        auto& list = Scene<BE, PR>::referenceConstraints;
+        auto same = [&](const ReferencePointConstraint& c) {
+            return c.objPair.query == (Index)followerObj
+                && c.vertexPair.query == fv;
+        };
+        list.erase(std::remove_if(list.begin(), list.end(), same),
+                   list.end());
+        if (followerObj == leaderObj && fv == lv) return false;
+
+        // First between this object pair? (checked after the same-
+        // follower erase, before adding the new one.)
+        bool firstBetweenPair =
+            std::none_of(list.begin(), list.end(),
+                [&](const ReferencePointConstraint& c) {
+                    return c.objPair.query  == (Index)followerObj
+                        && c.objPair.target == (Index)leaderObj;
+                });
+
+        ReferencePointConstraint c;
+        c.objPair.query     = (Index)followerObj;
+        c.vertexPair.query  = fv;
+        c.objPair.target    = (Index)leaderObj;
+        c.vertexPair.target = lv;
+        list.push_back(c);
+
+        if (firstBetweenPair && followerObj != leaderObj && havePos) {
+            if (auto* fMesh = Scene<BE, PR>::findById(followerObj)) {
+                tinym::vec3 delta = lPos - fPos;
+                translateObject(followerObj,
+                                fMesh->transformPosition + delta);
+            }
+        }
+        return true;
+    }
+
     // Move a single vertex to an absolute world position. Mirrors
     // translateObject's dual-write (state.x + state.xPrev + preview) but
     // for ONE vertex. Deliberately does NOT mark the scene dirty: a
@@ -6031,12 +6112,46 @@ struct Simulator {
         }
         bool removingSelected = (selectedObj == meshId);
 
+        // Snapshot oldId→lifetimeId for ALL requests before the erase, and
+        // the removed request's lifetimeId. Reference constraints store
+        // volatile object ids; after renumbering they must be re-resolved
+        // through the stable lifetimeId (same scheme as selection above),
+        // and any constraint touching the removed mesh must be dropped.
+        std::unordered_map<int, int> oldIdToLifetime;
+        for (const auto& r : reqs) oldIdToLifetime[r.id] = r.lifetimeId;
+        const int removedLifetime = it->lifetimeId;
+
         delete it->initializer;
         reqs.erase(it);
         if (Scene<BE, PR>::numMeshes > 0) Scene<BE, PR>::numMeshes--;
 
         // Compact ids back to [0, size) in request order.
         for (int k = 0; k < (int)reqs.size(); ++k) reqs[k].id = k;
+
+        // Reconcile reference-point constraints against the new ids.
+        // Physics vids (vertexPair) are unaffected — each surviving
+        // mesh's own geometry is unchanged; only its packed slot/id
+        // moved. Drop constraints whose query OR target mesh was
+        // removed (or can't be re-resolved).
+        {
+            std::unordered_map<int, int> lifetimeToNewId;
+            for (const auto& r : reqs) lifetimeToNewId[r.lifetimeId] = r.id;
+            auto remap = [&](Index& objId) -> bool {
+                auto lit = oldIdToLifetime.find((int)objId);
+                if (lit == oldIdToLifetime.end()) return false;
+                if (lit->second == removedLifetime) return false;
+                auto nit = lifetimeToNewId.find(lit->second);
+                if (nit == lifetimeToNewId.end()) return false;
+                objId = (Index)nit->second;
+                return true;
+            };
+            auto& cons = Scene<BE, PR>::referenceConstraints;
+            cons.erase(std::remove_if(cons.begin(), cons.end(),
+                [&](ReferencePointConstraint& c) {
+                    return !remap(c.objPair.query)
+                        || !remap(c.objPair.target);
+                }), cons.end());
+        }
 
         // Re-resolve the selection against the new ids via lifetimeId.
         selectedObj = -1;
@@ -7052,6 +7167,17 @@ struct Simulator {
                 break;
             }
         }
+        // Reference-point constraints are scene-level (cross-object
+        // capable). objPair/vertexPair already hold object ids + physics
+        // vertex ids, so this is a flat copy onto the snapshot.
+        for (const auto& c : Scene<BE,PR>::referenceConstraints) {
+            scene_format::ReferenceConstraint rc;
+            rc.queryObject  = (int)c.objPair.query;
+            rc.queryVertex  = (int)c.vertexPair.query;
+            rc.targetObject = (int)c.objPair.target;
+            rc.targetVertex = (int)c.vertexPair.target;
+            s.referenceConstraints.push_back(rc);
+        }
         return s;
     }
 
@@ -7072,6 +7198,9 @@ struct Simulator {
         Scene<BE,PR>::meshes.clear();
         for (auto& r : Scene<BE,PR>::requestsGeneralMeshes) delete r.initializer;
         Scene<BE,PR>::requestsGeneralMeshes.clear();
+        // Scene-boundary churn: drop old reference constraints; the
+        // snapshot's are restored after the objects are rebuilt below.
+        Scene<BE,PR>::referenceConstraints.clear();
         Scene<BE,PR>::numMeshes = 0;
         // D-041 turn-2: reset id counter at the scene boundary so
         // save/load round-trips assign ids 0, 1, 2, ... in load order.
@@ -7235,6 +7364,17 @@ struct Simulator {
                     }
                 }
             }
+        }
+        // Restore scene-level reference-point constraints. Stored as
+        // object id + physics vid (same space the integrator consumes),
+        // so this is a flat copy back into the Scene-static list.
+        for (const auto& rc : r.value.referenceConstraints) {
+            ReferencePointConstraint c;
+            c.objPair.query     = (Index)rc.queryObject;
+            c.vertexPair.query  = (Index)rc.queryVertex;
+            c.objPair.target    = (Index)rc.targetObject;
+            c.vertexPair.target = (Index)rc.targetVertex;
+            Scene<BE,PR>::referenceConstraints.push_back(c);
         }
         return r;
     }
@@ -7433,6 +7573,14 @@ struct ExplicitSystem<METAL, PR> {
     MTL::ComputePipelineState* integrateClothPSO;
     MTL::ComputePipelineState* clothGridFastForcePSO;
     MTL::ComputePipelineState* integrateClothGridPSO;
+    MTL::ComputePipelineState* refCopyPosPSO = nullptr;
+    MTL::ComputePipelineState* refCopyForcePSO = nullptr;
+    // Dedicated shared buffer of pre-resolved {queryGlobalVid,
+    // targetGlobalVid} uint2 pairs for the reference-point constraint
+    // kernels. Grown on demand; never freed (lives as long as the
+    // System). Not pool-allocated so it survives pool resets.
+    MTL::Buffer* refPairBuf = nullptr;
+    size_t refPairCap = 0;
 
     // Sim vars
     PR h = 1/PR(60);
@@ -7461,6 +7609,66 @@ struct ExplicitSystem<METAL, PR> {
         integrateClothPSO = MetalKernelContext::getPSO("integrate_cloth");
         clothGridFastForcePSO = MetalKernelContext::getPSO("compute_cloth_grid_forces_fast");
         integrateClothGridPSO = MetalKernelContext::getPSO("integrate_cloth_grid");
+        refCopyPosPSO   = MetalKernelContext::getPSO("ref_constraint_copy_pos");
+        refCopyForcePSO = MetalKernelContext::getPSO("ref_constraint_copy_force");
+    }
+
+    // Resolve Scene::referenceConstraints into global vertex-index pairs
+    // and upload them into refPairBuf. Returns the valid pair count.
+    // objId == compacted mesh id == statesOffsets subscript (same key
+    // integrate_cloth binds as `oid`); a global vid is
+    // statesOffsets[objId] + localPhysicsVid. Stale/out-of-range
+    // constraints (object deleted, vid past the mesh) are skipped.
+    uint buildRefPairs(Scene<METAL, PR>& scene) {
+        auto& cons = Scene<METAL, PR>::referenceConstraints;
+        if (cons.empty()) return 0;
+        auto& off = Scene<METAL, PR>::packedMeshData.statesOffsets;
+        if (!off.ptr || off.size == 0) return 0;
+        const uint32_t numMeshes = (uint32_t)Scene<METAL, PR>::numMeshes;
+
+        static std::vector<uint32_t> scratch;  // 2 entries per pair
+        scratch.clear();
+        auto resolve = [&](Index obj, Index vid, uint32_t& out) -> bool {
+            if (obj + 1 >= off.size || obj >= numMeshes) return false;
+            uint32_t base = (uint32_t)off.ptr[obj];
+            uint32_t cnt  = (uint32_t)off.ptr[obj + 1] - base;
+            if ((uint32_t)vid >= cnt) return false;
+            out = base + (uint32_t)vid;
+            return true;
+        };
+        for (const auto& c : cons) {
+            uint32_t gq, gt;
+            if (!resolve(c.objPair.query,  c.vertexPair.query,  gq)) continue;
+            if (!resolve(c.objPair.target, c.vertexPair.target, gt)) continue;
+            scratch.push_back(gq);
+            scratch.push_back(gt);
+        }
+        uint count = (uint)(scratch.size() / 2);
+        if (count == 0) return 0;
+
+        size_t bytes = scratch.size() * sizeof(uint32_t);
+        if (!refPairBuf || refPairCap < bytes) {
+            if (refPairBuf) refPairBuf->release();
+            refPairBuf = MetalGlobalContext::getDevice()->newBuffer(
+                bytes, MTL::ResourceStorageModeShared);
+            refPairCap = bytes;
+        }
+        std::memcpy(refPairBuf->contents(), scratch.data(), bytes);
+        return count;
+    }
+
+    // Dispatch one of the two constraint kernels over `count` pairs,
+    // binding the two global packed buffers it mutates at slots 0/1.
+    void dispatchRefKernel(MTL::ComputePipelineState* pso,
+                           VectorBase<METAL, PR>& b0,
+                           VectorBase<METAL, PR>& b1,
+                           uint count) {
+        MetalGlobalContext::setBuffer(b0, 0);
+        MetalGlobalContext::setBuffer(b1, 1);
+        MetalGlobalContext::getComputeCommandEncoder()->setBuffer(
+            refPairBuf, 0, 2);
+        MetalGlobalContext::setBytes(count, 3);
+        MetalGlobalContext::dispatchThreads(pso, count);
     }
     
     struct SimParams {
@@ -7481,51 +7689,78 @@ struct ExplicitSystem<METAL, PR> {
     };
 
     // 2. update() 함수 수정
+    //
+    // Restructured into two passes so a reference-point constraint can
+    // sit between them per the design's 1-1..1-4 steps. The Metal
+    // compute encoder dispatches serially, so each step below completes
+    // before the next begins — that ordering IS the "fence":
+    //   (1-1) ref_constraint_copy_pos   — snap follower x onto leader
+    //   (... ) all cloth force kernels
+    //   (1-3) ref_constraint_copy_force — follower f/v := leader's
+    //   (1-4) all cloth integrate kernels
+    // With no constraints the two passes are exactly the old per-mesh
+    // force-then-integrate sequence (pairCount == 0 skips both copies).
     void update(Scene<METAL, PR>& sceneObjects) {
+        uint pairCount = buildRefPairs(sceneObjects);
 
+        // Step 1-1: position snap before any force computation.
+        if (pairCount > 0) {
+            dispatchRefKernel(refCopyPosPSO,
+                              Scene<METAL, PR>::packedMeshData.x,
+                              Scene<METAL, PR>::packedMeshData.xPrev,
+                              pairCount);
+        }
+
+        // Pass 1: forces only.
         for(auto& mesh : sceneObjects.meshes) {
-
             SimParams params = { subh, G, kair, kd, (uint)mesh.state.x.size/3, acctime };
-
-            //BehaviorParams<PR> clothParams = mesh.behaviorParams;
-
-            //switch(mesh.behaviorType) {
-            //    case BehaviorType::TriangularCloth:
-            //        TriangularClothBehavior<METAL, PR>::setBuffer(mesh, params);
-            //        break;
-            //    case BehaviorType::FastGridCloth:
-            //        FastGridClothBehavior<METAL, PR>::setBuffer(mesh, params);
-            //        break;
-            //    case BehaviorType::Float:
-            //        break;
-            //    case BehaviorType::Elastic:
-            //    case BehaviorType::Rigid:
-            //    case BehaviorType::Fluid:
-            //    case BehaviorType::Generator:
-            //    default: break;
-            //}
-            //for(size_t i = 0; i < subSteps; i++) {
             switch(mesh.behaviorType) {
                 case BehaviorType::TriangularCloth:
                     TriangularClothBehavior<METAL, PR>::setBuffer(mesh, params);
                     TriangularClothBehavior<METAL, PR>::update(mesh.state);
-                    MetalGlobalContext::dispatchThreads(integrateClothPSO, mesh.state.x.size/3);
                     break;
                 case BehaviorType::FastGridCloth:
                     FastGridClothBehavior<METAL, PR>::setBuffer(mesh, params);
                     FastGridClothBehavior<METAL, PR>::update(mesh.state);
-                    MetalGlobalContext::dispatchThreads(integrateClothGridPSO, mesh.state.x.size/3);
                     break;
                 case BehaviorType::Float:
-                    break;
                 case BehaviorType::Elastic:
                 case BehaviorType::Rigid:
                 case BehaviorType::Fluid:
                 case BehaviorType::Generator:
                 default: break;
             }
+        }
 
-            //}
+        // Step 1-3: force/velocity copy after every force kernel.
+        if (pairCount > 0) {
+            dispatchRefKernel(refCopyForcePSO,
+                              Scene<METAL, PR>::packedMeshData.f,
+                              Scene<METAL, PR>::packedMeshData.v,
+                              pairCount);
+        }
+
+        // Pass 2 (step 1-4): integrate. setBuffer must be re-bound per
+        // mesh — pass 1's later meshes and the constraint dispatch
+        // overwrote the encoder's buffer table.
+        for(auto& mesh : sceneObjects.meshes) {
+            SimParams params = { subh, G, kair, kd, (uint)mesh.state.x.size/3, acctime };
+            switch(mesh.behaviorType) {
+                case BehaviorType::TriangularCloth:
+                    TriangularClothBehavior<METAL, PR>::setBuffer(mesh, params);
+                    MetalGlobalContext::dispatchThreads(integrateClothPSO, mesh.state.x.size/3);
+                    break;
+                case BehaviorType::FastGridCloth:
+                    FastGridClothBehavior<METAL, PR>::setBuffer(mesh, params);
+                    MetalGlobalContext::dispatchThreads(integrateClothGridPSO, mesh.state.x.size/3);
+                    break;
+                case BehaviorType::Float:
+                case BehaviorType::Elastic:
+                case BehaviorType::Rigid:
+                case BehaviorType::Fluid:
+                case BehaviorType::Generator:
+                default: break;
+            }
         }
     }
 };
@@ -11689,18 +11924,18 @@ int main(int argc, char** argv) {
     simulator.initialize();
     std::cout << "[Main] simulator is initialized" << std::endl;
 
-    if(Scene<Backend, Precision>::numMeshes > 0) {
-        std::cout << "Try to pin general meshes\n";
-        for(auto& mesh: Scene<Backend, Precision>::meshes) {
-            std::cout << mesh.id << std::endl;
-        }
-        auto* mesh = Scene<Backend, Precision>::findById(0);
-        std::cout << mesh << std::endl;
-        mesh->constraints.fixParticle(0);
-        //mesh->constraints.fixParticle(particleNum1D-1);
-    }
+    // if(Scene<Backend, Precision>::numMeshes > 0) {
+    //     std::cout << "Try to pin general meshes\n";
+    //     for(auto& mesh: Scene<Backend, Precision>::meshes) {
+    //         std::cout << mesh.id << std::endl;
+    //     }
+    //     auto* mesh = Scene<Backend, Precision>::findById(0);
+    //     std::cout << mesh << std::endl;
+    //     mesh->constraints.fixParticle(0);
+    //     //mesh->constraints.fixParticle(particleNum1D-1);
+    // }
 
-    std::cout << "[Main] particles are pinned" << std::endl;
+    // std::cout << "[Main] particles are pinned" << std::endl;
 
 
 
@@ -11966,23 +12201,22 @@ int main(int argc, char** argv) {
         simulator->clearDebugLines();
         if (simulator->selectionMode == SelectionMode::Point) {
             if (simulator->pointRefPickActive) {
-                // Reference-pick: the clicked vertex is a position
-                // SOURCE. Copy its world pos into the already-selected
-                // vertex, keep the selection unchanged, exit ref mode.
-                tinym::vec3 refPos;
+                // Reference-pick: register a PERSISTENT coincidence
+                // constraint — the already-selected vertex (FOLLOWER /
+                // query) must track the clicked vertex (LEADER / target)
+                // every step. Selection unchanged; exit ref mode.
                 if (simulator->selectedVert >= 0
                     && simulator->selectedVertObj >= 0
                     && simulator->hoveredVert >= 0
                     && simulator->hoveredVertObj >= 0
-                    && simulator->vertexWorldPos(simulator->hoveredVertObj,
-                                                 simulator->hoveredVert, refPos)) {
-                    simulator->translateVertexTo(simulator->selectedVertObj,
-                                                 simulator->selectedVert, refPos);
-                    std::cout << "RefCopied: ("
-                              << refPos.x << ", " << refPos.y << ", "
-                              << refPos.z << ") -> obj "
+                    && simulator->setReferenceConstraint(
+                           simulator->selectedVertObj, simulator->selectedVert,
+                           simulator->hoveredVertObj,  simulator->hoveredVert)) {
+                    std::cout << "RefConstraint: obj "
                               << simulator->selectedVertObj << " vert "
-                              << simulator->selectedVert << std::endl;
+                              << simulator->selectedVert << " -> obj "
+                              << simulator->hoveredVertObj << " vert "
+                              << simulator->hoveredVert << std::endl;
                 }
                 simulator->pointRefPickActive = false;
             } else {

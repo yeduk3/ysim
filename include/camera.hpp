@@ -15,6 +15,7 @@
 
 #include <GL/glew.h>
 #include <GLFW/glfw3.h>
+#include <cmath>
 #include <iostream>
 
 void cursorPosCallback(GLFWwindow *window, double xpos, double ypos);
@@ -70,7 +71,36 @@ public:
     }
     
     void rotatePosition() {
-        curPosition = getRotate() * vec4(initPosition, 1);
+        // Orbit rotates initPosition about the world origin; `look` is
+        // the pan pivot, added after rotation so the camera and its
+        // target translate together (look defaults to origin, so this
+        // is a no-op until pan() moves it — orbit behavior unchanged).
+        vec4 rp = getRotate() * vec4(initPosition, 1);
+        curPosition = vec3(rp.x + look.x, rp.y + look.y, rp.z + look.z);
+    }
+
+    // Pan the view by a normalized cursor delta (fraction of the
+    // window). Shifts the look pivot along the camera's right/up axes,
+    // scaled by the orbit distance so the framing feels consistent at
+    // any zoom. rotatePosition() then carries curPosition along.
+    void pan(float ndx, float ndy) {
+        vec3 cp = curPosition;
+        vec3 fwd = vec3(look.x - cp.x, look.y - cp.y, look.z - cp.z)
+                       .normalize();
+        vec3 right = fwd.cross(up).normalize();
+        vec3 camUp = right.cross(fwd);
+        float dist = std::sqrt((cp.x - look.x) * (cp.x - look.x)
+                             + (cp.y - look.y) * (cp.y - look.y)
+                             + (cp.z - look.z) * (cp.z - look.z));
+        if (dist < 1e-4f) dist = 1e-4f;
+        // Drag direction follows the cursor: moving right pushes the
+        // scene right (camera/pivot move left), hence -ndx on right.
+        float sx = -ndx * dist;
+        float sy =  ndy * dist;
+        look.x += right.x * sx + camUp.x * sy;
+        look.y += right.y * sx + camUp.y * sy;
+        look.z += right.z * sx + camUp.z * sy;
+        rotatePosition();
     }
     
     mat4 lookAt() {
@@ -129,28 +159,31 @@ void cursorPosCallback(GLFWwindow *window, double xpos, double ypos)
 {
     static double lastX = 0;
     static double lastY = 0;
-    // when left mouse button clicked
-    if (glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_1))
+
+    bool left  = glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_LEFT);
+    bool right = glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_RIGHT);
+    bool mid   = glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_MIDDLE);
+    bool shift = glfwGetKey(window, GLFW_KEY_LEFT_SHIFT) == GLFW_PRESS
+              || glfwGetKey(window, GLFW_KEY_RIGHT_SHIFT) == GLFW_PRESS;
+
+    if (left || right || mid)
     {
         int w, h;
         glfwGetWindowSize(window, &w, &h);
         double dx = (xpos - lastX) / w;
         double dy = (ypos - lastY) / h;
-//        if(glfwGetKey(window, GLFW_KEY_LEFT_CONTROL)) {
-//            auto v = glm::normalize(camera.look - camera.getCurPosition());
-//            auto r = glm::normalize(glm::cross(v, glm::vec3(0,1,0)));
-//            auto u = glm::cross(r, v);
-//            
-//            auto t = glm::mat3(r, u, v) * glm::vec3(-dx, dy, 1);
-//            camera.look += t;
-//            camera.initPosition += t;
-//        } else {
+
+        // Pan with right / middle drag, or Shift+left (trackpad-
+        // friendly). Plain left drag keeps orbiting as before.
+        if (right || mid || (left && shift)) {
+            camera.pan((float)dx, (float)dy);
+        } else {
             camera.theta -= dx * PI; // related with y-axis rotation
             camera.phi -= dy * PI;   // related with x-axis rotation
             camera.phi = comp::clamp(camera.phi, -PI / 2 + 0.01f, PI / 2 - 0.01f);
-            
+
             camera.rotatePosition();
-//        }
+        }
     }
     // whenever, save current cursor position as previous one
     lastX = xpos;

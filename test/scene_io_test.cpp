@@ -345,6 +345,54 @@ TEST_CASE("BDD-011/012: non-default gravity and wind round-trip bit-stable") {
     std::remove(path.c_str());
 }
 
+// ---- Reference-point constraint round-trip (verification gate) --------
+// Proves a point-panel reference constraint survives save→load and that
+// the whole scene can be restored bit-for-bit to "the current point" —
+// the precondition the user mandated before the integrator work begins.
+
+TEST_CASE("reference-point constraint round-trips field-by-field + byte-stable") {
+    auto snap = makePopulatedSnapshot();
+    // (queryObject, queryVertex) must follow (targetObject, targetVertex).
+    snap.referenceConstraints.push_back(ReferenceConstraint{0, 12, 1, 5});
+    snap.referenceConstraints.push_back(ReferenceConstraint{1, 7, 0, 30});
+
+    auto path = tempPath("refc");
+    REQUIRE(writeToFile(snap, path));
+    auto r = readFromFile(path);
+    REQUIRE(r.ok);
+    auto& loaded = r.value;
+
+    REQUIRE(loaded.referenceConstraints.size()
+            == snap.referenceConstraints.size());
+    for (size_t i = 0; i < snap.referenceConstraints.size(); ++i) {
+        const auto& a = snap.referenceConstraints[i];
+        const auto& b = loaded.referenceConstraints[i];
+        CHECK(a.queryObject  == b.queryObject);
+        CHECK(a.queryVertex  == b.queryVertex);
+        CHECK(a.targetObject == b.targetObject);
+        CHECK(a.targetVertex == b.targetVertex);
+    }
+    // save → load → save byte identity == "return to the current point".
+    CHECK(toString(snap) == toString(loaded));
+    std::remove(path.c_str());
+}
+
+TEST_CASE("reference-point constraint is optional + omitted when empty") {
+    // No constraints → the key must not appear, so pre-feature scenes
+    // stay byte-identical (backward-compat guard).
+    auto snap = makePopulatedSnapshot();
+    nlohmann::json j = toJson(snap);
+    CHECK_FALSE(j.contains("reference_constraints"));
+
+    // A snapshot with no reference_constraints key loads cleanly to empty.
+    auto path = tempPath("refc_empty");
+    REQUIRE(writeToFile(snap, path));
+    auto r = readFromFile(path);
+    REQUIRE(r.ok);
+    CHECK(r.value.referenceConstraints.empty());
+    std::remove(path.c_str());
+}
+
 TEST_CASE("BDD-011/012: missing environment falls back to schema defaults") {
     auto path = tempPath("envdef");
     REQUIRE(writeText(path, R"({"format_version": 1, "objects": []})"));

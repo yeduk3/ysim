@@ -80,7 +80,9 @@ void drawMeshInspectorWindow(
             }
             if (target.point_ref_active) ImGui::PopStyleColor();
             ImGui::TextDisabled(
-                "버튼을 누른 뒤 다른 점을 클릭하면\n그 점의 위치를 이 점에 복사합니다.");
+                "버튼을 누른 뒤 다른 점을 클릭하면\n"
+                "이 점이 그 점의 위치를 계속 따라가는\n"
+                "제약이 설정됩니다 (reset 후에도 유지).");
         }
 
         if (!state.status_message.empty()) {

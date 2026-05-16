@@ -100,6 +100,18 @@ struct Environment {
     Vec3 backgroundColor{0.05, 0.05, 0.08};
 };
 
+// A reference-point coincidence constraint set in the point-selection
+// panel: the (queryObject, queryVertex) vertex must occupy the same
+// world position as the (targetObject, targetVertex) vertex every
+// step. Cross-object capable, so this is a scene-level list (not per
+// Object). Indices are physics-vertex ids, matching FixedParticle.vid.
+struct ReferenceConstraint {
+    int queryObject = 0;
+    int queryVertex = 0;
+    int targetObject = 0;
+    int targetVertex = 0;
+};
+
 struct LoadError {
     std::string message;
 };
@@ -116,6 +128,9 @@ struct SceneSnapshot {
     int formatVersion = kFormatVersion;
     std::vector<Object> objects;
     Environment environment;
+    // Reference-point coincidence constraints (point panel). Optional in
+    // JSON — older snapshots simply have none.
+    std::vector<ReferenceConstraint> referenceConstraints;
     LoadWarnings warnings;
 };
 
@@ -301,12 +316,26 @@ inline nlohmann::json toJson(const Environment& e) {
     return j;
 }
 
+inline nlohmann::json toJson(const ReferenceConstraint& c) {
+    nlohmann::json j;
+    j["query"]  = {{"object", c.queryObject},  {"vertex", c.queryVertex}};
+    j["target"] = {{"object", c.targetObject}, {"vertex", c.targetVertex}};
+    return j;
+}
+
 inline nlohmann::json toJson(const SceneSnapshot& s) {
     nlohmann::json j;
     j["format_version"] = s.formatVersion;
     j["objects"] = nlohmann::json::array();
     for (const auto& o : s.objects) j["objects"].push_back(toJson(o));
     j["environment"] = toJson(s.environment);
+    // Omit the key entirely when empty so constraint-free scenes stay
+    // byte-identical to pre-feature snapshots (mirrors fixed_particles).
+    if (!s.referenceConstraints.empty()) {
+        nlohmann::json rc = nlohmann::json::array();
+        for (const auto& c : s.referenceConstraints) rc.push_back(toJson(c));
+        j["reference_constraints"] = std::move(rc);
+    }
     return j;
 }
 
@@ -545,6 +574,31 @@ inline Result<SceneSnapshot> fromJson(const nlohmann::json& j) {
         auto er = environmentFromJson(*envj);
         if (!er.ok) return R::fail(er.error.message);
         s.environment = er.value;
+    }
+    // reference_constraints is optional (backward compat). Malformed
+    // entries are skipped rather than failing the whole load, matching
+    // the fixed_particles loader policy.
+    if (auto it = j.find("reference_constraints");
+        it != j.end() && it->is_array()) {
+        for (const auto& e : *it) {
+            auto q = e.find("query");
+            auto t = e.find("target");
+            if (q == e.end() || t == e.end()
+                || !q->is_object() || !t->is_object()) continue;
+            auto qo = q->find("object"); auto qv = q->find("vertex");
+            auto to = t->find("object"); auto tv = t->find("vertex");
+            if (qo == q->end() || qv == q->end()
+                || to == t->end() || tv == t->end()
+                || !qo->is_number_integer() || !qv->is_number_integer()
+                || !to->is_number_integer() || !tv->is_number_integer())
+                continue;
+            ReferenceConstraint c;
+            c.queryObject  = qo->get<int>();
+            c.queryVertex  = qv->get<int>();
+            c.targetObject = to->get<int>();
+            c.targetVertex = tv->get<int>();
+            s.referenceConstraints.push_back(c);
+        }
     }
     return R::success(std::move(s));
 }

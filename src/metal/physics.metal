@@ -349,6 +349,51 @@ kernel void integrate_cloth(
     x[id] = pos;
 }
 
+// ========================================================
+// Reference-point coincidence constraint (point panel).
+// Operates on the GLOBAL packed state buffers; `pairs[i]` holds
+// {queryGlobalVid, targetGlobalVid} pre-resolved on the host from
+// statesOffsets[objId] + localVid, so a single dispatch handles
+// cross-mesh constraints. Serial encoder ordering supplies the
+// "fence" the design calls for: copy_pos runs before the force
+// kernels; copy_force runs after them and before integrate.
+// ========================================================
+
+// Step 1-1: snap each follower (query) onto its leader (target)
+// BEFORE the cloth force kernels, so the follower's springs are
+// evaluated as if it sat at the leader's location.
+kernel void ref_constraint_copy_pos(
+    device packed_float3* x [[buffer(0)]],
+    device packed_float3* xprev [[buffer(1)]],
+    device const uint2* pairs [[buffer(2)]],
+    constant uint& count [[buffer(3)]],
+    uint id [[thread_position_in_grid]]
+) {
+    if (id >= count) return;
+    uint q = pairs[id].x;
+    uint t = pairs[id].y;
+    x[q] = x[t];
+    xprev[q] = xprev[t];
+}
+
+// Step 1-3: after force computation, give the follower the leader's
+// force (and velocity, so the subsequent integrate produces an
+// identical position update — without matched velocity the two
+// points drift apart within the substep).
+kernel void ref_constraint_copy_force(
+    device packed_float3* f [[buffer(0)]],
+    device packed_float3* v [[buffer(1)]],
+    device const uint2* pairs [[buffer(2)]],
+    constant uint& count [[buffer(3)]],
+    uint id [[thread_position_in_grid]]
+) {
+    if (id >= count) return;
+    uint q = pairs[id].x;
+    uint t = pairs[id].y;
+    f[q] = f[t];
+    v[q] = v[t];
+}
+
 //kernel void integrate_all(
 //    device packed_float3* x [[buffer(0)]],
 //    device packed_float3* v [[buffer(1)]],
