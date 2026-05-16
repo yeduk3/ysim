@@ -54,6 +54,9 @@ void drawMeshInspectorWindow(
         if (ImGui::Button("구 추가...", btn) && target.on_request_add_sphere) {
             target.on_request_add_sphere();
         }
+        if (ImGui::Button("평면 추가...", btn) && target.on_request_add_plane) {
+            target.on_request_add_plane();
+        }
         if (ImGui::Button("OBJ 파일 추가...", btn) && target.on_request_add_import) {
             target.on_request_add_import();
         }
@@ -122,6 +125,16 @@ void drawMeshInspectorWindow(
             target.on_rotate(target.mesh_id,
                              newWxyz[0], newWxyz[1], newWxyz[2], newWxyz[3]);
             state.status_message = "회전이 갱신됨.";
+        }
+    }
+
+    // ─── Scale: per-axis ──────────────────────────────────────────────
+    if (target.scale && target.on_scale) {
+        float s[3] = { target.scale->x, target.scale->y, target.scale->z };
+        ImGui::InputFloat3("스케일", s);
+        if (ImGui::IsItemDeactivatedAfterEdit()) {
+            target.on_scale(target.mesh_id, tinym::vec3(s[0], s[1], s[2]));
+            state.status_message = "스케일이 갱신됨.";
         }
     }
 

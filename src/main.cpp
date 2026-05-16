@@ -1047,6 +1047,49 @@ struct MeshAdjacencyInitializer {
         //    std::cout << std::endl;
         //}
     }
+
+    // Re-measure the stretch (restEdgeLengths) and bend (restOppLengths)
+    // rest quantities from the CURRENT state.x, reusing the topology
+    // (edges / vertexOppVertices) that `initialize()` already built.
+    //
+    // Why this exists: Scene::pack() runs mesh.initialize() (which calls
+    // the function above and seeds rest lengths from the initializer's
+    // param-regenerated geometry) and ONLY THEN overrides state.x with
+    // the per-request PreviewState (D-042 R-3 memcpy). Any preview-only
+    // edit — scaleObject / rotateObject write the new geometry into
+    // preview.x, never back into the initializer params — would leave
+    // rest lengths describing the un-edited grid while the simulated
+    // particles sit at the edited positions, pre-stressing every spring
+    // (a 2x scaled sheet starts at 100% strain → instant blow-up, even
+    // in free fall). The invariant is: rest length == the geometry the
+    // user actually sees (the preview state). pack() calls this right
+    // after the R-3 memcpy so that invariant holds unconditionally,
+    // including under scale (the scale question raised in review) and
+    // rotation.
+    static void recomputeRestLengths(MeshState<BE, PR>& state,
+                                     MeshAdjacency<BE, PR>& adjacency) {
+        auto dist = [&](Index a, Index b) {
+            auto va = tinym::vec3_view(state.x.ptr + a*3);
+            auto vb = tinym::vec3_view(state.x.ptr + b*3);
+            return (vb - va).norm();
+        };
+        if (adjacency.edges.ptr && adjacency.restEdgeLengths.ptr) {
+            Index numEdges = adjacency.edges.size / 2;
+            for (Index e = 0; e < numEdges; ++e)
+                adjacency.restEdgeLengths[e] =
+                    dist(adjacency.edges[e*2], adjacency.edges[e*2+1]);
+        }
+        if (adjacency.vertexOppVertices.ptr
+            && adjacency.vertexOppVerticesOffsets.ptr
+            && adjacency.restOppLengths.ptr) {
+            Index numPoints = state.x.size / 3;
+            for (Index v = 0; v < numPoints; ++v)
+                for (Index k = adjacency.vertexOppVerticesOffsets[v];
+                     k < adjacency.vertexOppVerticesOffsets[v+1]; ++k)
+                    adjacency.restOppLengths[k] =
+                        dist(v, adjacency.vertexOppVertices[k]);
+        }
+    }
 };
 
 enum struct PlaneDirection : Index {
@@ -1231,6 +1274,39 @@ struct MeshGridInitializer : GeneralMeshInitializer<BE, PR> {
             }
         }
         preview.recomputeNormals();
+    }
+
+    // Deterministic cloth jiggle, applied at Scene::pack time ONLY when
+    // the mesh's current behavior is a cloth type. A perfectly coplanar
+    // sheet is degenerate for the cloth solver / point-triangle narrow
+    // phase (zero out-of-plane stiffness, coplanar self-contacts with
+    // garbage indices); a sub-visible (<=1e-4) normal-axis perturbation
+    // breaks the degeneracy. This is NOT the constructor `params.jiggle`
+    // flag path (that writes the initializer regen which Scene::pack's
+    // R-3 memcpy then clobbers with the flat preview, so it never
+    // reached the sim). Here we perturb the post-memcpy state.x directly.
+    //
+    // Idempotent / accumulation-free by construction: pack always calls
+    // this on the freshly memcpy'd FLAT preview, never on an already-
+    // jiggled buffer, and the RNG is reseeded from (params.seed ^ id)
+    // every call. So Rigid pack -> flat state.x; Cloth pack -> flat +
+    // identical deterministic noise. Toggling Rigid<->Cloth any number
+    // of times reproduces the exact same cloth rest configuration (the
+    // recomputeRestLengths call right after measures this jiggled
+    // state, so rest length stays consistent with what is simulated).
+    void applyClothJiggle(PR* x, Index numPoints, uint32_t idSeed) {
+        if (!x || numPoints <= 0) return;
+        int axis; // plane-normal component, mirrors initialize()'s pz slot
+        switch (params.dir) {
+            case PlaneDirection::XYPlane: axis = 2; break; // z
+            case PlaneDirection::YZPlane: axis = 0; break; // x
+            case PlaneDirection::XZPlane: axis = 1; break; // y
+            default:                      axis = 1; break;
+        }
+        std::mt19937 rng(params.seed ^ idSeed);
+        std::uniform_real_distribution<PR> jiggleDist(PR(0), PR(1.0/10000.0));
+        for (Index p = 0; p < numPoints; ++p)
+            x[p*3 + axis] += jiggleDist(rng);
     }
 
     InitializerParams<PR>* getParams() override { return &params; }
@@ -1861,6 +1937,12 @@ struct GeneralMesh {
     // initializer's center/offset so existing meshes preserve their author
     // intent. Persists through saveScene/loadScene via Simulator::toSnapshot.
     tinym::vec3 transformPosition = tinym::vec3(0);
+    // Per-axis world-space scale mirror for the inspector scale path.
+    // Mutated only by Simulator::scaleObject; carried through Scene::pack
+    // via RequestGeneralMesh::scale (geometry is preserved by the R-3
+    // preview memcpy, this preserves the stored factor the inspector
+    // shows and scaleObject composes its delta against). Default unit.
+    tinym::vec3 scale = tinym::vec3(1.0f, 1.0f, 1.0f);
     Constraints<BE, PR> constraints;
     ExternalForces<BE, PR> externalForces;
 
@@ -1897,6 +1979,7 @@ struct GeneralMesh {
           material(std::move(other.material)),
           rotationQuat(other.rotationQuat),
           transformPosition(other.transformPosition),
+          scale(other.scale),
           constraints(std::move(other.constraints)),
           externalForces(std::move(other.externalForces)),
           applyGravity(other.applyGravity),
@@ -1988,6 +2071,21 @@ struct Scene {
         // true (matches GeneralMesh defaults).
         bool applyGravity = true;
         bool applyWind = true;
+        // Mirror of GeneralMesh.rotationQuat kept on the request so the
+        // user's orientation survives Scene::pack rebuilds (initialize /
+        // reset / loadScene). Without this, pack rebuilds meshes from the
+        // initializer with a default identity quat — the geometry stays
+        // rotated (carried by preview's R-3 memcpy) but the stored
+        // quaternion (what the inspector displays and what rotateObject
+        // composes deltas against) snapped back to identity. pack copies
+        // this into the realized mesh; rotateObject writes here in
+        // addition to the live mesh field. Defaults to identity.
+        ::Quat rotationQuat{};
+        // Mirror of GeneralMesh.scale kept on the request so the user's
+        // per-axis scale survives Scene::pack rebuilds, same rationale as
+        // rotationQuat above. pack copies this onto the realized mesh;
+        // scaleObject writes here in addition to the live mesh field.
+        tinym::vec3 scale = tinym::vec3(1.0f, 1.0f, 1.0f);
         // D-042 R-1: heap-owned vertex/facet/normal preview, populated by
         // initializer->populatePreview() at addGeneralMesh time. Stays
         // alive across Scene::pack / pool-reset cycles. R-2 will point
@@ -2159,6 +2257,17 @@ struct Scene {
             // Apply Gravity / Apply Wind selections.
             meshes[i].applyGravity = req.applyGravity;
             meshes[i].applyWind    = req.applyWind;
+            // Carry the user's orientation through pack. The R-3 preview
+            // memcpy below restores the rotated *geometry*; this restores
+            // the stored *quaternion* so the inspector keeps showing the
+            // accumulated rotation and the next rotateObject composes its
+            // delta against the true current orientation (not identity).
+            meshes[i].rotationQuat = req.rotationQuat;
+            // Same as rotationQuat: R-3's preview memcpy restores the
+            // scaled geometry, this restores the stored scale factor so
+            // the inspector keeps showing it and scaleObject composes its
+            // next delta against the true current scale (not unit).
+            meshes[i].scale = req.scale;
             // Seed transformPosition from the initializer's center/offset so
             // BDD-003's translate path computes deltas against the author
             // intent, not against (0,0,0). Mirrors the dynamic_cast cascade
@@ -2221,6 +2330,42 @@ struct Scene {
                                 expectedFacets * 3 * sizeof(uint32_t));
                 }
             }
+
+            // Behavior-driven cloth jiggle. state.x currently holds the
+            // flat preview (R-3 memcpy above). If THIS mesh is currently
+            // a cloth, perturb it sub-visibly so the solver/narrow-phase
+            // isn't degenerate on a perfectly coplanar sheet; if it is
+            // Rigid (or anything non-cloth) leave it flat. Reseeded from
+            // the stable mesh id each pack and always run on the just-
+            // memcpy'd FLAT buffer, so toggling Rigid<->Cloth back and
+            // forth reproduces the identical cloth state every time with
+            // zero accumulation. Runs BEFORE recomputeRestLengths so the
+            // rest config is measured from the jiggled (== simulated)
+            // geometry — keeps the "rest length == what is simulated"
+            // invariant intact.
+            {
+                bool isCloth =
+                    meshes[i].behaviorType == BehaviorType::TriangularCloth
+                 || meshes[i].behaviorType == BehaviorType::FastGridCloth;
+                if (isCloth) {
+                    if (auto* g = dynamic_cast<MeshGridInitializer<BE, PR>*>(
+                            req.initializer)) {
+                        g->applyClothJiggle(meshes[i].state.x.ptr,
+                                            curNumPoints,
+                                            (uint32_t)meshes[i].id);
+                    }
+                }
+            }
+
+            // Rest length must reflect the geometry the user sees (the
+            // preview just memcpy'd into state.x), NOT the initializer's
+            // param-regen that mesh.initialize() measured a few lines up.
+            // Without this, scale/rotate edits (preview-only mutations)
+            // leave every cloth spring pre-stressed → free-fall blow-up.
+            // (When cloth, "what the user sees" includes the <=1e-4
+            // jiggle applied just above — invisible but consistent.)
+            MeshAdjacencyInitializer<BE, PR>::recomputeRestLengths(
+                meshes[i].state, meshes[i].adjacency);
 
             // Seed xPrev with the initial position so the first substep's
             // swept-CCD narrow check (D-013) sees a degenerate segment
@@ -5171,9 +5316,12 @@ struct Simulator {
             BehaviorType::FastGridCloth,
             FastGridClothBehaviorParams<PR>{
                 particleNum1D,
-                size1D/particleNum1D,
-                size1D/particleNum1D*std::sqrtf(2),
-                size1D/particleNum1D*2,
+                // size1D/(particleNum1D-1): pn points → pn-1 segments.
+                // Matches MeshGridInitializer's grid spacing; the prior
+                // /particleNum1D under-shot every rest length.
+                size1D/(particleNum1D-1),
+                size1D/(particleNum1D-1)*std::sqrtf(2),
+                size1D/(particleNum1D-1)*2,
                 kstretch,
                 kshear,
                 kbend,
@@ -5233,6 +5381,33 @@ struct Simulator {
                 false // jiggle
             }),
             BehaviorType::Float,
+            FloatBehaviorParams<PR>{}
+        );
+        registerPreviewBindingForLastRequest();
+    };
+
+    // Parallel to addGround but with a caller-chosen particleNum1D so the
+    // plane carries a real grid topology. addGround stays a fixed 2x2
+    // quad for static collision floors; addPlane is the authoring entry
+    // for a subdividable sheet the user can later retag as cloth via the
+    // inspector behavior dropdown (changeBehavior → TriangularCloth /
+    // FastGridCloth — both require the MeshGridInitializer grid topology
+    // this produces). Created as Float; the cloth swap is a separate
+    // user gesture, matching the existing create-then-retag flow.
+    void addPlane(PlaneDirection dir, tinym::vec3 center, Index particleNum1D,
+                  PR size1D, PR mass=0.1,
+                  BehaviorType behavior=BehaviorType::Float) {
+        if (particleNum1D < 2) particleNum1D = 2;
+        scene.addGeneralMesh(
+            new MeshGridInitializer<BE, PR>({
+                dir,
+                center,
+                particleNum1D,
+                size1D,
+                mass,
+                false // jiggle
+            }),
+            behavior,
             FloatBehaviorParams<PR>{}
         );
         registerPreviewBindingForLastRequest();
@@ -5373,6 +5548,13 @@ struct Simulator {
                     req.preview.x[i*3+1] = p_rot.y;
                     req.preview.x[i*3+2] = p_rot.z;
                 }
+                // Persist the absolute orientation on the request so
+                // Scene::pack restores it onto the rebuilt mesh. preview
+                // above carries the rotated geometry; this carries the
+                // quaternion the inspector reads and the next delta
+                // composes against. reset() re-applies this to the
+                // freshly-regenerated preview around the same pivot.
+                req.rotationQuat = newAbs;
                 break;
             }
         }
@@ -5392,6 +5574,63 @@ struct Simulator {
         // rotations is UNCHANGED — that path applies the saved rotation
         // exactly once at the first post-load initialize.
         // D-041: mark scene dirty (see translateObject; same rationale).
+        Scene<BE, PR>::dirty = true;
+    }
+
+    // Set the named mesh's absolute per-axis scale to newScale. Mirrors
+    // rotateObject: state.x / state.xPrev and the per-request preview are
+    // scaled about the transformPosition pivot by the delta from the
+    // current mesh.scale; mesh.scale + req.scale are updated to the new
+    // absolute factor so Scene::pack restores it and the next call
+    // composes its delta against the true current scale. state.v is
+    // unchanged. reset() re-applies the stored scale to the regenerated
+    // preview (scale-then-rotate, standard TRS reconstruction order).
+    void scaleObject(int meshId, tinym::vec3 newScale) {
+        auto* mesh = Scene<BE, PR>::findById(meshId);
+        if (!mesh) return;
+        if (!mesh->state.x.ptr) return;
+
+        // Reject non-positive factors (degenerate / mirrored geometry):
+        // clamp to a small epsilon so the mesh never collapses to zero
+        // volume or inverts winding.
+        auto clampPos = [](float v) { return v < 1e-4f ? 1e-4f : v; };
+        tinym::vec3 absS(clampPos(newScale.x),
+                         clampPos(newScale.y),
+                         clampPos(newScale.z));
+        tinym::vec3 cur = mesh->scale;
+        tinym::vec3 d(absS.x / clampPos(cur.x),
+                      absS.y / clampPos(cur.y),
+                      absS.z / clampPos(cur.z));
+        tinym::vec3 pivot = mesh->transformPosition;
+
+        auto scaleAbout = [&](PR* base) {
+            tinym::vec3 p((float)base[0], (float)base[1], (float)base[2]);
+            tinym::vec3 q = p - pivot;
+            base[0] = (PR)(pivot.x + q.x * d.x);
+            base[1] = (PR)(pivot.y + q.y * d.y);
+            base[2] = (PR)(pivot.z + q.z * d.z);
+        };
+
+        const Index n = mesh->state.x.size / 3;
+        for (Index i = 0; i < n; ++i) {
+            scaleAbout(&mesh->state.x.ptr[i*3]);
+            if (mesh->state.xPrev.ptr) scaleAbout(&mesh->state.xPrev.ptr[i*3]);
+        }
+        for (auto& req : Scene<BE, PR>::requestsGeneralMeshes) {
+            if (req.id == meshId) {
+                const size_t np = req.preview.numPoints();
+                for (size_t i = 0; i < np; ++i)
+                    scaleAbout(&req.preview.x[i*3]);
+                req.scale = absS;
+                break;
+            }
+        }
+        mesh->scale = absS;
+        // D-023 parity: refit the BVH so click-pick reads the new extent
+        // immediately, even on a paused sim before the next sim.update().
+        collisionPipeline.broadPhase.refit();
+        // D-041 parity with translate/rotate: mark dirty so the next
+        // update's pre-pause check rebuilds (Rigid backend etc. catch up).
         Scene<BE, PR>::dirty = true;
     }
 
@@ -5538,7 +5777,14 @@ struct Simulator {
                 Index pn1D = g->params.particleNum1D;
                 if (pn1D < 2) return false;
                 PR size1D = g->params.size1D;
-                PR rest = size1D / PR(pn1D);
+                // Grid spacing is size1D / (pn1D - 1): pn1D points span
+                // pn1D-1 segments. Using pn1D here (the prior code, and
+                // the same off-by-one in addClothGridFast) made every
+                // FastGridCloth stretch spring's rest length shorter than
+                // the actual edge, so the sheet contracted on the first
+                // step and never settled. Mirrors MeshGridInitializer's
+                // `length = size1D/(particleNum1D-1)` at construction.
+                PR rest = size1D / PR(pn1D - 1);
                 mesh->behaviorType = BehaviorType::FastGridCloth;
                 mesh->behaviorParams = FastGridClothBehaviorParams<PR>{
                     static_cast<uint>(pn1D),
@@ -5582,12 +5828,17 @@ struct Simulator {
     // memcpy(preview → state.x); only an explicit user gesture (e.g., the
     // "0" hotkey) should clobber preview back to initializer truth.
     //
-    // Mechanism: repopulate each request's preview from its initializer.
-    // Translates have already write-backed center/offset into initializer
-    // params (see translateObject), so post-reset positions reflect those
-    // edits. Rotations are NOT preserved (R-4 retired the per-call
-    // pendingRotations stash); a future slice could re-apply
-    // mesh->rotationQuat after populatePreview if user feedback wants it.
+    // Mechanism: repopulate each request's preview from its initializer,
+    // then re-apply the request's stored scale and rotationQuat to that
+    // fresh (unit-scale, identity-orientation) preview around the mesh's
+    // transformPosition pivot, in standard TRS reconstruction order
+    // (scale first, then rotate). Translates have already write-backed
+    // center/offset into initializer params (see translateObject), so
+    // post-reset positions reflect those edits; the scale + rotation
+    // re-apply below makes the full transform survive reset
+    // symmetrically. Pivot matches the one scaleObject / rotateObject
+    // used (mesh->transformPosition == initializer center/offset, since
+    // translate write-backs keep them in sync).
     //
     // FUTURE DIRECTION: when a per-frame position cache (Alembic / ring
     // buffer) ships, reset() should load frame[0] of the cache instead of
@@ -5602,6 +5853,46 @@ struct Simulator {
             req.preview.n.clear();
             req.preview.facets.clear();
             req.initializer->populatePreview(req.preview);
+
+            auto* mesh = Scene<BE, PR>::findById(req.id);
+            if (!mesh) continue;
+            tinym::vec3 pivot = mesh->transformPosition;
+            const size_t np = req.preview.numPoints();
+
+            // 1. Scale about the pivot (skip if unit).
+            const tinym::vec3& s = req.scale;
+            bool unitScale = std::abs(s.x - 1.0f) < 1e-7f
+                          && std::abs(s.y - 1.0f) < 1e-7f
+                          && std::abs(s.z - 1.0f) < 1e-7f;
+            if (!unitScale) {
+                for (size_t i = 0; i < np; ++i) {
+                    tinym::vec3 p(req.preview.x[i*3+0],
+                                  req.preview.x[i*3+1],
+                                  req.preview.x[i*3+2]);
+                    tinym::vec3 v = p - pivot;
+                    req.preview.x[i*3+0] = pivot.x + v.x * s.x;
+                    req.preview.x[i*3+1] = pivot.y + v.y * s.y;
+                    req.preview.x[i*3+2] = pivot.z + v.z * s.z;
+                }
+            }
+
+            // 2. Rotate about the pivot (skip if identity).
+            const ::Quat& q = req.rotationQuat;
+            bool isIdentity = std::abs(q.w - 1.0f) < 1e-7f
+                           && std::abs(q.x) < 1e-7f
+                           && std::abs(q.y) < 1e-7f
+                           && std::abs(q.z) < 1e-7f;
+            if (!isIdentity) {
+                for (size_t i = 0; i < np; ++i) {
+                    tinym::vec3 p(req.preview.x[i*3+0],
+                                  req.preview.x[i*3+1],
+                                  req.preview.x[i*3+2]);
+                    tinym::vec3 p_rot = pivot + rotateVector(q, p - pivot);
+                    req.preview.x[i*3+0] = p_rot.x;
+                    req.preview.x[i*3+1] = p_rot.y;
+                    req.preview.x[i*3+2] = p_rot.z;
+                }
+            }
         }
         initialize();
     }
@@ -11218,6 +11509,7 @@ int main(int argc, char** argv) {
         bool openImportModal = false;
         bool openSphereModal = false;
         bool openCubeModal = false;
+        bool openPlaneModal = false;
 
         auto buildSelectedMeshTarget = [&]() {
             mesh_inspector::MeshInspectorTarget target;
@@ -11233,6 +11525,10 @@ int main(int argc, char** argv) {
                 target.rotation_wxyz = &selectedMesh->rotationQuat.w;
                 target.on_rotate = [&simulator](int id, float w, float x, float y, float z) {
                     simulator.rotateObject(id, ::Quat{w, x, y, z});
+                };
+                target.scale = &selectedMesh->scale;
+                target.on_scale = [&simulator](int id, tinym::vec3 s) {
+                    simulator.scaleObject(id, s);
                 };
                 // D-027: material inspector path. base_color is set above;
                 // wire the other 4 material fields + the commit callback so
@@ -11320,6 +11616,7 @@ int main(int argc, char** argv) {
             // keeps the call site free of selection-aware branches.
             target.on_request_add_cube   = [&openCubeModal]()   { openCubeModal   = true; };
             target.on_request_add_sphere = [&openSphereModal]() { openSphereModal = true; };
+            target.on_request_add_plane  = [&openPlaneModal]()  { openPlaneModal  = true; };
             target.on_request_add_import = [&openImportModal]() { openImportModal = true; };
             return target;
         };
@@ -11338,6 +11635,10 @@ int main(int argc, char** argv) {
         static float primSize = 1.0f;
         static int primTess = 16;
         static float primPos[3] = {0.f, 0.f, 0.f};
+        static float planeSize = 5.0f;
+        static float planePos[3] = {0.f, 0.f, 0.f};
+        static int planeDirIdx = 2; // 0:XY, 1:YZ, 2:XZ (default ground)
+        static int planeTess = 20; // particleNum1D; >=2. higher = cloth-ready
 
         // ─── Main menu bar ────────────────────────────────────────────
         // Only File → Save Scene / Load Scene survives. Import + the
@@ -11423,6 +11724,7 @@ int main(int argc, char** argv) {
         if (openImportModal) ImGui::OpenPopup("OBJ 파일 가져오기");
         if (openSphereModal) ImGui::OpenPopup("구 생성");
         if (openCubeModal) ImGui::OpenPopup("정육면체 생성");
+        if (openPlaneModal) ImGui::OpenPopup("평면 생성");
         if (ImGui::BeginPopupModal("씬 저장하기", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
             ImGui::InputText("경로", scenePathBuf, sizeof(scenePathBuf));
             if (ImGui::Button("저장")) {
@@ -11514,6 +11816,33 @@ int main(int argc, char** argv) {
         };
         primitiveModal("구 생성", true);
         primitiveModal("정육면체 생성", false);
+        if (ImGui::BeginPopupModal("평면 생성", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+            const char* dirNames[] = { "XY 평면", "YZ 평면", "XZ 평면 (바닥)" };
+            ImGui::Combo("방향", &planeDirIdx, dirNames, 3);
+            ImGui::InputFloat("크기", &planeSize);
+            ImGui::InputInt("분할 수", &planeTess);
+            ImGui::TextDisabled("분할 수를 높이고 소재를 옷감으로 바꾸면 천처럼 시뮬레이션됩니다.");
+            ImGui::InputFloat3("위치", planePos);
+            if (ImGui::Button("생성")) {
+                PlaneDirection dir = PlaneDirection::XZPlane;
+                if (planeDirIdx == 0)      dir = PlaneDirection::XYPlane;
+                else if (planeDirIdx == 1) dir = PlaneDirection::YZPlane;
+                else                       dir = PlaneDirection::XZPlane;
+                float s = planeSize;
+                if (s <= 0.f) s = 1.f;
+                int pn = planeTess;
+                if (pn < 2) pn = 2;
+                simulator.addPlane(dir,
+                                   tinym::vec3(planePos[0], planePos[1], planePos[2]),
+                                   (Index)pn, (Precision)s);
+                simulator.initialize();
+                sceneIOStatus = "평면 생성됨";
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("취소")) ImGui::CloseCurrentPopup();
+            ImGui::EndPopup();
+        }
 
         if (collectProfileFrame) {
             auto scope = frameProfiler.scoped("physics_total");

@@ -165,6 +165,14 @@ struct MeshInspectorTarget {
     // must be set together to enable the InputFloat4 row.
     float* rotation_wxyz = nullptr;
     std::function<void(int, float, float, float, float)> on_rotate;
+    // Inspector scale path, mirrors the translate path. The pointer reads
+    // the mesh's current per-axis scale; the callback applies a finished
+    // edit through Simulator::scaleObject (which scales state.x /
+    // state.xPrev / preview about the transformPosition pivot and writes
+    // the new absolute scale onto the mesh + request for pack survival).
+    // Both must be set together to enable the InputFloat3 row.
+    tinym::vec3* scale = nullptr;
+    std::function<void(int, tinym::vec3)> on_scale;
     // FR-005 / D-027 inspector material path. The 4 scalar/vec3 pointers
     // read the mesh's material fields (D-005's v1 OpenPBR subset: base_color,
     // metallic, roughness, specular_weight, emission_color). Widgets mutate
@@ -232,6 +240,7 @@ struct MeshInspectorTarget {
     // modals that used to live behind the Create + File menus.
     std::function<void()> on_request_add_cube;
     std::function<void()> on_request_add_sphere;
+    std::function<void()> on_request_add_plane;
     std::function<void()> on_request_add_import;
 };
 
