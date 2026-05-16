@@ -1068,6 +1068,22 @@ struct MeshAdjacencyInitializer {
     // rotation.
     static void recomputeRestLengths(MeshState<BE, PR>& state,
                                      MeshAdjacency<BE, PR>& adjacency) {
+        // A pool allocation that overflowed capacity returns a null
+        // sub-view (see ByteMemoryPool::alloc → "[Pool] Tried to
+        // allocate more than tha capacity"). Large imports (Human.obj:
+        // 24461 verts / 48918 tris) hit this. Deref-guard so a failed
+        // allocation degrades to "no rest update" instead of a segfault.
+        if (!state.x.ptr || state.x.size == 0) return;
+        const Index numPoints = state.x.size / 3;
+        // edges / vertexOppVertices are allocated to params.numEdges /
+        // an upper-bound offset total, but MeshAdjacencyInitializer only
+        // *writes* the deduplicated subset and never reads past it. The
+        // unwritten tail is uninitialized pool memory (large garbage,
+        // especially after a big import churns the pool). Treat any
+        // endpoint outside [0, numPoints) as a tail slot and skip it —
+        // the physics shaders never consume those entries anyway, so
+        // leaving their rest value stale is correct and crash-free.
+        auto inRange = [&](Index v) { return v < numPoints; }; // Index is unsigned
         auto dist = [&](Index a, Index b) {
             auto va = tinym::vec3_view(state.x.ptr + a*3);
             auto vb = tinym::vec3_view(state.x.ptr + b*3);
@@ -1075,19 +1091,23 @@ struct MeshAdjacencyInitializer {
         };
         if (adjacency.edges.ptr && adjacency.restEdgeLengths.ptr) {
             Index numEdges = adjacency.edges.size / 2;
-            for (Index e = 0; e < numEdges; ++e)
-                adjacency.restEdgeLengths[e] =
-                    dist(adjacency.edges[e*2], adjacency.edges[e*2+1]);
+            for (Index e = 0; e < numEdges; ++e) {
+                Index a = adjacency.edges[e*2];
+                Index b = adjacency.edges[e*2+1];
+                if (!inRange(a) || !inRange(b)) continue;
+                adjacency.restEdgeLengths[e] = dist(a, b);
+            }
         }
         if (adjacency.vertexOppVertices.ptr
             && adjacency.vertexOppVerticesOffsets.ptr
             && adjacency.restOppLengths.ptr) {
-            Index numPoints = state.x.size / 3;
             for (Index v = 0; v < numPoints; ++v)
                 for (Index k = adjacency.vertexOppVerticesOffsets[v];
-                     k < adjacency.vertexOppVerticesOffsets[v+1]; ++k)
-                    adjacency.restOppLengths[k] =
-                        dist(v, adjacency.vertexOppVertices[k]);
+                     k < adjacency.vertexOppVerticesOffsets[v+1]; ++k) {
+                    Index o = adjacency.vertexOppVertices[k];
+                    if (!inRange(o)) continue;
+                    adjacency.restOppLengths[k] = dist(v, o);
+                }
         }
     }
 };
@@ -2045,13 +2065,14 @@ struct Scene {
     // and is the D-018 RNG seed). Used by BroadPhase::build to gate
     // the Float-mesh skip — see CM-008 (graduated).
     inline static int lifetimeMeshCount = 0;
-    // D-041 turn-2 (2026-05-14): monotone counter for mesh.id, decoupled
-    // from numMeshes so removeMesh + subsequent addX does NOT collide on
-    // ids (numMeshes is decremented on remove; using it for ids let new
-    // meshes reuse a surviving mesh's id → MeshRenderState[id] keyed on
-    // the same slot → render corruption). Reset by resetScene + loadScene
-    // (alongside numMeshes) so save/load round-trips IDs starting at 0
-    // and self-tests keep their deterministic id sequence.
+    // Vestigial. id is no longer a monotone counter: it is the compacted
+    // [0, numMeshes) array slot, (re)assigned in addGeneralMesh /
+    // removeMesh / Scene::pack so it always equals the request's index
+    // (== statesOffsets / objTrees / faceObj subscript == objPair). The
+    // old monotone scheme avoided MeshRenderState id reuse by never
+    // compacting; removeMesh now rebuilds the id-keyed render cache
+    // instead. Kept (still zeroed by loadScene) only to avoid churning
+    // that reset path; nothing reads it for id assignment anymore.
     inline static int nextMeshId = 0;
 
     inline static std::vector<GeneralMesh<BE, PR>> meshes;
@@ -2109,13 +2130,18 @@ struct Scene {
         //meshes.emplace_back(initializer, behaviorType, behaviorParams);
         //meshes.back().id = numMeshes++;
 
-        // D-041 turn-2: id from nextMeshId (monotone within session;
-        // reset only at resetScene/loadScene boundary). Without this,
-        // removeMesh's numMeshes-- could let a subsequent addGeneralMesh
-        // reuse a surviving mesh's id, causing MeshRenderState collisions
-        // (two meshes share the same MeshGL cache slot → one renders
-        // with the other's vertex pointers).
-        requestsGeneralMeshes.emplace_back(nextMeshId++, lifetimeMeshCount++,
+        // id is the compacted [0, numMeshes) slot that governs ALL mesh
+        // access — findById AND packed-data subscripts (statesOffsets,
+        // objTrees, faceObj) AND objPair in collisions. It equals the
+        // request's position in requestsGeneralMeshes, which (since we
+        // only append here and removeMesh renumbers) is always numMeshes.
+        // It is internal logic only, never persisted as an identity:
+        // save/load and removeMesh both re-derive it from load/array
+        // order. lifetimeId stays the monotone never-reused identity
+        // (D-026 BVH Float-skip gate); id and lifetimeId are distinct on
+        // purpose — id is volatile, lifetimeId is stable.
+        int newId = (int)requestsGeneralMeshes.size();
+        requestsGeneralMeshes.emplace_back(newId, lifetimeMeshCount++,
                                            initializer, behaviorType, behaviorParams);
         numMeshes++;
 
@@ -2250,7 +2276,13 @@ struct Scene {
         for(Index i = 0; i < numMeshes; ++i) {
             RequestGeneralMesh& req = requestsGeneralMeshes[i];
             meshes.emplace_back(req.initializer, req.behaviorType, req.behaviorParams);
-            meshes[i].id = req.id;
+            // pack is the single authoritative compaction point: id == the
+            // request's array index i == this mesh's statesOffsets /
+            // objTrees / faceObj subscript == objPair value. add/removeMesh
+            // keep req.id == i too; writing it back here makes pack robust
+            // to any caller (loadScene order, etc.) that didn't pre-compact.
+            req.id = (int)i;
+            meshes[i].id = (int)i;
             meshes[i].lifetimeId = req.lifetimeId;  // D-026
             // Carry per-mesh environment-force toggles through pack so
             // reset / load / changeBehavior rebuilds preserve the user's
@@ -5245,13 +5277,17 @@ struct Simulator {
     // flat per-face shading without averaging across welded seams.
     // Sphere/grid/file initializers leave render buffers empty so the
     // render*Ptr/numRender* accessors fall back to x/n/facets transparently.
-    void registerPreviewBindingForLastRequest() {
-        if (Scene<BE, PR>::requestsGeneralMeshes.empty()) return;
-        auto& req = Scene<BE, PR>::requestsGeneralMeshes.back();
+    void registerPreviewBindingFor(
+            typename Scene<BE, PR>::RequestGeneralMesh& req) {
         renderState.registerPreviewBinding(req.id,
             req.preview.renderXPtr(), req.preview.numRenderPoints(),
             req.preview.renderFacetsPtr(), req.preview.numRenderFacets(),
             req.preview.renderNPtr());
+    }
+
+    void registerPreviewBindingForLastRequest() {
+        if (Scene<BE, PR>::requestsGeneralMeshes.empty()) return;
+        registerPreviewBindingFor(Scene<BE, PR>::requestsGeneralMeshes.back());
     }
 
     void addClothFile(std::string prefix, std::string fileName, tinym::vec3 offset, PR scale, PR kstretch=1e5, PR kshear=1e5, PR kbend=3e5, PR thickness=0.001, PR mass=0.1) {
@@ -5652,37 +5688,68 @@ struct Simulator {
         Scene<BE, PR>::dirty = true;
     }
 
-    // D-041: removeMesh erases the matching request, frees its
-    // initializer, decrements numMeshes (preserves Scene::pack's
-    // numMeshes == requestsGeneralMeshes.size() invariant), and marks
-    // dirty so Simulator::update's pre-pause check rebuilds the scene
-    // on the next frame. Also drops pendingMaterials/Rotations for the
-    // removed id and clears selectedObj if it pointed at the doomed
-    // mesh.
+    // removeMesh erases the matching request, frees its initializer, then
+    // RENUMBERS every surviving request so ids stay the compacted
+    // [0, numMeshes) sequence that governs all mesh access (findById,
+    // statesOffsets / objTrees / faceObj subscripts, objPair). Scene::pack
+    // rebuilds meshes in this same request order and stamps meshes[i].id = i,
+    // so id == array index == packed index everywhere after the next
+    // (dirty-triggered) re-init.
     //
-    // ID-collision caveat: addGeneralMesh uses `id = numMeshes++` for
-    // ID generation. After remove + a subsequent addX call, the new
-    // mesh's id could match a surviving mesh's id (since the removed
-    // mesh may not have been the topmost). Live collision affects
-    // findById's first-match semantics until the next saveScene →
-    // loadScene cycle re-monotonizes IDs in load order. Acceptable
-    // for v1; future slice could decouple id-assignment from numMeshes.
+    // Because id is volatile (any remove shifts the ids of all later
+    // meshes), every id-keyed side table is reconciled here:
+    //  - selectedObj is remapped via the stable lifetimeId (so selection
+    //    follows the same mesh, not whatever now occupies the old slot).
+    //  - renderState (MeshGL + preview bindings, keyed by id) is rebuilt
+    //    under the new ids — the GL buffers belong to each request's
+    //    stable PreviewState heap, so re-registering by new id and
+    //    letting getOrCreate re-materialize is correct and collision-free
+    //    (this is what the old monotone-nextMeshId scheme existed to
+    //    avoid; we pay one MeshGL rebuild on the rare user remove instead
+    //    of leaking the id space forever).
+    //  - pendingMaterials / pendingRotations are loadScene-deferred and
+    //    are always already consumed+cleared by applyPendingMaterials
+    //    (run inside initialize()) before any interactive removeMesh, so
+    //    clearing them here is a no-op in real flows and strictly safer
+    //    than carrying now-stale id keys.
     void removeMesh(int meshId) {
         auto& reqs = Scene<BE, PR>::requestsGeneralMeshes;
         auto it = std::find_if(reqs.begin(), reqs.end(),
             [meshId](const auto& r) { return r.id == meshId; });
         if (it == reqs.end()) return;
+
+        // Capture the selected mesh's stable identity BEFORE the erase so
+        // selection can be re-resolved after ids shift.
+        int selectedLifetime = -1;
+        if (selectedObj >= 0) {
+            auto sit = std::find_if(reqs.begin(), reqs.end(),
+                [this](const auto& r) { return r.id == selectedObj; });
+            if (sit != reqs.end()) selectedLifetime = sit->lifetimeId;
+        }
+        bool removingSelected = (selectedObj == meshId);
+
         delete it->initializer;
         reqs.erase(it);
         if (Scene<BE, PR>::numMeshes > 0) Scene<BE, PR>::numMeshes--;
-        pendingMaterials.erase(meshId);
-        pendingRotations.erase(meshId);
-        if (selectedObj == meshId) selectedObj = -1;
-        // D-042 R-2: drop the pending preview binding + any materialized
-        // MeshGL for the removed id. D-041 turn-2's monotone nextMeshId
-        // guarantees the slot won't be reused, but the entry would still
-        // leak otherwise (small per-remove leak before R-2's cleanup).
-        renderState.removeById(meshId);
+
+        // Compact ids back to [0, size) in request order.
+        for (int k = 0; k < (int)reqs.size(); ++k) reqs[k].id = k;
+
+        // Re-resolve the selection against the new ids via lifetimeId.
+        selectedObj = -1;
+        if (!removingSelected && selectedLifetime >= 0) {
+            for (auto& r : reqs)
+                if (r.lifetimeId == selectedLifetime) { selectedObj = r.id; break; }
+        }
+
+        pendingMaterials.clear();
+        pendingRotations.clear();
+
+        // Rebuild the entire id-keyed render cache under the new ids.
+        renderState.clear();
+        renderState.clearPreviewBindings();
+        for (auto& r : reqs) registerPreviewBindingFor(r);
+
         Scene<BE, PR>::dirty = true;
     }
 
@@ -6370,8 +6437,18 @@ struct Simulator {
             NarrowCollision& nc = packedCol.narrowCollisions[cid];
 
             auto& packedMesh = Scene<BE, PR>::packedMeshData;
+            // Global vertex = statesOffsets[objIndex] + localPointIndex.
+            // The old code added objPair.query (the small mesh INDEX, e.g.
+            // 1, 2…) instead of obase (statesOffsets[query], the packed
+            // vertex base = sum of all prior meshes' point counts). It
+            // happened to look right only for object index 0 (obase==0);
+            // for any later mesh — e.g. an imported Human at index >= 1 —
+            // the debug marker resolved to a wildly wrong packed vertex,
+            // which is exactly the "충돌 인덱스가 이상함" symptom. Mirrors
+            // the correct convention at narrow grouping (obase + pid) and
+            // bruteforce.metal (statesOffsets[objPair.x] + indexPair.x).
             Index obase = packedMesh.statesOffsets[nc.objPair.query];
-            Index ppid = nc.indexPair.point + nc.objPair.query;
+            Index ppid = obase + nc.indexPair.point;
             tinym::vec3_view v(packedMesh.x.ptr + ppid*3);
             tinym::vec3_view n(nc.collisionNormalAndDistance.v);
             tinym::vec3 t = v+n*.2f;
@@ -10569,16 +10646,20 @@ static int runSelfTest() {
         sim.pause = true;
     }
 
-    // ---- Block 34: D-041 turn-2 — removeMesh + addX preserves unique IDs. -
-    // User-reported bug: in main scene (cloth + Human + ground), deleting
-    // Human then creating a sphere caused ground rendering to corrupt.
-    // Root cause was mesh.id collision because addGeneralMesh used
-    // numMeshes++ for id-assignment; after removeMesh decremented
-    // numMeshes, a subsequent addX could reuse a surviving mesh's id.
-    // MeshRenderState keys MeshGL by id → collision → shared GL slot →
-    // one mesh renders with the other's vertex pointers. D-041 turn-2
-    // adds Scene::nextMeshId (monotone within session; reset on resetScene
-    // / loadScene) decoupled from numMeshes.
+    // ---- Block 34: compacted-id model — removeMesh + addX recompacts. -----
+    // Original D-041 bug: deleting the middle mesh then adding one caused
+    // a mesh.id collision (addGeneralMesh used numMeshes++; removeMesh
+    // decremented it so addX reused a surviving id) → MeshRenderState GL
+    // slot collision → render corruption.
+    //
+    // Redesign (per user directive): id is NOT a monotone identity. It is
+    // the compacted [0, numMeshes) slot that governs all mesh access
+    // (findById AND statesOffsets / objTrees / faceObj / objPair). add /
+    // removeMesh / Scene::pack keep id == array index. removeMesh erases
+    // then renumbers survivors and rebuilds the id-keyed render cache, so
+    // the collision is impossible by construction (ids are always a
+    // contiguous unique 0..n-1 run and renderState is re-registered under
+    // the new ids). This block now asserts that NEW contract.
     {
         resetScene();
         // Mimic main scene structure: cloth + middle Float-import-like
@@ -10602,19 +10683,27 @@ static int runSelfTest() {
         // Remove the middle (id=1) — mirrors "Delete Human" from main.
         sim.removeMesh(1);
 
-        // Add a new sphere — would collide with ground's id=2 under the
-        // numMeshes-based id-assignment. Under the fix, gets id=3.
+        // Add a new sphere. Under compaction: removeMesh(1) renumbers
+        // survivors to [cloth=0, ground=1]; addSphere appends → id=2.
         sim.addSphere(tinym::vec3(2.0f, 0.0f, 0.0f), /*tess=*/3, /*size=*/0.2f);
 
-        // Trigger D-041 pre-pause init via 1 update tick. (sim.pause stays
+        // Trigger pre-pause init via 1 update tick. (sim.pause stays
         // true; the dirty check fires before the pause-return.)
         pumpFrames(sim, 1);
 
-        // After re-init: meshes should be [cloth(0), ground(2), sphere(3)].
+        // After re-init: meshes are [cloth(0), ground(1), sphere(2)] —
+        // a contiguous 0..n-1 run with id == array index for every slot.
         bool sizeOk = Scene<Backend, Precision>::meshes.size() == 3;
         bool clothOk  = sizeOk && Scene<Backend, Precision>::meshes[0].id == 0;
-        bool groundOk = sizeOk && Scene<Backend, Precision>::meshes[1].id == 2;
-        bool sphereOk = sizeOk && Scene<Backend, Precision>::meshes[2].id == 3;
+        bool groundOk = sizeOk && Scene<Backend, Precision>::meshes[1].id == 1;
+        bool sphereOk = sizeOk && Scene<Backend, Precision>::meshes[2].id == 2;
+        // The core compacted-id invariant: id == array index everywhere.
+        // This is what makes objPair usable as both a findById key and a
+        // statesOffsets subscript, and is what structurally rules out the
+        // original MeshRenderState id-collision.
+        bool idEqIndexOk = sizeOk;
+        for (int i = 0; sizeOk && i < 3; ++i)
+            idEqIndexOk &= (Scene<Backend, Precision>::meshes[i].id == i);
         bool uniqueOk = sizeOk &&
             (Scene<Backend, Precision>::meshes[0].id !=
              Scene<Backend, Precision>::meshes[1].id) &&
@@ -10623,31 +10712,34 @@ static int runSelfTest() {
             (Scene<Backend, Precision>::meshes[1].id !=
              Scene<Backend, Precision>::meshes[2].id);
 
-        if (beforeOk && sizeOk && clothOk && groundOk && sphereOk && uniqueOk) {
-            pass("D-041 turn-2 / removeMesh + addX preserves unique mesh IDs (no MeshRenderState collision)");
+        if (beforeOk && sizeOk && clothOk && groundOk && sphereOk
+            && idEqIndexOk && uniqueOk) {
+            pass("compacted-id / removeMesh + addX recompacts ids to contiguous 0..n-1 (id == index, no MeshRenderState collision)");
         } else {
-            fail("D-041 turn-2 / removeMesh + addX preserves unique mesh IDs (no MeshRenderState collision)",
+            fail("compacted-id / removeMesh + addX recompacts ids to contiguous 0..n-1 (id == index, no MeshRenderState collision)",
                  "beforeOk=" + std::to_string((int)beforeOk)
                  + " sizeOk=" + std::to_string((int)sizeOk)
                  + " clothOk(0)=" + std::to_string((int)clothOk)
-                 + " groundOk(2)=" + std::to_string((int)groundOk)
-                 + " sphereOk(3)=" + std::to_string((int)sphereOk)
+                 + " groundOk(1)=" + std::to_string((int)groundOk)
+                 + " sphereOk(2)=" + std::to_string((int)sphereOk)
+                 + " idEqIndexOk=" + std::to_string((int)idEqIndexOk)
                  + " uniqueOk=" + std::to_string((int)uniqueOk));
         }
     }
 
-    // ---- Block 35: D-041 turn-3 — narrow-phase after middle-mesh removal. -
-    // User-reported bug: in main scene (cloth + Human + ground), deleting
-    // Human caused cloth-vs-ground narrow phase to stop firing even though
-    // broad phase still detected the pair. Root cause was `BVH::queryPoints`
-    // writing `objPair = (mesh.id, mesh.id)` into broadCollisions; the
-    // Metal `narrow_pt_tri` kernel reads `scenePackedPositionsOffsets
-    // [objPair.x/y]` which is INDEX-keyed. Pre-D-041 id == array index so
-    // the bug was hidden; D-041 turn-2 decoupled id from index, and after
-    // a middle-mesh remove the surviving meshes have id ≠ index.
-    // Fix (turn-3): TRI_LBVH gains `objIndex` (alongside `objid`); broad
-    // phase writes INDEX into objPair. SpatialHashing path already used
-    // index via faceObj[]; this aligns the BVH path with that semantic.
+    // ---- Block 35: narrow-phase fires after middle-mesh removal. ----------
+    // Original D-041 bug: deleting the middle mesh stopped cloth-vs-ground
+    // narrow phase even though broad phase still paired them — objPair
+    // carried mesh.id while the narrow kernel indexes
+    // scenePackedPositionsOffsets[objPair] (an INDEX), and the old
+    // monotone scheme let id ≠ index after a middle removal.
+    //
+    // Redesign: removeMesh recompacts ids so id == array index is RESTORED
+    // immediately after the delete (not left divergent). That makes
+    // objPair simultaneously a valid findById key and a valid
+    // statesOffsets subscript, structurally eliminating the mismatch.
+    // This block now asserts the post-remove state has id == index AND
+    // that narrow phase actually fires for cloth-vs-ground.
     {
         resetScene();
         // Place cloth just above ground (gap ≈ 0.1 m at cloth-bottom)
@@ -10663,10 +10755,10 @@ static int runSelfTest() {
         // Delete the middle mesh — this is the user's "Delete Human" step.
         sim.removeMesh(1);
 
-        // After remove: cloth.id=0 sits at index 0, ground.id=2 at index 1.
-        // Pre-D-041-turn-3 the BVH would write objPair=(0,2); the narrow
-        // kernel would index scenePackedPositionsOffsets[2] which is the
-        // "end" sentinel (one past ground's data) → zero contacts.
+        // After remove + recompaction: survivors are [cloth, ground] with
+        // ids renumbered to [0, 1] == their array indices. objPair now
+        // works as both a findById key and a statesOffsets subscript, so
+        // narrow phase must fire for cloth-vs-ground.
         auto& packedCol = Scene<Backend, Precision>::packedCollisionData;
         packedCol.cumulativeNarrowCollisions = 0;
         sim.pause = false;
@@ -10678,21 +10770,22 @@ static int runSelfTest() {
 
         size_t cumNarrow = packedCol.cumulativeNarrowCollisions;
         bool clothId  = Scene<Backend, Precision>::meshes[0].id == 0;
-        bool groundId = Scene<Backend, Precision>::meshes[1].id == 2;
-        // id != index for ground — that's the very condition that
-        // triggered the bug. Verify it's present, otherwise the test
-        // is degenerate (not actually exercising the regression).
-        bool indexNeqId = (groundId &&
-            Scene<Backend, Precision>::meshes[1].id !=
-            (int)1 /* its array index */);
+        bool groundId = Scene<Backend, Precision>::meshes[1].id == 1;
+        // The redesign's guarantee: after a middle-mesh removal ids are
+        // recompacted so id == array index for every survivor (this is
+        // what structurally eliminates the original objPair mismatch).
+        bool idEqIndexOk =
+            Scene<Backend, Precision>::meshes.size() == 2 &&
+            Scene<Backend, Precision>::meshes[0].id == 0 &&
+            Scene<Backend, Precision>::meshes[1].id == 1;
 
-        if (clothId && groundId && indexNeqId && cumNarrow > 0) {
-            pass("D-041 turn-3 / narrow-phase fires for cloth-vs-ground after middle-mesh removal (id != index)");
+        if (clothId && groundId && idEqIndexOk && cumNarrow > 0) {
+            pass("compacted-id / narrow-phase fires for cloth-vs-ground after middle-mesh removal (id == index restored)");
         } else {
-            fail("D-041 turn-3 / narrow-phase fires for cloth-vs-ground after middle-mesh removal (id != index)",
+            fail("compacted-id / narrow-phase fires for cloth-vs-ground after middle-mesh removal (id == index restored)",
                  "clothId(0)=" + std::to_string((int)clothId)
-                 + " groundId(2)=" + std::to_string((int)groundId)
-                 + " indexNeqId=" + std::to_string((int)indexNeqId)
+                 + " groundId(1)=" + std::to_string((int)groundId)
+                 + " idEqIndexOk=" + std::to_string((int)idEqIndexOk)
                  + " cumNarrow=" + std::to_string(cumNarrow));
         }
 
