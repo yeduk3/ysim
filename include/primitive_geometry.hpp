@@ -318,6 +318,97 @@ inline Geometry cube(float size, int tessellation,
     return g;
 }
 
+// ---- Cylinder --------------------------------------------------------------
+
+// Axis = +Y. `size` is both the diameter and the height (a unit-ish
+// cylinder scaled uniformly, consistent with cube/sphere's single
+// `size` knob). tessellation = radial segment count AND axial segment
+// count (clamped >= 3). Closed manifold (side tube + 2 fan caps) so —
+// like sphere/grid — renderer and physics share x/n/facets (no
+// render-split buffers; cloth springs cross the whole surface).
+//
+// Layout: side ring i (0..t) has `t` vertices (wrap, no seam dupe);
+// then bottom-cap centre, then top-cap centre.
+//   V = (t+1)*t + 2
+//   F = side 2t² + caps 2t
+//   E = V + F - 2 = 3t² + 3t   (closed manifold, Euler)
+inline int cylinderVertexCount(int tessellation) {
+    int t = tessellation < 3 ? 3 : tessellation;
+    return (t + 1) * t + 2;
+}
+
+inline int cylinderFacetCount(int tessellation) {
+    int t = tessellation < 3 ? 3 : tessellation;
+    return 2 * t * t + 2 * t;
+}
+
+inline int cylinderEdgeCount(int tessellation) {
+    int t = tessellation < 3 ? 3 : tessellation;
+    return 3 * t * t + 3 * t;
+}
+
+inline Geometry cylinder(float size, int tessellation,
+                          std::array<float, 3> center = {0.f, 0.f, 0.f}) {
+    int t = tessellation < 3 ? 3 : tessellation;
+    const float r = size * 0.5f;
+    const float halfH = size * 0.5f;
+    const float pi = 3.14159265358979323846f;
+
+    Geometry g;
+    g.positions.reserve(3 * cylinderVertexCount(t));
+    g.facets.reserve(3 * cylinderFacetCount(t));
+
+    auto push = [&](float x, float y, float z) {
+        g.positions.push_back(x + center[0]);
+        g.positions.push_back(y + center[1]);
+        g.positions.push_back(z + center[2]);
+    };
+
+    // Side: (t+1) axial rings × t radial verts.
+    for (int i = 0; i <= t; ++i) {
+        float y = -halfH + size * (float)i / (float)t;
+        for (int j = 0; j < t; ++j) {
+            float phi = 2.f * pi * (float)j / (float)t;
+            push(r * std::cos(phi), y, r * std::sin(phi));
+        }
+    }
+    const Index bottomC = (Index)((t + 1) * t);
+    const Index topC    = bottomC + 1;
+    push(0.f, -halfH, 0.f);  // bottom cap centre
+    push(0.f,  halfH, 0.f);  // top cap centre
+
+    auto side = [&](int i, int j) -> Index {
+        return (Index)(i * t + (j % t));
+    };
+    auto pushTri = [&](Index a, Index b, Index c) {
+        g.facets.push_back(a);
+        g.facets.push_back(b);
+        g.facets.push_back(c);
+    };
+
+    // Side bands (outward winding mirrors sphere's middle band).
+    for (int i = 0; i < t; ++i) {
+        for (int j = 0; j < t; ++j) {
+            Index a = side(i,     j);
+            Index b = side(i,     j + 1);
+            Index c = side(i + 1, j);
+            Index d = side(i + 1, j + 1);
+            pushTri(a, c, d);
+            pushTri(a, d, b);
+        }
+    }
+    // Bottom cap (ring i=0, centre at -Y → fan winds like sphere south).
+    for (int j = 0; j < t; ++j) {
+        pushTri(bottomC, side(0, j + 1), side(0, j));
+    }
+    // Top cap (ring i=t, centre at +Y → fan winds like sphere north).
+    for (int j = 0; j < t; ++j) {
+        pushTri(topC, side(t, j), side(t, j + 1));
+    }
+
+    return g;
+}
+
 }  // namespace primitive
 
 #endif  // YSIM_PRIMITIVE_GEOMETRY_HPP

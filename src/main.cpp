@@ -1477,6 +1477,66 @@ struct MeshSphereInitializer : GeneralMeshInitializer<BE, PR> {
 };
 
 template <typename PR>
+struct MeshCylinderInitializerParams : InitializerParams<PR> {
+    Index tessellation;
+    PR size;
+    tinym::vec3 center;
+
+    MeshCylinderInitializerParams(tinym::vec3 center, Index tessellation, PR size, PR mass)
+        : InitializerParams<PR>(
+              primitive::cylinderVertexCount((int)tessellation),
+              primitive::cylinderFacetCount((int)tessellation),
+              primitive::cylinderEdgeCount((int)tessellation),
+              mass),
+          tessellation(tessellation), size(size), center(center) {}
+};
+
+template <typename BE, typename PR>
+struct MeshCylinderInitializer : GeneralMeshInitializer<BE, PR> {
+    using ParamsType = MeshCylinderInitializerParams<PR>;
+    ParamsType params;
+
+    MeshCylinderInitializer(ParamsType params) : params(params) {}
+
+    void initialize(MeshState<BE, PR>& state, MeshAdjacency<BE, PR>& adjacency) override {
+        state.memoryAllocation(params);
+        adjacency.memoryAllocation(params);
+
+        auto geom = primitive::cylinder(
+            (float)params.size, (int)params.tessellation,
+            {params.center.x, params.center.y, params.center.z});
+
+        for (Index v = 0; v < params.numPoints; ++v) {
+            Index vbase = v * 3;
+            state.x[vbase    ] = (PR)geom.positions[vbase    ];
+            state.x[vbase + 1] = (PR)geom.positions[vbase + 1];
+            state.x[vbase + 2] = (PR)geom.positions[vbase + 2];
+        }
+
+        if (adjacency.vertexAdjFacets.ptr) return;
+        for (Index f = 0; f < params.numFacets; ++f) {
+            Index fbase = f * 3;
+            adjacency.facets[fbase    ] = geom.facets[fbase    ];
+            adjacency.facets[fbase + 1] = geom.facets[fbase + 1];
+            adjacency.facets[fbase + 2] = geom.facets[fbase + 2];
+        }
+
+        MeshAdjacencyInitializer<BE, PR>::initialize(state, adjacency);
+    }
+
+    void populatePreview(PreviewState<PR>& preview) override {
+        auto geom = primitive::cylinder(
+            (float)params.size, (int)params.tessellation,
+            {params.center.x, params.center.y, params.center.z});
+        preview.x.assign(geom.positions.begin(), geom.positions.end());
+        preview.facets.assign(geom.facets.begin(), geom.facets.end());
+        preview.recomputeNormals();
+    }
+
+    InitializerParams<PR>* getParams() override { return &params; }
+};
+
+template <typename PR>
 struct MeshCubeInitializerParams : InitializerParams<PR> {
     Index tessellation;
     PR size;
@@ -2363,6 +2423,8 @@ struct Scene {
                 meshes[i].transformPosition = sp->params.center;
             } else if (auto* cb = dynamic_cast<MeshCubeInitializer  <BE, PR>*>(req.initializer)) {
                 meshes[i].transformPosition = cb->params.center;
+            } else if (auto* cy = dynamic_cast<MeshCylinderInitializer<BE, PR>*>(req.initializer)) {
+                meshes[i].transformPosition = cy->params.center;
             } else if (auto* f  = dynamic_cast<MeshFileInitializer  <BE, PR>*>(req.initializer)) {
                 meshes[i].transformPosition = f->params.offset;
             }
@@ -5508,6 +5570,16 @@ struct Simulator {
         registerPreviewBindingForLastRequest();
     }
 
+    void addCylinder(tinym::vec3 center, Index tessellation, PR size, PR mass=PR(0.1),
+                     BehaviorType behavior=BehaviorType::Float) {
+        scene.addGeneralMesh(
+            new MeshCylinderInitializer<BE,PR>(MeshCylinderInitializerParams<PR>(
+                center, tessellation, size, mass)),
+            behavior,
+            FloatBehaviorParams<PR>{});
+        registerPreviewBindingForLastRequest();
+    }
+
     void addGround(PlaneDirection dir, tinym::vec3 center, PR size1D, PR mass=0.1) {
         scene.addGeneralMesh(
             new MeshGridInitializer<BE, PR>({
@@ -5605,6 +5677,8 @@ struct Simulator {
             sp->params.center = newPos;
         } else if (auto* cb = dynamic_cast<MeshCubeInitializer  <BE, PR>*>(mesh->initializer)) {
             cb->params.center = newPos;
+        } else if (auto* cy = dynamic_cast<MeshCylinderInitializer<BE, PR>*>(mesh->initializer)) {
+            cy->params.center = newPos;
         } else if (auto* f  = dynamic_cast<MeshFileInitializer  <BE, PR>*>(mesh->initializer)) {
             f->params.offset = newPos;
         }
@@ -6889,6 +6963,13 @@ struct Simulator {
                 o.source.primitive.tessellation = (int)cb->params.tessellation;
                 o.source.primitive.mass = (double)cb->params.mass;
                 o.transform.position = {cb->params.center.x, cb->params.center.y, cb->params.center.z};
+            } else if (auto* cy = dynamic_cast<MeshCylinderInitializer<BE,PR>*>(init)) {
+                o.source.kind = Source::Kind::Primitive;
+                o.source.primitive.shape = "cylinder";
+                o.source.primitive.size = (double)cy->params.size;
+                o.source.primitive.tessellation = (int)cy->params.tessellation;
+                o.source.primitive.mass = (double)cy->params.mass;
+                o.transform.position = {cy->params.center.x, cy->params.center.y, cy->params.center.z};
             } else if (auto* f = dynamic_cast<MeshFileInitializer<BE,PR>*>(init)) {
                 o.source.kind = Source::Kind::Import;
                 std::string p = f->params.prefix;
@@ -7071,6 +7152,12 @@ struct Simulator {
                         (PR)o.source.primitive.mass));
                 } else if (o.source.primitive.shape == "cube") {
                     init = new MeshCubeInitializer<BE,PR>(MeshCubeInitializerParams<PR>(
+                        pos,
+                        (Index)o.source.primitive.tessellation,
+                        (PR)o.source.primitive.size,
+                        (PR)o.source.primitive.mass));
+                } else if (o.source.primitive.shape == "cylinder") {
+                    init = new MeshCylinderInitializer<BE,PR>(MeshCylinderInitializerParams<PR>(
                         pos,
                         (Index)o.source.primitive.tessellation,
                         (PR)o.source.primitive.size,
@@ -11990,6 +12077,7 @@ int main(int argc, char** argv) {
         bool openImportModal = false;
         bool openSphereModal = false;
         bool openCubeModal = false;
+        bool openCylinderModal = false;
         bool openPlaneModal = false;
 
         auto buildSelectedMeshTarget = [&]() {
@@ -12028,6 +12116,7 @@ int main(int argc, char** argv) {
                 // add-buttons panel shows; wire those callbacks too.
                 target.on_request_add_cube   = [&openCubeModal]()   { openCubeModal   = true; };
                 target.on_request_add_sphere = [&openSphereModal]() { openSphereModal = true; };
+                target.on_request_add_cylinder = [&openCylinderModal]() { openCylinderModal = true; };
                 target.on_request_add_plane  = [&openPlaneModal]()  { openPlaneModal  = true; };
                 target.on_request_add_import = [&openImportModal]() { openImportModal = true; };
                 return target;
@@ -12149,6 +12238,7 @@ int main(int argc, char** argv) {
             // keeps the call site free of selection-aware branches.
             target.on_request_add_cube   = [&openCubeModal]()   { openCubeModal   = true; };
             target.on_request_add_sphere = [&openSphereModal]() { openSphereModal = true; };
+            target.on_request_add_cylinder = [&openCylinderModal]() { openCylinderModal = true; };
             target.on_request_add_plane  = [&openPlaneModal]()  { openPlaneModal  = true; };
             target.on_request_add_import = [&openImportModal]() { openImportModal = true; };
             return target;
@@ -12283,6 +12373,7 @@ int main(int argc, char** argv) {
         if (openImportModal) ImGui::OpenPopup("OBJ 파일 가져오기");
         if (openSphereModal) ImGui::OpenPopup("구 생성");
         if (openCubeModal) ImGui::OpenPopup("정육면체 생성");
+        if (openCylinderModal) ImGui::OpenPopup("원기둥 생성");
         if (openPlaneModal) ImGui::OpenPopup("평면 생성");
         if (ImGui::BeginPopupModal("씬 저장하기", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
             ImGui::InputText("경로", scenePathBuf, sizeof(scenePathBuf));
@@ -12346,26 +12437,34 @@ int main(int argc, char** argv) {
             if (ImGui::Button("취소")) ImGui::CloseCurrentPopup();
             ImGui::EndPopup();
         }
-        auto primitiveModal = [&](const char* title, bool isSphere) {
+        // kind: 0 = sphere, 1 = cube, 2 = cylinder.
+        auto primitiveModal = [&](const char* title, int kind) {
             if (ImGui::BeginPopupModal(title, nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
                 ImGui::InputFloat("크기", &primSize);
                 ImGui::InputInt("분할 수", &primTess);
                 ImGui::InputFloat3("위치", primPos);
                 if (ImGui::Button("생성")) {
                     int t = primTess;
-                    if (isSphere) {
+                    tinym::vec3 c(primPos[0], primPos[1], primPos[2]);
+                    const char* doneMsg = "";
+                    if (kind == 0) {
                         if (t < 3) t = 3;
-                        simulator.addSphere(tinym::vec3(primPos[0], primPos[1], primPos[2]),
-                                            (Index)t, (Precision)primSize,
+                        simulator.addSphere(c, (Index)t, (Precision)primSize,
                                             (Precision)0.1, BehaviorType::Rigid);
-                    } else {
+                        doneMsg = "구 생성됨";
+                    } else if (kind == 1) {
                         if (t < 1) t = 1;
-                        simulator.addCube(tinym::vec3(primPos[0], primPos[1], primPos[2]),
-                                          (Index)t, (Precision)primSize,
+                        simulator.addCube(c, (Index)t, (Precision)primSize,
                                           (Precision)0.1, BehaviorType::Rigid);
+                        doneMsg = "정육면체 생성됨";
+                    } else {
+                        if (t < 3) t = 3;
+                        simulator.addCylinder(c, (Index)t, (Precision)primSize,
+                                              (Precision)0.1, BehaviorType::Rigid);
+                        doneMsg = "원기둥 생성됨";
                     }
                     simulator.initialize();
-                    sceneIOStatus = std::string(isSphere ? "구 생성됨" : "정육면체 생성됨");
+                    sceneIOStatus = doneMsg;
                     ImGui::CloseCurrentPopup();
                 }
                 ImGui::SameLine();
@@ -12373,8 +12472,9 @@ int main(int argc, char** argv) {
                 ImGui::EndPopup();
             }
         };
-        primitiveModal("구 생성", true);
-        primitiveModal("정육면체 생성", false);
+        primitiveModal("구 생성", 0);
+        primitiveModal("정육면체 생성", 1);
+        primitiveModal("원기둥 생성", 2);
         if (ImGui::BeginPopupModal("평면 생성", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
             const char* dirNames[] = { "XY 평면", "YZ 평면", "XZ 평면 (바닥)" };
             ImGui::Combo("방향", &planeDirIdx, dirNames, 3);

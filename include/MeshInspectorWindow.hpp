@@ -246,6 +246,7 @@ struct MeshInspectorTarget {
     // modals that used to live behind the Create + File menus.
     std::function<void()> on_request_add_cube;
     std::function<void()> on_request_add_sphere;
+    std::function<void()> on_request_add_cylinder;
     std::function<void()> on_request_add_plane;
     std::function<void()> on_request_add_import;
 

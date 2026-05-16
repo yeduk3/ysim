@@ -106,6 +106,9 @@ void drawMeshInspectorWindow(
         if (ImGui::Button("구 추가...", btn) && target.on_request_add_sphere) {
             target.on_request_add_sphere();
         }
+        if (ImGui::Button("원기둥 추가...", btn) && target.on_request_add_cylinder) {
+            target.on_request_add_cylinder();
+        }
         if (ImGui::Button("평면 추가...", btn) && target.on_request_add_plane) {
             target.on_request_add_plane();
         }
