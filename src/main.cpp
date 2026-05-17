@@ -12809,12 +12809,13 @@ int main(int argc, char** argv) {
         const ImVec4 cGray5  (0.976f, 0.980f, 0.984f, 1.0f);
         const ImVec4 cWhite  (1, 1, 1, 1);
 
-        // XYZ input: "x 0" — fixed prefix label inside input, gap=4
-        auto InputXYZ = [CW](const char* id, float v[3]) -> bool {
+        // XYZ input: available width minus right padding (P=24)
+        auto InputXYZ = [P](const char* id, float v[3]) -> bool {
             bool changed = false;
             ImGui::PushID(id);
+            float w = ImGui::GetContentRegionAvail().x - P;
             float gap = 4.0f;
-            float chW = (CW - gap * 2.0f) / 3.0f;
+            float chW = (w - gap * 2.0f) / 3.0f;
             const char* labels[] = {"x", "y", "z"};
             for (int i = 0; i < 3; ++i) {
                 if (i > 0) ImGui::SameLine(0, gap);
@@ -12829,13 +12830,14 @@ int main(int argc, char** argv) {
             return changed;
         };
 
-        // RGB input: "R 0" fixed prefix + color picker swatch
-        auto InputRGB = [CW](const char* id, float col[3]) -> bool {
+        // RGB input: available width minus right padding (P=24)
+        auto InputRGB = [P](const char* id, float col[3]) -> bool {
             bool changed = false;
             ImGui::PushID(id);
+            float w = ImGui::GetContentRegionAvail().x - P;
             float gap = 4.0f;
             float swatchW = 40.0f;
-            float chW = (CW - swatchW - gap * 3.0f) / 3.0f;
+            float chW = (w - swatchW - gap * 3.0f) / 3.0f;
             const char* labels[] = {"R", "G", "B"};
             for (int i = 0; i < 3; ++i) {
                 if (i > 0) ImGui::SameLine(0, gap);
@@ -13038,7 +13040,7 @@ int main(int argc, char** argv) {
                 // "세기" left + "1.6" right
                 ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.420f, 0.463f, 0.518f, 1.0f));
                 ImGui::TextUnformatted("세기");
-                ImGui::SameLine(CW - 18);
+                ImGui::SameLine(ImGui::GetContentRegionAvail().x - P - 18);
                 ImGui::Text("%.1f", env.lightIntensity);
                 ImGui::PopStyleColor();
                 ImGui::Dummy({0, 4});
@@ -13047,7 +13049,7 @@ int main(int argc, char** argv) {
                 ImGui::PushStyleColor(ImGuiCol_FrameBgHovered, cGray10);
                 ImGui::PushStyleColor(ImGuiCol_FrameBgActive, cGray10);
                 ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(0, 4)); // (28-20)/2
-                ImGui::SetNextItemWidth(CW);
+                ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - P);
                 ImGui::SliderFloat("##lightInt", &env.lightIntensity, 0.0f, 10.0f, "");
                 ImGui::PopStyleVar();
                 ImGui::PopStyleColor(3);
