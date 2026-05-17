@@ -82,7 +82,7 @@ static bool AccordionHeader(const char* kr, const char* en) {
     if(cl)sA[aid]=!sA[aid];
     bool op=sA[aid];
     ImFont* fo=ImGui::GetFont();
-    float tFS=ImGui::GetFontSize()*1.2f, sFS=ImGui::GetFontSize();
+    float tFS=ImGui::GetFontSize(), sFS=ImGui::GetFontSize()*0.85f;
     float tY=pos.y+(hH-tFS)/2, sY=pos.y+(hH-sFS)/2;
     dl->AddText(fo,tFS,{pos.x+kP,tY},ImGui::ColorConvertFloat4ToU32(kG100),kr);
     if(en&&en[0]){ImVec2 ts=fo->CalcTextSizeA(tFS,FLT_MAX,0,kr);dl->AddText(fo,sFS,{pos.x+kP+ts.x+4,sY},ImGui::ColorConvertFloat4ToU32(kG60),en);}
@@ -181,8 +181,8 @@ void drawMeshInspectorWindow(MeshInspectorWindowState& st, const MeshInspectorTa
         bool fx=t.point_fixed;if(ImGui::Checkbox("점 고정",&fx)&&t.on_point_set_fixed)t.on_point_set_fixed(fx);
         ImGui::Dummy({0,12});
         ImGui::PushStyleColor(ImGuiCol_Text,kG60);ImGui::TextUnformatted("위치");ImGui::PopStyleColor();ImGui::Dummy({0,4});
-        float p[3]={t.point_position[0],t.point_position[1],t.point_position[2]};InputXYZ("pp",p);
-        if(ImGui::IsItemDeactivatedAfterEdit()&&t.on_point_move)t.on_point_move(p[0],p[1],p[2]);
+        float p[3]={t.point_position[0],t.point_position[1],t.point_position[2]};
+        if(InputXYZ("pp",p)&&t.on_point_move)t.on_point_move(p[0],p[1],p[2]);
         ImGui::Dummy({0,12});
         {bool ra=t.point_ref_active;if(ra){ImGui::PushStyleColor(ImGuiCol_Button,kG90);ImGui::PushStyleColor(ImGuiCol_Text,kW);}
         if(ImGui::Button(ra?"참조점 선택 중...":"다른 점 위치 참조",{CW(),40})&&t.on_point_ref_toggle)t.on_point_ref_toggle();
@@ -224,7 +224,7 @@ void drawMeshInspectorWindow(MeshInspectorWindowState& st, const MeshInspectorTa
 
         // Title text
         char hdr[64];std::snprintf(hdr,64,"Mesh #%d",t.mesh_id);
-        ImFont* fo=ImGui::GetFont();float tFS=ImGui::GetFontSize()*1.2f;
+        ImFont* fo=ImGui::GetFont();float tFS=ImGui::GetFontSize();
         dl->AddText(fo,tFS,{hP.x+kP,hP.y+(hH-tFS)/2},ImGui::ColorConvertFloat4ToU32(kG100),hdr);
 
         float rX=hP.x+winW-kP;
@@ -292,20 +292,20 @@ void drawMeshInspectorWindow(MeshInspectorWindowState& st, const MeshInspectorTa
             if(t.transform_position&&t.on_translate){
                 ImGui::PushStyleColor(ImGuiCol_Text,kG60);ImGui::TextUnformatted("위치");ImGui::PopStyleColor();ImGui::Dummy({0,4});
                 float pp[3]={t.transform_position->x,t.transform_position->y,t.transform_position->z};
-                InputXYZ("pos",pp);if(ImGui::IsItemDeactivatedAfterEdit())t.on_translate(t.mesh_id,tinym::vec3(pp[0],pp[1],pp[2]));
+                if(InputXYZ("pos",pp))t.on_translate(t.mesh_id,tinym::vec3(pp[0],pp[1],pp[2]));
                 ImGui::Dummy({0,20});
             }
             if(t.rotation_wxyz&&t.on_rotate){
                 const float cw[4]={t.rotation_wxyz[0],t.rotation_wxyz[1],t.rotation_wxyz[2],t.rotation_wxyz[3]};
                 float deg[3];quatWxyzToEulerXYZDeg(cw,deg);
                 ImGui::PushStyleColor(ImGuiCol_Text,kG60);ImGui::TextUnformatted("회전 (각도)");ImGui::PopStyleColor();ImGui::Dummy({0,4});
-                InputXYZ("rot",deg);if(ImGui::IsItemDeactivatedAfterEdit()){float nw[4];eulerXYZDegToQuatWxyz(deg,nw);t.on_rotate(t.mesh_id,nw[0],nw[1],nw[2],nw[3]);}
+                if(InputXYZ("rot",deg)){float nw[4];eulerXYZDegToQuatWxyz(deg,nw);t.on_rotate(t.mesh_id,nw[0],nw[1],nw[2],nw[3]);}
                 ImGui::Dummy({0,20});
             }
             if(t.scale&&t.on_scale){
                 float s[3]={t.scale->x,t.scale->y,t.scale->z};
                 ImGui::PushStyleColor(ImGuiCol_Text,kG60);ImGui::TextUnformatted("스케일");ImGui::PopStyleColor();ImGui::Dummy({0,4});
-                InputXYZ("scale",s);if(ImGui::IsItemDeactivatedAfterEdit())t.on_scale(t.mesh_id,tinym::vec3(s[0],s[1],s[2]));
+                if(InputXYZ("scale",s))t.on_scale(t.mesh_id,tinym::vec3(s[0],s[1],s[2]));
             }
             ImGui::Unindent(kP);ImGui::Dummy({0,kP});
         }

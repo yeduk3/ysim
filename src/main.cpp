@@ -13361,7 +13361,7 @@ int main(int argc, char** argv) {
         };
         auto modalTitle = [&](const char* title) {
             ImFont* fo = ImGui::GetFont();
-            float tFS = ImGui::GetFontSize() * 1.2f;
+            float tFS = ImGui::GetFontSize();
             ImGui::Dummy({0, 0});
             ImDrawList* dl = ImGui::GetWindowDrawList();
             ImVec2 pos = ImGui::GetCursorScreenPos();
