@@ -354,6 +354,15 @@ struct FakeMemoryPool<METAL> {
 template <typename BE>
 struct DynamicByteMemoryPool {
     std::vector<ByteMemoryPool<BE>> poolList;
+    // Index of the sub-pool alloc() currently bump-allocates from. Advances
+    // when a sub-pool fills; rewound to 0 by resetMarkers() so a re-init
+    // REPLAYS the original allocation sequence into the SAME sub-pools at
+    // the SAME offsets. Without this, alloc() always used poolList.back(),
+    // so after a reset every allocation piled onto the last/new sub-pool —
+    // a different memory layout than the first run. Any pool pointer not
+    // re-pointed on re-init then aliased a live buffer → corruption that
+    // surfaced at the first collision (largest, layout-sensitive buffers).
+    size_t cursor = 0;
 
     DynamicByteMemoryPool() {}
     DynamicByteMemoryPool(size_t N) { poolList.emplace_back(N); }
@@ -373,16 +382,29 @@ struct DynamicByteMemoryPool {
         size_t need = requiredBytes<PR>(count);
         size_t minBoundSize = 1 << 20;
 
-        if (poolList.empty())
+        if (poolList.empty()) {
             poolList.emplace_back(std::max<size_t>(need, minBoundSize));
-
-        auto ret = poolList.back().template alloc<PR>(count);
-        if (!ret.ptr) {
-            //std::cout << "[DynamicByteMemoryPool alloc] allocate new one" << std::endl;
-            poolList.emplace_back(std::max<size_t>(need, minBoundSize));
-            ret = poolList.back().template alloc<PR>(count);
+            cursor = 0;
         }
-        return ret;
+
+        // A zero-count request never yields a non-null ptr; return the
+        // empty block directly (the walk below would loop forever on it).
+        if (count == 0)
+            return poolList[std::min(cursor, poolList.size() - 1)]
+                       .template alloc<PR>(0);
+
+        // Walk sub-pools from the cursor. On a fresh run this appends new
+        // pools exactly as before; after resetMarkers() (cursor=0, all
+        // markers=0) it replays the SAME sequence into the SAME pools, so
+        // every buffer lands at the SAME address as the first run.
+        for (;;) {
+            if (cursor >= poolList.size())
+                poolList.emplace_back(std::max<size_t>(need, minBoundSize));
+            auto ret = poolList[cursor].template alloc<PR>(count);
+            if (ret.ptr) return ret;
+            // Current sub-pool can't fit this request — move to the next.
+            ++cursor;
+        }
     }
 
     template <typename PR>
@@ -439,6 +461,7 @@ struct DynamicByteMemoryPool {
     // a cube and re-initializing N times grew the pool roughly N×.
     void resetMarkers() {
         for (auto& p : poolList) p.marker = 0;
+        cursor = 0;
     }
 
 };
@@ -5351,6 +5374,10 @@ struct Simulator {
     bool checkCollision = true;
     bool enableSelfCollisions = false;
     Index frame = 0;
+    // 진행 바가 시뮬레이션할 목표 프레임 수. frame이 여기에 도달하면
+    // update()가 pause를 켜고, 그 상태에서 다시 재생하면 frame 0부터
+    // 다시 시작한다 (reset == frame 0). ImGui::InputInt 바인딩용 int.
+    int targetFrames = 300;
     profiler::FrameProfiler* profiler = nullptr;
 
 
@@ -6529,6 +6556,20 @@ struct Simulator {
         // that became dangling whenever pack rebuilt; preview heap is
         // immune. `MeshRenderState::clear()` itself remains as a public API
         // for future forced-rebuild paths if needed.
+        // GlobalAutoAllocator::reset() above rewound the pool; pack()
+        // re-handed those offsets to packedMeshData/packedCollisionData.
+        // The broad-phase BVH/SH persist pool-backed buffers whose build()
+        // only reallocates on a size/identity change — so a same-mesh-count
+        // reset would skip realloc and leave positions/indices/tree (and
+        // Float-skipped objTrees) ALIASING the freshly packed collision
+        // data, corrupting it on the next refit and crashing at the first
+        // real collision. Force-fresh the broad phases so the build() calls
+        // below take the realloc branch and get non-aliased pool memory.
+        // (BVH()/SpatialHashing() ctors only fetch cached PSOs — cheap.)
+        collisionPipeline.broadPhase     = decltype(collisionPipeline.broadPhase){};
+        collisionPipeline.broadPhaseTest = decltype(collisionPipeline.broadPhaseTest){};
+        shBroadPhase                     = decltype(shBroadPhase){};
+
         collisionPipeline.broadPhase.build(scene);
         shBroadPhase.build(scene);
 
@@ -6648,6 +6689,24 @@ struct Simulator {
         // / rigid-body / cloth pipelines until they unpaused.
         if (Scene<BE, PR>::dirty) initialize();
         if(pause) return;
+
+        // 진행 바 로직: 직전 실행에서 목표 프레임에 도달해 멈춰 있었다면,
+        // 다시 재생을 누른 이 시점에서 frame 0으로 되돌린 뒤 진행한다.
+        //
+        // 여기서 reset()/initialize()를 직접 부르면 pool 마커 rewind +
+        // Scene::pack 재할당이 collision/substep 상태가 살아있는 update()
+        // 한복판에서 일어나, 재시작 몇 프레임 뒤 dangling 포인터로 segfault
+        // (S3-2 커밋이 고친 "intermittent mid-run exit"와 동일 패턴).
+        // 안전한 재초기화 지점은 update() 맨 위의 `if (dirty) initialize()`
+        // 하나뿐이므로, 여기서는 dirty만 세우고 이번 프레임을 건너뛴다.
+        // 다음 update()의 최상단이 frame=0으로 재초기화한 뒤 진행한다.
+        {
+            const Index tgt = (Index)(targetFrames < 1 ? 1 : targetFrames);
+            if (frame >= tgt) {
+                Scene<BE, PR>::dirty = true;
+                return;
+            }
+        }
         //std::cout << "[Simulator Update] Start update" << std::endl;
         
         
@@ -6870,6 +6929,14 @@ struct Simulator {
         
         system.acctime += system.h;
         frame++;
+
+        // 목표 프레임 수에 도달하면 시뮬레이션을 멈춘다. 진행 바는
+        // 100%로 채워진 채 유지되고, 다시 재생을 누르면 위쪽 restart
+        // 로직이 frame 0으로 되돌린다.
+        {
+            const Index tgt = (Index)(targetFrames < 1 ? 1 : targetFrames);
+            if (frame >= tgt) pause = true;
+        }
 
         // S3-4: preview is a pure projection of the packed state. The
         // post-update sync is now one call; uploadMeshes() also calls
@@ -12791,9 +12858,12 @@ int main(int argc, char** argv) {
         // 패널 폭은 UI 스케일과 비례. 위젯이 1.2배 커졌으므로 폭도
         // 같은 비율로 늘려야 라벨이 잘리지 않음 (300 * 1.2 = 360).
         const float panelW = 400.0f;
-        // No margin, fill full work area height
+        // 하단 진행 바 높이를 고려하여 패널 높이 결정
+        const float barH    = ImGui::GetFrameHeight()
+                            + ImGui::GetStyle().WindowPadding.y * 2.0f + 6.0f;
+        const float barGap  = 8.0f;
         const float panelTop = vp->WorkPos.y;
-        const float panelH = vp->WorkSize.y;
+        const float panelH  = vp->WorkSize.y - barH - barGap;
 
         // ─── Figma helpers (shared by both panels) ─────────────────────
         const float P = 24.0f;
@@ -13084,6 +13154,59 @@ int main(int argc, char** argv) {
         ImGui::SetNextWindowSize(ImVec2(panelW, panelH), ImGuiCond_Always);
         mesh_inspector::drawMeshInspectorWindow(
             meshInspectorWindowState, buildSelectedMeshTarget());
+
+        // ─── 시뮬레이션 진행 바 (하단, 고정) ──────────────────────────
+        // 좌/우 패널 사이 중앙 영역을 가로지르며 뷰포트 하단에 핀.
+        // [재생/일시정지] [진행 바: 현재 / 목표 프레임] [목표 프레임 입력]
+        {
+            // 화면 가로 너비보다 약간 작게 (좌우 작은 여백) — 중앙 정렬.
+            const float barMargin = 12.0f;
+            const float barW = vp->WorkSize.x - 2.0f * barMargin;
+            ImGui::SetNextWindowPos(
+                ImVec2(vp->WorkPos.x + vp->WorkSize.x * 0.5f,
+                       vp->WorkPos.y + vp->WorkSize.y - barMargin),
+                ImGuiCond_Always, ImVec2(0.5f, 1.0f));
+            ImGui::SetNextWindowSize(ImVec2(barW, barH), ImGuiCond_Always);
+            if (ImGui::Begin("시뮬레이션 진행", nullptr,
+                             ImGuiWindowFlags_NoMove |
+                             ImGuiWindowFlags_NoResize |
+                             ImGuiWindowFlags_NoCollapse |
+                             ImGuiWindowFlags_NoTitleBar |
+                             ImGuiWindowFlags_NoScrollbar |
+                             ImGuiWindowFlags_NoSavedSettings)) {
+                if (simulator.targetFrames < 1) simulator.targetFrames = 1;
+                const int   tgt = simulator.targetFrames;
+                const Index cur = simulator.frame;
+
+                if (ImGui::Button(simulator.pause ? "재생" : "일시정지",
+                                  ImVec2(90.0f * kUiScale, 0.0f))) {
+                    simulator.pause = !simulator.pause;
+                }
+                ImGui::SameLine();
+
+                const float inputW   = 110.0f * kUiScale;
+                const float spacing  = ImGui::GetStyle().ItemSpacing.x;
+                float       progW    = ImGui::GetContentRegionAvail().x
+                                       - inputW - spacing;
+                if (progW < 60.0f) progW = 60.0f;
+
+                float frac = (float)cur / (float)tgt;
+                if (frac < 0.0f) frac = 0.0f;
+                if (frac > 1.0f) frac = 1.0f;
+                char overlay[64];
+                std::snprintf(overlay, sizeof(overlay),
+                              "%u / %d 프레임", (unsigned)cur, tgt);
+                ImGui::ProgressBar(frac, ImVec2(progW, 0.0f), overlay);
+
+                ImGui::SameLine();
+                ImGui::SetNextItemWidth(inputW);
+                if (ImGui::InputInt("##목표프레임", &simulator.targetFrames)
+                    && simulator.targetFrames < 1) {
+                    simulator.targetFrames = 1;
+                }
+            }
+            ImGui::End();
+        }
 
         // ─── Modal popups ─────────────────────────────────────────────
         // Triggered by either the File menu (Save/Load) or the right
