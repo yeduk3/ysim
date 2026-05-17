@@ -12362,16 +12362,21 @@ int main(int argc, char** argv) {
         s.ScrollbarRounding = 99.0f;
     }
 
-    // ─── Font: AppleSDGothicNeo (Pretendard 대용) ────────────────────
+    // ─── Font: Pretendard 우선 ──────────────────────────────────────
     {
+        const char* home = getenv("HOME");
+        std::string userFont = home ? std::string(home) + "/Library/Fonts/Pretendard-Medium.ttf" : "";
         const char* fontCandidates[] = {
-            "/System/Library/Fonts/AppleSDGothicNeo.ttc",
+            userFont.c_str(),
             "/Library/Fonts/Pretendard-Medium.otf",
+            "/Library/Fonts/Pretendard-Medium.ttf",
+            "/System/Library/Fonts/AppleSDGothicNeo.ttc",
             "/System/Library/Fonts/Supplemental/AppleGothic.ttf",
         };
         ImFontConfig cfg;
         cfg.OversampleH = 2;
         cfg.OversampleV = 1;
+        cfg.GlyphExtraAdvanceX = -0.18f;  // -1% at 18px (15 * 1.2)
         bool loaded = false;
         for (const char* path : fontCandidates) {
             ImFont* f = io.Fonts->AddFontFromFileTTF(
@@ -13029,19 +13034,21 @@ int main(int argc, char** argv) {
             if (clicked) accordionStates[aid] = !accordionStates[aid];
             bool open = accordionStates[aid];
 
-            // Title text: larger size (1.2x default ≈ 18px equivalent)
+            // Title 1.1x (bold feel) + subtitle 0.85x, both vertically centered
             ImFont* font = ImGui::GetFont();
-            float titleFontSize = ImGui::GetFontSize() * 1.2f;
-            float subFontSize = ImGui::GetFontSize();
-            float textY = pos.y + (headerH - titleFontSize) * 0.5f;
-            float subY = pos.y + (headerH - subFontSize) * 0.5f;
+            float tFS = ImGui::GetFontSize() * 1.1f;
+            float sFS = ImGui::GetFontSize() * 0.85f;
+            float tY = pos.y + (headerH - tFS) * 0.5f;
+            float sY = pos.y + (headerH - sFS) * 0.5f;
 
+            // Title: draw twice for fake bold
             ImU32 titleCol = ImGui::ColorConvertFloat4ToU32(cGray100);
-            dl->AddText(font, titleFontSize, {pos.x + P, textY}, titleCol, korean);
+            dl->AddText(font, tFS, {pos.x + P, tY}, titleCol, korean);
+            dl->AddText(font, tFS, {pos.x + P + 0.5f, tY}, titleCol, korean);
 
             if (english && english[0]) {
-                ImVec2 titleSize = font->CalcTextSizeA(titleFontSize, FLT_MAX, 0, korean);
-                dl->AddText(font, subFontSize, {pos.x + P + titleSize.x + 4.0f, subY},
+                ImVec2 titleSize = font->CalcTextSizeA(tFS, FLT_MAX, 0, korean);
+                dl->AddText(font, sFS, {pos.x + P + titleSize.x + 4.0f, sY},
                             ImGui::ColorConvertFloat4ToU32(cGray60), english);
             }
 

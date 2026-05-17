@@ -82,9 +82,11 @@ static bool AccordionHeader(const char* kr, const char* en) {
     if(cl)sA[aid]=!sA[aid];
     bool op=sA[aid];
     ImFont* fo=ImGui::GetFont();
-    float tFS=ImGui::GetFontSize(), sFS=ImGui::GetFontSize()*0.85f;
+    float tFS=ImGui::GetFontSize()*1.1f, sFS=ImGui::GetFontSize()*0.85f;
     float tY=pos.y+(hH-tFS)/2, sY=pos.y+(hH-sFS)/2;
-    dl->AddText(fo,tFS,{pos.x+kP,tY},ImGui::ColorConvertFloat4ToU32(kG100),kr);
+    ImU32 tC=ImGui::ColorConvertFloat4ToU32(kG100);
+    dl->AddText(fo,tFS,{pos.x+kP,tY},tC,kr);
+    dl->AddText(fo,tFS,{pos.x+kP+0.5f,tY},tC,kr); // fake bold
     if(en&&en[0]){ImVec2 ts=fo->CalcTextSizeA(tFS,FLT_MAX,0,kr);dl->AddText(fo,sFS,{pos.x+kP+ts.x+4,sY},ImGui::ColorConvertFloat4ToU32(kG60),en);}
     float aX=pos.x+fW-kP,aY=pos.y+hH/2;float r=5;ImU32 aC=ImGui::ColorConvertFloat4ToU32(kG60);
     if(op){dl->PathLineTo({aX-r,aY+r*.4f});dl->PathLineTo({aX,aY-r*.4f});dl->PathLineTo({aX+r,aY+r*.4f});}
