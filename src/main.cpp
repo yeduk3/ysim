@@ -2471,38 +2471,48 @@ struct Scene {
 
             meshes[i].initialize();
 
-            // D-042 R-3 (2026-05-14): PreviewState is the source of truth
-            // for vertex/facet/normal data at pack time. The initializer's
-            // regen (mesh.initialize() above) populated state.x / state.n /
-            // adjacency.facets from the initializer's params; now override
-            // with preview data so any pre-pack edit to preview (R-4 will
-            // mutate preview in translateObject etc.) propagates through
-            // Scene::pack into the packed sub-views consumed by BroadPhase
-            // + ExplicitSystem. Size-guarded so a future initializer
-            // subtype without populatePreview (base class default no-op)
-            // falls back to the initializer's regen — parallel-symbol
-            // invariant.
+            // S3-3: pack rebuilds the FULL transformed geometry
+            // deterministically from the request alone — no preview
+            // carrier. mesh.initialize() above produced the base shape
+            // + topology at `center`; bake the request's transform in
+            // place over state.x: scale → rotate → translate, pivot =
+            // transformPosition (== the initializer center, set just
+            // above). Topology (adjacency.facets) and base normals came
+            // from the initializer regen and are correct; rotation also
+            // rotates the normals so a paused mesh lights correctly
+            // pre-sim. Replaces the D-042 R-3 preview→state override.
             {
-                const size_t expectedVerts  = (size_t)curNumPoints;
-                const size_t expectedFacets = (size_t)(packedMeshData.facetsOffsets[i+1]
-                                                       - packedMeshData.facetsOffsets[i]);
-                if (req.preview.numPoints() == expectedVerts
-                    && req.preview.x.size() >= expectedVerts * 3) {
-                    std::memcpy(meshes[i].state.x.ptr,
-                                req.preview.x.data(),
-                                expectedVerts * 3 * sizeof(PR));
-                }
-                if (req.preview.numPoints() == expectedVerts
-                    && req.preview.n.size() >= expectedVerts * 3) {
-                    std::memcpy(meshes[i].state.n.ptr,
-                                req.preview.n.data(),
-                                expectedVerts * 3 * sizeof(PR));
-                }
-                if (req.preview.numFacets() == expectedFacets
-                    && req.preview.facets.size() >= expectedFacets * 3) {
-                    std::memcpy(meshes[i].adjacency.facets.ptr,
-                                req.preview.facets.data(),
-                                expectedFacets * 3 * sizeof(uint32_t));
+                const tinym::vec3 pivot = meshes[i].transformPosition;
+                auto* ip = req.initializer->getParams();
+                const tinym::vec3 s = ip->scale;
+                const ::Quat q = ip->rotationQuat;
+                const bool unitS = std::abs(s.x-1.f)<1e-7f
+                                && std::abs(s.y-1.f)<1e-7f
+                                && std::abs(s.z-1.f)<1e-7f;
+                const bool idQ = std::abs(q.w-1.f)<1e-7f
+                              && std::abs(q.x)<1e-7f
+                              && std::abs(q.y)<1e-7f
+                              && std::abs(q.z)<1e-7f;
+                if (!unitS || !idQ) {
+                    const size_t nP = (size_t)curNumPoints;
+                    PR* xs = meshes[i].state.x.ptr;
+                    PR* ns = meshes[i].state.n.ptr;
+                    for (size_t v = 0; v < nP; ++v) {
+                        tinym::vec3 p(xs[v*3+0], xs[v*3+1], xs[v*3+2]);
+                        tinym::vec3 d = p - pivot;
+                        d = tinym::vec3(d.x*s.x, d.y*s.y, d.z*s.z);
+                        if (!idQ) d = rotateVector(q, d);
+                        xs[v*3+0] = (PR)(pivot.x + d.x);
+                        xs[v*3+1] = (PR)(pivot.y + d.y);
+                        xs[v*3+2] = (PR)(pivot.z + d.z);
+                        if (ns && !idQ) {
+                            tinym::vec3 nv = rotateVector(q,
+                                tinym::vec3(ns[v*3+0], ns[v*3+1], ns[v*3+2]));
+                            ns[v*3+0] = (PR)nv.x;
+                            ns[v*3+1] = (PR)nv.y;
+                            ns[v*3+2] = (PR)nv.z;
+                        }
+                    }
                 }
             }
 
@@ -5702,25 +5712,10 @@ struct Simulator {
                 mesh->state.xPrev.ptr[i*3+2] += delta.z;
             }
         }
-        // D-042 R-3 (2026-05-14) + R-4 canonicalization: PreviewState is
-        // the source of truth for vertex positions; state.x mirrors
-        // preview through Scene::pack's memcpy block. translateObject
-        // writes BOTH (state.x for D-014's immediate-effect + D-023's
-        // BVH refit pose; preview.x so the next pack memcpy survives
-        // the translate). R-4's rotateObject preview write below uses
-        // the same pattern — canonical dual-write, no longer
-        // "transitional".
-        for (auto& req : Scene<BE, PR>::requestsGeneralMeshes) {
-            if (req.id == meshId) {
-                const size_t np = req.preview.numPoints();
-                for (size_t i = 0; i < np; ++i) {
-                    req.preview.x[i*3+0] += delta.x;
-                    req.preview.x[i*3+1] += delta.y;
-                    req.preview.x[i*3+2] += delta.z;
-                }
-                break;
-            }
-        }
+        // S3-3: no preview dual-write. state.x is mutated in place
+        // above for immediate effect; the initializer center write
+        // below makes a structural re-pack rebuild at the new position
+        // deterministically; syncPreviewFromState re-derives preview.
         mesh->transformPosition = newPos;
         // Write back to the initializer's center/offset so a subsequent
         // Scene::pack() (triggered by create/import/load flows) rebuilds
@@ -5799,39 +5794,14 @@ struct Simulator {
                 mesh->state.xPrev.ptr[i*3+2] = prev_rot.z;
             }
         }
-        // D-042 R-4 (2026-05-14): rotate the per-request PreviewState
-        // by the same delta around the same pivot so preview tracks
-        // rotation eagerly. Mirrors R-3's translateObject preview
-        // dual-write. Pre-R-4 rotation persisted through Scene::pack
-        // via D-025 pendingRotations re-apply only; R-4 adds eager
-        // preview tracking so pre-init rendering + future R-5 packed
-        // → preview resync don't need a "rotation hasn't synced yet"
-        // special-case branch. The R-4 retirement of the per-call
-        // pendingRotations stash means this loop is now the SOLE
-        // mechanism preserving rotation through Scene::pack.
+        // S3-3: no preview dual-write. state.x/xPrev rotated in place
+        // above for immediate effect; the request + initializer params
+        // carry the absolute orientation so a structural re-pack
+        // rebuilds the rotated geometry deterministically;
+        // syncPreviewFromState re-derives preview.
         for (auto& req : Scene<BE, PR>::requestsGeneralMeshes) {
             if (req.id == meshId) {
-                const size_t np = req.preview.numPoints();
-                for (size_t i = 0; i < np; ++i) {
-                    tinym::vec3 p(req.preview.x[i*3+0],
-                                  req.preview.x[i*3+1],
-                                  req.preview.x[i*3+2]);
-                    tinym::vec3 p_rot = pivot + rotateVector(delta, p - pivot);
-                    req.preview.x[i*3+0] = p_rot.x;
-                    req.preview.x[i*3+1] = p_rot.y;
-                    req.preview.x[i*3+2] = p_rot.z;
-                }
-                // Persist the absolute orientation on the request so
-                // Scene::pack restores it onto the rebuilt mesh. preview
-                // above carries the rotated geometry; this carries the
-                // quaternion the inspector reads and the next delta
-                // composes against. reset() re-applies this to the
-                // freshly-regenerated preview around the same pivot.
                 req.rotationQuat = newAbs;
-                // S3: the initializer params own the transform so a
-                // structural re-pack can rebuild the rotated geometry
-                // from the request alone (consumed in S3-3; kept in
-                // sync here from now on).
                 if (req.initializer)
                     req.initializer->getParams()->rotationQuat = newAbs;
                 break;
@@ -5901,14 +5871,13 @@ struct Simulator {
             scaleAbout(&mesh->state.x.ptr[i*3]);
             if (mesh->state.xPrev.ptr) scaleAbout(&mesh->state.xPrev.ptr[i*3]);
         }
+        // S3-3: no preview dual-write. state.x/xPrev scaled in place
+        // above; request + initializer params carry the absolute scale
+        // for deterministic re-pack; syncPreviewFromState re-derives
+        // preview.
         for (auto& req : Scene<BE, PR>::requestsGeneralMeshes) {
             if (req.id == meshId) {
-                const size_t np = req.preview.numPoints();
-                for (size_t i = 0; i < np; ++i)
-                    scaleAbout(&req.preview.x[i*3]);
                 req.scale = absS;
-                // S3: keep the initializer params' scale in sync (used
-                // by S3-3's pack-time deterministic rebuild).
                 if (req.initializer)
                     req.initializer->getParams()->scale = absS;
                 break;
@@ -6230,20 +6199,11 @@ struct Simulator {
             mesh->state.xPrev.ptr[b+2] += (PR)d.z;
         }
 
-        if (b+2 < (Index)req->preview.x.size()) {
-            req->preview.x[b+0] = (PR)newPos.x;
-            req->preview.x[b+1] = (PR)newPos.y;
-            req->preview.x[b+2] = (PR)newPos.z;
-        }
-        if (req->preview.hasRender()) {
-            for (size_t rv = 0; rv < req->preview.renderToPhysics.size(); ++rv)
-                if (req->preview.renderToPhysics[rv] == pvid) {
-                    req->preview.renderX[rv*3+0] = (PR)newPos.x;
-                    req->preview.renderX[rv*3+1] = (PR)newPos.y;
-                    req->preview.renderX[rv*3+2] = (PR)newPos.z;
-                }
-        }
-
+        // S3-3: no preview dual-write (syncPreviewFromState re-derives
+        // preview from state.x every frame). If the vertex is pinned,
+        // its held position lives on the request (fixedVertices) and is
+        // re-applied by pack — that is the only per-vertex edit that
+        // survives a structural re-pack (gap-2 decision (a)).
         for (auto& fv : req->fixedVertices)
             if (fv.vid == pvid) { fv.pos = newPos; break; }
 
@@ -6527,54 +6487,15 @@ struct Simulator {
     // frame" record while populatePreview is just an initializer-param
     // regen that loses any pre-sim deformation. Until then this is the
     // closest approximation.
+    // S3-3: reset = rebuild the pack from the requests. pack now bakes
+    // the full transform (scale→rotate→translate) deterministically
+    // from each request's initializer params, and syncPreviewFromState
+    // re-derives preview, so the old manual preview repopulate +
+    // scale/rotate pass here is redundant. A structural rebuild from
+    // the request IS the reset (sim state returns to the authored
+    // configuration; transforms/pins/constraints are preserved because
+    // they live on the request).
     void reset() {
-        for (auto& req : Scene<BE, PR>::requestsGeneralMeshes) {
-            if (!req.initializer) continue;
-            req.preview.x.clear();
-            req.preview.n.clear();
-            req.preview.facets.clear();
-            req.initializer->populatePreview(req.preview);
-
-            auto* mesh = Scene<BE, PR>::findById(req.id);
-            if (!mesh) continue;
-            tinym::vec3 pivot = mesh->transformPosition;
-            const size_t np = req.preview.numPoints();
-
-            // 1. Scale about the pivot (skip if unit).
-            const tinym::vec3& s = req.scale;
-            bool unitScale = std::abs(s.x - 1.0f) < 1e-7f
-                          && std::abs(s.y - 1.0f) < 1e-7f
-                          && std::abs(s.z - 1.0f) < 1e-7f;
-            if (!unitScale) {
-                for (size_t i = 0; i < np; ++i) {
-                    tinym::vec3 p(req.preview.x[i*3+0],
-                                  req.preview.x[i*3+1],
-                                  req.preview.x[i*3+2]);
-                    tinym::vec3 v = p - pivot;
-                    req.preview.x[i*3+0] = pivot.x + v.x * s.x;
-                    req.preview.x[i*3+1] = pivot.y + v.y * s.y;
-                    req.preview.x[i*3+2] = pivot.z + v.z * s.z;
-                }
-            }
-
-            // 2. Rotate about the pivot (skip if identity).
-            const ::Quat& q = req.rotationQuat;
-            bool isIdentity = std::abs(q.w - 1.0f) < 1e-7f
-                           && std::abs(q.x) < 1e-7f
-                           && std::abs(q.y) < 1e-7f
-                           && std::abs(q.z) < 1e-7f;
-            if (!isIdentity) {
-                for (size_t i = 0; i < np; ++i) {
-                    tinym::vec3 p(req.preview.x[i*3+0],
-                                  req.preview.x[i*3+1],
-                                  req.preview.x[i*3+2]);
-                    tinym::vec3 p_rot = pivot + rotateVector(q, p - pivot);
-                    req.preview.x[i*3+0] = p_rot.x;
-                    req.preview.x[i*3+1] = p_rot.y;
-                    req.preview.x[i*3+2] = p_rot.z;
-                }
-            }
-        }
         initialize();
     }
 
@@ -7560,54 +7481,25 @@ struct Simulator {
                                     (float)o.material.emissionColor[1],
                                     (float)o.material.emissionColor[2])
                     };
+                    // S3-3: the request's initializer params own the
+                    // transform; pack bakes scale→rotate→translate from
+                    // them deterministically. No pendingRotations defer,
+                    // no preview scale pre-bake — pack measures cloth
+                    // rest lengths from the already-transformed state.x.
                     ::Quat q;
                     q.w = (float)o.transform.rotation[0];
                     q.x = (float)o.transform.rotation[1];
                     q.y = (float)o.transform.rotation[2];
                     q.z = (float)o.transform.rotation[3];
-                    pendingRotations[meshId] = q;
-                    // Scale must be baked into the preview BEFORE the
-                    // first pack: pack's recomputeRestLengths measures
-                    // cloth rest lengths from state.x (== preview). A
-                    // deferred (rotation-style) scale would leave the
-                    // first post-load sim frame running with rest
-                    // lengths from UNSCALED geometry → every stretched
-                    // spring pre-stressed → stiff explicit-Euler blow-up
-                    // → NaN → GPU BVH OOB → segfault. Rotation stays
-                    // deferred safely (length-preserving); scale does
-                    // not. reset() uses the same pre-pack scale order.
                     auto& rq = Scene<BE,PR>::requestsGeneralMeshes[idx];
                     tinym::vec3 sc((float)o.transform.scale[0],
                                    (float)o.transform.scale[1],
                                    (float)o.transform.scale[2]);
                     rq.scale = sc;
-                    bool unitScale = std::abs(sc.x - 1.0f) < 1e-7f
-                                  && std::abs(sc.y - 1.0f) < 1e-7f
-                                  && std::abs(sc.z - 1.0f) < 1e-7f;
-                    if (!unitScale) {
-                        const size_t np = rq.preview.numPoints();
-                        for (size_t pi = 0; pi < np; ++pi) {
-                            tinym::vec3 p(rq.preview.x[pi*3+0],
-                                          rq.preview.x[pi*3+1],
-                                          rq.preview.x[pi*3+2]);
-                            tinym::vec3 v = p - pos;  // pivot = saved position
-                            rq.preview.x[pi*3+0] = pos.x + v.x * sc.x;
-                            rq.preview.x[pi*3+1] = pos.y + v.y * sc.y;
-                            rq.preview.x[pi*3+2] = pos.z + v.z * sc.z;
-                        }
-                        if (rq.preview.hasRender()) {
-                            const size_t nr =
-                                rq.preview.renderToPhysics.size();
-                            for (size_t rv = 0; rv < nr; ++rv) {
-                                tinym::vec3 p(rq.preview.renderX[rv*3+0],
-                                              rq.preview.renderX[rv*3+1],
-                                              rq.preview.renderX[rv*3+2]);
-                                tinym::vec3 v = p - pos;
-                                rq.preview.renderX[rv*3+0] = pos.x + v.x*sc.x;
-                                rq.preview.renderX[rv*3+1] = pos.y + v.y*sc.y;
-                                rq.preview.renderX[rv*3+2] = pos.z + v.z*sc.z;
-                            }
-                        }
+                    rq.rotationQuat = q;
+                    if (rq.initializer) {
+                        rq.initializer->getParams()->scale = sc;
+                        rq.initializer->getParams()->rotationQuat = q;
                     }
                     // Write env-force toggles directly into the request
                     // (RequestGeneralMesh.applyGravity / applyWind). pack()
