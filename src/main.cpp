@@ -12347,7 +12347,7 @@ int main(int argc, char** argv) {
 
         c[ImGuiCol_PlotLines]            = gray90;
         c[ImGuiCol_PlotLinesHovered]     = error;
-        c[ImGuiCol_PlotHistogram]        = gray90;
+        c[ImGuiCol_PlotHistogram]        = gray80;  // progress bar fill = gray80
         c[ImGuiCol_PlotHistogramHovered] = gray60;
 
         s.ScaleAllSizes(kUiScale);
@@ -12828,23 +12828,89 @@ int main(int argc, char** argv) {
         static int planeDirIdx = 2; // 0:XY, 1:YZ, 2:XZ (default ground)
         static int planeTess = 20; // particleNum1D; >=2. higher = cloth-ready
 
-        // ─── Main menu bar ────────────────────────────────────────────
-        // Only File → Save Scene / Load Scene survives. Import + the
-        // Create menu moved into the right-side Object panel's
-        // no-selection branch.
-        if (ImGui::BeginMainMenuBar()) {
-            if (ImGui::BeginMenu("파일")) {
-                if (ImGui::MenuItem("씬 저장하기...")) openSaveModal = true;
-                if (ImGui::MenuItem("씬 불러오기...")) openLoadModal = true;
-                ImGui::EndMenu();
-            }
-            if (ImGui::BeginMenu("보기")) {
-                if (ImGui::MenuItem("프로파일러 윈도우 열기")) {
-                    profilerWindowState.open = true;
+        // ─── Top bar: h≈56, 파일/보기(px=12) + 우측 선택모드 탭(hug) ──
+        {
+            // Menu bar frame padding: 12px horizontal for menu items, 18px vertical for h≈56
+            ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(12, 18));
+            ImGui::PushStyleColor(ImGuiCol_MenuBarBg, ImVec4(1,1,1,1));
+            // Dropdown popup style: more padding
+            ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(24, 16));
+            if (ImGui::BeginMainMenuBar()) {
+                if (ImGui::BeginMenu("파일")) {
+                    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(8, 12));
+                    if (ImGui::MenuItem("씬 저장하기...")) openSaveModal = true;
+                    if (ImGui::MenuItem("씬 불러오기...")) openLoadModal = true;
+                    ImGui::PopStyleVar();
+                    ImGui::EndMenu();
                 }
-                ImGui::EndMenu();
+                if (ImGui::BeginMenu("보기")) {
+                    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(8, 12));
+                    if (ImGui::MenuItem("프로파일러")) profilerWindowState.open = true;
+                    ImGui::PopStyleVar();
+                    ImGui::EndMenu();
+                }
+
+                // Right-aligned selection mode segment tab (hug content)
+                {
+                    // Measure text to compute hug width
+                    ImVec2 szObj = ImGui::CalcTextSize("오브젝트");
+                    ImVec2 szPt  = ImGui::CalcTextSize("점");
+                    float pad = 4, segH = 28, segPadX = 12;
+                    float segWObj = szObj.x + segPadX * 2;
+                    float segWPt  = szPt.x + segPadX * 2;
+                    float tabW = pad + segWObj + pad + segWPt + pad;
+                    float tabH = segH + pad * 2;
+
+                    float menuBarH = ImGui::GetWindowSize().y;
+                    float rightX = ImGui::GetWindowSize().x - tabW - 16;
+                    float tabY = (menuBarH - tabH) * 0.5f;
+                    ImVec2 wPos = ImGui::GetWindowPos();
+
+                    ImDrawList* dl = ImGui::GetWindowDrawList();
+                    ImVec2 tPos = {wPos.x + rightX, wPos.y + tabY};
+                    dl->AddRectFilled(tPos, {tPos.x + tabW, tPos.y + tabH},
+                                      ImGui::ColorConvertFloat4ToU32(ImVec4(0.933f,0.941f,0.949f,1)), 8);
+
+                    bool objMode = simulator.selectionMode == SelectionMode::Object;
+                    bool ptMode  = simulator.selectionMode == SelectionMode::Point;
+                    float textH = ImGui::GetFontSize();
+                    float fpy = (segH - textH) * 0.5f;
+
+                    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 8);
+                    ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 0);
+                    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, {segPadX, fpy});
+
+                    ImGui::SetCursorScreenPos({tPos.x + pad, tPos.y + pad});
+                    ImGui::PushStyleColor(ImGuiCol_Button, objMode ? ImVec4(1,1,1,1) : ImVec4(0,0,0,0));
+                    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, objMode ? ImVec4(1,1,1,1) : ImVec4(1,1,1,0.5f));
+                    ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(1,1,1,1));
+                    ImGui::PushStyleColor(ImGuiCol_Text, objMode ? ImVec4(0.098f,0.122f,0.157f,1) : ImVec4(0.545f,0.584f,0.631f,1));
+                    if (ImGui::Button("오브젝트", {segWObj, segH})) {
+                        simulator.selectionMode = SelectionMode::Object;
+                        simulator.hoveredVert = simulator.selectedVert = -1;
+                        simulator.hoveredVertObj = simulator.selectedVertObj = -1;
+                        simulator.pointRefPickActive = false;
+                    }
+                    ImGui::PopStyleColor(4);
+
+                    ImGui::SetCursorScreenPos({tPos.x + pad + segWObj + pad, tPos.y + pad});
+                    ImGui::PushStyleColor(ImGuiCol_Button, ptMode ? ImVec4(1,1,1,1) : ImVec4(0,0,0,0));
+                    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ptMode ? ImVec4(1,1,1,1) : ImVec4(1,1,1,0.5f));
+                    ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(1,1,1,1));
+                    ImGui::PushStyleColor(ImGuiCol_Text, ptMode ? ImVec4(0.098f,0.122f,0.157f,1) : ImVec4(0.545f,0.584f,0.631f,1));
+                    if (ImGui::Button("점", {segWPt, segH})) {
+                        simulator.selectionMode = SelectionMode::Point;
+                        simulator.hoveredObj = -1;
+                    }
+                    ImGui::PopStyleColor(4);
+
+                    ImGui::PopStyleVar(3);
+                }
+
+                ImGui::EndMainMenuBar();
             }
-            ImGui::EndMainMenuBar();
+            ImGui::PopStyleVar(2); // FramePadding, WindowPadding
+            ImGui::PopStyleColor(); // MenuBarBg
         }
 
         // ─── Layout geometry ──────────────────────────────────────────
@@ -12858,12 +12924,8 @@ int main(int argc, char** argv) {
         // 패널 폭은 UI 스케일과 비례. 위젯이 1.2배 커졌으므로 폭도
         // 같은 비율로 늘려야 라벨이 잘리지 않음 (300 * 1.2 = 360).
         const float panelW = 400.0f;
-        // 하단 진행 바 높이를 고려하여 패널 높이 결정
-        const float barH    = ImGui::GetFrameHeight()
-                            + ImGui::GetStyle().WindowPadding.y * 2.0f + 6.0f;
-        const float barGap  = 8.0f;
         const float panelTop = vp->WorkPos.y;
-        const float panelH  = vp->WorkSize.y - barH - barGap;
+        const float panelH  = vp->WorkSize.y; // full height, bar floats on top
 
         // ─── Figma helpers (shared by both panels) ─────────────────────
         const float P = 24.0f;
@@ -13076,8 +13138,7 @@ int main(int argc, char** argv) {
                 ImGui::TextUnformatted("중력");
                 ImGui::PopStyleColor();
                 ImGui::Dummy({0, 4});
-                InputXYZ("gravity", gravity);
-                if (ImGui::IsItemDeactivatedAfterEdit())
+                if (InputXYZ("gravity", gravity))
                     env.gravity = tinym::vec3(gravity[0], gravity[1], gravity[2]);
 
                 ImGui::Dummy({0, 20});
@@ -13086,8 +13147,7 @@ int main(int argc, char** argv) {
                 ImGui::TextUnformatted("바람");
                 ImGui::PopStyleColor();
                 ImGui::Dummy({0, 4});
-                InputXYZ("wind", wind);
-                if (ImGui::IsItemDeactivatedAfterEdit())
+                if (InputXYZ("wind", wind))
                     env.wind = tinym::vec3(wind[0], wind[1], wind[2]);
 
                 ImGui::Unindent(P);
@@ -13155,18 +13215,28 @@ int main(int argc, char** argv) {
         mesh_inspector::drawMeshInspectorWindow(
             meshInspectorWindowState, buildSelectedMeshTarget());
 
-        // ─── 시뮬레이션 진행 바 (하단, 고정) ──────────────────────────
-        // 좌/우 패널 사이 중앙 영역을 가로지르며 뷰포트 하단에 핀.
-        // [재생/일시정지] [진행 바: 현재 / 목표 프레임] [목표 프레임 입력]
+        // ─── 하단 재생 바: 둥둥 떠다니는 바, rounded-20, h=64 ──────────
+        // 좌우 패널 사이 24px gap, fill width, max 800px, 하단 24px 위
         {
-            // 화면 가로 너비보다 약간 작게 (좌우 작은 여백) — 중앙 정렬.
-            const float barMargin = 12.0f;
-            const float barW = vp->WorkSize.x - 2.0f * barMargin;
+            float gapFromPanel = 24.0f;
+            float leftEdge = vp->WorkPos.x + panelW + gapFromPanel;
+            float rightEdge = vp->WorkPos.x + vp->WorkSize.x - panelW - gapFromPanel;
+            float barW = rightEdge - leftEdge;
+            if (barW > 800.0f) barW = 800.0f;
+            float barCenterX = (leftEdge + rightEdge) * 0.5f;
+            float barY = vp->WorkPos.y + vp->WorkSize.y - 24.0f; // 24px from bottom
+
+            const float barHH = 64.0f; // bar height
+            const float elemH = 36.0f; // all inner elements same height
+            // Vertical padding to center elements: (64 - 36) / 2 = 14
+            ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 20);
+            ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 1);
+            ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(P, (barHH - elemH) / 2));
+            ImGui::PushStyleColor(ImGuiCol_Border, cGray20);
             ImGui::SetNextWindowPos(
-                ImVec2(vp->WorkPos.x + vp->WorkSize.x * 0.5f,
-                       vp->WorkPos.y + vp->WorkSize.y - barMargin),
+                ImVec2(barCenterX, barY),
                 ImGuiCond_Always, ImVec2(0.5f, 1.0f));
-            ImGui::SetNextWindowSize(ImVec2(barW, barH), ImGuiCond_Always);
+            ImGui::SetNextWindowSize(ImVec2(barW, barHH), ImGuiCond_Always);
             if (ImGui::Begin("시뮬레이션 진행", nullptr,
                              ImGuiWindowFlags_NoMove |
                              ImGuiWindowFlags_NoResize |
@@ -13178,34 +13248,81 @@ int main(int argc, char** argv) {
                 const int   tgt = simulator.targetFrames;
                 const Index cur = simulator.frame;
 
-                if (ImGui::Button(simulator.pause ? "재생" : "일시정지",
-                                  ImVec2(90.0f * kUiScale, 0.0f))) {
-                    simulator.pause = !simulator.pause;
+                // All elements: height = elemH, vertically centered by WindowPadding
+
+                // Play/Pause: icon-only square button
+                // Paused → gray80 filled (play icon white)
+                // Playing → gray outline (pause icon gray80)
+                {
+                    bool paused = simulator.pause;
+                    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 8);
+                    if (paused) {
+                        // Gray80 filled
+                        ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 0);
+                        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.200f,0.239f,0.294f,1)); // gray80
+                        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.250f,0.290f,0.340f,1));
+                        ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.150f,0.190f,0.240f,1));
+                    } else {
+                        // Gray outline
+                        ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 1);
+                        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0,0,0,0));
+                        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, cGray10);
+                        ImGui::PushStyleColor(ImGuiCol_ButtonActive, cGray20);
+                    }
+                    ImVec2 btnPos = ImGui::GetCursorScreenPos();
+                    if (ImGui::Button("##play", ImVec2(elemH, elemH))) {
+                        simulator.pause = !simulator.pause;
+                    }
+                    ImGui::PopStyleColor(3);
+                    ImGui::PopStyleVar(2); // FrameRounding + FrameBorderSize
+
+                    // Draw icon centered
+                    ImDrawList* dl = ImGui::GetWindowDrawList();
+                    float cx = btnPos.x + elemH / 2, cy = btnPos.y + elemH / 2;
+                    if (paused) {
+                        // Play triangle (white)
+                        ImU32 ic = IM_COL32(255, 255, 255, 255);
+                        dl->AddTriangleFilled({cx - 4, cy - 6}, {cx - 4, cy + 6}, {cx + 6, cy}, ic);
+                    } else {
+                        // Pause bars (gray80)
+                        ImU32 ic = ImGui::ColorConvertFloat4ToU32(ImVec4(0.200f,0.239f,0.294f,1));
+                        dl->AddRectFilled({cx - 5, cy - 5}, {cx - 2, cy + 5}, ic, 1);
+                        dl->AddRectFilled({cx + 2, cy - 5}, {cx + 5, cy + 5}, ic, 1);
+                    }
                 }
                 ImGui::SameLine();
 
-                const float inputW   = 110.0f * kUiScale;
-                const float spacing  = ImGui::GetStyle().ItemSpacing.x;
-                float       progW    = ImGui::GetContentRegionAvail().x
-                                       - inputW - spacing;
+                // Progress bar: fill remaining minus input width
+                const float inputW = 120.0f;
+                const float spacing = ImGui::GetStyle().ItemSpacing.x;
+                float progW = ImGui::GetContentRegionAvail().x - inputW - spacing;
                 if (progW < 60.0f) progW = 60.0f;
 
+                // Match progress bar height to elemH
+                ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, {4, (elemH - ImGui::GetFontSize()) / 2});
                 float frac = (float)cur / (float)tgt;
                 if (frac < 0.0f) frac = 0.0f;
                 if (frac > 1.0f) frac = 1.0f;
                 char overlay[64];
                 std::snprintf(overlay, sizeof(overlay),
-                              "%u / %d 프레임", (unsigned)cur, tgt);
-                ImGui::ProgressBar(frac, ImVec2(progW, 0.0f), overlay);
+                              "%u / %d", (unsigned)cur, tgt);
+                ImGui::ProgressBar(frac, ImVec2(progW, elemH), overlay);
+                ImGui::PopStyleVar();
 
+                // Frame input: 120px total, no +/- buttons, padding 12px
                 ImGui::SameLine();
+                ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, {12, (elemH - ImGui::GetFontSize()) / 2});
                 ImGui::SetNextItemWidth(inputW);
-                if (ImGui::InputInt("##목표프레임", &simulator.targetFrames)
+                int step = 0; // step=0 hides +/- buttons
+                if (ImGui::InputInt("##tgt", &simulator.targetFrames, step)
                     && simulator.targetFrames < 1) {
                     simulator.targetFrames = 1;
                 }
+                ImGui::PopStyleVar();
             }
             ImGui::End();
+            ImGui::PopStyleColor();
+            ImGui::PopStyleVar(3);
         }
 
         // ─── Modal popups ─────────────────────────────────────────────
@@ -13226,8 +13343,11 @@ int main(int argc, char** argv) {
             ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 16);
             ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(P, P));
             ImGui::PushStyleColor(ImGuiCol_PopupBg, ImVec4(1,1,1,1));
-            ImGui::SetNextWindowSize(ImVec2(480, 0)); // 480px fixed width, auto height
-            bool opened = ImGui::BeginPopupModal(title, nullptr, ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize);
+            ImGui::SetNextWindowSize(ImVec2(480, 0));
+            // Center modal in viewport
+            ImVec2 center = ImGui::GetMainViewport()->GetCenter();
+            ImGui::SetNextWindowPos(center, ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+            bool opened = ImGui::BeginPopupModal(title, nullptr, ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove);
             if (!opened) {
                 ImGui::PopStyleColor();
                 ImGui::PopStyleVar(2);
