@@ -2235,6 +2235,11 @@ struct Scene {
         // Mirror of GeneralMesh.clothStiffnessScale ("팽팽함") so the
         // multiplier survives Scene::pack rebuilds. Default 1.
         PR clothStiffnessScale = PR(1);
+        // S3-2: material owned by the request (single source of truth).
+        // pack copies this onto the realized mesh; setMaterial writes
+        // here + the live mesh in place (no re-pack — a value
+        // overwrite). Replaces the pendingMaterials side-map.
+        ::Material material{};
         // Pinned-vertex constraints (point-selection panel). Source of
         // truth for which vertices are fixed and where: Scene::pack
         // re-applies these into constraints.fixedParticles + state.x +
@@ -2441,6 +2446,10 @@ struct Scene {
             // next delta against the true current scale (not unit).
             meshes[i].scale = req.scale;
             meshes[i].clothStiffnessScale = req.clothStiffnessScale;
+            // S3-2: material is request-owned; restore it onto the
+            // rebuilt mesh (replaces the post-pack pendingMaterials
+            // apply).
+            meshes[i].material = req.material;
             // Seed transformPosition from the initializer's center/offset so
             // BDD-003's translate path computes deltas against the author
             // intent, not against (0,0,0). Mirrors the dynamic_cast cascade
@@ -6210,22 +6219,19 @@ struct Simulator {
         collisionPipeline.broadPhase.refit();
     }
 
-    // D-027: edit-time material mutator. Mirrors translateObject (D-014) and
-    // rotateObject (D-021). Writes mesh->material AND pendingMaterials[id]
-    // so the edit survives Scene::pack rebuild via D-025's auto-call from
-    // Simulator::initialize(). No broadPhase.refit() needed — material does
-    // not affect AABBs.
+    // S3-2: material is a pure in-place value overwrite — write the
+    // live mesh AND the request mirror (so a structural re-pack
+    // preserves it; pack copies req.material onto the rebuilt mesh).
+    // NO Scene::dirty / re-pack: a colour-slider drag firing this every
+    // frame must not trigger a realloc-ing re-pack (that was the
+    // pool-fragment-accumulation → intermittent mid-run exit). Material
+    // does not affect AABBs/geometry, so nothing else need refresh.
     void setMaterial(int meshId, const Material& mat) {
         auto* mesh = Scene<BE,PR>::findById(meshId);
         if (!mesh) return;
         mesh->material = mat;
-        pendingMaterials[meshId] = mat;
-        // D-041: material edit marks scene dirty (per user directive —
-        // "behavior parameter 수정" reads broadly). Next frame's
-        // Simulator::update dirty-check re-initializes so the renderer
-        // and any downstream consumers pick the change up via the
-        // applyPendingMaterials path inside initialize.
-        Scene<BE, PR>::dirty = true;
+        for (auto& req : Scene<BE,PR>::requestsGeneralMeshes)
+            if (req.id == meshId) { req.material = mat; break; }
     }
 
     // removeMesh erases the matching request, frees its initializer, then
@@ -6315,9 +6321,6 @@ struct Simulator {
             for (auto& r : reqs)
                 if (r.lifetimeId == selectedLifetime) { selectedObj = r.id; break; }
         }
-
-        pendingMaterials.clear();
-        pendingRotations.clear();
 
         // Rebuild the entire id-keyed render cache under the new ids.
         renderState.clear();
@@ -7271,12 +7274,9 @@ struct Simulator {
             }
         } else {
             for (auto& r : Scene<BE,PR>::requestsGeneralMeshes) {
-                ::Material defaultMat;
-                ::Quat defaultRot;
-                auto pr = pendingRotations.find(r.id);
-                if (pr != pendingRotations.end()) defaultRot = pr->second;
+                // S3-2: request owns material + rotation now.
                 encodeOne(r.id, r.initializer, r.behaviorType, r.behaviorParams,
-                          defaultMat, defaultRot,
+                          r.material, r.rotationQuat,
                           r.scale,
                           nullptr,
                           "object_" + std::to_string(r.id),
@@ -7337,8 +7337,6 @@ struct Simulator {
         // save/load round-trips assign ids 0, 1, 2, ... in load order.
         Scene<BE,PR>::nextMeshId = 0;
         Scene<BE,PR>::dirty = true;
-        pendingMaterials.clear();
-        pendingRotations.clear();
         // D-042 R-3 (2026-05-14) + turn-38 BLOCK fix-turn: drop both the
         // materialized MeshGL cache AND the pending preview bindings.
         // `getOrCreate(mesh)` checks `state` (materialized map) BEFORE the
@@ -7470,7 +7468,10 @@ struct Simulator {
                 int idx = Scene<BE,PR>::numMeshes - 1;
                 if (idx < (int)Scene<BE,PR>::requestsGeneralMeshes.size()) {
                     int meshId = Scene<BE,PR>::requestsGeneralMeshes[idx].id;
-                    pendingMaterials[meshId] = {
+                    (void)meshId;
+                    // S3-2: material is request-owned; pack copies it
+                    // onto the rebuilt mesh (no pendingMaterials defer).
+                    Scene<BE,PR>::requestsGeneralMeshes[idx].material = {
                         tinym::vec3((float)o.material.baseColor[0],
                                     (float)o.material.baseColor[1],
                                     (float)o.material.baseColor[2]),
@@ -7543,39 +7544,13 @@ struct Simulator {
         return r;
     }
 
-    std::unordered_map<int, ::Material> pendingMaterials;
-    std::unordered_map<int, ::Quat> pendingRotations;
-    void applyPendingMaterials() {
-        // Snapshot rotation entries before the loop. As of D-042 R-4,
-        // `rotateObject()` no longer self-populates `pendingRotations`
-        // (that was the pre-R-4 D-025 write-back), but loadScene still
-        // stashes per-mesh rotations from the saved snapshot. Snapshot,
-        // apply, then clear — keeps the iterator-stability guard intact
-        // in case a future code path re-introduces a self-stash.
-        std::vector<std::pair<int, ::Quat>> rotations;
-        rotations.reserve(pendingRotations.size());
-        for (auto& kv : pendingRotations) rotations.push_back(kv);
-
-        for (auto& m : Scene<BE,PR>::meshes) {
-            auto mit = pendingMaterials.find(m.id);
-            if (mit != pendingMaterials.end()) m.material = mit->second;
-        }
-        // Scale is NOT re-applied here — loadScene bakes it into the
-        // request preview BEFORE the first pack so cloth rest lengths
-        // are measured from scaled geometry. Rotation stays deferred
-        // (length-preserving, so rest lengths are unaffected).
-        // D-025 / D-042 R-4: re-apply load-deferred rotations by calling
-        // rotateObject so fresh state.x (just rebuilt by Scene::pack) AND
-        // req.preview.x both pick up the rotation around the pivot. After
-        // R-4, the only entries in `pendingRotations` come from loadScene's
-        // saved-snapshot stash; user-action rotateObject calls handle
-        // pack-survival via the preview write-back inline.
-        for (auto& kv : rotations) {
-            rotateObject(kv.first, kv.second);
-        }
-        pendingMaterials.clear();
-        pendingRotations.clear();
-    }
+    // S3-2/S3-3: retired. Material is request-owned (pack copies
+    // req.material onto the rebuilt mesh); rotation/scale are baked by
+    // pack from the request's initializer params. The pendingMaterials
+    // / pendingRotations side-maps and the D-025 deferred re-apply are
+    // gone. Kept as an empty no-op so existing call sites
+    // (initialize / loadScene flows / harness) compile unchanged.
+    void applyPendingMaterials() {}
 };
 
 
