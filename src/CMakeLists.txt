@@ -39,6 +39,7 @@ target_link_libraries(ysim PRIVATE
     BulletDynamics
     BulletCollision
     LinearMath
+    assimp        # third_party/assimp — 3D model import (D-???)
     "-framework AppKit"  # Dock icon (dock_icon.mm)
 )
 
@@ -46,6 +47,8 @@ target_include_directories(ysim PRIVATE
     ${CMAKE_SOURCE_DIR}/third_party/imgui
     ${CMAKE_SOURCE_DIR}/third_party/imgui/backends
     ${CMAKE_SOURCE_DIR}/third_party/bullet3/src
+    ${CMAKE_SOURCE_DIR}/third_party/assimp/include
+    ${CMAKE_BINARY_DIR}/third_party/assimp/include
 )
 
 if (GLFW_NATIVE_INCLUDE_DIR)

@@ -85,6 +85,19 @@ set(USE_DOUBLE_PRECISION   OFF CACHE BOOL "" FORCE)
 set(BUILD_PYBULLET         OFF CACHE BOOL "" FORCE)
 add_subdirectory(third_party/bullet3 EXCLUDE_FROM_ALL)
 
+# Assimp v5.4.3 — vendored under third_party/assimp as a git submodule.
+# Import-only, static, no tools/tests/samples/exporters. Vendor zlib so we
+# don't depend on a system copy. BUILD_SHARED_LIBS is already forced OFF by
+# the Bullet block above, so libassimp builds static and links into ysim.
+set(ASSIMP_BUILD_TESTS         OFF CACHE BOOL "" FORCE)
+set(ASSIMP_BUILD_ASSIMP_TOOLS  OFF CACHE BOOL "" FORCE)
+set(ASSIMP_BUILD_SAMPLES       OFF CACHE BOOL "" FORCE)
+set(ASSIMP_INSTALL             OFF CACHE BOOL "" FORCE)
+set(ASSIMP_WARNINGS_AS_ERRORS  OFF CACHE BOOL "" FORCE)
+set(ASSIMP_NO_EXPORT           ON  CACHE BOOL "" FORCE)
+set(ASSIMP_BUILD_ZLIB          OFF CACHE BOOL "" FORCE)  # use system zlib; assimp's bundled zlib breaks on modern macOS SDK
+add_subdirectory(third_party/assimp EXCLUDE_FROM_ALL)
+
 # 4. src 폴더의 CMakeLists.txt 실행
 add_subdirectory(src)
 

@@ -10,6 +10,7 @@
 #include "SceneActionLog.hpp"
 #include "program.hpp"
 #include "objreader.hpp"
+#include "assimpreader.hpp"
 #include "scene_format.hpp"
 #include "MeshGL.hpp"
 #include "MeshRenderState.hpp"
@@ -1391,6 +1392,86 @@ struct MeshFileInitializer : GeneralMeshInitializer<BE, PR> {
 
     MeshFileInitializer(ParamsType params) : params(params) {
         data.loadObject(params.prefix, params.fileName);
+
+        this->params.numPoints = data.nVertices;
+        this->params.numFacets = data.nElements3;
+
+        std::set<std::pair<int,int>> edges;
+        for (const auto& face : data.elements3) {
+            int n = 3;
+            for (int i = 0; i < n; ++i) {
+                int a = face[i];
+                int b = face[(i + 1) % n];
+
+                if (a > b) std::swap(a, b);
+                edges.insert({a, b});
+            }
+        }
+        this->params.numEdges = edges.size();
+    }
+
+    void initialize(MeshState<BE, PR>& state, MeshAdjacency<BE, PR>& adjacency) override {
+        state.memoryAllocation(params); // numPoints
+        adjacency.memoryAllocation(params); // numPoints, numFacets, numEdges
+
+        for(Index vid = 0; vid < params.numPoints; vid++) {
+            Index vbase = vid*3;
+            state.x[vbase  ] = data.vertices[vid].x*params.scale + params.offset.x;
+            state.x[vbase+1] = data.vertices[vid].y*params.scale + params.offset.y;
+            state.x[vbase+2] = data.vertices[vid].z*params.scale + params.offset.z;
+        }
+
+        if(adjacency.vertexAdjFacets.ptr) return;
+        for(Index fid = 0; fid < params.numFacets; fid++) {
+            Index fbase = fid*3;
+            adjacency.facets[fbase  ] = data.elements3[fid].x;
+            adjacency.facets[fbase+1] = data.elements3[fid].y;
+            adjacency.facets[fbase+2] = data.elements3[fid].z;
+        }
+
+        MeshAdjacencyInitializer<BE, PR>::initialize(state, adjacency);
+    }
+
+    void populatePreview(PreviewState<PR>& preview) override {
+        const Index nPts = (Index)params.numPoints;
+        const Index nFacets = (Index)params.numFacets;
+        preview.x.assign(nPts * 3, PR(0));
+        for (Index vid = 0; vid < nPts; ++vid) {
+            const Index vbase = vid * 3;
+            preview.x[vbase    ] = (PR)data.vertices[vid].x * params.scale + (PR)params.offset.x;
+            preview.x[vbase + 1] = (PR)data.vertices[vid].y * params.scale + (PR)params.offset.y;
+            preview.x[vbase + 2] = (PR)data.vertices[vid].z * params.scale + (PR)params.offset.z;
+        }
+        preview.facets.assign(nFacets * 3, 0);
+        for (Index fid = 0; fid < nFacets; ++fid) {
+            const Index fbase = fid * 3;
+            preview.facets[fbase    ] = (uint32_t)data.elements3[fid].x;
+            preview.facets[fbase + 1] = (uint32_t)data.elements3[fid].y;
+            preview.facets[fbase + 2] = (uint32_t)data.elements3[fid].z;
+        }
+        preview.recomputeNormals();
+    }
+
+    InitializerParams<PR>* getParams() override { return &params; }
+};
+
+// Parallel to MeshFileInitializer (objreader/ObjData::loadObject path) but
+// loads via Assimp (any format, always triangulated). Reuses the same
+// MeshFileInitializerParams and the same ObjData -> MeshState/MeshAdjacency
+// conversion so downstream is unchanged. Added (not modifying the OBJ path).
+template <typename BE, typename PR>
+struct AssimpMeshFileInitializer : GeneralMeshInitializer<BE, PR> {
+    using ParamsType = MeshFileInitializerParams<PR>;
+    ParamsType params;
+    ObjData data;
+
+    AssimpMeshFileInitializer(ParamsType params) : params(params) {
+        std::string err;
+        if (!loadModelWithAssimp(params.prefix, params.fileName, data, &err)) {
+            std::cerr << err << std::endl;
+            // data stays empty -> numPoints/numFacets = 0 (graceful, like a
+            // failed loadObject); importModel() probes the file beforehand.
+        }
 
         this->params.numPoints = data.nVertices;
         this->params.numFacets = data.nElements3;
@@ -5822,6 +5903,37 @@ struct Simulator {
             params);
         registerPreviewBindingForLastRequest();
         scene_log::logObject("OBJ 가져오기: " + fileName + " (id " +
+            std::to_string((int)Scene<BE, PR>::numMeshes - 1) + ")");
+        return true;
+    }
+    // Parallel to importMesh(): loads any 3D model format via Assimp
+    // (always triangulated). The "3D 모델 파일" UI button routes here.
+    bool importModel(const std::string& prefix, const std::string& fileName,
+                     PR scale, PR mass = PR(0.1), std::string* error = nullptr,
+                     BehaviorType behavior = BehaviorType::Float) {
+        std::string fullPath = prefix.empty() ? fileName : (prefix + "/" + fileName);
+        std::ifstream probe(fullPath);
+        if (!probe.good()) {
+            if (error) *error = "file not found: " + fullPath;
+            scene_log::logObject(
+                "3D 모델 가져오기 실패: " + fullPath + " (파일 없음)", false);
+            return false;
+        }
+        BehaviorParams<PR> params = (behavior == BehaviorType::TriangularCloth)
+            ? BehaviorParams<PR>{ClothBehaviorParams<PR>{PR(1e5), PR(1e5), PR(3e5), PR(0.01)}}
+            : BehaviorParams<PR>{FloatBehaviorParams<PR>{}};
+        auto* init = new AssimpMeshFileInitializer<BE, PR>(
+            {prefix, fileName, tinym::vec3(0), scale, mass});
+        if (init->params.numPoints == 0 || init->params.numFacets == 0) {
+            delete init;
+            if (error) *error = "assimp: no triangulated geometry: " + fullPath;
+            scene_log::logObject(
+                "3D 모델 가져오기 실패: " + fullPath + " (지오메트리 없음)", false);
+            return false;
+        }
+        scene.addGeneralMesh(init, behavior, params);
+        registerPreviewBindingForLastRequest();
+        scene_log::logObject("3D 모델 가져오기: " + fileName + " (id " +
             std::to_string((int)Scene<BE, PR>::numMeshes - 1) + ")");
         return true;
     }
@@ -13739,7 +13851,7 @@ int main(int argc, char** argv) {
         // here so OpenPopup → BeginPopupModal stay co-located.
         if (openSaveModal) ImGui::OpenPopup("씬 저장하기");
         if (openLoadModal) ImGui::OpenPopup("씬 불러오기");
-        if (openImportModal) ImGui::OpenPopup("OBJ 파일 가져오기");
+        if (openImportModal) ImGui::OpenPopup("3D 모델 파일 가져오기");
         if (openSphereModal) ImGui::OpenPopup("구 생성");
         if (openCubeModal) ImGui::OpenPopup("정육면체 생성");
         if (openCylinderModal) ImGui::OpenPopup("원기둥 생성");
@@ -13847,9 +13959,9 @@ int main(int argc, char** argv) {
             modalEnd();
         }
 
-        // ─── OBJ 파일 가져오기 ──────────────────────────────────
-        if (modalBegin("OBJ 파일 가져오기")) {
-            modalTitle("OBJ 파일 가져오기");
+        // ─── 3D 모델 파일 가져오기 ──────────────────────────────────
+        if (modalBegin("3D 모델 파일 가져오기")) {
+            modalTitle("3D 모델 파일 가져오기");
             modalLabel("경로");
             ImGui::SetNextItemWidth(-FLT_MIN);
             ImGui::InputText("##impPath", importPathBuf, sizeof(importPathBuf));
@@ -13864,7 +13976,7 @@ int main(int argc, char** argv) {
                 if (slash != std::string::npos) { prefix = path.substr(0, slash); file = path.substr(slash+1); }
                 else file = path;
                 std::string err;
-                if (simulator.importMesh(prefix, file, (Precision)importScale, Precision(0.1), &err, BehaviorType::Rigid)) {
+                if (simulator.importModel(prefix, file, (Precision)importScale, Precision(0.1), &err, BehaviorType::Rigid)) {
                     simulator.initialize(); simulator.applyPendingMaterials();
                 }
                 ImGui::CloseCurrentPopup();

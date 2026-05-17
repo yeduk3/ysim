@@ -226,7 +226,7 @@ void drawMeshInspectorWindow(MeshInspectorWindowState& st, const MeshInspectorTa
         }
         ImGui::Dummy({0,16});
         ImGui::PushStyleColor(ImGuiCol_Text,kG60);ImGui::TextUnformatted("새 물체 추가");ImGui::PopStyleColor();ImGui::Dummy({0,8});
-        if(CardButton("obj","OBJ 파일 불러오기",IcoPlus)&&t.on_request_add_import)t.on_request_add_import();ImGui::Dummy({0,4});
+        if(CardButton("obj","3D 모델 파일 불러오기",IcoPlus)&&t.on_request_add_import)t.on_request_add_import();ImGui::Dummy({0,4});
         if(CardButton("cube","정육면체",IcoCube)&&t.on_request_add_cube)t.on_request_add_cube();ImGui::Dummy({0,4});
         if(CardButton("sphere","구",IcoSphere)&&t.on_request_add_sphere)t.on_request_add_sphere();ImGui::Dummy({0,4});
         if(CardButton("cyl","원기둥",IcoCyl)&&t.on_request_add_cylinder)t.on_request_add_cylinder();ImGui::Dummy({0,4});
