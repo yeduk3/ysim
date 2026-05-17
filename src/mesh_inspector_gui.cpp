@@ -85,6 +85,28 @@ void drawMeshInspectorWindow(
                 "제약이 설정됩니다 (reset 후에도 유지).");
         }
 
+        ImGui::Spacing();
+        ImGui::Separator();
+        ImGui::TextUnformatted("연결된 참조점");
+        if (target.point_ref_constraints.empty()) {
+            ImGui::TextDisabled("(없음)");
+        } else {
+            for (size_t i = 0; i < target.point_ref_constraints.size(); ++i) {
+                const auto& e = target.point_ref_constraints[i];
+                ImGui::PushID((int)i);
+                ImGui::Text(e.selected_is_follower
+                                ? "이 점 → 물체 %d / 정점 %d (따라감)"
+                                : "물체 %d / 정점 %d → 이 점 (이끔)",
+                            e.other_obj, e.other_vert);
+                ImGui::SameLine();
+                if (ImGui::SmallButton("제거") && target.on_point_ref_remove) {
+                    target.on_point_ref_remove((int)i);
+                    state.status_message = "참조점 제약이 제거됨.";
+                }
+                ImGui::PopID();
+            }
+        }
+
         if (!state.status_message.empty()) {
             ImGui::Spacing();
             ImGui::Separator();

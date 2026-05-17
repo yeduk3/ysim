@@ -51,6 +51,10 @@ struct Source {
 struct Transform {
     Vec3 position{0, 0, 0};
     Quat rotation{1, 0, 0, 0};
+    // Per-axis object scale (inspector "크기"). Optional in JSON —
+    // omitted when unit so pre-scale snapshots stay byte-identical;
+    // absent on read defaults to no scaling.
+    Vec3 scale{1, 1, 1};
 };
 
 struct Material {
@@ -97,7 +101,7 @@ struct Environment {
     Vec3 wind{0.0, 0.0, 0.0};
     // UI viewport clear color. Optional in JSON for backward compat with
     // pre-existing scenes (default mirrors SceneEnvironment::backgroundColor).
-    Vec3 backgroundColor{0.05, 0.05, 0.08};
+    Vec3 backgroundColor{0.68, 0.85, 0.95};
 };
 
 // A reference-point coincidence constraint set in the point-selection
@@ -264,6 +268,10 @@ inline nlohmann::json toJson(const Transform& t) {
     Quat q = normalizeQuat(t.rotation);
     j["position"] = detail::vec3ToJson(t.position);
     j["rotation"] = detail::quatToJson(q);
+    // Omit unit scale so constraint-free / unscaled scenes stay
+    // byte-identical to pre-feature snapshots (mirrors fixed_particles).
+    if (t.scale[0] != 1.0 || t.scale[1] != 1.0 || t.scale[2] != 1.0)
+        j["scale"] = detail::vec3ToJson(t.scale);
     return j;
 }
 
@@ -364,7 +372,7 @@ inline bool isReservedShape(const std::string& /*s*/) {
 }
 
 inline bool isKnownShape(const std::string& s) {
-    return s == "grid" || s == "sphere" || s == "cube";
+    return s == "grid" || s == "sphere" || s == "cube" || s == "cylinder";
 }
 
 inline Result<Source> sourceFromJson(const nlohmann::json& j, int idx) {
@@ -425,6 +433,11 @@ inline Result<Transform> transformFromJson(const nlohmann::json& j, int idx) {
     if (rit == j.end()) return R::fail("missing 'rotation' at " + path);
     if (!detail::readQuat(*rit, t.rotation, err, path + ".rotation")) return R::fail(err);
     t.rotation = normalizeQuat(t.rotation);
+    // Optional (backward compat) — absent means unit scale.
+    if (auto sit = j.find("scale"); sit != j.end()) {
+        if (!detail::readVec3(*sit, t.scale, err, path + ".scale"))
+            return R::fail(err);
+    }
     return R::success(t);
 }
 

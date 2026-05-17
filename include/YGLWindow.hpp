@@ -90,7 +90,7 @@ struct YGLWindow {
     void mainLoop() {
         init_();
         
-        while(!glfwWindowShouldClose(window_) && !glfwGetKey(window_, GLFW_KEY_ESCAPE)) {
+        while(!glfwWindowShouldClose(window_) /* && !glfwGetKey(window_, GLFW_KEY_ESCAPE) */) {
             render_();
             
             glfwSwapBuffers(window_);

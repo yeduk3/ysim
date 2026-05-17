@@ -5,6 +5,7 @@
 #include <cmath>
 #include <functional>
 #include <string>
+#include <vector>
 
 namespace mesh_inspector {
 
@@ -267,6 +268,21 @@ struct MeshInspectorTarget {
     std::function<void(bool)> on_point_set_fixed;
     std::function<void(float, float, float)> on_point_move;
     std::function<void()> on_point_ref_toggle;
+
+    // Reference-point constraints touching the selected vertex. One
+    // entry per constraint where the selected point is either the
+    // follower (selected_is_follower = true: this point tracks
+    // other_obj/other_vert) or the leader (false: other_obj/other_vert
+    // tracks this point). Rebuilt each frame by production. The remove
+    // callback takes the entry's index in this vector; production
+    // re-resolves the same ordered match list and erases that one.
+    struct PointRefEntry {
+        bool selected_is_follower = true;
+        int other_obj = -1;
+        int other_vert = -1;
+    };
+    std::vector<PointRefEntry> point_ref_constraints;
+    std::function<void(int /*entryIndex*/)> on_point_ref_remove;
 };
 
 void drawMeshInspectorWindow(

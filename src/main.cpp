@@ -440,6 +440,7 @@ struct DynamicByteMemoryPool {
     void resetMarkers() {
         for (auto& p : poolList) p.marker = 0;
     }
+
 };
 
 template <typename BE>
@@ -2169,7 +2170,7 @@ struct SceneEnvironment {
     // Viewport clear color. Read by the render loop each frame and pushed
     // through glClearColor; mirrored into scene_format::Environment so
     // saveScene/loadScene round-trip the choice.
-    tinym::vec3 backgroundColor = tinym::vec3(0.05f, 0.05f, 0.08f);
+    tinym::vec3 backgroundColor = tinym::vec3(0.68f, 0.85f, 0.95f);
 };
 
 template <typename BE, typename PR>
@@ -4058,17 +4059,31 @@ struct BVH<BE, PR, BVHMODE::LINEAR, PRIMITIVE> {
     // tree[] and treeVisitCounts are CPU-visible. For pure-CPU
     // mode (maxDepth == 0) the caller goes through `bottomUpCombine`
     // instead — treeVisitCounts is undefined there.
+    // Iterative form of the recursive skip-walk (same stack-overflow
+    // rationale as bottomUpCombine). A node whose subtree the GPU
+    // already combined (treeVisitCounts == 2) is treated as a leaf:
+    // not descended and not recombined — identical to the old early
+    // `return`.
     void bottomUpCombineWithSkip() {
-        auto walk = [&](auto&& self, BVHNode& node, int nodeId) -> void {
-            if (node.childA < 0) return;                       // leaf
-            if (treeVisitCounts[nodeId] == 2u) return;         // GPU done
-            self(self, tree[node.childA], node.childA);
-            self(self, tree[node.childB], node.childB);
-            node.aabb.min = tree[node.childA].aabb.min;
-            node.aabb.max = tree[node.childA].aabb.max;
-            node.aabb.combine(tree[node.childB].aabb);
-        };
-        walk(walk, tree[0], 0);
+        if (tree.size == 0) return;
+        std::vector<std::pair<int,bool>> stk;
+        stk.emplace_back(0, false);
+        while (!stk.empty()) {
+            auto [id, done] = stk.back();
+            stk.pop_back();
+            BVHNode& node = tree[id];
+            if (node.childA < 0) continue;            // leaf
+            if (treeVisitCounts[id] == 2u) continue;  // GPU-combined subtree
+            if (!done) {
+                stk.emplace_back(id, true);
+                stk.emplace_back(node.childA, false);
+                stk.emplace_back(node.childB, false);
+            } else {
+                node.aabb.min = tree[node.childA].aabb.min;
+                node.aabb.max = tree[node.childA].aabb.max;
+                node.aabb.combine(tree[node.childB].aabb);
+            }
+        }
     }
 
     // D-030: hybrid bottom-up driver. GPU partial-depth combine
@@ -4512,16 +4527,32 @@ struct BVH<BE, PR, BVHMODE::LINEAR, PRIMITIVE> {
         }
     }
 
+    // Iterative post-order combine. Was a recursive lambda whose depth
+    // equaled the BVH height — a large / unbalanced LBVH (big mesh, e.g.
+    // a high-tessellation cloth or imported Human.obj) recursed deep
+    // enough to overflow the main-thread stack → EXC_BAD_ACCESS. An
+    // explicit heap stack removes the depth limit; the (id,childrenDone)
+    // marker preserves exact post-order so a parent AABB is combined
+    // only after both children are final.
     void bottomUpCombine() {
-        auto combineAABB = [&](auto&& self, BVHNode& node) -> void {
-            if(node.childA < 0) return;
-            self(self, tree[node.childA]);
-            self(self, tree[node.childB]);
-            node.aabb.min = tree[node.childA].aabb.min;
-            node.aabb.max = tree[node.childA].aabb.max;
-            node.aabb.combine(tree[node.childB].aabb);
-        };
-        combineAABB(combineAABB, tree[0]);
+        if (tree.size == 0) return;
+        std::vector<std::pair<int,bool>> stk;
+        stk.emplace_back(0, false);
+        while (!stk.empty()) {
+            auto [id, done] = stk.back();
+            stk.pop_back();
+            BVHNode& node = tree[id];
+            if (node.childA < 0) continue;            // leaf
+            if (!done) {
+                stk.emplace_back(id, true);
+                stk.emplace_back(node.childA, false);
+                stk.emplace_back(node.childB, false);
+            } else {
+                node.aabb.min = tree[node.childA].aabb.min;
+                node.aabb.max = tree[node.childA].aabb.max;
+                node.aabb.combine(tree[node.childB].aabb);
+            }
+        }
     }
 
     void refit() {
@@ -5706,11 +5737,14 @@ struct Simulator {
         // (BroadPhase::refit at src/main.cpp:3961 — single call covers both
         // levels).
         collisionPipeline.broadPhase.refit();
-        // D-041: mark scene dirty so Simulator::update's pre-pause dirty
-        // check triggers a full re-initialize on the next frame. This
-        // makes Rigid bodies (and other state) catch up to the translate
-        // without requiring a manual sim.initialize() call.
-        Scene<BE, PR>::dirty = true;
+        // S1 refactor: translation is an in-place edit — it overwrites
+        // existing pack memory (state.x / xPrev / preview) and refits
+        // the BVH above. It does NOT change topology or buffer sizes, so
+        // it must NOT trigger a full re-pack. The old D-041 `dirty=true`
+        // here forced a realloc-ing re-initialize on every transform and
+        // (compounded by the leak-forward pool reset) was the driver of
+        // the cold multi-scene RSS blow-up. Structural changes still set
+        // dirty at their own sites.
     }
 
     // FR-004 / D-021: set the named mesh's absolute orientation to newQuat.
@@ -5803,8 +5837,14 @@ struct Simulator {
         // `pendingRotations[id] = q` stash for deferred-at-load
         // rotations is UNCHANGED — that path applies the saved rotation
         // exactly once at the first post-load initialize.
-        // D-041: mark scene dirty (see translateObject; same rationale).
-        Scene<BE, PR>::dirty = true;
+        // S1 refactor: rotation is an in-place, length-preserving edit
+        // (state.x / xPrev / preview overwritten in place, BVH refit
+        // done by the caller path). No topology/size change → no
+        // re-pack. Removing the old D-041 `dirty=true` also stops the
+        // post-load re-init cascade (loadScene→initialize→
+        // applyPendingMaterials→rotateObject used to re-dirty and force
+        // initialize #2/#3, the cold-load pool growth). Structural
+        // changes still set dirty at their own sites.
     }
 
     // Set the named mesh's absolute per-axis scale to newScale. Mirrors
@@ -5877,6 +5917,19 @@ struct Simulator {
             return (Index)-1;
         }
         return (Index)rv;
+    }
+
+    // Inverse of renderToPhysicsVid for display: first render vert that
+    // maps to `pvid`, else pvid itself (meshes with no separate render
+    // mapping have render == physics).
+    static int physicsToRenderVid(
+            typename Scene<BE, PR>::RequestGeneralMesh& req, Index pvid) {
+        if (req.preview.hasRender()) {
+            for (size_t rv = 0; rv < req.preview.renderToPhysics.size(); ++rv)
+                if ((Index)req.preview.renderToPhysics[rv] == pvid)
+                    return (int)rv;
+        }
+        return (int)pvid;
     }
 
     typename Scene<BE, PR>::RequestGeneralMesh* findRequest(int id) {
@@ -6001,7 +6054,120 @@ struct Simulator {
                                 fMesh->transformPosition + delta);
             }
         }
+        // Mutating the constraint set must trigger the same next-frame
+        // clean re-init every other scene mutation uses (translate /
+        // rotate / behavior / removeMesh). translateObject already sets
+        // dirty on the auto-snap path; set it unconditionally so the
+        // no-snap (2nd+ constraint) path is covered too. Without this
+        // the sim keeps running on packed/BVH state built for the old
+        // constraint configuration → stale-state segfault.
+        Scene<BE, PR>::dirty = true;
         return true;
+    }
+
+    struct PointRefView {
+        bool selectedIsFollower;
+        int otherObj;
+        int otherVert;  // render-vid for display
+    };
+
+    // Reference constraints touching (objId, renderVert): the point as
+    // follower (query) → other is the leader; or as leader (target) →
+    // other is the follower. Ordered to match
+    // removeReferenceConstraintForPoint's scan.
+    std::vector<PointRefView> referenceConstraintsForPoint(int objId,
+                                                           int renderVert) {
+        std::vector<PointRefView> out;
+        auto* req = findRequest(objId);
+        if (!req) return out;
+        Index pvid = renderToPhysicsVid(*req, renderVert);
+        if (pvid == (Index)-1) return out;
+        for (const auto& c : Scene<BE, PR>::referenceConstraints) {
+            if (c.objPair.query == (Index)objId
+                && c.vertexPair.query == pvid) {
+                auto* o = findRequest((int)c.objPair.target);
+                out.push_back({true, (int)c.objPair.target,
+                    o ? physicsToRenderVid(*o, c.vertexPair.target)
+                      : (int)c.vertexPair.target});
+            } else if (c.objPair.target == (Index)objId
+                       && c.vertexPair.target == pvid) {
+                auto* o = findRequest((int)c.objPair.query);
+                out.push_back({false, (int)c.objPair.query,
+                    o ? physicsToRenderVid(*o, c.vertexPair.query)
+                      : (int)c.vertexPair.query});
+            }
+        }
+        return out;
+    }
+
+    // Erase the `idx`-th constraint touching (objId, renderVert) using
+    // the same ordered scan as referenceConstraintsForPoint.
+    bool removeReferenceConstraintForPoint(int objId, int renderVert,
+                                           int idx) {
+        auto* req = findRequest(objId);
+        if (!req) return false;
+        Index pvid = renderToPhysicsVid(*req, renderVert);
+        if (pvid == (Index)-1) return false;
+        auto& cons = Scene<BE, PR>::referenceConstraints;
+        int seen = 0;
+        for (auto it = cons.begin(); it != cons.end(); ++it) {
+            bool match =
+                (it->objPair.query == (Index)objId
+                 && it->vertexPair.query == pvid)
+             || (it->objPair.target == (Index)objId
+                 && it->vertexPair.target == pvid);
+            if (!match) continue;
+            if (seen == idx) {
+                cons.erase(it);
+                // Same contract as setReferenceConstraint: force a
+                // clean next-frame initialize() so the simulation
+                // pipeline (packed buffers, BVH, rigid backend) is
+                // rebuilt without the removed constraint instead of
+                // continuing on now-stale state (segfault repro).
+                Scene<BE, PR>::dirty = true;
+                return true;
+            }
+            ++seen;
+        }
+        return false;
+    }
+
+    // Set by loadScene; consumed once by initialize() after the first
+    // post-load pack. Triggers the reference-constraint auto-snap that
+    // live setReferenceConstraint applies at creation time.
+    bool pendingRefSnap = false;
+
+    // Re-apply the creation-time auto-snap for loaded constraints: for
+    // the FIRST constraint of each ordered (follower→leader) object
+    // pair (distinct objects), translate the whole follower object so
+    // its constrained vertex coincides with the leader's. Mirrors
+    // setReferenceConstraint's snap; uses post-pack state.x positions.
+    void applyLoadedReferenceSnaps() {
+        std::set<std::pair<Index, Index>> snappedPairs;
+        for (const auto& c : Scene<BE, PR>::referenceConstraints) {
+            if (c.objPair.query == c.objPair.target) continue;
+            auto key = std::make_pair(c.objPair.query, c.objPair.target);
+            if (!snappedPairs.insert(key).second) continue;  // not first
+
+            auto* fMesh = Scene<BE, PR>::findById((int)c.objPair.query);
+            auto* lMesh = Scene<BE, PR>::findById((int)c.objPair.target);
+            if (!fMesh || !lMesh) continue;
+            if (!fMesh->state.x.ptr || !lMesh->state.x.ptr) continue;
+            Index fb = c.vertexPair.query * 3;
+            Index lb = c.vertexPair.target * 3;
+            if (fb + 2 >= (Index)fMesh->state.x.size) continue;
+            if (lb + 2 >= (Index)lMesh->state.x.size) continue;
+
+            tinym::vec3 fpos((float)fMesh->state.x.ptr[fb+0],
+                             (float)fMesh->state.x.ptr[fb+1],
+                             (float)fMesh->state.x.ptr[fb+2]);
+            tinym::vec3 lpos((float)lMesh->state.x.ptr[lb+0],
+                             (float)lMesh->state.x.ptr[lb+1],
+                             (float)lMesh->state.x.ptr[lb+2]);
+            tinym::vec3 delta = lpos - fpos;
+            translateObject((int)c.objPair.query,
+                            fMesh->transformPosition + delta);
+        }
     }
 
     // Move a single vertex to an absolute world position. Mirrors
@@ -6422,6 +6588,19 @@ struct Simulator {
         // applyPendingMaterials() calls (after loadScene in main.cpp /
         // runSelfTest) become no-ops because the maps are cleared here.
         applyPendingMaterials();
+
+        // Re-apply the reference-constraint auto-snap once after a load.
+        // Live setReferenceConstraint translates the follower so the
+        // first constraint between an object pair coincides; loadScene
+        // pushes constraints directly (bypassing that), so without this
+        // the follower starts far from the (possibly moving Rigid)
+        // leader and ref_constraint_copy_pos teleports it across a large
+        // gap on substep 0 → stiff-spring blow-up → NaN → GPU OOB.
+        // Runs AFTER applyPendingMaterials so scale/rotation are final.
+        if (pendingRefSnap) {
+            applyLoadedReferenceSnaps();
+            pendingRefSnap = false;
+        }
 
         // D-039: rigid backend per-scene reset. Stale handles from prior
         // scene are cleared; the sweep below idempotently re-adds backend
@@ -7039,6 +7218,7 @@ struct Simulator {
         auto encodeOne = [&](int id, GeneralMeshInitializer<BE,PR>* init,
                               BehaviorType btype, const BehaviorParams<PR>& bparams,
                               const ::Material& mat, const ::Quat& rot,
+                              const tinym::vec3& scale,
                               const tinym::vec3* transformOverride,
                               const std::string& name,
                               bool applyGravity, bool applyWind,
@@ -7103,6 +7283,7 @@ struct Simulator {
                                         transformOverride->z};
             }
             o.transform.rotation = {rot.w, rot.x, rot.y, rot.z};
+            o.transform.scale = {scale.x, scale.y, scale.z};
 
             o.behavior.type = behaviorTypeName(btype);
             o.behavior.params = nlohmann::json::object();
@@ -7134,6 +7315,7 @@ struct Simulator {
             for (auto& m : Scene<BE,PR>::meshes) {
                 encodeOne(m.id, m.initializer, m.behaviorType, m.behaviorParams,
                           m.material, m.rotationQuat,
+                          m.scale,
                           &m.transformPosition,
                           "object_" + std::to_string(m.id),
                           m.applyGravity, m.applyWind,
@@ -7147,6 +7329,7 @@ struct Simulator {
                 if (pr != pendingRotations.end()) defaultRot = pr->second;
                 encodeOne(r.id, r.initializer, r.behaviorType, r.behaviorParams,
                           defaultMat, defaultRot,
+                          r.scale,
                           nullptr,
                           "object_" + std::to_string(r.id),
                           r.applyGravity, r.applyWind,
@@ -7218,6 +7401,21 @@ struct Simulator {
         // scene-boundary churn. Closes R-2 Estimator turn-37 WARNING.
         renderState.clearPreviewBindings();
         renderState.clear();
+
+        // Scene-boundary churn: selection/hover indices are per-runtime
+        // scene. The old scene's selectedVert/hoveredVert (vertex ids in
+        // the PREVIOUS mesh's vertex space) would otherwise dangle into
+        // the freshly loaded scene — drawSelectablePoints' drawOnePoint,
+        // the point id-pass and the inspector all index live buffers by
+        // these. Reset them so the loaded scene starts with no stale
+        // (out-of-range) selection → bad-memory-access crash on load.
+        selectedObj = -1;
+        selectedVert = -1;
+        selectedVertObj = -1;
+        hoveredObj = -1;
+        hoveredVert = -1;
+        hoveredVertObj = -1;
+        pointRefPickActive = false;
 
         Scene<BE,PR>::environment.gravity = tinym::vec3(
             (float)r.value.environment.gravity[0],
@@ -7341,6 +7539,49 @@ struct Simulator {
                     q.y = (float)o.transform.rotation[2];
                     q.z = (float)o.transform.rotation[3];
                     pendingRotations[meshId] = q;
+                    // Scale must be baked into the preview BEFORE the
+                    // first pack: pack's recomputeRestLengths measures
+                    // cloth rest lengths from state.x (== preview). A
+                    // deferred (rotation-style) scale would leave the
+                    // first post-load sim frame running with rest
+                    // lengths from UNSCALED geometry → every stretched
+                    // spring pre-stressed → stiff explicit-Euler blow-up
+                    // → NaN → GPU BVH OOB → segfault. Rotation stays
+                    // deferred safely (length-preserving); scale does
+                    // not. reset() uses the same pre-pack scale order.
+                    auto& rq = Scene<BE,PR>::requestsGeneralMeshes[idx];
+                    tinym::vec3 sc((float)o.transform.scale[0],
+                                   (float)o.transform.scale[1],
+                                   (float)o.transform.scale[2]);
+                    rq.scale = sc;
+                    bool unitScale = std::abs(sc.x - 1.0f) < 1e-7f
+                                  && std::abs(sc.y - 1.0f) < 1e-7f
+                                  && std::abs(sc.z - 1.0f) < 1e-7f;
+                    if (!unitScale) {
+                        const size_t np = rq.preview.numPoints();
+                        for (size_t pi = 0; pi < np; ++pi) {
+                            tinym::vec3 p(rq.preview.x[pi*3+0],
+                                          rq.preview.x[pi*3+1],
+                                          rq.preview.x[pi*3+2]);
+                            tinym::vec3 v = p - pos;  // pivot = saved position
+                            rq.preview.x[pi*3+0] = pos.x + v.x * sc.x;
+                            rq.preview.x[pi*3+1] = pos.y + v.y * sc.y;
+                            rq.preview.x[pi*3+2] = pos.z + v.z * sc.z;
+                        }
+                        if (rq.preview.hasRender()) {
+                            const size_t nr =
+                                rq.preview.renderToPhysics.size();
+                            for (size_t rv = 0; rv < nr; ++rv) {
+                                tinym::vec3 p(rq.preview.renderX[rv*3+0],
+                                              rq.preview.renderX[rv*3+1],
+                                              rq.preview.renderX[rv*3+2]);
+                                tinym::vec3 v = p - pos;
+                                rq.preview.renderX[rv*3+0] = pos.x + v.x*sc.x;
+                                rq.preview.renderX[rv*3+1] = pos.y + v.y*sc.y;
+                                rq.preview.renderX[rv*3+2] = pos.z + v.z*sc.z;
+                            }
+                        }
+                    }
                     // Write env-force toggles directly into the request
                     // (RequestGeneralMesh.applyGravity / applyWind). pack()
                     // will carry them into the realized mesh next
@@ -7376,12 +7617,15 @@ struct Simulator {
             c.vertexPair.target = (Index)rc.targetVertex;
             Scene<BE,PR>::referenceConstraints.push_back(c);
         }
+        // Schedule the creation-time auto-snap to run once after the
+        // first post-load pack (see initialize()). Only when something
+        // was actually restored.
+        pendingRefSnap = !Scene<BE,PR>::referenceConstraints.empty();
         return r;
     }
 
     std::unordered_map<int, ::Material> pendingMaterials;
     std::unordered_map<int, ::Quat> pendingRotations;
-
     void applyPendingMaterials() {
         // Snapshot rotation entries before the loop. As of D-042 R-4,
         // `rotateObject()` no longer self-populates `pendingRotations`
@@ -7397,6 +7641,10 @@ struct Simulator {
             auto mit = pendingMaterials.find(m.id);
             if (mit != pendingMaterials.end()) m.material = mit->second;
         }
+        // Scale is NOT re-applied here — loadScene bakes it into the
+        // request preview BEFORE the first pack so cloth rest lengths
+        // are measured from scaled geometry. Rotation stays deferred
+        // (length-preserving, so rest lengths are unaffected).
         // D-025 / D-042 R-4: re-apply load-deferred rotations by calling
         // rotateObject so fresh state.x (just rebuilt by Scene::pack) AND
         // req.preview.x both pick up the rotation around the pivot. After
@@ -12344,6 +12592,17 @@ int main(int argc, char** argv) {
                     };
                     target.on_point_ref_toggle = [&simulator]() {
                         simulator.pointRefPickActive = !simulator.pointRefPickActive;
+                    };
+                    for (const auto& e :
+                         simulator.referenceConstraintsForPoint(o, v)) {
+                        mesh_inspector::MeshInspectorTarget::PointRefEntry pe;
+                        pe.selected_is_follower = e.selectedIsFollower;
+                        pe.other_obj  = e.otherObj;
+                        pe.other_vert = e.otherVert;
+                        target.point_ref_constraints.push_back(pe);
+                    }
+                    target.on_point_ref_remove = [&simulator, o, v](int i) {
+                        simulator.removeReferenceConstraintForPoint(o, v, i);
                     };
                 }
                 // No vertex selected → mesh_id stays -1 so the same

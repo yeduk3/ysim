@@ -377,6 +377,34 @@ TEST_CASE("reference-point constraint round-trips field-by-field + byte-stable")
     std::remove(path.c_str());
 }
 
+TEST_CASE("per-object scale round-trips + omitted when unit") {
+    auto snap = makePopulatedSnapshot();
+    // Unit scale on both objects → key absent (byte-compat guard).
+    {
+        nlohmann::json j = toJson(snap);
+        CHECK_FALSE(j["objects"][0]["transform"].contains("scale"));
+        CHECK_FALSE(j["objects"][1]["transform"].contains("scale"));
+    }
+    // Non-unit scale must round-trip field-by-field + byte-stable.
+    snap.objects[0].transform.scale = {2.0, 0.5, 3.25};
+    auto path = tempPath("scale");
+    REQUIRE(writeToFile(snap, path));
+    auto r = readFromFile(path);
+    REQUIRE(r.ok);
+    {
+        nlohmann::json j = toJson(snap);
+        CHECK(j["objects"][0]["transform"].contains("scale"));
+    }
+    for (int k = 0; k < 3; ++k)
+        CHECK(snap.objects[0].transform.scale[k]
+              == doctest::Approx(r.value.objects[0].transform.scale[k]));
+    // Object 1 (unit) defaults back to (1,1,1) on load.
+    for (int k = 0; k < 3; ++k)
+        CHECK(r.value.objects[1].transform.scale[k] == doctest::Approx(1.0));
+    CHECK(toString(snap) == toString(r.value));
+    std::remove(path.c_str());
+}
+
 TEST_CASE("reference-point constraint is optional + omitted when empty") {
     // No constraints → the key must not appear, so pre-feature scenes
     // stay byte-identical (backward-compat guard).
