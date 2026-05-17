@@ -6947,17 +6947,24 @@ struct Simulator {
         system.acctime += system.h;
         frame++;
 
-        // D-042 R-5 (2026-05-14): resync packed state.x → per-request
-        // preview.x at the END of every update. After this point preview
-        // reflects the current simulated positions (cloth integrator
-        // output, rigid backend Δpos, narrow-phase constraint resolution);
-        // subsequent translate/rotate edits + future preview-iterating
-        // renderers see post-sim state. Mirrors R-3's preview→packed
-        // memcpy in reverse. Size-guarded — silently skipped on mismatch
-        // (defensive for future no-preview initializers). R-7 (2026-05-15)
-        // appended `req.preview.recomputeNormals()` after the position
-        // memcpy so per-vertex normals also track simulated deformation;
-        // see Block 42 for the corrupt-and-restore verification.
+        // S3-4: preview is a pure projection of the packed state. The
+        // post-update sync is now one call; uploadMeshes() also calls
+        // it every render frame so a paused / just-edited scene shows
+        // the current state.x without relying on per-edit dual-writes.
+        syncPreviewFromState();
+
+        //collisionPipeline.broadPhase.build(sceneObjects.squareClothes[0].x, sceneObjects.squareClothes[0].facet);
+        //std::cout << "[Simulator Update] Finished update" << std::endl;
+    }
+
+    // S3-4: project the packed state into each request's PreviewState
+    // (positions + recomputed normals + render-topology resync). This
+    // is THE single place preview is derived from the pack — preview is
+    // never an independent source of truth. Called post-update AND every
+    // render frame (uploadMeshes), so paused/just-edited scenes show the
+    // current state.x without per-edit preview dual-writes. Size-guarded
+    // (defensive for future no-preview initializers). Was D-042 R-5/R-7.
+    void syncPreviewFromState() {
         for (auto& mesh : Scene<BE, PR>::meshes) {
             if (!mesh.state.x.ptr) continue;
             const size_t stateVerts = (size_t)(mesh.state.x.size / 3);
@@ -6968,24 +6975,11 @@ struct Simulator {
                 std::memcpy(req.preview.x.data(),
                             mesh.state.x.ptr,
                             stateVerts * 3 * sizeof(PR));
-                // D-042 R-7 (2026-05-14): recompute preview.n so per-vertex
-                // normals stay current with simulated deformation (cloth
-                // bending, rigid rotation, translate). Pre-R-7 preview.n
-                // held addX-time normals — visually stale post-sim. The
-                // cost is O(numFacets + numPoints) per mesh per frame,
-                // negligible for v1 scene sizes.
                 req.preview.recomputeNormals();
-                // 2026-05-15 (A2 split): if the mesh carries a separate
-                // render topology (cube), push welded positions back into
-                // the unwelded renderX via renderToPhysics, then refresh
-                // renderN. No-op for sphere/grid/file (hasRender=false).
                 req.preview.resyncRenderFromPhysics();
                 break;
             }
         }
-
-        //collisionPipeline.broadPhase.build(sceneObjects.squareClothes[0].x, sceneObjects.squareClothes[0].facet);
-        //std::cout << "[Simulator Update] Finished update" << std::endl;
     }
 
     // Render-side per-frame mesh upload. Called by the GUI loop, NOT by
@@ -6993,6 +6987,9 @@ struct Simulator {
     // from a non-GL-context process (e.g. the --self-test harness) was the
     // last GL coupling left after D-011. update() is now pure simulation.
     void uploadMeshes() {
+        // preview = projection of the packed state, refreshed every
+        // render frame (covers paused / post-edit, pause-independent).
+        syncPreviewFromState();
         if (profiler) {
             auto scope = profiler->scoped("mesh_upload");
             for(auto& mesh : scene.meshes)
