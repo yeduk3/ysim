@@ -20,6 +20,37 @@ struct NarrowParams {
     uint maxNumCollisions;
     float radius;
     float thickness;
+    uint skipSphere;   // slice (c): 1 ⇒ skip Sphere pairs (analytic path)
 };
+
+// Slice (c). MUST match the C++ AnalyticShape (main.cpp) byte layout:
+// 4×float4 then 4×uint (80 bytes, 16-aligned). tinym::vec4 ↔ float4
+// is the same ABI already used for NarrowCollision.collisionNormal.
+struct AnalyticShape {
+    float4 centerRadius;   // xyz world center, w radius (sphere/cyl)
+    float4 halfExtHeight;  // xyz OBB half-extents (cube), w cyl half-height
+    float4 rotQuat;        // world orientation w,x,y,z (cube/cyl)
+    float4 prevCenterPad;  // xyz prev center (reserved c-4 CCD), w pad
+    uint shapeType;        // ShapeType: 0 Mesh,1 Plane,2 Sphere,3 Cube,4 Cyl
+    uint objId;
+    uint behaviorType;
+    uint flags;            // bit0 = collidable
+};
+
+// Per-(cloth-mesh) dispatch params for narrow_pt_analytic.
+struct AnalyticNarrowParams {
+    uint  oid;             // owning cloth mesh id (== objPair.query)
+    uint  numVerts;        // cloth vertex count (thread domain)
+    uint  numShapes;       // entries in the AnalyticShape array
+    uint  maxNumCollisions;
+    uint  clothBehavior;   // BehaviorType for behaviorPair (debug/A5)
+    float radius;
+    float thickness;
+};
+
+// ShapeType primitive enum values shared with main.cpp's enum.
+#define YSIM_SHAPE_SPHERE   2u
+#define YSIM_SHAPE_CUBE     3u
+#define YSIM_SHAPE_CYLINDER 4u
 
 #endif

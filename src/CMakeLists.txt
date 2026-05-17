@@ -4,6 +4,7 @@ add_executable(ysim
     metal_impl.cpp
     profiler_gui.cpp
     mesh_inspector_gui.cpp
+    scene_action_log.cpp
     BulletRigidPhysicsBackend.cpp
     dock_icon.mm
     ${CMAKE_SOURCE_DIR}/third_party/imgui/imgui.cpp
@@ -116,9 +117,16 @@ configure_file(
     ${CMAKE_BINARY_DIR}/point.frag
     COPYONLY
 )
-add_custom_command(TARGET ysim POST_BUILD
+# Asset sync. A standalone custom *target* (no OUTPUT) is always considered
+# out-of-date, so the copy runs on every `cmake --build` — even when only
+# files under assets/ changed and ysim itself was not relinked. (A
+# POST_BUILD custom command on the ysim target would only fire when ysim
+# is actually re-linked, silently skipping newly added asset files.)
+add_custom_target(copy_assets ALL
     COMMAND ${CMAKE_COMMAND} -E copy_directory
             ${CMAKE_SOURCE_DIR}/assets
-            $<TARGET_FILE_DIR:ysim>/assets
+            ${CMAKE_BINARY_DIR}/assets
+    COMMENT "Syncing assets -> ${CMAKE_BINARY_DIR}/assets"
 )
+add_dependencies(ysim copy_assets)
 

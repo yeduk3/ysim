@@ -65,6 +65,16 @@ kernel void narrow_pt_tri(
 
     BroadCollision bc = broadCollisions[id];
 
+    // Slice (c-1) A6, runtime-gated: only when params.skipSphere is
+    // set (Simulator::useAnalyticPrimitive == true) are sphere pairs
+    // skipped here so narrow_pt_analytic feeds them instead (no
+    // double-feed). When the toggle is OFF (default) skipSphere==0 and
+    // spheres flow through the original triangle-soup path unchanged.
+    // Cube/Cylinder always use triangle soup until c-3.
+    if (params.skipSphere != 0u
+     && (bc.shapePair.x == YSIM_SHAPE_SPHERE
+      || bc.shapePair.y == YSIM_SHAPE_SPHERE)) return;
+
     uint point    = bc.indexPair.x;
     uint triangle = bc.indexPair.y;
 
@@ -171,4 +181,59 @@ kernel void fill_vf_offsets(
     NarrowCollision nc = narrowCollisions[id];
     uint ppid = scenePackedPositionsOffsets[nc.objPair.x] + nc.indexPair.x;
     atomic_fetch_add_explicit(&vertColFacetsOffsets[ppid+1], 1u, memory_order_relaxed);
+}
+
+// Slice (c-1) — analytic cloth-vertex vs primitive narrow phase.
+// One thread per cloth vertex of ONE cloth mesh (oid). Loops the
+// compact AnalyticShape array and, for spheres (c-1 scope), emits a
+// NarrowCollision into the SAME shared narrowCollisions buffer the
+// triangle path uses, so the existing CPU sort + unchanged cloth
+// integrators consume it transparently. DCD only (Q2): tests the
+// current position, no swept xPrev. Cube/Cylinder are skipped here
+// (still triangle-soup) until c-3.
+kernel void narrow_pt_analytic(
+    device atomic_uint*          numNarrowCollisions [[buffer(0)]],
+    device NarrowCollision*      narrowCollisions    [[buffer(1)]],
+    device const packed_float3*  scenePackedPositions [[buffer(2)]],
+    device const uint*           scenePackedPositionsOffsets [[buffer(3)]],
+    device const AnalyticShape*  shapes              [[buffer(4)]],
+    constant AnalyticNarrowParams& p                 [[buffer(5)]],
+    uint id [[thread_position_in_grid]]
+) {
+    if (id >= p.numVerts) return;
+
+    uint gid = scenePackedPositionsOffsets[p.oid] + id;
+    float3 pos = float3(scenePackedPositions[gid]);
+
+    for (uint s = 0u; s < p.numShapes; ++s) {
+        AnalyticShape sh = shapes[s];
+        if ((sh.flags & 1u) == 0u) continue;        // not collidable
+        if (sh.shapeType != YSIM_SHAPE_SPHERE) continue; // c-1: sphere only
+
+        float3 c = sh.centerRadius.xyz;
+        float  r = sh.centerRadius.w;
+
+        float3 dir = pos - c;
+        float  len = length(dir);
+
+        // Signed surface distance; gate matches narrow_pt_tri
+        // (radius + thickness band). Negative ⇒ penetrating.
+        float d = len - r;
+        if (d >= p.radius + p.thickness) continue;
+
+        // Outward radial normal. Degenerate at the exact center —
+        // pick +Y so the contact is still well-formed.
+        float3 n = (len > 1e-6f) ? (dir / len) : float3(0.0f, 1.0f, 0.0f);
+
+        uint outIdx = atomic_fetch_add_explicit(
+            numNarrowCollisions, 1u, memory_order_relaxed);
+        if (outIdx >= p.maxNumCollisions) return;
+
+        narrowCollisions[outIdx].indexPair = uint2(id, 0u);
+        narrowCollisions[outIdx].objPair   = uint2(p.oid, sh.objId);
+        narrowCollisions[outIdx].collisionNormalAndDistance = float4(n, d);
+        narrowCollisions[outIdx].behaviorPair = uint2(p.clothBehavior,
+                                                      sh.behaviorType);
+        narrowCollisions[outIdx].shapePair = uint2(0u, sh.shapeType);
+    }
 }

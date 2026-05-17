@@ -27,7 +27,7 @@ static bool InputXYZ(const char* id, float v[3]) {
     for(int i=0;i<3;++i){
         if(i)ImGui::SameLine(0,gap);
         ImGui::SetNextItemWidth(chW);
-        char f[16]; std::snprintf(f,16,"%s  %%.1f",L[i]);
+        char f[16]; std::snprintf(f,16,"%s  %%.3f",L[i]);
         ImGui::PushID(i); if(ImGui::DragFloat("##v",&v[i],0.01f,0,0,f))ch=true; ImGui::PopID();
     }
     ImGui::PopID(); return ch;
@@ -106,7 +106,7 @@ static bool InlineSlider(const char* label, float* v, float vmin, float vmax) {
     bool ch=ImGui::SliderFloat("##sl",v,vmin,vmax,"");
     ImGui::PopStyleVar();ImGui::PopStyleColor(3);
     ImGui::SameLine(kP+contentW-valW);
-    ImGui::PushStyleColor(ImGuiCol_Text,kG60);ImGui::Text("%.2f",*v);ImGui::PopStyleColor();
+    ImGui::PushStyleColor(ImGuiCol_Text,kG60);ImGui::Text("%.3f",*v);ImGui::PopStyleColor();
     ImGui::PopID();return ch;
 }
 
@@ -199,11 +199,32 @@ void drawMeshInspectorWindow(MeshInspectorWindowState& st, const MeshInspectorTa
     if(t.mesh_id<0||t.base_color==nullptr){
         ImGui::Dummy({0,kP});ImGui::Indent(kP);
         ImGui::PushStyleColor(ImGuiCol_Text,kG60);ImGui::TextUnformatted("물체 리스트");ImGui::PopStyleColor();
-        ImGui::Dummy({0,40});
-        {float aw=CW();
-        auto ctr=[&](const char* tx,ImVec4 c){ImVec2 sz=ImGui::CalcTextSize(tx);ImGui::SetCursorPosX(kP+(aw-sz.x)/2);ImGui::PushStyleColor(ImGuiCol_Text,c);ImGui::TextUnformatted(tx);ImGui::PopStyleColor();};
-        ctr("아직 물체가 없어요",kG100);ctr("추가할 물체를 클릭하여 선택하세요.",kG60);}
-        ImGui::Dummy({0,40});ImGui::Dummy({0,4});
+        ImGui::Dummy({0,12});
+        if(t.object_list.empty()){
+            float aw=CW();
+            auto ctr=[&](const char* tx,ImVec4 c){ImVec2 sz=ImGui::CalcTextSize(tx);ImGui::SetCursorPosX(kP+(aw-sz.x)/2);ImGui::PushStyleColor(ImGuiCol_Text,c);ImGui::TextUnformatted(tx);ImGui::PopStyleColor();};
+            ImGui::Dummy({0,28});
+            ctr("아직 물체가 없어요",kG100);ctr("추가할 물체를 클릭하여 선택하세요.",kG60);
+            ImGui::Dummy({0,28});
+        } else {
+            for(const auto& e:t.object_list){
+                ImGui::PushID(e.id);
+                // gray5 filled row (not the outline/line button), label
+                // left-aligned with 16px left padding.
+                ImGui::PushStyleColor(ImGuiCol_Button,kG5);
+                ImGui::PushStyleColor(ImGuiCol_ButtonHovered,kG10);
+                ImGui::PushStyleColor(ImGuiCol_ButtonActive,kG10);
+                ImGui::PushStyleVar(ImGuiStyleVar_ButtonTextAlign,ImVec2(0.0f,0.5f));
+                ImGui::PushStyleVar(ImGuiStyleVar_FramePadding,ImVec2(16,0));
+                ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize,0.0f);
+                if(ImGui::Button(e.label.c_str(),{CW(),36})&&t.on_select_object)t.on_select_object(e.id);
+                ImGui::PopStyleVar(3);
+                ImGui::PopStyleColor(3);
+                ImGui::PopID();
+                ImGui::Dummy({0,4});
+            }
+        }
+        ImGui::Dummy({0,16});
         ImGui::PushStyleColor(ImGuiCol_Text,kG60);ImGui::TextUnformatted("새 물체 추가");ImGui::PopStyleColor();ImGui::Dummy({0,8});
         if(CardButton("obj","OBJ 파일 불러오기",IcoPlus)&&t.on_request_add_import)t.on_request_add_import();ImGui::Dummy({0,4});
         if(CardButton("cube","정육면체",IcoCube)&&t.on_request_add_cube)t.on_request_add_cube();ImGui::Dummy({0,4});

@@ -251,6 +251,18 @@ struct MeshInspectorTarget {
     std::function<void()> on_request_add_plane;
     std::function<void()> on_request_add_import;
 
+    // No-selection branch: the scene's objects, one entry per
+    // RequestGeneralMesh (the canonical, pack-surviving list).
+    // Rebuilt each frame by production. Clicking a row calls
+    // on_select_object(id) → production sets selectedObj, so the
+    // panel switches to that object's editor next frame.
+    struct ObjectListEntry {
+        int id = -1;
+        std::string label;
+    };
+    std::vector<ObjectListEntry> object_list;
+    std::function<void(int /*meshId*/)> on_select_object;
+
     // ── Point panel ──────────────────────────────────────────────────
     // When point_panel is true the inspector renders the per-vertex
     // panel (pin toggle, position, reference-copy) for the selected

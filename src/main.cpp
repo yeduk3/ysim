@@ -7,6 +7,7 @@
 #include "FrameProfiler.hpp"
 #include "MeshInspectorWindow.hpp"
 #include "ProfilerWindow.hpp"
+#include "SceneActionLog.hpp"
 #include "program.hpp"
 #include "objreader.hpp"
 #include "scene_format.hpp"
@@ -1660,9 +1661,24 @@ struct alignas(8) IndexPair {
     }
 };
 
+// Per-mesh collision geometry class. Mirrored into the GPU
+// `meshShapes` buffer (Scene::pack → MetalGlobalContext slot 10) as
+// the raw enum value, so the numeric order is GPU-visible — APPEND
+// new entries, never renumber existing ones. Assigned in Scene::pack
+// from the request's initializer subtype (the same dynamic_cast
+// cascade that seeds transformPosition).
+//
+// Sphere/Cube/Cylinder are analytic primitives: a future slice (c)
+// keys an analytic broad/narrow path on these so they skip the
+// BVH/SH mesh pipeline. Until then this is classification metadata
+// only — no collision code branches on it yet, so assigning it is
+// behaviorally inert (safe to land independently).
 enum struct ShapeType : Index {
-    Mesh, // each collisions are checked in a particle way
-    Plane,
+    Mesh,     // general triangle soup — per-particle/triangle collision
+    Plane,    // reserved analytic plane (not yet auto-assigned; see (c))
+    Sphere,
+    Cube,
+    Cylinder,
 };
 
 // Picking mode. Object: id-buffer triangle pass → whole-mesh hover/
@@ -1714,6 +1730,9 @@ const char* shapeTypeName(ShapeType shapeType) {
     switch (shapeType) {
         case ShapeType::Mesh: return "Mesh";
         case ShapeType::Plane: return "Plane";
+        case ShapeType::Sphere: return "Sphere";
+        case ShapeType::Cube: return "Cube";
+        case ShapeType::Cylinder: return "Cylinder";
         default: return "Unknown";
     }
 }
@@ -1731,6 +1750,25 @@ struct NarrowCollision {
     tinym::vec4 collisionNormalAndDistance;
     IndexPair behaviorPair;
     IndexPair shapePair;
+};
+
+// Slice (c) — per-primitive analytic collision descriptor. COMPACT
+// array (count = #primitive-shaped meshes, NOT numMeshes; A4): each
+// entry self-describes via objId. Allocated at Scene::pack, contents
+// refilled from the live mesh transform each frame (D3). GPU-visible;
+// vec4-packed so the future analytic narrow kernel reads it without
+// padding surprises. INERT in c-0 — allocated + filled, no consumer
+// kernel yet (c-1 adds it). `prevCenterPad` is reserved for the c-4
+// swept-CCD / Bullet-motion path; v1 is DCD (Q2) so it stays unused.
+struct alignas(16) AnalyticShape {
+    tinym::vec4 centerRadius;   // xyz = world center, w = radius (sphere/cyl)
+    tinym::vec4 halfExtHeight;  // xyz = OBB half-extents (cube), w = cyl half-height
+    tinym::vec4 rotQuat;        // world orientation (w,x,y,z) for OBB cube/cyl
+    tinym::vec4 prevCenterPad;  // xyz = prev center (reserved c-4 CCD); w = pad
+    uint32_t shapeType;         // ShapeType enum value
+    uint32_t objId;             // owning mesh id (debug / NarrowCollision.objPair)
+    uint32_t behaviorType;      // BehaviorType (cloth-vs-prim gate / future prim-prim)
+    uint32_t flags;             // bit0 = collidable
 };
 
 template <typename BE, typename PR>
@@ -2359,6 +2397,12 @@ struct Scene {
         VectorBase<BE, Index> statesOffsets;
         VectorBase<BE, Index> facetsOffsets;
         VectorBase<BE, Index> edgesOffsets;
+        // Slice (c) A1: owning mesh index per packed vertex (size
+        // numPoints), built once per Scene::pack from statesOffsets.
+        // Lets the analytic narrow kernel resolve thread→mesh (and its
+        // behavior via meshBehaviors) without an in-kernel binary
+        // search over statesOffsets. Inert until c-1 consumes it.
+        VectorBase<BE, Index> vertObj;
     };
     inline static PackedMeshData packedMeshData;
 
@@ -2391,6 +2435,70 @@ struct Scene {
         Index approxColsPerRay = 4096;
     };
     inline static RayTracedData rayTracedData;
+
+    // Slice (c) — compact analytic-primitive array (A4). numAnalytic =
+    // #meshes whose shapeType is Sphere/Cube/Cylinder. Allocated in
+    // packAnalyticShapes() at pack; contents refilled by
+    // refreshAnalyticShapes() each update (D3). No consumer in c-0.
+    inline static VectorBase<BE, AnalyticShape> meshAnalytic;
+    inline static Index numAnalytic = 0;
+
+    static bool isPrimitiveShape(ShapeType s) {
+        return s == ShapeType::Sphere
+            || s == ShapeType::Cube
+            || s == ShapeType::Cylinder;
+    }
+
+    // Refill meshAnalytic from the live mesh transform + initializer
+    // intrinsic size. Iterates meshes in the SAME order as the count
+    // pass so entry k always maps to the same mesh across frames.
+    // v1 reads authoring transform (Q2: primitives static; Bullet-
+    // driven motion reconciliation is c-4 / A9).
+    static void refreshAnalyticShapes() {
+        if (numAnalytic == 0 || !meshAnalytic.ptr) return;
+        Index k = 0;
+        for (Index i = 0; i < (Index)meshes.size(); ++i) {
+            auto& m = meshes[i];
+            if (!isPrimitiveShape(m.shapeType)) continue;
+
+            // Intrinsic radius / half-extent (scale 1) from the
+            // initializer; scaled into world units below. Spheres are
+            // forced-uniform (Q3) so scale.x is authoritative.
+            PR sz = PR(0);
+            if (auto* sp = dynamic_cast<MeshSphereInitializer  <BE,PR>*>(m.initializer)) sz = sp->params.size;
+            else if (auto* cb = dynamic_cast<MeshCubeInitializer    <BE,PR>*>(m.initializer)) sz = cb->params.size;
+            else if (auto* cy = dynamic_cast<MeshCylinderInitializer<BE,PR>*>(m.initializer)) sz = cy->params.size;
+
+            const tinym::vec3 c = m.transformPosition;
+            const tinym::vec3 s = m.scale;
+
+            AnalyticShape a{};
+            a.centerRadius  = tinym::vec4(c.x, c.y, c.z, (float)(sz * s.x));
+            a.halfExtHeight = tinym::vec4((float)(sz * s.x),
+                                          (float)(sz * s.y),
+                                          (float)(sz * s.z),
+                                          (float)(sz * s.y));
+            a.rotQuat       = tinym::vec4(m.rotationQuat.w, m.rotationQuat.x,
+                                          m.rotationQuat.y, m.rotationQuat.z);
+            a.prevCenterPad = tinym::vec4(c.x, c.y, c.z, 0.0f);
+            a.shapeType     = (uint32_t)m.shapeType;
+            a.objId         = (uint32_t)m.id;
+            a.behaviorType  = (uint32_t)m.behaviorType;
+            a.flags         = 1u; // bit0 = collidable
+            meshAnalytic[k++] = a;
+        }
+    }
+
+    // Count primitives, (re)allocate the compact buffer, fill it.
+    // Called at the end of Scene::pack (size can change across packs).
+    static void packAnalyticShapes() {
+        Index count = 0;
+        for (auto& m : meshes) if (isPrimitiveShape(m.shapeType)) ++count;
+        numAnalytic = count;
+        if (count == 0) { meshAnalytic = VectorBase<BE, AnalyticShape>(); return; }
+        meshAnalytic = VectorBase<BE, AnalyticShape>(count);
+        refreshAnalyticShapes();
+    }
 
     static void pack() {
         if(!dirty) {
@@ -2425,6 +2533,13 @@ struct Scene {
 
         // allocate MeshState
         Index numPoints = packedMeshData.statesOffsets[numMeshes];
+        // Slice (c) A1: per-vertex owning mesh index. Each mesh i owns
+        // the packed-vertex range [statesOffsets[i], statesOffsets[i+1]).
+        packedMeshData.vertObj = VectorBase<BE, Index>(numPoints > 0 ? numPoints : 1, 0);
+        for (Index i = 0; i < numMeshes; ++i)
+            for (Index v = packedMeshData.statesOffsets[i];
+                 v < packedMeshData.statesOffsets[i+1]; ++v)
+                packedMeshData.vertObj[v] = i;
         Index numStatesData = numPoints*3;
         packedMeshData.x = VectorBase<BE, PR>(numStatesData);
         packedMeshData.xPrev = VectorBase<BE, PR>(numStatesData);
@@ -2483,16 +2598,29 @@ struct Scene {
             // BDD-003's translate path computes deltas against the author
             // intent, not against (0,0,0). Mirrors the dynamic_cast cascade
             // in toSnapshot.
+            // Also classifies shapeType from the initializer subtype in
+            // the same pass ((a)+(b)). Set in EVERY branch (not relying
+            // on the default) so a re-pack of a reused meshes[i] slot
+            // can't carry a stale class. Grid/File stay Mesh — a grid
+            // can be deforming cloth, so it is honestly mesh-collision;
+            // analytic Plane is left for slice (c).
             if (auto* g  = dynamic_cast<MeshGridInitializer  <BE, PR>*>(req.initializer)) {
                 meshes[i].transformPosition = g->params.center;
+                meshes[i].shapeType = ShapeType::Mesh;
             } else if (auto* sp = dynamic_cast<MeshSphereInitializer<BE, PR>*>(req.initializer)) {
                 meshes[i].transformPosition = sp->params.center;
+                meshes[i].shapeType = ShapeType::Sphere;
             } else if (auto* cb = dynamic_cast<MeshCubeInitializer  <BE, PR>*>(req.initializer)) {
                 meshes[i].transformPosition = cb->params.center;
+                meshes[i].shapeType = ShapeType::Cube;
             } else if (auto* cy = dynamic_cast<MeshCylinderInitializer<BE, PR>*>(req.initializer)) {
                 meshes[i].transformPosition = cy->params.center;
+                meshes[i].shapeType = ShapeType::Cylinder;
             } else if (auto* f  = dynamic_cast<MeshFileInitializer  <BE, PR>*>(req.initializer)) {
                 meshes[i].transformPosition = f->params.offset;
+                meshes[i].shapeType = ShapeType::Mesh;
+            } else {
+                meshes[i].shapeType = ShapeType::Mesh;
             }
             Index prevNumPoints = packedMeshData.statesOffsets[i];
             Index curNumPoints = packedMeshData.statesOffsets[i+1]-prevNumPoints;
@@ -2679,6 +2807,11 @@ struct Scene {
 
 
         // adjacency data
+
+        // Slice (c) c-0: build the compact analytic-primitive array
+        // from the now-realized meshes (shapeType/transform set by the
+        // cascade above). Inert — no kernel consumes it yet.
+        packAnalyticShapes();
 
         dirty = false;
     }
@@ -5117,16 +5250,32 @@ struct BruteForce<CPU, PR> {
 template <typename PR>
 struct BruteForce<METAL, PR> {
     MTL::ComputePipelineState* bruteForcePSO;
+    MTL::ComputePipelineState* analyticPSO;   // slice (c-1)
     BruteForce() {
         bruteForcePSO = MetalKernelContext::getPSO("narrow_pt_tri");
+        analyticPSO   = MetalKernelContext::getPSO("narrow_pt_analytic");
     }
     struct NarrowParams {
         uint32_t numBroadCollisions;
         uint32_t maxNumCollisions;
         float radius;
         float thickness;
+        // Slice (c) A6: 1 ⇒ skip Sphere pairs (analytic path handles
+        // them). 0 ⇒ original behavior (sphere via triangle soup).
+        uint32_t skipSphere;
     };
-    bool narrow(PR radius, PR thickness) {
+    // Mirrors AnalyticNarrowParams in common_types.metalh (field order
+    // and types MUST match — bound via setBytes).
+    struct AnalyticNarrowParams {
+        uint32_t oid;
+        uint32_t numVerts;
+        uint32_t numShapes;
+        uint32_t maxNumCollisions;
+        uint32_t clothBehavior;
+        float    radius;
+        float    thickness;
+    };
+    bool narrow(PR radius, PR thickness, bool analyticEnabled = false) {
         typename Scene<METAL, PR>::PackedMeshData& packedMesh = Scene<METAL, PR>::packedMeshData;
         typename Scene<METAL, PR>::PackedCollisionData& packedCol = Scene<METAL, PR>::packedCollisionData;
 
@@ -5143,6 +5292,8 @@ struct BruteForce<METAL, PR> {
         // Slow-touch band is radius + thickness; integrator gates vn-zero
         // and position-push on (distance < thickness) per D-016.
         nparams.thickness = static_cast<float>(thickness);
+        // Only skip sphere pairs here when the analytic path is on.
+        nparams.skipSphere = analyticEnabled ? 1u : 0u;
 
         MetalGlobalContext::setBuffer(packedCol.broadCollisions, 0);
         MetalGlobalContext::setBuffer(packedCol.numNarrowCollisions, 1);
@@ -5161,11 +5312,63 @@ struct BruteForce<METAL, PR> {
         MetalGlobalContext::dispatchThreads(bruteForcePSO, nparams.numBroadCollisions);
         return true;
     }
-    void narrowAndSortByVertices(PR radius, PR thickness) {
 
-        if(narrow(radius, thickness))
-            MetalGlobalContext::commitAndWait();
-        else return;
+    // Slice (c-1) — analytic cloth-vs-primitive narrow phase. Appends
+    // into the SAME shared narrowCollisions / numNarrowCollisions the
+    // triangle path uses (does NOT resetNarrow — narrow() already did),
+    // so the existing CPU sort + unchanged integrators consume it.
+    // Per-cloth-mesh dispatch (mirrors the integrator dispatch loop):
+    // CPU knows the mesh is cloth, so no GPU behavior buffer needed.
+    // Returns true if at least one dispatch was issued.
+    bool narrowAnalytic(PR radius, PR thickness) {
+        if (Scene<METAL, PR>::numAnalytic == 0
+            || !Scene<METAL, PR>::meshAnalytic.ptr) return false;
+        auto& packedMesh = Scene<METAL, PR>::packedMeshData;
+        auto& packedCol  = Scene<METAL, PR>::packedCollisionData;
+        bool dispatched = false;
+        for (auto& mesh : Scene<METAL, PR>::meshes) {
+            if (mesh.behaviorType != BehaviorType::TriangularCloth
+             && mesh.behaviorType != BehaviorType::FastGridCloth) continue;
+            uint32_t numVerts = (uint32_t)(mesh.state.x.size / 3);
+            if (numVerts == 0) continue;
+
+            AnalyticNarrowParams ap{};
+            ap.oid              = (uint32_t)mesh.id;
+            ap.numVerts         = numVerts;
+            ap.numShapes        = (uint32_t)Scene<METAL, PR>::numAnalytic;
+            ap.maxNumCollisions = (uint32_t)packedCol.maxNumCollisions;
+            ap.clothBehavior    = (uint32_t)mesh.behaviorType;
+            ap.radius           = (float)radius;
+            ap.thickness        = (float)thickness;
+
+            MetalGlobalContext::setBuffer(packedCol.numNarrowCollisions, 0);
+            MetalGlobalContext::setBuffer(packedCol.narrowCollisions, 1);
+            MetalGlobalContext::setBuffer(packedMesh.x, 2);
+            MetalGlobalContext::setBuffer(packedMesh.statesOffsets, 3);
+            MetalGlobalContext::setBuffer(Scene<METAL, PR>::meshAnalytic, 4);
+            MetalGlobalContext::setBytes(ap, 5);
+            MetalGlobalContext::dispatchThreads(analyticPSO, numVerts);
+            dispatched = true;
+        }
+        return dispatched;
+    }
+
+    void narrowAndSortByVertices(PR radius, PR thickness,
+                                  bool analyticEnabled = false) {
+
+        // narrow() resets the shared narrow buffers, then dispatches
+        // the triangle path (only when broad pairs exist). When the
+        // analytic toggle is on, the analytic path appends afterward
+        // into the same buffers (no reset) and narrow() skips sphere
+        // pairs so they are not double-fed. Toggle OFF (default) =
+        // original pipeline: narrow_pt_tri handles spheres, analytic
+        // not dispatched. Each dispatch is committed+waited before the
+        // next so the shared atomic counter / array are coherent.
+        bool tri = narrow(radius, thickness, analyticEnabled);
+        if (tri) MetalGlobalContext::commitAndWait();
+        bool ana = analyticEnabled && narrowAnalytic(radius, thickness);
+        if (ana) MetalGlobalContext::commitAndWait();
+        if (!tri && !ana) return;
         // Cumulative narrow-contact counter for the harness — `numNarrowCollisions`
         // resets between substeps, so a per-frame harness sample misses contacts
         // that fired in earlier substeps. This static accumulates across the run
@@ -5366,6 +5569,13 @@ struct Simulator {
     // SpatialHashing is broadphase-only.
     SpatialHashing<METAL, PR> shBroadPhase;
     bool useSpatialHashing = false;
+
+    // Slice (c) A/B toggle. false (default) = ORIGINAL pipeline:
+    // spheres collide via the triangle-soup narrow_pt_tri exactly as
+    // before c-1 (narrow_pt_analytic not dispatched, no sphere gate).
+    // true = analytic sphere path. Flipped at runtime with the 'A'
+    // key for side-by-side comparison.
+    bool useAnalyticPrimitive = false;
 
     // Per-substep stdout log for the SH path. Toggling this on also enables
     // shBroadPhase.verbose (forces a commit after the broad-phase dispatch so
@@ -5594,6 +5804,8 @@ struct Simulator {
         std::ifstream probe(fullPath);
         if (!probe.good()) {
             if (error) *error = "file not found: " + fullPath;
+            scene_log::logObject(
+                "OBJ 가져오기 실패: " + fullPath + " (파일 없음)", false);
             return false;
         }
         // UI add-OBJ path passes BehaviorType::Rigid; self-tests use the
@@ -5609,6 +5821,8 @@ struct Simulator {
             behavior,
             params);
         registerPreviewBindingForLastRequest();
+        scene_log::logObject("OBJ 가져오기: " + fileName + " (id " +
+            std::to_string((int)Scene<BE, PR>::numMeshes - 1) + ")");
         return true;
     }
     void addClothGridFast(Index particleNum1D = 200, PR size1D = 100, PR kstretch=1e5, PR kshear=1e5, PR kbend=3e5, PR thickness=0.001, PR mass=0.1) {
@@ -5668,6 +5882,8 @@ struct Simulator {
             behavior,
             FloatBehaviorParams<PR>{});
         registerPreviewBindingForLastRequest();
+        scene_log::logObject("구 추가 (id " +
+            std::to_string((int)Scene<BE, PR>::numMeshes - 1) + ")");
     }
 
     void addCube(tinym::vec3 center, Index tessellation, PR size, PR mass=PR(0.1),
@@ -5678,6 +5894,8 @@ struct Simulator {
             behavior,
             FloatBehaviorParams<PR>{});
         registerPreviewBindingForLastRequest();
+        scene_log::logObject("정육면체 추가 (id " +
+            std::to_string((int)Scene<BE, PR>::numMeshes - 1) + ")");
     }
 
     void addCylinder(tinym::vec3 center, Index tessellation, PR size, PR mass=PR(0.1),
@@ -5688,6 +5906,8 @@ struct Simulator {
             behavior,
             FloatBehaviorParams<PR>{});
         registerPreviewBindingForLastRequest();
+        scene_log::logObject("원기둥 추가 (id " +
+            std::to_string((int)Scene<BE, PR>::numMeshes - 1) + ")");
     }
 
     void addGround(PlaneDirection dir, tinym::vec3 center, PR size1D, PR mass=0.1) {
@@ -5731,6 +5951,8 @@ struct Simulator {
             FloatBehaviorParams<PR>{}
         );
         registerPreviewBindingForLastRequest();
+        scene_log::logObject("평면 추가 (id " +
+            std::to_string((int)Scene<BE, PR>::numMeshes - 1) + ")");
     };
 
     // BDD-003: translate the named mesh by mutating state.x (and state.xPrev)
@@ -6033,6 +6255,10 @@ struct Simulator {
             if (it != req->fixedVertices.end())
                 req->fixedVertices.erase(it);
         }
+        scene_log::logConstraint(
+            (fixed ? "점 고정: obj " : "점 고정 해제: obj ")
+            + std::to_string(objId) + ", 점 "
+            + std::to_string(renderVert));
     }
 
     // Register a reference-point coincidence constraint: the follower
@@ -6103,6 +6329,11 @@ struct Simulator {
         // the sim keeps running on packed/BVH state built for the old
         // constraint configuration → stale-state segfault.
         Scene<BE, PR>::dirty = true;
+        scene_log::logConstraint(
+            "참조점 설정: obj " + std::to_string(followerObj)
+            + " 점 " + std::to_string(followerRenderVert)
+            + " → obj " + std::to_string(leaderObj)
+            + " 점 " + std::to_string(leaderRenderVert));
         return true;
     }
 
@@ -6160,6 +6391,9 @@ struct Simulator {
             if (!match) continue;
             if (seen == idx) {
                 cons.erase(it);
+                scene_log::logConstraint(
+                    "참조점 해제: obj " + std::to_string(objId)
+                    + " 점 " + std::to_string(renderVert));
                 // Same contract as setReferenceConstraint: force a
                 // clean next-frame initialize() so the simulation
                 // pipeline (packed buffers, BVH, rigid backend) is
@@ -6319,6 +6553,8 @@ struct Simulator {
         delete it->initializer;
         reqs.erase(it);
         if (Scene<BE, PR>::numMeshes > 0) Scene<BE, PR>::numMeshes--;
+        scene_log::logObject("오브젝트 삭제 (id " +
+            std::to_string(meshId) + ")");
 
         // Compact ids back to [0, size) in request order.
         for (int k = 0; k < (int)reqs.size(); ++k) reqs[k].id = k;
@@ -6696,6 +6932,12 @@ struct Simulator {
         if (Scene<BE, PR>::dirty) initialize();
         if(pause) return;
 
+        // Slice (c) c-0: keep the analytic-primitive array current.
+        // Once per update() suffices for v1 (Q2: primitives static);
+        // c-4 moves this per-substep when Bullet drives primitive
+        // motion. Inert — no consumer yet.
+        Scene<BE, PR>::refreshAnalyticShapes();
+
         // 진행 바 로직: 직전 실행에서 목표 프레임에 도달해 멈춰 있었다면,
         // 다시 재생을 누른 이 시점에서 frame 0으로 되돌린 뒤 진행한다.
         //
@@ -6886,9 +7128,9 @@ struct Simulator {
 
                 if (profiler) {
                     auto scope = profiler->scoped("narrow_phase");
-                    collisionPipeline.narrowPhase.narrowAndSortByVertices(radius, margin);
+                    collisionPipeline.narrowPhase.narrowAndSortByVertices(radius, margin, useAnalyticPrimitive);
                 } else {
-                    collisionPipeline.narrowPhase.narrowAndSortByVertices(radius, margin);
+                    collisionPipeline.narrowPhase.narrowAndSortByVertices(radius, margin, useAnalyticPrimitive);
                 }
 
                 if (profiler) {
@@ -7036,7 +7278,7 @@ struct Simulator {
     // the hovered vertex (light yellow) and selected vertex (yellow).
     // Caller sets M/V/P on pointShader and enables depth test.
     void drawSelectablePoints(Program& pointShader) {
-        constexpr float kDot = 15.0f;
+        constexpr float kDot = 5.0f;
         // 1. Every selectable vertex → black.
         pointShader.setUniform("uColor", tinym::vec3(0.0f, 0.0f, 0.0f));
         glPointSize(kDot);
@@ -7239,6 +7481,10 @@ struct Simulator {
             Scene<BE,PR>::environment.backgroundColor.y,
             Scene<BE,PR>::environment.backgroundColor.z};
 
+        // Persist the live solver timing (시뮬레이션 환경 panel).
+        s.simulation.timePerFrame = (double)system.h;
+        s.simulation.subSteps     = (int)system.subSteps;
+
         auto encodeOne = [&](int id, GeneralMeshInitializer<BE,PR>* init,
                               BehaviorType btype, const BehaviorParams<PR>& bparams,
                               const ::Material& mat, const ::Quat& rot,
@@ -7387,12 +7633,27 @@ struct Simulator {
 
     bool saveScene(const std::string& path, std::string* error = nullptr) {
         auto snap = toSnapshot();
-        return scene_format::writeToFile(snap, path, error);
+        std::string localErr;
+        bool ok = scene_format::writeToFile(snap, path,
+                                            error ? error : &localErr);
+        if (ok) {
+            scene_log::logSceneIO("씬 저장: " + path);
+        } else {
+            scene_log::logSceneIO(
+                "씬 저장 실패: " + path + " (" +
+                (error ? *error : localErr) + ")", false);
+        }
+        return ok;
     }
 
     scene_format::Result<scene_format::SceneSnapshot> loadScene(const std::string& path) {
         auto r = scene_format::readFromFile(path);
-        if (!r.ok) return r;
+        if (!r.ok) {
+            scene_log::logSceneIO(
+                "씬 불러오기 실패: " + path + " (" + r.error.message + ")",
+                false);
+            return r;
+        }
 
         // BDD-016: only mutate the scene after parse + structural validation succeed.
         // Match the pack()-side ownership convention: meshes are non-owning
@@ -7448,6 +7709,18 @@ struct Simulator {
             (float)r.value.environment.backgroundColor[0],
             (float)r.value.environment.backgroundColor[1],
             (float)r.value.environment.backgroundColor[2]);
+
+        // Restore solver timing into the live system. r.value.simulation
+        // already carries the engine defaults (1/60 s, 60 substeps) when
+        // the scene file has no "simulation" block (old scenes), so this
+        // is an unconditional assign — backward compat is handled by the
+        // loader's default-init, not a branch here. subh must be
+        // recomputed (it is the per-substep integrator dt; see the
+        // 시뮬레이션 환경 panel for the same resync rationale).
+        system.h        = (PR)r.value.simulation.timePerFrame;
+        system.subSteps = (size_t)(r.value.simulation.subSteps > 0
+                                   ? r.value.simulation.subSteps : 1);
+        system.subh     = system.h / (PR)system.subSteps;
 
         const std::string sceneDir = scene_format::sceneDir(path);
         for (auto& o : r.value.objects) {
@@ -7614,6 +7887,8 @@ struct Simulator {
         // first post-load pack (see initialize()). Only when something
         // was actually restored.
         pendingRefSnap = !Scene<BE,PR>::referenceConstraints.empty();
+        scene_log::logSceneIO("씬 불러오기: " + path + " (오브젝트 " +
+            std::to_string(r.value.objects.size()) + "개)");
         return r;
     }
 
@@ -8709,7 +8984,7 @@ static int runSelfTest() {
         const int beforeImport = Scene<Backend, Precision>::numMeshes;
 
         std::string err;
-        bool ok = sim.importMesh("src/assets", "Human.obj",
+        bool ok = sim.importMesh("assets", "Human.obj",
                                  /*scale=*/(Precision)0.04,
                                  /*mass=*/(Precision)0.1, &err);
         if (!ok) {
@@ -8796,7 +9071,7 @@ static int runSelfTest() {
         // Error path — missing file must NOT mutate the scene.
         const int beforeMissing = Scene<Backend, Precision>::numMeshes;
         std::string missErr;
-        bool missingOk = sim.importMesh("src/assets",
+        bool missingOk = sim.importMesh("assets",
                                         "ysim_selftest_does_not_exist.obj",
                                         (Precision)1.0, (Precision)0.1, &missErr);
         const int afterMissing = Scene<Backend, Precision>::numMeshes;
@@ -12137,7 +12412,7 @@ int main(int argc, char** argv) {
     //simulator.addClothFile("src/assets", "horse-gallop-01.obj", {0,0,0}, 80, 1e4, 0, 2e4, thickness mass);
     //simulator.addFloatMesh("src/assets", "horse-gallop-01.obj", {0, -1, 0}, 1.2);
     //simulator.addFloatMesh("src/assets", "camel-gallop-reference.obj", {0, -1, 0}, 1.2);
-    simulator.addFloatMesh("src/assets", "Human.obj", {0, -0.65, 0}, 0.04);
+    simulator.addFloatMesh("assets", "Human.obj", {0, -0.65, 0}, 0.04);
     simulator.addGround(PlaneDirection::XZPlane, tinym::vec3(0, -1, 0), 5);
 
     std::cout << "[Main] mesh added to scene" << std::endl;
@@ -12244,6 +12519,7 @@ int main(int argc, char** argv) {
     profiler::FrameProfiler frameProfiler(360);
     profiler::ProfilerWindowState profilerWindowState;
     mesh_inspector::MeshInspectorWindowState meshInspectorWindowState;
+    scene_log::SceneActionLogWindowState sceneLogWindowState;
 
     std::cout << "[Main] programs are loaded" << std::endl;
 
@@ -12312,6 +12588,13 @@ int main(int argc, char** argv) {
         c[ImGuiCol_FrameBg]              = white;
         c[ImGuiCol_FrameBgHovered]       = gray5;
         c[ImGuiCol_FrameBgActive]        = gray5;
+        // ImGui 1.92's InputText caret uses its own color
+        // (ImGuiCol_InputTextCursor), not ImGuiCol_Text. This palette
+        // assigns the whole Colors[] array without first calling a
+        // StyleColors* preset, so the caret was left at the dark-theme
+        // default (near-white) → invisible on the white input bg. Pin
+        // it to the dark text color so the caret shows in every field.
+        c[ImGuiCol_InputTextCursor]      = gray90;
 
         c[ImGuiCol_TitleBg]              = white;
         c[ImGuiCol_TitleBgActive]        = white;
@@ -12574,6 +12857,26 @@ int main(int argc, char** argv) {
     };
     auto keyCallback = [](GLFWwindow* window, int key, int scancode, int action, int mods) {
         ImGui_ImplGlfw_KeyCallback(window, key, scancode, action, mods);
+
+        // ESC = deselect, handled BEFORE the WantCaptureKeyboard guard
+        // so it works no matter which window holds ImGui keyboard/nav
+        // focus. Selecting an object from the right-panel list focuses
+        // that ImGui window → WantCaptureKeyboard becomes true → the
+        // guard below would otherwise swallow ESC, so list-selected
+        // objects could not be cleared while viewport-picked ones
+        // could. One code path now serves both selection routes.
+        // Skipped while a text field is being edited (WantTextInput)
+        // so ESC keeps its ImGui "cancel edit" meaning there.
+        if (key == GLFW_KEY_ESCAPE && action == GLFW_PRESS
+            && !ImGui::GetIO().WantTextInput) {
+            auto* p = static_cast<CallbacksDataPack*>(glfwGetWindowUserPointer(window));
+            auto* sim = p->simulator;
+            sim->selectedObj        = -1;
+            sim->selectedVert       = -1;
+            sim->selectedVertObj    = -1;
+            sim->pointRefPickActive = false;
+        }
+
         if (ImGui::GetIO().WantCaptureKeyboard) return;
 
         auto* pack = static_cast<CallbacksDataPack*>(glfwGetWindowUserPointer(window));
@@ -12609,7 +12912,18 @@ int main(int argc, char** argv) {
             simulator->logSHPerSubstep = !(simulator->logSHPerSubstep);
             std::cout << "[main] logSHPerSubstep = "
                       << (simulator->logSHPerSubstep ? "on" : "off") << "\n";
+        } else if(key == GLFW_KEY_A && action == GLFW_PRESS) {
+            // Slice (c) A/B: flip analytic-primitive collision on/off
+            // at runtime to compare against the original triangle-soup
+            // pipeline (default off).
+            simulator->useAnalyticPrimitive = !(simulator->useAnalyticPrimitive);
+            std::cout << "[main] useAnalyticPrimitive = "
+                      << (simulator->useAnalyticPrimitive ? "on (analytic)" : "off (original)")
+                      << "\n";
         }
+        // NOTE: ESC-deselect is handled in the early block above
+        // (before the WantCaptureKeyboard guard), not here — see the
+        // comment there for why list-selected objects need it.
     };
     glfwSetCursorPosCallback(yglwindow->getGLFWWindow(), cursorCallback);
     glfwSetScrollCallback(yglwindow->getGLFWWindow(), scrollCallbackWrapped);
@@ -12648,6 +12962,42 @@ int main(int argc, char** argv) {
 
         auto buildSelectedMeshTarget = [&]() {
             mesh_inspector::MeshInspectorTarget target;
+
+            // Object list shown in the no-selection (empty) state.
+            // Built from requestsGeneralMeshes — the canonical,
+            // pack-surviving object list (ids are the compacted ids the
+            // rest of the inspector / picking uses). Built before the
+            // point-mode early return so the list is available in both
+            // the object-mode and point-mode empty states.
+            // Object type from the request's initializer subtype
+            // (same dynamic_cast cascade Scene::pack uses). Grid =
+            // 평면. Behavior collapses to the two user-facing buckets:
+            // cloth variants → 옷감, everything else (Float/Rigid) →
+            // 강체. Label: "{타입} {id}: {행동}".
+            auto objTypeName = [](GeneralMeshInitializer<Backend, Precision>* in)
+                -> const char* {
+                if (dynamic_cast<MeshSphereInitializer  <Backend, Precision>*>(in)) return "구";
+                if (dynamic_cast<MeshCubeInitializer    <Backend, Precision>*>(in)) return "정육면체";
+                if (dynamic_cast<MeshCylinderInitializer<Backend, Precision>*>(in)) return "원기둥";
+                if (dynamic_cast<MeshFileInitializer    <Backend, Precision>*>(in)) return "OBJ 파일";
+                if (dynamic_cast<MeshGridInitializer    <Backend, Precision>*>(in)) return "평면";
+                return "물체";
+            };
+            auto behaviorBucket = [](BehaviorType b) -> const char* {
+                return (b == BehaviorType::TriangularCloth
+                     || b == BehaviorType::FastGridCloth) ? "옷감" : "강체";
+            };
+            for (auto& r : Scene<Backend, Precision>::requestsGeneralMeshes) {
+                mesh_inspector::MeshInspectorTarget::ObjectListEntry e;
+                e.id = r.id;
+                e.label = std::string(objTypeName(r.initializer)) + " "
+                        + std::to_string(r.id) + ": "
+                        + behaviorBucket(r.behaviorType);
+                target.object_list.push_back(std::move(e));
+            }
+            target.on_select_object = [&simulator](int id) {
+                simulator.selectedObj = id;
+            };
 
             // Point selection mode: a selected vertex → point panel; no
             // selected vertex → fall through with mesh_id=-1 so the same
@@ -12829,7 +13179,7 @@ int main(int argc, char** argv) {
         // the Save / Load / Cube / Sphere / Import modals. Statics so the
         // text fields retain their contents across frames.
         static char scenePathBuf[512] = "scene.ysim.json";
-        static char importPathBuf[512] = "src/assets/Human.obj";
+        static char importPathBuf[512] = "assets/Human.obj";
         static float importScale = 1.0f;
         static std::string sceneIOStatus;
         static float primSize = 1.0f;
@@ -12858,6 +13208,7 @@ int main(int argc, char** argv) {
                 if (ImGui::BeginMenu("보기")) {
                     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(8, 12));
                     if (ImGui::MenuItem("프로파일러")) profilerWindowState.open = true;
+                    if (ImGui::MenuItem("씬 동작 로그")) sceneLogWindowState.open = true;
                     ImGui::PopStyleVar();
                     ImGui::EndMenu();
                 }
@@ -12964,7 +13315,7 @@ int main(int argc, char** argv) {
             for (int i = 0; i < 3; ++i) {
                 if (i > 0) ImGui::SameLine(0, gap);
                 ImGui::SetNextItemWidth(chW);
-                char fmt[16]; snprintf(fmt, sizeof(fmt), "%s  %%.1f", labels[i]);
+                char fmt[16]; snprintf(fmt, sizeof(fmt), "%s  %%.3f", labels[i]);
                 ImGui::PushID(i);
                 if (ImGui::DragFloat("##v", &v[i], 0.01f, 0, 0, fmt))
                     changed = true;
@@ -13166,6 +13517,51 @@ int main(int argc, char** argv) {
                 ImGui::Dummy({0, P});
             }
 
+            // ── 시뮬레이션 환경 Simulation ───────────────────────
+            // Edits the live ExplicitSystem driving the sim: `h` is
+            // the per-frame time step (default 1/60 s), `subSteps` the
+            // substep count per frame (default 60). subh = h/subSteps
+            // is only computed in the System ctor, so it MUST be
+            // recomputed here on every edit — it is the value actually
+            // fed to the integrator each substep (SimParams.subh) and
+            // to the swept-AABB enlargeTrajectory. Without the resync
+            // the UI would change nothing.
+            if (AccordionHeader("시뮬레이션 환경", "Simulation")) {
+                ImGui::Dummy({0, P});
+                ImGui::Indent(P);
+
+                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.420f, 0.463f, 0.518f, 1.0f));
+                ImGui::TextUnformatted("프레임 당 시간 (초)");
+                ImGui::PopStyleColor();
+                ImGui::Dummy({0, 4});
+                ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - P);
+                float frameDt = (float)system.h;
+                if (ImGui::InputFloat("##simDt", &frameDt, 0.0f, 0.0f, "%.6f")) {
+                    if (frameDt > 1e-6f) {
+                        system.h = (Precision)frameDt;
+                        system.subh = system.h /
+                            (Precision)(system.subSteps > 0 ? system.subSteps : 1);
+                    }
+                }
+
+                ImGui::Dummy({0, 20});
+
+                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.420f, 0.463f, 0.518f, 1.0f));
+                ImGui::TextUnformatted("한 프레임 당 분할 계산 횟수");
+                ImGui::PopStyleColor();
+                ImGui::Dummy({0, 4});
+                ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - P);
+                int subN = (int)system.subSteps;
+                if (ImGui::InputInt("##simSub", &subN)) {
+                    if (subN < 1) subN = 1;
+                    system.subSteps = (size_t)subN;
+                    system.subh = system.h / (Precision)system.subSteps;
+                }
+
+                ImGui::Unindent(P);
+                ImGui::Dummy({0, P});
+            }
+
             // ── 조명 Light ───────────────────────────────────────
             if (AccordionHeader("조명", "Light")) {
                 ImGui::Dummy({0, P});
@@ -13183,7 +13579,7 @@ int main(int argc, char** argv) {
                 ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.420f, 0.463f, 0.518f, 1.0f));
                 ImGui::TextUnformatted("세기");
                 ImGui::SameLine(ImGui::GetContentRegionAvail().x - P - 18);
-                ImGui::Text("%.1f", env.lightIntensity);
+                ImGui::Text("%.3f", env.lightIntensity);
                 ImGui::PopStyleColor();
                 ImGui::Dummy({0, 4});
                 // Slider: gray10 bg, height=28 (grab 24px circle fits square)
@@ -13599,10 +13995,12 @@ int main(int argc, char** argv) {
                 idPointShader.setUniform("M", Mid);
                 idPointShader.setUniform("V", Vid);
                 idPointShader.setUniform("P", Pid);
-                // Match the on-screen dot size (drawSelectablePoints
-                // kDot=15) so the pick hit-area lines up with what the
-                // user sees.
-                glPointSize(15.0f);
+                // Intentionally larger than the on-screen dot
+                // (drawSelectablePoints kDot=5): the off-screen id
+                // buffer renders fat points so the pick hit-area is
+                // forgiving — easier to click a vertex than the small
+                // visible dot would suggest.
+                glPointSize(20.0f);
                 glDepthFunc(GL_LEQUAL);
                 simulator.drawPointIds(idPointShader);
                 glDepthFunc(GL_LESS);
@@ -13778,6 +14176,7 @@ int main(int argc, char** argv) {
                 &meshInspectorWindowState.open,
                 sceneCounts
             );
+            scene_log::drawSceneActionLogWindow(sceneLogWindowState);
             ImGui::Render();
             ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
         } else {
@@ -13791,6 +14190,7 @@ int main(int argc, char** argv) {
                 &meshInspectorWindowState.open,
                 sceneCounts
             );
+            scene_log::drawSceneActionLogWindow(sceneLogWindowState);
             ImGui::Render();
             ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
         }

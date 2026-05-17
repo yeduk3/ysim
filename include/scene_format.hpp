@@ -104,6 +104,15 @@ struct Environment {
     Vec3 backgroundColor{0.68, 0.85, 0.95};
 };
 
+// Solver timing for the ExplicitSystem driving the sim. Optional in
+// JSON for backward compat: scenes saved before this field load with
+// the engine defaults (1/60 s per frame, 60 substeps), exactly the
+// values a fresh launch uses.
+struct Simulation {
+    double timePerFrame = 1.0 / 60.0; // ExplicitSystem::h (seconds)
+    int    subSteps     = 60;         // ExplicitSystem::subSteps
+};
+
 // A reference-point coincidence constraint set in the point-selection
 // panel: the (queryObject, queryVertex) vertex must occupy the same
 // world position as the (targetObject, targetVertex) vertex every
@@ -132,6 +141,7 @@ struct SceneSnapshot {
     int formatVersion = kFormatVersion;
     std::vector<Object> objects;
     Environment environment;
+    Simulation simulation;
     // Reference-point coincidence constraints (point panel). Optional in
     // JSON — older snapshots simply have none.
     std::vector<ReferenceConstraint> referenceConstraints;
@@ -324,6 +334,13 @@ inline nlohmann::json toJson(const Environment& e) {
     return j;
 }
 
+inline nlohmann::json toJson(const Simulation& sm) {
+    nlohmann::json j;
+    j["time_per_frame"] = sm.timePerFrame;
+    j["substeps"] = sm.subSteps;
+    return j;
+}
+
 inline nlohmann::json toJson(const ReferenceConstraint& c) {
     nlohmann::json j;
     j["query"]  = {{"object", c.queryObject},  {"vertex", c.queryVertex}};
@@ -337,6 +354,7 @@ inline nlohmann::json toJson(const SceneSnapshot& s) {
     j["objects"] = nlohmann::json::array();
     for (const auto& o : s.objects) j["objects"].push_back(toJson(o));
     j["environment"] = toJson(s.environment);
+    j["simulation"] = toJson(s.simulation);
     // Omit the key entirely when empty so constraint-free scenes stay
     // byte-identical to pre-feature snapshots (mirrors fixed_particles).
     if (!s.referenceConstraints.empty()) {
@@ -559,6 +577,34 @@ inline Result<Environment> environmentFromJson(const nlohmann::json& j) {
     return R::success(e);
 }
 
+// All fields optional — a missing key (old scene) or a missing
+// "simulation" block leaves the engine default in place. Wrong-typed
+// values are rejected (consistent with environmentFromJson's strict
+// numeric checks) rather than silently defaulted.
+inline Result<Simulation> simulationFromJson(const nlohmann::json& j) {
+    using R = Result<Simulation>;
+    Simulation sm;
+    auto t = j.find("time_per_frame");
+    if (t != j.end()) {
+        if (!t->is_number())
+            return R::fail("simulation.time_per_frame must be a number");
+        double v = t->get<double>();
+        if (!(v > 0.0))
+            return R::fail("simulation.time_per_frame must be > 0");
+        sm.timePerFrame = v;
+    }
+    auto s = j.find("substeps");
+    if (s != j.end()) {
+        if (!s->is_number_integer())
+            return R::fail("simulation.substeps must be an integer");
+        int v = s->get<int>();
+        if (v < 1)
+            return R::fail("simulation.substeps must be >= 1");
+        sm.subSteps = v;
+    }
+    return R::success(sm);
+}
+
 inline Result<SceneSnapshot> fromJson(const nlohmann::json& j) {
     using R = Result<SceneSnapshot>;
     SceneSnapshot s;
@@ -587,6 +633,15 @@ inline Result<SceneSnapshot> fromJson(const nlohmann::json& j) {
         auto er = environmentFromJson(*envj);
         if (!er.ok) return R::fail(er.error.message);
         s.environment = er.value;
+    }
+    // simulation is optional (backward compat): absent → engine
+    // defaults (1/60 s, 60 substeps) already in s.simulation.
+    if (auto simj = j.find("simulation"); simj != j.end()) {
+        if (!simj->is_object())
+            return R::fail("'simulation' must be a JSON object");
+        auto sr = simulationFromJson(*simj);
+        if (!sr.ok) return R::fail(sr.error.message);
+        s.simulation = sr.value;
     }
     // reference_constraints is optional (backward compat). Malformed
     // entries are skipped rather than failing the whole load, matching
