@@ -5,6 +5,7 @@ add_executable(ysim
     profiler_gui.cpp
     mesh_inspector_gui.cpp
     BulletRigidPhysicsBackend.cpp
+    dock_icon.mm
     ${CMAKE_SOURCE_DIR}/third_party/imgui/imgui.cpp
     ${CMAKE_SOURCE_DIR}/third_party/imgui/imgui_draw.cpp
     ${CMAKE_SOURCE_DIR}/third_party/imgui/imgui_tables.cpp
@@ -37,6 +38,7 @@ target_link_libraries(ysim PRIVATE
     BulletDynamics
     BulletCollision
     LinearMath
+    "-framework AppKit"  # Dock icon (dock_icon.mm)
 )
 
 target_include_directories(ysim PRIVATE

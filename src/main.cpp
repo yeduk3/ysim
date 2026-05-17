@@ -18,6 +18,12 @@
 #include "imgui_impl_glfw.h"
 #include "imgui_impl_opengl3.h"
 
+// stb_image: just declare what we need (impl lives in framebuffer.hpp)
+extern "C" {
+    extern unsigned char* stbi_load(const char*, int*, int*, int*, int);
+    extern void stbi_image_free(void*);
+}
+
 #include <cstddef>
 #include <iostream>
 #include <iterator>
@@ -12083,6 +12089,12 @@ int main(int argc, char** argv) {
 
     //window = new YGLWindow(640, 480, "ysim");
     yglwindow = new YGLWindow(1600, 900, "ysim");
+
+    // Set macOS Dock icon — done via setDockIcon() in dock_icon.mm
+    #ifdef __APPLE__
+    extern void setDockIcon(const char* path);
+    setDockIcon("assets/icons/app_icon.png");
+    #endif
 
 
     // Add Ground
