@@ -2179,7 +2179,7 @@ struct SceneEnvironment {
     // Viewport clear color. Read by the render loop each frame and pushed
     // through glClearColor; mirrored into scene_format::Environment so
     // saveScene/loadScene round-trip the choice.
-    tinym::vec3 backgroundColor = tinym::vec3(0.68f, 0.85f, 0.95f);
+    tinym::vec3 backgroundColor = tinym::vec3(0.886f, 0.906f, 0.922f); // #E2E7EB gray20
 };
 
 template <typename BE, typename PR>
@@ -12173,36 +12173,147 @@ int main(int argc, char** argv) {
 
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
-    ImGui::StyleColorsDark();
     ImGuiIO& io = ImGui::GetIO();
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
 
-    // 1.2× UI 스케일 — 폰트, 위젯 스페이싱, 좌/우 패널 폭이 모두 같은
-    // 배율을 공유해야 비례가 맞는다. panelW (메뉴/패널 레이아웃)도
-    // 이 상수를 곱해 산출한다.
     constexpr float kUiScale = 1.2f;
 
-    // Korean glyph support. ImGui's default font is ASCII-only — Hangul
-    // shows as ▯ without this. Load AppleGothic.ttf (ships with macOS)
-    // and pass GetGlyphRangesKorean() so the atlas includes Hangul +
-    // common CJK punctuation in addition to ASCII. Must run BEFORE
-    // ImGui_ImplOpenGL3_Init so the backend builds its font texture
-    // from the merged atlas. Falls back to the default font if the
-    // system file is missing (no Hangul, but the UI still renders).
+    // ─── ELDS Light Theme — Figma pixel-exact tokens ───────────────
     {
-        const char* kKoreanFontPath =
-            "/System/Library/Fonts/Supplemental/AppleGothic.ttf";
+        ImGuiStyle& s = ImGui::GetStyle();
+
+        // Figma: panels rounded-[16px], inputs rounded-[8px]
+        s.WindowRounding    = 16.0f;
+        s.ChildRounding     = 16.0f;
+        s.FrameRounding     = 8.0f;
+        s.PopupRounding     = 16.0f;
+        s.ScrollbarRounding = 99.0f;
+        s.GrabRounding      = 99.0f;  // pill-shaped slider grab
+        s.TabRounding       = 8.0f;
+
+        // Figma: panel inner padding 24px, content gap 4px
+        s.WindowPadding     = ImVec2(0, 0);  // managed manually per-section
+        s.FramePadding      = ImVec2(12, 10); // inputs: p-[12px], h=40px → 10px vert
+        s.ItemSpacing       = ImVec2(4, 4);   // Figma: gap-[4px] between inputs
+        s.ItemInnerSpacing  = ImVec2(4, 4);
+        s.ScrollbarSize     = 8.0f;
+        s.GrabMinSize       = 24.0f;   // Figma: 24x24 slider thumb
+        s.WindowBorderSize  = 1.0f;    // Figma: border 1px gray10
+        s.FrameBorderSize   = 1.0f;    // Figma: border 1px gray20
+        s.PopupBorderSize   = 1.0f;
+        s.WindowTitleAlign  = ImVec2(0.04f, 0.50f);
+        s.SeparatorTextBorderSize = 0.0f;
+
+        // Figma exact color tokens
+        const ImVec4 gray100 = ImVec4(0.063f, 0.078f, 0.102f, 1.0f); // #10141A
+        const ImVec4 gray90  = ImVec4(0.098f, 0.122f, 0.157f, 1.0f); // #191F28
+        const ImVec4 gray80  = ImVec4(0.200f, 0.239f, 0.294f, 1.0f); // #333D4B
+        const ImVec4 gray60  = ImVec4(0.420f, 0.463f, 0.518f, 1.0f); // #6B7684
+        const ImVec4 gray50  = ImVec4(0.545f, 0.584f, 0.631f, 1.0f); // #8B95A1
+        const ImVec4 gray40  = ImVec4(0.690f, 0.722f, 0.757f, 1.0f); // #B0B8C1
+        const ImVec4 gray20  = ImVec4(0.886f, 0.906f, 0.922f, 1.0f); // #E2E7EB
+        const ImVec4 gray10  = ImVec4(0.933f, 0.941f, 0.949f, 1.0f); // #EEF0F2
+        const ImVec4 gray08  = ImVec4(0.898f, 0.910f, 0.922f, 1.0f); // #E5E8EB
+        const ImVec4 gray5   = ImVec4(0.976f, 0.980f, 0.984f, 1.0f); // #F9FAFB
+        const ImVec4 white   = ImVec4(1.0f, 1.0f, 1.0f, 1.0f);
+        const ImVec4 transparent = ImVec4(0, 0, 0, 0);
+        const ImVec4 error   = ImVec4(1.0f, 0.369f, 0.369f, 1.0f);
+
+        ImVec4* c = s.Colors;
+
+        c[ImGuiCol_WindowBg]             = white;
+        c[ImGuiCol_ChildBg]              = white;
+        c[ImGuiCol_PopupBg]              = ImVec4(1, 1, 1, 0.98f);
+        c[ImGuiCol_Text]                 = gray90;
+        c[ImGuiCol_TextDisabled]         = gray60;  // Figma: labels are gray60
+        c[ImGuiCol_Border]               = gray10;  // Figma: window border is gray10
+        c[ImGuiCol_BorderShadow]         = transparent;
+
+        // Figma inputs: white bg, gray20 border (FrameBorder handles this)
+        c[ImGuiCol_FrameBg]              = white;
+        c[ImGuiCol_FrameBgHovered]       = gray5;
+        c[ImGuiCol_FrameBgActive]        = gray5;
+
+        c[ImGuiCol_TitleBg]              = white;
+        c[ImGuiCol_TitleBgActive]        = white;
+        c[ImGuiCol_TitleBgCollapsed]     = white;
+        c[ImGuiCol_MenuBarBg]            = white;
+
+        c[ImGuiCol_ScrollbarBg]          = transparent;
+        c[ImGuiCol_ScrollbarGrab]        = gray20;
+        c[ImGuiCol_ScrollbarGrabHovered] = gray40;
+        c[ImGuiCol_ScrollbarGrabActive]  = gray50;
+
+        // Button — grayOutline (transparent bg + border)
+        c[ImGuiCol_Button]               = transparent;
+        c[ImGuiCol_ButtonHovered]        = gray10;
+        c[ImGuiCol_ButtonActive]         = gray20;
+
+        // Figma accordion header: bg gray5, full width
+        c[ImGuiCol_Header]               = gray5;
+        c[ImGuiCol_HeaderHovered]        = gray10;
+        c[ImGuiCol_HeaderActive]         = gray10;
+
+        c[ImGuiCol_Separator]            = gray20;
+        c[ImGuiCol_SeparatorHovered]     = gray40;
+        c[ImGuiCol_SeparatorActive]      = gray60;
+
+        // Figma slider: gray100 fill, gray08 bg track, white 24px grab
+        c[ImGuiCol_SliderGrab]           = white;   // white circle thumb
+        c[ImGuiCol_SliderGrabActive]     = white;
+        c[ImGuiCol_CheckMark]            = gray90;
+
+        c[ImGuiCol_Tab]                  = gray10;
+        c[ImGuiCol_TabHovered]           = gray5;
+
+        c[ImGuiCol_TableHeaderBg]        = gray10;
+        c[ImGuiCol_TableBorderStrong]    = gray20;
+        c[ImGuiCol_TableBorderLight]     = gray10;
+        c[ImGuiCol_TableRowBg]           = white;
+        c[ImGuiCol_TableRowBgAlt]        = gray5;
+
+        c[ImGuiCol_ModalWindowDimBg]     = ImVec4(0, 0, 0, 0.35f);
+
+        c[ImGuiCol_ResizeGrip]           = gray20;
+        c[ImGuiCol_ResizeGripHovered]    = gray40;
+        c[ImGuiCol_ResizeGripActive]     = gray60;
+
+        c[ImGuiCol_PlotLines]            = gray90;
+        c[ImGuiCol_PlotLinesHovered]     = error;
+        c[ImGuiCol_PlotHistogram]        = gray90;
+        c[ImGuiCol_PlotHistogramHovered] = gray60;
+
+        s.ScaleAllSizes(kUiScale);
+
+        // Force exact rounding values after scale (ScaleAllSizes multiplies them)
+        s.WindowRounding = 16.0f;
+        s.ChildRounding  = 16.0f;
+        s.FrameRounding  = 8.0f;
+        s.PopupRounding  = 16.0f;
+        s.GrabRounding   = 99.0f;
+        s.TabRounding    = 8.0f;
+        s.ScrollbarRounding = 99.0f;
+    }
+
+    // ─── Font: AppleSDGothicNeo (Pretendard 대용) ────────────────────
+    {
+        const char* fontCandidates[] = {
+            "/System/Library/Fonts/AppleSDGothicNeo.ttc",
+            "/Library/Fonts/Pretendard-Medium.otf",
+            "/System/Library/Fonts/Supplemental/AppleGothic.ttf",
+        };
         ImFontConfig cfg;
         cfg.OversampleH = 2;
         cfg.OversampleV = 1;
-        ImFont* korean = io.Fonts->AddFontFromFileTTF(
-            kKoreanFontPath, 15.0f * kUiScale, &cfg,
-            io.Fonts->GetGlyphRangesKorean());
-        if (!korean) io.Fonts->AddFontDefault();
+        bool loaded = false;
+        for (const char* path : fontCandidates) {
+            ImFont* f = io.Fonts->AddFontFromFileTTF(
+                path, 15.0f * kUiScale, &cfg,
+                io.Fonts->GetGlyphRangesKorean());
+            if (f) { loaded = true; break; }
+        }
+        if (!loaded) io.Fonts->AddFontDefault();
     }
-    // 폰트 사이즈와 같은 배율로 padding/spacing/rounding을 확대.
-    // ScaleAllSizes는 폰트와 독립이라 따로 호출해야 비례가 보존됨.
-    ImGui::GetStyle().ScaleAllSizes(kUiScale);
 
     ImGui_ImplGlfw_InitForOpenGL(yglwindow->getGLFWWindow(), false);
 #ifdef __APPLE__
@@ -12679,74 +12790,295 @@ int main(int argc, char** argv) {
         const float menuH = ImGui::GetFrameHeight();
         // 패널 폭은 UI 스케일과 비례. 위젯이 1.2배 커졌으므로 폭도
         // 같은 비율로 늘려야 라벨이 잘리지 않음 (300 * 1.2 = 360).
-        const float panelW = 300.0f * kUiScale;
-        const float panelH = vp->WorkSize.y - menuH - 20.0f;
-        const float yCenter = vp->WorkPos.y + menuH + (vp->WorkSize.y - menuH) * 0.5f;
+        const float panelW = 400.0f;
+        // No margin, fill full work area height
+        const float panelTop = vp->WorkPos.y;
+        const float panelH = vp->WorkSize.y;
 
-        // ─── Scene panel (left, fixed) ────────────────────────────────
-        ImGui::SetNextWindowPos(ImVec2(vp->WorkPos.x, yCenter),
-                                ImGuiCond_Always, ImVec2(0.0f, 0.5f));
+        // ─── Figma helpers (shared by both panels) ─────────────────────
+        const float P = 24.0f;
+        const float CW = panelW - P * 2;  // 352px content width
+
+        const ImVec4 cGray100(0.063f, 0.078f, 0.102f, 1.0f);
+        const ImVec4 cGray90 (0.098f, 0.122f, 0.157f, 1.0f);
+        const ImVec4 cGray60 (0.420f, 0.463f, 0.518f, 1.0f);
+        const ImVec4 cGray50 (0.545f, 0.584f, 0.631f, 1.0f);
+        const ImVec4 cGray40 (0.690f, 0.722f, 0.757f, 1.0f);
+        const ImVec4 cGray20 (0.886f, 0.906f, 0.922f, 1.0f);
+        const ImVec4 cGray10 (0.933f, 0.941f, 0.949f, 1.0f);
+        const ImVec4 cGray5  (0.976f, 0.980f, 0.984f, 1.0f);
+        const ImVec4 cWhite  (1, 1, 1, 1);
+
+        // XYZ input: "x 0" — fixed prefix label inside input, gap=4
+        auto InputXYZ = [CW](const char* id, float v[3]) -> bool {
+            bool changed = false;
+            ImGui::PushID(id);
+            float gap = 4.0f;
+            float chW = (CW - gap * 2.0f) / 3.0f;
+            const char* labels[] = {"x", "y", "z"};
+            for (int i = 0; i < 3; ++i) {
+                if (i > 0) ImGui::SameLine(0, gap);
+                ImGui::SetNextItemWidth(chW);
+                char fmt[16]; snprintf(fmt, sizeof(fmt), "%s  %%.1f", labels[i]);
+                ImGui::PushID(i);
+                if (ImGui::DragFloat("##v", &v[i], 0.01f, 0, 0, fmt))
+                    changed = true;
+                ImGui::PopID();
+            }
+            ImGui::PopID();
+            return changed;
+        };
+
+        // RGB input: "R 0" fixed prefix + color picker swatch
+        auto InputRGB = [CW](const char* id, float col[3]) -> bool {
+            bool changed = false;
+            ImGui::PushID(id);
+            float gap = 4.0f;
+            float swatchW = 40.0f;
+            float chW = (CW - swatchW - gap * 3.0f) / 3.0f;
+            const char* labels[] = {"R", "G", "B"};
+            for (int i = 0; i < 3; ++i) {
+                if (i > 0) ImGui::SameLine(0, gap);
+                ImGui::SetNextItemWidth(chW);
+                char fmt[16]; snprintf(fmt, sizeof(fmt), "%s  %%.0f", labels[i]);
+                ImGui::PushID(i);
+                float v255 = col[i] * 255.0f;
+                if (ImGui::DragFloat("##c", &v255, 1.0f, 0.0f, 255.0f, fmt)) {
+                    col[i] = v255 / 255.0f;
+                    changed = true;
+                }
+                ImGui::PopID();
+            }
+            // Color swatch → opens color picker on click
+            ImGui::SameLine(0, gap);
+            ImVec4 preview(col[0], col[1], col[2], 1.0f);
+            if (ImGui::ColorButton("##sw", preview,
+                                   ImGuiColorEditFlags_NoTooltip,
+                                   ImVec2(swatchW, swatchW))) {
+                ImGui::OpenPopup("##picker");
+            }
+            if (ImGui::BeginPopup("##picker")) {
+                if (ImGui::ColorPicker3("##pick", col,
+                        ImGuiColorEditFlags_NoSidePreview |
+                        ImGuiColorEditFlags_NoSmallPreview |
+                        ImGuiColorEditFlags_NoInputs))
+                    changed = true;
+                ImGui::EndPopup();
+            }
+            ImGui::PopID();
+            return changed;
+        };
+
+        // Accordion header: custom draw, h=56, gray5 bg, gray20 top+bottom border
+        // Clips to parent window so rounded corners are respected
+        static std::unordered_map<ImGuiID, bool> accordionStates;
+        auto AccordionHeader = [&](const char* korean, const char* english) -> bool {
+            ImGui::PushID(korean);
+            ImGuiID aid = ImGui::GetID("##acc");
+            if (accordionStates.find(aid) == accordionStates.end())
+                accordionStates[aid] = true;
+
+            float fullW = ImGui::GetContentRegionAvail().x;
+            float headerH = 56.0f;
+            ImVec2 pos = ImGui::GetCursorScreenPos();
+            ImDrawList* dl = ImGui::GetWindowDrawList();
+
+            ImU32 bgCol     = ImGui::ColorConvertFloat4ToU32(cGray5);
+            ImU32 borderCol = ImGui::ColorConvertFloat4ToU32(cGray20);
+
+            // Background
+            dl->AddRectFilled(pos, {pos.x + fullW, pos.y + headerH}, bgCol);
+            (void)borderCol; // no borders on accordion
+
+            // Click area
+            bool clicked = ImGui::InvisibleButton("##accBtn", {fullW, headerH});
+            if (clicked) accordionStates[aid] = !accordionStates[aid];
+            bool open = accordionStates[aid];
+
+            // Title text: larger size (1.2x default ≈ 18px equivalent)
+            ImFont* font = ImGui::GetFont();
+            float titleFontSize = ImGui::GetFontSize() * 1.2f;
+            float subFontSize = ImGui::GetFontSize();
+            float textY = pos.y + (headerH - titleFontSize) * 0.5f;
+            float subY = pos.y + (headerH - subFontSize) * 0.5f;
+
+            ImU32 titleCol = ImGui::ColorConvertFloat4ToU32(cGray100);
+            dl->AddText(font, titleFontSize, {pos.x + P, textY}, titleCol, korean);
+
+            if (english && english[0]) {
+                ImVec2 titleSize = font->CalcTextSizeA(titleFontSize, FLT_MAX, 0, korean);
+                dl->AddText(font, subFontSize, {pos.x + P + titleSize.x + 4.0f, subY},
+                            ImGui::ColorConvertFloat4ToU32(cGray60), english);
+            }
+
+            // Chevron: vertically centered, right-aligned at fullW - P
+            {
+                float arrowX = pos.x + fullW - P;
+                float arrowY = pos.y + headerH * 0.5f;
+                float r = 5.0f;
+                ImU32 arrowCol = ImGui::ColorConvertFloat4ToU32(cGray60);
+                if (open) {
+                    dl->PathLineTo({arrowX - r, arrowY + r * 0.4f});
+                    dl->PathLineTo({arrowX,     arrowY - r * 0.4f});
+                    dl->PathLineTo({arrowX + r, arrowY + r * 0.4f});
+                } else {
+                    dl->PathLineTo({arrowX - r, arrowY - r * 0.4f});
+                    dl->PathLineTo({arrowX,     arrowY + r * 0.4f});
+                    dl->PathLineTo({arrowX + r, arrowY - r * 0.4f});
+                }
+                dl->PathStroke(arrowCol, 0, 2.0f);
+            }
+
+            ImGui::PopID();
+            return open;
+        };
+
+        // Figma segment tab helper
+        auto SegmentTab2 = [](const char* id, const char* labelA, const char* labelB,
+                              bool aActive, auto onA, auto onB) {
+            ImGui::PushID(id);
+            const ImVec4 cGray10(0.933f, 0.941f, 0.949f, 1.0f);
+            const ImVec4 cWhite(1, 1, 1, 1);
+            const ImVec4 cGray90(0.098f, 0.122f, 0.157f, 1.0f);
+            const ImVec4 cGray50(0.545f, 0.584f, 0.631f, 1.0f);
+
+            ImVec2 cPos = ImGui::GetCursorScreenPos();
+            float cW = ImGui::GetContentRegionAvail().x;
+            float cH = 40.0f, pad = 4.0f, segH = 32.0f;
+            float segW = (cW - pad * 3.0f) / 2.0f;
+
+            ImGui::GetWindowDrawList()->AddRectFilled(
+                cPos, {cPos.x + cW, cPos.y + cH},
+                ImGui::ColorConvertFloat4ToU32(cGray10), 8.0f);
+
+            ImGui::SetCursorScreenPos({cPos.x + pad, cPos.y + pad});
+            ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 8.0f);
+            ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 0.0f);
+
+            ImGui::PushStyleColor(ImGuiCol_Button, aActive ? cWhite : ImVec4(0,0,0,0));
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, aActive ? cWhite : ImVec4(1,1,1,0.5f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonActive, cWhite);
+            ImGui::PushStyleColor(ImGuiCol_Text, aActive ? cGray90 : cGray50);
+            if (ImGui::Button(labelA, {segW, segH})) onA();
+            ImGui::PopStyleColor(4);
+
+            ImGui::SameLine(0, pad);
+
+            bool bActive = !aActive;
+            ImGui::PushStyleColor(ImGuiCol_Button, bActive ? cWhite : ImVec4(0,0,0,0));
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, bActive ? cWhite : ImVec4(1,1,1,0.5f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonActive, cWhite);
+            ImGui::PushStyleColor(ImGuiCol_Text, bActive ? cGray90 : cGray50);
+            if (ImGui::Button(labelB, {segW, segH})) onB();
+            ImGui::PopStyleColor(4);
+
+            ImGui::PopStyleVar(2);
+            ImGui::SetCursorScreenPos({cPos.x, cPos.y + cH});
+            ImGui::PopID();
+        };
+
+        // ─── Scene panel (left, flush to edge, no margin) ──────────────
+        ImGui::SetNextWindowPos(
+            ImVec2(vp->WorkPos.x, panelTop),
+            ImGuiCond_Always, ImVec2(0.0f, 0.0f));
         ImGui::SetNextWindowSize(ImVec2(panelW, panelH), ImGuiCond_Always);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
         if (ImGui::Begin("씬", nullptr,
                          ImGuiWindowFlags_NoMove |
                          ImGuiWindowFlags_NoResize |
                          ImGuiWindowFlags_NoCollapse |
-                         ImGuiWindowFlags_NoSavedSettings)) {
-            // ── Selection mode toggle (object vs vertex picking) ──────
-            ImGui::TextUnformatted("선택 모드");
-            {
-                const ImVec4 activeCol(0.20f, 0.55f, 0.95f, 1.0f);
-                bool objMode = simulator.selectionMode == SelectionMode::Object;
-                bool ptMode  = simulator.selectionMode == SelectionMode::Point;
-                if (objMode) ImGui::PushStyleColor(ImGuiCol_Button, activeCol);
-                if (ImGui::Button("오브젝트 선택")) {
-                    simulator.selectionMode = SelectionMode::Object;
-                    simulator.hoveredVert = simulator.selectedVert = -1;
-                    simulator.hoveredVertObj = simulator.selectedVertObj = -1;
-                    // req 3: leaving Point mode cancels reference-pick.
-                    simulator.pointRefPickActive = false;
-                }
-                if (objMode) ImGui::PopStyleColor();
-                ImGui::SameLine();
-                if (ptMode) ImGui::PushStyleColor(ImGuiCol_Button, activeCol);
-                if (ImGui::Button("점 선택")) {
-                    simulator.selectionMode = SelectionMode::Point;
-                    simulator.hoveredObj = -1;
-                }
-                if (ptMode) ImGui::PopStyleColor();
-            }
-            ImGui::Separator();
-            ImGui::Spacing();
-
+                         ImGuiWindowFlags_NoSavedSettings |
+                         ImGuiWindowFlags_NoTitleBar)) {
             auto& env = Scene<Backend, Precision>::environment;
+
+            // ── 물리 환경 Physical Environment ───────────────────
             float gravity[3] = {(float)env.gravity.x, (float)env.gravity.y, (float)env.gravity.z};
             float wind[3]    = {(float)env.wind.x,    (float)env.wind.y,    (float)env.wind.z};
-            if (ImGui::InputFloat3("중력", gravity)) {
-                env.gravity = tinym::vec3(gravity[0], gravity[1], gravity[2]);
-            }
-            if (ImGui::InputFloat3("바람", wind)) {
-                env.wind = tinym::vec3(wind[0], wind[1], wind[2]);
-            }
-            ImGui::Spacing();
-            ImGui::ColorEdit3("조명 색상", env.lightColor.v);
-            ImGui::SliderFloat("조명 세기", &env.lightIntensity,
-                               0.0f, 10.0f, "%.2f");
-            ImGui::Spacing();
-            ImGui::ColorEdit3("배경 색상", env.backgroundColor.v);
 
-            if (!sceneIOStatus.empty()) {
-                ImGui::Spacing();
-                ImGui::Separator();
-                ImGui::TextDisabled("씬 입출력");
-                ImGui::TextWrapped("%s", sceneIOStatus.c_str());
+            if (AccordionHeader("물리 환경", "Physical Environment")) {
+                ImGui::Dummy({0, P});
+                ImGui::Indent(P);
+
+                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.420f, 0.463f, 0.518f, 1.0f));
+                ImGui::TextUnformatted("중력");
+                ImGui::PopStyleColor();
+                ImGui::Dummy({0, 4});
+                InputXYZ("gravity", gravity);
+                if (ImGui::IsItemDeactivatedAfterEdit())
+                    env.gravity = tinym::vec3(gravity[0], gravity[1], gravity[2]);
+
+                ImGui::Dummy({0, 20});
+
+                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.420f, 0.463f, 0.518f, 1.0f));
+                ImGui::TextUnformatted("바람");
+                ImGui::PopStyleColor();
+                ImGui::Dummy({0, 4});
+                InputXYZ("wind", wind);
+                if (ImGui::IsItemDeactivatedAfterEdit())
+                    env.wind = tinym::vec3(wind[0], wind[1], wind[2]);
+
+                ImGui::Unindent(P);
+                ImGui::Dummy({0, P});
             }
+
+            // ── 조명 Light ───────────────────────────────────────
+            if (AccordionHeader("조명", "Light")) {
+                ImGui::Dummy({0, P});
+                ImGui::Indent(P);
+
+                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.420f, 0.463f, 0.518f, 1.0f));
+                ImGui::TextUnformatted("RGB");
+                ImGui::PopStyleColor();
+                ImGui::Dummy({0, 4});
+                InputRGB("lightColor", env.lightColor.v);
+
+                ImGui::Dummy({0, 16});
+
+                // "세기" left + "1.6" right
+                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.420f, 0.463f, 0.518f, 1.0f));
+                ImGui::TextUnformatted("세기");
+                ImGui::SameLine(CW - 18);
+                ImGui::Text("%.1f", env.lightIntensity);
+                ImGui::PopStyleColor();
+                ImGui::Dummy({0, 4});
+                // Slider: gray10 bg, height=28 (grab 24px circle fits square)
+                ImGui::PushStyleColor(ImGuiCol_FrameBg, cGray10);
+                ImGui::PushStyleColor(ImGuiCol_FrameBgHovered, cGray10);
+                ImGui::PushStyleColor(ImGuiCol_FrameBgActive, cGray10);
+                ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(0, 4)); // (28-20)/2
+                ImGui::SetNextItemWidth(CW);
+                ImGui::SliderFloat("##lightInt", &env.lightIntensity, 0.0f, 10.0f, "");
+                ImGui::PopStyleVar();
+                ImGui::PopStyleColor(3);
+
+                ImGui::Unindent(P);
+                ImGui::Dummy({0, P});
+            }
+
+            // ── 배경 Background ──────────────────────────────────
+            if (AccordionHeader("배경", "Background")) {
+                ImGui::Dummy({0, P});
+                ImGui::Indent(P);
+
+                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.420f, 0.463f, 0.518f, 1.0f));
+                ImGui::TextUnformatted("RGB");
+                ImGui::PopStyleColor();
+                ImGui::Dummy({0, 4});
+                InputRGB("bgColor", env.backgroundColor.v);
+
+                ImGui::Unindent(P);
+                ImGui::Dummy({0, P});
+            }
+
         }
+        ImGui::PopStyleVar(2);  // WindowRounding, WindowBorderSize
         ImGui::End();
 
-        // ─── Object panel (right, fixed) ──────────────────────────────
-        // Pin position/size BEFORE drawMeshInspectorWindow's Begin call.
-        ImGui::SetNextWindowPos(ImVec2(vp->WorkPos.x + vp->WorkSize.x, yCenter),
-                                ImGuiCond_Always, ImVec2(1.0f, 0.5f));
+        // ─── Object panel (right, flush to edge, no margin) ─────────────
+        ImGui::SetNextWindowPos(
+            ImVec2(vp->WorkPos.x + vp->WorkSize.x - panelW, panelTop),
+            ImGuiCond_Always, ImVec2(0.0f, 0.0f));
         ImGui::SetNextWindowSize(ImVec2(panelW, panelH), ImGuiCond_Always);
         mesh_inspector::drawMeshInspectorWindow(
             meshInspectorWindowState, buildSelectedMeshTarget());
@@ -12762,132 +13094,197 @@ int main(int argc, char** argv) {
         if (openCubeModal) ImGui::OpenPopup("정육면체 생성");
         if (openCylinderModal) ImGui::OpenPopup("원기둥 생성");
         if (openPlaneModal) ImGui::OpenPopup("평면 생성");
-        if (ImGui::BeginPopupModal("씬 저장하기", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
-            ImGui::InputText("경로", scenePathBuf, sizeof(scenePathBuf));
-            if (ImGui::Button("저장")) {
+        // ─── Modal style helpers ─────────────────────────────────────
+        // Figma: rounded-16, p=24, gray100 filled primary btn, outline cancel btn
+        // Modal: 480px fixed width, rounded-16, p=24
+        auto modalBegin = [&](const char* title) -> bool {
+            ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 16);
+            ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(P, P));
+            ImGui::PushStyleColor(ImGuiCol_PopupBg, ImVec4(1,1,1,1));
+            ImGui::SetNextWindowSize(ImVec2(480, 0)); // 480px fixed width, auto height
+            bool opened = ImGui::BeginPopupModal(title, nullptr, ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize);
+            if (!opened) {
+                ImGui::PopStyleColor();
+                ImGui::PopStyleVar(2);
+            }
+            return opened;
+        };
+        auto modalEnd = [&]() {
+            ImGui::EndPopup();
+            ImGui::PopStyleColor();
+            ImGui::PopStyleVar(2);
+        };
+        auto modalTitle = [&](const char* title) {
+            ImFont* fo = ImGui::GetFont();
+            float tFS = ImGui::GetFontSize() * 1.2f;
+            ImGui::Dummy({0, 0});
+            ImDrawList* dl = ImGui::GetWindowDrawList();
+            ImVec2 pos = ImGui::GetCursorScreenPos();
+            dl->AddText(fo, tFS, pos, ImGui::ColorConvertFloat4ToU32(cGray100), title);
+            ImGui::Dummy({0, tFS + 16});
+        };
+        auto modalLabel = [&](const char* label) {
+            ImGui::PushStyleColor(ImGuiCol_Text, cGray60);
+            ImGui::TextUnformatted(label);
+            ImGui::PopStyleColor();
+            ImGui::Dummy({0, 4});
+        };
+        auto modalButtons = [&](const char* cancelLabel, const char* confirmLabel) -> int {
+            // 0=none, 1=cancel, 2=confirm
+            ImGui::Dummy({0, 16});
+            float bW = (ImGui::GetContentRegionAvail().x - 8) / 2;
+            float bH = 48;
+            float tH = ImGui::GetFontSize();
+            float padY = (bH - tH) / 2;
+            int result = 0;
+            // Cancel: outline
+            ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 8);
+            ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 1);
+            ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, {0, padY});
+            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(1,1,1,1));
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, cGray5);
+            ImGui::PushStyleColor(ImGuiCol_ButtonActive, cGray10);
+            ImGui::PushStyleColor(ImGuiCol_Text, cGray90);
+            ImGui::PushStyleColor(ImGuiCol_Border, cGray20);
+            if (ImGui::Button(cancelLabel, {bW, bH})) result = 1;
+            ImGui::PopStyleColor(5);
+            ImGui::PopStyleVar(3);
+            ImGui::SameLine(0, 8);
+            // Confirm: gray100 filled
+            ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 8);
+            ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 0);
+            ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, {0, padY});
+            ImGui::PushStyleColor(ImGuiCol_Button, cGray100);
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, cGray90);
+            ImGui::PushStyleColor(ImGuiCol_ButtonActive, cGray90);
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1,1,1,1));
+            if (ImGui::Button(confirmLabel, {bW, bH})) result = 2;
+            ImGui::PopStyleColor(4);
+            ImGui::PopStyleVar(3);
+            return result;
+        };
+
+        // ─── 씬 저장하기 ────────────────────────────────────────
+        if (modalBegin("씬 저장하기")) {
+            modalTitle("씬 저장하기");
+            modalLabel("경로");
+            ImGui::SetNextItemWidth(-FLT_MIN);
+            ImGui::InputText("##savePath", scenePathBuf, sizeof(scenePathBuf));
+            int r = modalButtons("취소", "저장");
+            if (r == 2) {
                 std::string err;
-                if (simulator.saveScene(scenePathBuf, &err)) {
-                    sceneIOStatus = std::string("저장됨: ") + scenePathBuf;
-                } else {
-                    sceneIOStatus = std::string("저장 실패: ") + err;
-                }
+                simulator.saveScene(scenePathBuf, &err);
                 ImGui::CloseCurrentPopup();
-            }
-            ImGui::SameLine();
-            if (ImGui::Button("취소")) ImGui::CloseCurrentPopup();
-            ImGui::EndPopup();
+            } else if (r == 1) ImGui::CloseCurrentPopup();
+            modalEnd();
         }
-        if (ImGui::BeginPopupModal("씬 불러오기", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
-            ImGui::InputText("경로", scenePathBuf, sizeof(scenePathBuf));
-            if (ImGui::Button("불러오기")) {
-                auto r = simulator.loadScene(scenePathBuf);
-                if (r.ok) {
-                    sceneIOStatus = std::string("불러옴: ") + scenePathBuf;
-                    for (const auto& w : r.value.warnings.messages) {
-                        sceneIOStatus += "\n경고: " + w;
-                    }
-                    simulator.initialize();
-                    simulator.applyPendingMaterials();
-                } else {
-                    sceneIOStatus = std::string("불러오기 실패: ") + r.error.message;
-                }
+
+        // ─── 씬 불러오기 ────────────────────────────────────────
+        if (modalBegin("씬 불러오기")) {
+            modalTitle("씬 불러오기");
+            modalLabel("경로");
+            ImGui::SetNextItemWidth(-FLT_MIN);
+            ImGui::InputText("##loadPath", scenePathBuf, sizeof(scenePathBuf));
+            int r = modalButtons("취소", "불러오기");
+            if (r == 2) {
+                auto lr = simulator.loadScene(scenePathBuf);
+                if (lr.ok) { simulator.initialize(); simulator.applyPendingMaterials(); }
                 ImGui::CloseCurrentPopup();
-            }
-            ImGui::SameLine();
-            if (ImGui::Button("취소")) ImGui::CloseCurrentPopup();
-            ImGui::EndPopup();
+            } else if (r == 1) ImGui::CloseCurrentPopup();
+            modalEnd();
         }
-        if (ImGui::BeginPopupModal("OBJ 파일 가져오기", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
-            ImGui::InputText("경로", importPathBuf, sizeof(importPathBuf));
-            ImGui::InputFloat("배율", &importScale);
-            if (ImGui::Button("가져오기")) {
-                std::string path = importPathBuf;
-                std::string prefix, file;
+
+        // ─── OBJ 파일 가져오기 ──────────────────────────────────
+        if (modalBegin("OBJ 파일 가져오기")) {
+            modalTitle("OBJ 파일 가져오기");
+            modalLabel("경로");
+            ImGui::SetNextItemWidth(-FLT_MIN);
+            ImGui::InputText("##impPath", importPathBuf, sizeof(importPathBuf));
+            ImGui::Dummy({0, 12});
+            modalLabel("배율");
+            ImGui::SetNextItemWidth(-FLT_MIN);
+            ImGui::InputFloat("##impScale", &importScale);
+            int r = modalButtons("취소", "가져오기");
+            if (r == 2) {
+                std::string path = importPathBuf, prefix, file;
                 auto slash = path.find_last_of('/');
-                if (slash != std::string::npos) {
-                    prefix = path.substr(0, slash);
-                    file = path.substr(slash + 1);
-                } else {
-                    file = path;
-                }
+                if (slash != std::string::npos) { prefix = path.substr(0, slash); file = path.substr(slash+1); }
+                else file = path;
                 std::string err;
                 if (simulator.importMesh(prefix, file, (Precision)importScale, Precision(0.1), &err, BehaviorType::Rigid)) {
-                    simulator.initialize();
-                    simulator.applyPendingMaterials();
-                    sceneIOStatus = std::string("가져옴: ") + path;
-                } else {
-                    sceneIOStatus = std::string("가져오기 실패: ") + err;
+                    simulator.initialize(); simulator.applyPendingMaterials();
                 }
                 ImGui::CloseCurrentPopup();
-            }
-            ImGui::SameLine();
-            if (ImGui::Button("취소")) ImGui::CloseCurrentPopup();
-            ImGui::EndPopup();
+            } else if (r == 1) ImGui::CloseCurrentPopup();
+            modalEnd();
         }
-        // kind: 0 = sphere, 1 = cube, 2 = cylinder.
+
+        // ─── Primitive modals (구/정육면체/원기둥) ──────────────
         auto primitiveModal = [&](const char* title, int kind) {
-            if (ImGui::BeginPopupModal(title, nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
-                ImGui::InputFloat("크기", &primSize);
-                ImGui::InputInt("분할 수", &primTess);
-                ImGui::InputFloat3("위치", primPos);
-                if (ImGui::Button("생성")) {
+            if (modalBegin(title)) {
+                modalTitle(title);
+                modalLabel("크기");
+                ImGui::SetNextItemWidth(-FLT_MIN);
+                ImGui::InputFloat("##primSz", &primSize);
+                ImGui::Dummy({0, 12});
+                modalLabel("분할 수");
+                ImGui::SetNextItemWidth(-FLT_MIN);
+                ImGui::InputInt("##primTess", &primTess);
+                ImGui::Dummy({0, 12});
+                modalLabel("위치");
+                ImGui::SetNextItemWidth(-FLT_MIN);
+                ImGui::InputFloat3("##primPos", primPos);
+                int r = modalButtons("취소", "생성");
+                if (r == 2) {
                     int t = primTess;
                     tinym::vec3 c(primPos[0], primPos[1], primPos[2]);
-                    const char* doneMsg = "";
-                    if (kind == 0) {
-                        if (t < 3) t = 3;
-                        simulator.addSphere(c, (Index)t, (Precision)primSize,
-                                            (Precision)0.1, BehaviorType::Rigid);
-                        doneMsg = "구 생성됨";
-                    } else if (kind == 1) {
-                        if (t < 1) t = 1;
-                        simulator.addCube(c, (Index)t, (Precision)primSize,
-                                          (Precision)0.1, BehaviorType::Rigid);
-                        doneMsg = "정육면체 생성됨";
-                    } else {
-                        if (t < 3) t = 3;
-                        simulator.addCylinder(c, (Index)t, (Precision)primSize,
-                                              (Precision)0.1, BehaviorType::Rigid);
-                        doneMsg = "원기둥 생성됨";
-                    }
+                    if (kind == 0) { if (t < 3) t = 3; simulator.addSphere(c, (Index)t, (Precision)primSize, (Precision)0.1, BehaviorType::Rigid); }
+                    else if (kind == 1) { if (t < 1) t = 1; simulator.addCube(c, (Index)t, (Precision)primSize, (Precision)0.1, BehaviorType::Rigid); }
+                    else { if (t < 3) t = 3; simulator.addCylinder(c, (Index)t, (Precision)primSize, (Precision)0.1, BehaviorType::Rigid); }
                     simulator.initialize();
-                    sceneIOStatus = doneMsg;
                     ImGui::CloseCurrentPopup();
-                }
-                ImGui::SameLine();
-                if (ImGui::Button("취소")) ImGui::CloseCurrentPopup();
-                ImGui::EndPopup();
+                } else if (r == 1) ImGui::CloseCurrentPopup();
+                modalEnd();
             }
         };
         primitiveModal("구 생성", 0);
         primitiveModal("정육면체 생성", 1);
         primitiveModal("원기둥 생성", 2);
-        if (ImGui::BeginPopupModal("평면 생성", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+
+        // ─── 평면 생성 ──────────────────────────────────────────
+        if (modalBegin("평면 생성")) {
+            modalTitle("평면 생성");
+            modalLabel("방향");
             const char* dirNames[] = { "XY 평면", "YZ 평면", "XZ 평면 (바닥)" };
-            ImGui::Combo("방향", &planeDirIdx, dirNames, 3);
-            ImGui::InputFloat("크기", &planeSize);
-            ImGui::InputInt("분할 수", &planeTess);
-            ImGui::TextDisabled("분할 수를 높이고 소재를 옷감으로 바꾸면 천처럼 시뮬레이션됩니다.");
-            ImGui::InputFloat3("위치", planePos);
-            if (ImGui::Button("생성")) {
+            ImGui::SetNextItemWidth(-FLT_MIN);
+            ImGui::Combo("##planeDir", &planeDirIdx, dirNames, 3);
+            ImGui::Dummy({0, 12});
+            modalLabel("크기");
+            ImGui::SetNextItemWidth(-FLT_MIN);
+            ImGui::InputFloat("##planeSz", &planeSize);
+            ImGui::Dummy({0, 12});
+            modalLabel("분할 수");
+            ImGui::SetNextItemWidth(-FLT_MIN);
+            ImGui::InputInt("##planeTess", &planeTess);
+            ImGui::PushStyleColor(ImGuiCol_Text, cGray50);
+            ImGui::TextWrapped("분할 수를 높이고 소재를 옷감으로 바꾸면 천처럼 시뮬레이션됩니다.");
+            ImGui::PopStyleColor();
+            ImGui::Dummy({0, 12});
+            modalLabel("위치");
+            ImGui::SetNextItemWidth(-FLT_MIN);
+            ImGui::InputFloat3("##planePos", planePos);
+            int r = modalButtons("취소", "생성");
+            if (r == 2) {
                 PlaneDirection dir = PlaneDirection::XZPlane;
-                if (planeDirIdx == 0)      dir = PlaneDirection::XYPlane;
+                if (planeDirIdx == 0) dir = PlaneDirection::XYPlane;
                 else if (planeDirIdx == 1) dir = PlaneDirection::YZPlane;
-                else                       dir = PlaneDirection::XZPlane;
-                float s = planeSize;
-                if (s <= 0.f) s = 1.f;
-                int pn = planeTess;
-                if (pn < 2) pn = 2;
-                simulator.addPlane(dir,
-                                   tinym::vec3(planePos[0], planePos[1], planePos[2]),
-                                   (Index)pn, (Precision)s);
+                float s = planeSize > 0 ? planeSize : 1;
+                int pn = planeTess < 2 ? 2 : planeTess;
+                simulator.addPlane(dir, tinym::vec3(planePos[0], planePos[1], planePos[2]), (Index)pn, (Precision)s);
                 simulator.initialize();
-                sceneIOStatus = "평면 생성됨";
                 ImGui::CloseCurrentPopup();
-            }
-            ImGui::SameLine();
-            if (ImGui::Button("취소")) ImGui::CloseCurrentPopup();
-            ImGui::EndPopup();
+            } else if (r == 1) ImGui::CloseCurrentPopup();
+            modalEnd();
         }
 
         if (collectProfileFrame) {
