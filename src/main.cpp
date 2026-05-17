@@ -5896,12 +5896,23 @@ struct Simulator {
             }
         }
         mesh->scale = absS;
+
+        // S2 refactor: scale is now a fully in-place edit. Unlike
+        // translate/rotate it changes edge lengths, so cloth spring
+        // rest lengths must be re-measured from the scaled geometry —
+        // otherwise every spring is pre-stressed and a stiff explicit
+        // integrator blows up (this is exactly the old scale-on-load
+        // crash). recomputeRestLengths overwrites the EXISTING rest
+        // arrays in place (no realloc), so we no longer need the
+        // D-041 `dirty=true` re-pack. Non-cloth meshes have no springs.
+        if (mesh->behaviorType == BehaviorType::TriangularCloth
+         || mesh->behaviorType == BehaviorType::FastGridCloth) {
+            MeshAdjacencyInitializer<BE, PR>::recomputeRestLengths(
+                mesh->state, mesh->adjacency);
+        }
         // D-023 parity: refit the BVH so click-pick reads the new extent
         // immediately, even on a paused sim before the next sim.update().
         collisionPipeline.broadPhase.refit();
-        // D-041 parity with translate/rotate: mark dirty so the next
-        // update's pre-pause check rebuilds (Rigid backend etc. catch up).
-        Scene<BE, PR>::dirty = true;
     }
 
     // ── Point-selection vertex ops ────────────────────────────────────
