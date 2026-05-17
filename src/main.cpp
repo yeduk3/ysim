@@ -13311,22 +13311,44 @@ int main(int argc, char** argv) {
                 }
                 ImGui::SameLine();
 
-                // Progress bar: fill remaining minus input width
+                // Progress bar + text + input: fill available width
                 const float inputW = 120.0f;
-                const float spacing = ImGui::GetStyle().ItemSpacing.x;
-                float progW = ImGui::GetContentRegionAvail().x - inputW - spacing;
+                const float spc = ImGui::GetStyle().ItemSpacing.x;
+                // Measure "N /" text width
+                char progText[32];
+                std::snprintf(progText, sizeof(progText), "%u /", (unsigned)cur);
+                float progTextW = ImGui::CalcTextSize(progText).x;
+                // progBar fills: avail - (spc + progTextW + 12 + inputW + spc)
+                float progW = ImGui::GetContentRegionAvail().x - spc - progTextW - 12.0f - inputW - spc;
                 if (progW < 60.0f) progW = 60.0f;
 
-                // Match progress bar height to elemH
-                ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, {4, (elemH - ImGui::GetFontSize()) / 2});
                 float frac = (float)cur / (float)tgt;
                 if (frac < 0.0f) frac = 0.0f;
                 if (frac > 1.0f) frac = 1.0f;
-                char overlay[64];
-                std::snprintf(overlay, sizeof(overlay),
-                              "%u / %d", (unsigned)cur, tgt);
-                ImGui::ProgressBar(frac, ImVec2(progW, elemH), overlay);
-                ImGui::PopStyleVar();
+
+                // Progress bar: gray10 bg, no border, gray80 fill
+                ImGui::PushStyleColor(ImGuiCol_FrameBg, cGray10);
+                ImGui::PushStyleColor(ImGuiCol_FrameBgHovered, cGray10);
+                ImGui::PushStyleColor(ImGuiCol_FrameBgActive, cGray10);
+                ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 0);
+                ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, {4, (elemH - ImGui::GetFontSize()) / 2});
+                ImGui::ProgressBar(frac, ImVec2(progW, elemH), ""); // no overlay text
+                ImGui::PopStyleVar(2);
+                ImGui::PopStyleColor(3);
+
+                // Progress text: "N /" only, smaller, vertically centered, 12px gap
+                ImGui::SameLine(0, 12);
+                ImGui::PushStyleColor(ImGuiCol_Text, cGray60);
+                float smallFS = ImGui::GetFontSize() * 0.85f;
+                ImFont* font = ImGui::GetFont();
+                ImVec2 tSz = font->CalcTextSizeA(smallFS, FLT_MAX, 0, progText);
+                ImVec2 scrPos = ImGui::GetCursorScreenPos();
+                float textYOff = (elemH - tSz.y) * 0.5f;
+                ImGui::GetWindowDrawList()->AddText(font, smallFS,
+                    {scrPos.x, scrPos.y + textYOff},
+                    ImGui::ColorConvertFloat4ToU32(cGray60), progText);
+                ImGui::Dummy({tSz.x, elemH});
+                ImGui::PopStyleColor();
 
                 // Frame input: 120px total, no +/- buttons, padding 12px
                 ImGui::SameLine();
