@@ -810,6 +810,15 @@ struct InitializerParams {
     // Commons
     Index numPoints, numFacets, numEdges;
     PR mass;
+    // S3: object-level transform owned by the initializer params so a
+    // structural re-pack rebuilds the FULL transformed geometry
+    // deterministically from the request alone (no preview carrier).
+    // `center` (position) already lives on each derived params struct;
+    // these add the missing rotation + per-axis scale. Pivot for both
+    // is `center`. Applied scale → rotate → translate, matching
+    // reset()'s order. Defaults = identity (no-op until set).
+    tinym::vec3 scale{1, 1, 1};
+    ::Quat rotationQuat{};
     InitializerParams(Index numPoints, Index numFacets, Index numEdges, PR mass) : numPoints(numPoints), numFacets(numFacets), numEdges(numEdges), mass(mass) {}
 };
 template <typename BE, typename PR>
@@ -5819,6 +5828,12 @@ struct Simulator {
                 // composes against. reset() re-applies this to the
                 // freshly-regenerated preview around the same pivot.
                 req.rotationQuat = newAbs;
+                // S3: the initializer params own the transform so a
+                // structural re-pack can rebuild the rotated geometry
+                // from the request alone (consumed in S3-3; kept in
+                // sync here from now on).
+                if (req.initializer)
+                    req.initializer->getParams()->rotationQuat = newAbs;
                 break;
             }
         }
@@ -5892,6 +5907,10 @@ struct Simulator {
                 for (size_t i = 0; i < np; ++i)
                     scaleAbout(&req.preview.x[i*3]);
                 req.scale = absS;
+                // S3: keep the initializer params' scale in sync (used
+                // by S3-3's pack-time deterministic rebuild).
+                if (req.initializer)
+                    req.initializer->getParams()->scale = absS;
                 break;
             }
         }
