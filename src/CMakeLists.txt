@@ -40,6 +40,7 @@ target_link_libraries(ysim PRIVATE
     BulletCollision
     LinearMath
     assimp        # third_party/assimp — 3D model import (D-???)
+    nfd           # third_party/nativefiledialog-extended — native file dialogs
     "-framework AppKit"  # Dock icon (dock_icon.mm)
 )
 

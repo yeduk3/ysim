@@ -98,6 +98,12 @@ set(ASSIMP_NO_EXPORT           ON  CACHE BOOL "" FORCE)
 set(ASSIMP_BUILD_ZLIB          OFF CACHE BOOL "" FORCE)  # use system zlib; assimp's bundled zlib breaks on modern macOS SDK
 add_subdirectory(third_party/assimp EXCLUDE_FROM_ALL)
 
+# nativefiledialog-extended v1.3.0 — native open/save file dialogs.
+# Vendored as a git submodule. Static (BUILD_SHARED_LIBS forced OFF above);
+# no tests. Target "nfd" carries its own include dirs + macOS frameworks.
+set(NFD_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+add_subdirectory(third_party/nativefiledialog-extended EXCLUDE_FROM_ALL)
+
 # 4. src 폴더의 CMakeLists.txt 실행
 add_subdirectory(src)
 

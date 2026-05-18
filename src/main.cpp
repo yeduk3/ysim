@@ -11,6 +11,7 @@
 #include "program.hpp"
 #include "objreader.hpp"
 #include "assimpreader.hpp"
+#include <nfd.hpp>
 #include "scene_format.hpp"
 #include "MeshGL.hpp"
 #include "MeshRenderState.hpp"
@@ -13850,8 +13851,29 @@ int main(int argc, char** argv) {
         // panel's add-object buttons (Sphere/Cube/Import). Centralized
         // here so OpenPopup → BeginPopupModal stay co-located.
         if (openSaveModal) ImGui::OpenPopup("씬 저장하기");
-        if (openLoadModal) ImGui::OpenPopup("씬 불러오기");
-        if (openImportModal) ImGui::OpenPopup("3D 모델 파일 가져오기");
+        if (openLoadModal) {
+            // 씬 불러오기 — native open dialog (NFD) instead of a text path.
+            NFD::Guard _nfdGuard;
+            NFD::UniquePath _nfdPath;
+            nfdfilteritem_t _nfdFilter[1] = {{"Scene", "json,ysim"}};
+            if (NFD::OpenDialog(_nfdPath, _nfdFilter, 1) == NFD_OKAY) {
+                auto lr = simulator.loadScene(_nfdPath.get());
+                if (lr.ok) { simulator.initialize(); simulator.applyPendingMaterials(); }
+            }
+        }
+        if (openImportModal) {
+            // 3D 물체 추가 — pick the model file via NFD, then the modal
+            // below still collects the import scale.
+            NFD::Guard _nfdGuard;
+            NFD::UniquePath _nfdPath;
+            nfdfilteritem_t _nfdFilter[1] =
+                {{"3D Model", "obj,fbx,gltf,glb,dae,stl,ply,3ds,blend,off,3mf,x"}};
+            if (NFD::OpenDialog(_nfdPath, _nfdFilter, 1) == NFD_OKAY) {
+                std::snprintf(importPathBuf, sizeof(importPathBuf), "%s",
+                              _nfdPath.get());
+                ImGui::OpenPopup("3D 모델 파일 가져오기");
+            }
+        }
         if (openSphereModal) ImGui::OpenPopup("구 생성");
         if (openCubeModal) ImGui::OpenPopup("정육면체 생성");
         if (openCylinderModal) ImGui::OpenPopup("원기둥 생성");
@@ -13944,27 +13966,13 @@ int main(int argc, char** argv) {
             modalEnd();
         }
 
-        // ─── 씬 불러오기 ────────────────────────────────────────
-        if (modalBegin("씬 불러오기")) {
-            modalTitle("씬 불러오기");
-            modalLabel("경로");
-            ImGui::SetNextItemWidth(-FLT_MIN);
-            ImGui::InputText("##loadPath", scenePathBuf, sizeof(scenePathBuf));
-            int r = modalButtons("취소", "불러오기");
-            if (r == 2) {
-                auto lr = simulator.loadScene(scenePathBuf);
-                if (lr.ok) { simulator.initialize(); simulator.applyPendingMaterials(); }
-                ImGui::CloseCurrentPopup();
-            } else if (r == 1) ImGui::CloseCurrentPopup();
-            modalEnd();
-        }
+        // (씬 불러오기는 NFD 네이티브 다이얼로그로 대체됨 — 위 openLoadModal 처리)
 
         // ─── 3D 모델 파일 가져오기 ──────────────────────────────────
         if (modalBegin("3D 모델 파일 가져오기")) {
             modalTitle("3D 모델 파일 가져오기");
-            modalLabel("경로");
-            ImGui::SetNextItemWidth(-FLT_MIN);
-            ImGui::InputText("##impPath", importPathBuf, sizeof(importPathBuf));
+            modalLabel("파일");
+            ImGui::TextWrapped("%s", importPathBuf[0] ? importPathBuf : "(파일 미선택)");
             ImGui::Dummy({0, 12});
             modalLabel("배율");
             ImGui::SetNextItemWidth(-FLT_MIN);
