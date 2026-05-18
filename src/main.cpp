@@ -2701,6 +2701,14 @@ struct Scene {
             } else if (auto* f  = dynamic_cast<MeshFileInitializer  <BE, PR>*>(req.initializer)) {
                 meshes[i].transformPosition = f->params.offset;
                 meshes[i].shapeType = ShapeType::Mesh;
+            } else if (auto* a  = dynamic_cast<AssimpMeshFileInitializer<BE, PR>*>(req.initializer)) {
+                // AssimpMeshFileInitializer is a SIBLING of MeshFileInitializer
+                // (both derive from GeneralMeshInitializer), so the cast above
+                // does not match it. Without this branch a re-pack on reset
+                // reseeds transformPosition to (0,0,0) and drops imported-mesh
+                // position.
+                meshes[i].transformPosition = a->params.offset;
+                meshes[i].shapeType = ShapeType::Mesh;
             } else {
                 meshes[i].shapeType = ShapeType::Mesh;
             }
@@ -6111,6 +6119,12 @@ struct Simulator {
             cy->params.center = newPos;
         } else if (auto* f  = dynamic_cast<MeshFileInitializer  <BE, PR>*>(mesh->initializer)) {
             f->params.offset = newPos;
+        } else if (auto* a  = dynamic_cast<AssimpMeshFileInitializer<BE, PR>*>(mesh->initializer)) {
+            // Sibling of MeshFileInitializer (see Scene::pack cascade): the
+            // cast above won't catch it. Write back so a subsequent re-pack
+            // (reset/import/load) rebuilds state.x at the translated pose
+            // instead of the stale (0,0,0) import offset.
+            a->params.offset = newPos;
         }
         // D-023: refit the BVH so click-pick reads the new pose
         // immediately, even on a paused sim before the next sim.update().
@@ -7656,6 +7670,16 @@ struct Simulator {
                 o.source.import.scale = (double)f->params.scale;
                 o.source.import.mass = (double)f->params.mass;
                 o.transform.position = {f->params.offset.x, f->params.offset.y, f->params.offset.z};
+            } else if (auto* a = dynamic_cast<AssimpMeshFileInitializer<BE,PR>*>(init)) {
+                // Sibling of MeshFileInitializer; needs its own case so
+                // saveScene persists the imported model's path and position.
+                o.source.kind = Source::Kind::Import;
+                std::string p = a->params.prefix;
+                if (!p.empty() && p.back() != '/') p.push_back('/');
+                o.source.import.path = p + a->params.fileName;
+                o.source.import.scale = (double)a->params.scale;
+                o.source.import.mass = (double)a->params.mass;
+                o.transform.position = {a->params.offset.x, a->params.offset.y, a->params.offset.z};
             }
             // Realized-mesh path overrides the initializer-derived position
             // with the live GeneralMesh::transformPosition so BDD-003 edits
@@ -13093,6 +13117,7 @@ int main(int argc, char** argv) {
                 if (dynamic_cast<MeshCubeInitializer    <Backend, Precision>*>(in)) return "정육면체";
                 if (dynamic_cast<MeshCylinderInitializer<Backend, Precision>*>(in)) return "원기둥";
                 if (dynamic_cast<MeshFileInitializer    <Backend, Precision>*>(in)) return "OBJ 파일";
+                if (dynamic_cast<AssimpMeshFileInitializer<Backend, Precision>*>(in)) return "모델 파일";
                 if (dynamic_cast<MeshGridInitializer    <Backend, Precision>*>(in)) return "평면";
                 return "물체";
             };
