@@ -1897,10 +1897,26 @@ struct ClothBehaviorParams {
     PR thickness;
 };
 
+// FastGridCloth rest lengths are PER DIRECTION (6 values), not 3 scalars.
+// A single stretch/shear/bend scalar only holds for a uniformly scaled
+// grid; a non-uniform scale (e.g. 3x on X, 1x on Y) gives the column
+// edges, row edges, the two cell diagonals, and the two bend spans all
+// different rest lengths. Grid layout (MeshGridInitializer, row-major,
+// idx = row*pn1D + col):
+//   stretchRestX : idx 0  -> idx 1            (col +1, horizontal edge)
+//   stretchRestY : idx 0  -> idx pn1D         (row +1, vertical edge)
+//   shearRestA   : idx 0  -> idx pn1D+1       ("\" diagonal, +row +col)
+//   shearRestB   : idx 1  -> idx pn1D         ("/" diagonal, +row -col)
+//   bendRestX    : idx 0  -> idx 2            (col +2, horizontal bend)
+//   bendRestY    : idx 0  -> idx 2*pn1D       (row +2, vertical bend)
+// Field order MUST stay byte-identical to physics.metal's ClothGridParams
+// (sent verbatim via setBytes; all members are 4-byte scalars, no pad).
 template <typename PR>
 struct FastGridClothBehaviorParams {
     uint particleNum1D;
-    PR stretchRest, shearRest, bendRest;
+    PR stretchRestX, stretchRestY;
+    PR shearRestA,   shearRestB;
+    PR bendRestX,    bendRestY;
     PR kstretch, kshear, kbend;
     PR thickness;
 };
@@ -1910,10 +1926,46 @@ struct FloatBehaviorParams {};
 
 template <typename PR>
 using BehaviorParams = std::variant<
-    ClothBehaviorParams<PR>, 
+    ClothBehaviorParams<PR>,
     FastGridClothBehaviorParams<PR>,
     FloatBehaviorParams<PR>
 >;
+
+// Derive FastGridCloth's 6 directional rest lengths from the LIVE grid
+// geometry. FastGridCloth physics reads these scalars directly (the
+// metal kernel routes each spring to its matching field), NOT the
+// adjacency restEdgeLengths arrays — so recomputeRestLengths() alone
+// leaves a scaled FastGrid sheet pre-stressed. Measuring from the
+// post-transform coordinates makes a uniformly OR non-uniformly scaled
+// sheet's rest config fall out naturally. Each value is only written
+// when its sample indices are in range and the measured length is
+// non-degenerate, so a collapsed axis can't zero out a rest length and
+// a too-small grid leaves the constructed defaults intact.
+template <typename PR>
+inline void recomputeFastGridRest(const PR* x, Index numPoints,
+                                  FastGridClothBehaviorParams<PR>& p) {
+    uint pn = p.particleNum1D;
+    if (pn < 2 || x == nullptr) return;
+    auto dist = [&](Index a, Index b) {
+        PR dx = x[a*3+0] - x[b*3+0];
+        PR dy = x[a*3+1] - x[b*3+1];
+        PR dz = x[a*3+2] - x[b*3+2];
+        return std::sqrt(dx*dx + dy*dy + dz*dz);
+    };
+    auto set = [&](PR& dst, Index a, Index b) {
+        if (a < numPoints && b < numPoints) {
+            PR d = dist(a, b);
+            if (d > PR(1e-9)) dst = d;
+        }
+    };
+    const Index P = (Index)pn;
+    set(p.stretchRestX, 0, 1);        // col +1
+    set(p.stretchRestY, 0, P);        // row +1
+    set(p.shearRestA,   0, P + 1);    // "\" diagonal
+    set(p.shearRestB,   1, P);        // "/" diagonal
+    set(p.bendRestX,    0, 2);        // col +2
+    set(p.bendRestY,    0, 2 * P);    // row +2
+}
 
 //! Force accumulator
 template <typename BE, typename PR>
@@ -2807,6 +2859,23 @@ struct Scene {
             // jiggle applied just above — invisible but consistent.)
             MeshAdjacencyInitializer<BE, PR>::recomputeRestLengths(
                 meshes[i].state, meshes[i].adjacency);
+
+            // recomputeRestLengths only fixes the adjacency arrays
+            // (TriangularCloth). FastGridCloth's solver instead reads
+            // the scalar rest lengths in its behavior params, so a
+            // scaled/rotated grid would stay pre-stressed without this.
+            // state.x here is the fully transformed geometry, so derive
+            // the scalars from it and keep the request copy in lock-step
+            // (a later non-dirty re-pack reuses req.behaviorParams).
+            if (meshes[i].behaviorType == BehaviorType::FastGridCloth) {
+                if (auto* fp = std::get_if<FastGridClothBehaviorParams<PR>>(
+                        &meshes[i].behaviorParams)) {
+                    recomputeFastGridRest<PR>(meshes[i].state.x.ptr,
+                                              meshes[i].state.x.size / 3,
+                                              *fp);
+                    req.behaviorParams = meshes[i].behaviorParams;
+                }
+            }
 
             // Seed xPrev with the initial position so the first substep's
             // swept-CCD narrow check (D-013) sees a degenerate segment
@@ -5959,14 +6028,17 @@ struct Simulator {
                 true
             }),
             BehaviorType::FastGridCloth,
+            // Freshly built grid is uniform: X==Y stretch, A==B shear,
+            // X==Y bend. size1D/(particleNum1D-1): pn points → pn-1
+            // segments, matching MeshGridInitializer's grid spacing.
             FastGridClothBehaviorParams<PR>{
                 particleNum1D,
-                // size1D/(particleNum1D-1): pn points → pn-1 segments.
-                // Matches MeshGridInitializer's grid spacing; the prior
-                // /particleNum1D under-shot every rest length.
-                size1D/(particleNum1D-1),
-                size1D/(particleNum1D-1)*std::sqrtf(2),
-                size1D/(particleNum1D-1)*2,
+                size1D/(particleNum1D-1),                  // stretchRestX
+                size1D/(particleNum1D-1),                  // stretchRestY
+                size1D/(particleNum1D-1)*std::sqrtf(2),    // shearRestA
+                size1D/(particleNum1D-1)*std::sqrtf(2),    // shearRestB
+                size1D/(particleNum1D-1)*2,                // bendRestX
+                size1D/(particleNum1D-1)*2,                // bendRestY
                 kstretch,
                 kshear,
                 kbend,
@@ -6288,6 +6360,25 @@ struct Simulator {
          || mesh->behaviorType == BehaviorType::FastGridCloth) {
             MeshAdjacencyInitializer<BE, PR>::recomputeRestLengths(
                 mesh->state, mesh->adjacency);
+        }
+        // FastGridCloth solves against the scalar rest lengths in its
+        // behavior params, which recomputeRestLengths above does NOT
+        // touch (it only rewrites the adjacency arrays). state.x/xPrev
+        // were just scaled in place, so re-derive the scalars from the
+        // scaled grid and sync both the live mesh and its request copy
+        // (so a dirty-triggered re-pack rebuilds with the new rest).
+        if (mesh->behaviorType == BehaviorType::FastGridCloth) {
+            if (auto* fp = std::get_if<FastGridClothBehaviorParams<PR>>(
+                    &mesh->behaviorParams)) {
+                recomputeFastGridRest<PR>(mesh->state.x.ptr,
+                                          mesh->state.x.size / 3, *fp);
+                for (auto& req : Scene<BE, PR>::requestsGeneralMeshes) {
+                    if (req.id == meshId) {
+                        req.behaviorParams = mesh->behaviorParams;
+                        break;
+                    }
+                }
+            }
         }
         // D-023 parity: refit the BVH so click-pick reads the new extent
         // immediately, even on a paused sim before the next sim.update().
@@ -6825,10 +6916,17 @@ struct Simulator {
                 // step and never settled. Mirrors MeshGridInitializer's
                 // `length = size1D/(particleNum1D-1)` at construction.
                 PR rest = size1D / PR(pn1D - 1);
+                PR restD = rest * std::sqrt(PR(2));
+                PR restB = rest * PR(2);
                 mesh->behaviorType = BehaviorType::FastGridCloth;
+                // Seed uniform (X==Y, A==B); the dirty-pack that follows
+                // re-derives all 6 from the actual (possibly scaled)
+                // geometry via recomputeFastGridRest.
                 mesh->behaviorParams = FastGridClothBehaviorParams<PR>{
                     static_cast<uint>(pn1D),
-                    rest, rest * std::sqrt(PR(2)), rest * PR(2),
+                    rest,  rest,
+                    restD, restD,
+                    restB, restB,
                     PR(1e5), PR(1e5), PR(3e5), PR(0.001)
                 };
                 syncBroadPhaseCaches(BehaviorType::FastGridCloth);
@@ -7703,9 +7801,12 @@ struct Simulator {
                     o.behavior.params["thickness"] = p.thickness;
                 } else if constexpr (std::is_same_v<P, FastGridClothBehaviorParams<PR>>) {
                     o.behavior.params["particle_num_1d"] = p.particleNum1D;
-                    o.behavior.params["stretch_rest"] = p.stretchRest;
-                    o.behavior.params["shear_rest"]   = p.shearRest;
-                    o.behavior.params["bend_rest"]    = p.bendRest;
+                    o.behavior.params["stretch_rest_x"] = p.stretchRestX;
+                    o.behavior.params["stretch_rest_y"] = p.stretchRestY;
+                    o.behavior.params["shear_rest_a"]   = p.shearRestA;
+                    o.behavior.params["shear_rest_b"]   = p.shearRestB;
+                    o.behavior.params["bend_rest_x"]    = p.bendRestX;
+                    o.behavior.params["bend_rest_y"]    = p.bendRestY;
                     o.behavior.params["k_stretch"]    = p.kstretch;
                     o.behavior.params["k_shear"]      = p.kshear;
                     o.behavior.params["k_bend"]       = p.kbend;
@@ -7875,9 +7976,18 @@ struct Simulator {
                 btype = BehaviorType::FastGridCloth;
                 FastGridClothBehaviorParams<PR> p{};
                 p.particleNum1D = o.behavior.params.value("particle_num_1d", 0u);
-                p.stretchRest   = o.behavior.params.value("stretch_rest", PR(0));
-                p.shearRest     = o.behavior.params.value("shear_rest",   PR(0));
-                p.bendRest      = o.behavior.params.value("bend_rest",    PR(0));
+                // Back-compat: pre-6-value scenes only stored the single
+                // stretch_rest/shear_rest/bend_rest scalars — fan them out
+                // to X==Y / A==B. Newer scenes carry all 6 directly.
+                PR legacyS = o.behavior.params.value("stretch_rest", PR(0));
+                PR legacyShear = o.behavior.params.value("shear_rest", PR(0));
+                PR legacyBend  = o.behavior.params.value("bend_rest",  PR(0));
+                p.stretchRestX = o.behavior.params.value("stretch_rest_x", legacyS);
+                p.stretchRestY = o.behavior.params.value("stretch_rest_y", legacyS);
+                p.shearRestA   = o.behavior.params.value("shear_rest_a", legacyShear);
+                p.shearRestB   = o.behavior.params.value("shear_rest_b", legacyShear);
+                p.bendRestX    = o.behavior.params.value("bend_rest_x", legacyBend);
+                p.bendRestY    = o.behavior.params.value("bend_rest_y", legacyBend);
                 p.kstretch      = o.behavior.params.value("k_stretch",    PR(0));
                 p.kshear        = o.behavior.params.value("k_shear",      PR(0));
                 p.kbend         = o.behavior.params.value("k_bend",       PR(0));
@@ -8306,7 +8416,9 @@ struct ExplicitSystem<METAL, PR> {
 
     struct ClothGridParams {
         uint particleNum1D;
-        float stretchRest, shearRest, bendRest;
+        float stretchRestX, stretchRestY;
+        float shearRestA,   shearRestB;
+        float bendRestX,    bendRestY;
         float kstretch, kshear, kbend;
         float thickness;
     };
@@ -12461,6 +12573,77 @@ static int runSelfTest() {
                  + " restoredOk=" + std::to_string((int)restoredOk)
                  + " actuallyDiff=" + std::to_string((int)actuallyDiff));
         }
+    }
+
+    // ---- Block FG-SCALE: FastGridCloth rest lengths must track scale. -----
+    // A grid plane turned into FastGridCloth then scaled must have ALL 6
+    // directional rest lengths follow the scaled geometry. The non-uniform
+    // case (3x X, 1x Y) is the one a single-scalar model could not express:
+    // stretchRestX != stretchRestY and bendRestX != bendRestY.
+    {
+        const Precision S = 0.6f;
+        const int       N = 4;                          // 4x4 grid
+        const Precision base = S / Precision(N - 1);     // 0.2 grid spacing
+        const Precision tol  = 1e-3f;
+        // Expected per-direction rest for column spacing dx, row spacing dy.
+        auto checkRest = [&](const char* name, Precision dx, Precision dy) {
+            auto* m = Scene<Backend, Precision>::findById(0);
+            if (!m) { fail(name, "mesh id 0 missing"); return; }
+            auto* fp = std::get_if<FastGridClothBehaviorParams<Precision>>(
+                           &m->behaviorParams);
+            if (!fp) { fail(name, "behaviorParams not FastGridCloth"); return; }
+            Precision wsX = dx,            wsY = dy;
+            Precision wsh = std::sqrt(dx*dx + dy*dy);     // both diagonals
+            Precision wbX = 2*dx,          wbY = 2*dy;
+            auto near = [&](Precision a, Precision b){ return std::abs(a-b) < tol; };
+            bool ok = near(fp->stretchRestX, wsX) && near(fp->stretchRestY, wsY)
+                   && near(fp->shearRestA, wsh)   && near(fp->shearRestB, wsh)
+                   && near(fp->bendRestX, wbX)    && near(fp->bendRestY, wbY);
+            if (ok) pass(name);
+            else fail(name,
+                "sX=" + std::to_string(fp->stretchRestX) + "/" + std::to_string(wsX)
+                + " sY=" + std::to_string(fp->stretchRestY) + "/" + std::to_string(wsY)
+                + " shA=" + std::to_string(fp->shearRestA) + "/" + std::to_string(wsh)
+                + " shB=" + std::to_string(fp->shearRestB) + "/" + std::to_string(wsh)
+                + " bX=" + std::to_string(fp->bendRestX) + "/" + std::to_string(wbX)
+                + " bY=" + std::to_string(fp->bendRestY) + "/" + std::to_string(wbY));
+        };
+        auto freshGrid = [&]() {
+            resetScene();
+            sim.addPlane(PlaneDirection::XYPlane, tinym::vec3(0.0f), N, S);
+            sim.initialize();
+        };
+
+        // Order A: plane → 옷감(FastGridCloth) → uniform scale 3x.
+        freshGrid();
+        sim.changeBehavior(0, BehaviorType::FastGridCloth);
+        sim.initialize();                       // dirty pack consumes the toggle
+        checkRest("FG-SCALE A0 / rest == grid spacing before scale", base, base);
+        sim.scaleObject(0, tinym::vec3(3.0f, 3.0f, 3.0f));
+        checkRest("FG-SCALE A1 / uniform 3x after changeBehavior->scale",
+                  base*3, base*3);
+        sim.initialize();                       // re-pack must keep scaled rest
+        checkRest("FG-SCALE A2 / scaled rest survives a re-pack",
+                  base*3, base*3);
+
+        // Order B: plane → scale(while Float) → 옷감(FastGridCloth).
+        freshGrid();
+        sim.scaleObject(0, tinym::vec3(3.0f, 3.0f, 3.0f));
+        sim.changeBehavior(0, BehaviorType::FastGridCloth);
+        sim.initialize();                       // dirty pack builds scaled grid
+        checkRest("FG-SCALE B / uniform 3x after scale->changeBehavior",
+                  base*3, base*3);
+
+        // Order C: NON-UNIFORM scale (X 3x, Y 1x) — the 6-value witness.
+        freshGrid();
+        sim.changeBehavior(0, BehaviorType::FastGridCloth);
+        sim.initialize();
+        sim.scaleObject(0, tinym::vec3(3.0f, 1.0f, 1.0f));
+        checkRest("FG-SCALE C1 / non-uniform 3x/1x (changeBehavior->scale)",
+                  base*3, base*1);
+        sim.initialize();
+        checkRest("FG-SCALE C2 / non-uniform survives re-pack",
+                  base*3, base*1);
     }
 
     if (failures == 0) {
