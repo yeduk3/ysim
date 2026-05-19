@@ -5321,21 +5321,29 @@ struct BVH<BE, PR, BVHMODE::SCENE, BVHPRIMITIVE::OBJECT> {
     void detectCollisions(PR margin, bool enableSelfCollisions=true) {
         queryBegin();
 
-        std::set<IndexPair> checked;
+        // Bidirectional registration. The old `std::set<IndexPair> checked`
+        // deduped on the SORTED pair {min,max}, so a colliding pair {A,B}
+        // was queried in ONE direction only — points from whichever mesh
+        // the outer loop reached first (== the lower mesh index == the
+        // EARLIER-created mesh). narrowAndSortByVertices keys collision
+        // response solely off objPair.query, so the other mesh (target /
+        // facet provider) was detected-but-never-responded. That made
+        // collision response depend on creation order (import-then-plane
+        // vs plane-then-import). The double loop already visits every
+        // ordered (q,t) exactly once, so simply NOT deduping yields both
+        // directions when both meshes are non-Float; a Float mesh is
+        // still skipped as a query (line above) so Float/non-Float pairs
+        // keep their single valid direction — no extra work, no change.
         for(Index q = 0; q < objTrees.size(); ++q) {
             auto& queryTree = objTrees[q];
             if(queryTree.objBehavior == BehaviorType::Float) continue;
 
             for(Index t = 0; t < objTrees.size(); ++t) {
-                Index a = std::min(q, t);
-                Index b = std::max(q, t);
                 if(q == t) {
                     if(!enableSelfCollisions) continue;
                     queryTree.checkSelfCollisions(margin);
-                    checked.insert({a, b});
                     continue;
                 }
-                if(checked.find({a, b}) != checked.end()) continue;
                 auto& qa = queryTree.tree[0].aabb;
                 auto& ta = objTrees[t].tree[0].aabb;
                 bool hit = ta.intersect(qa);
@@ -5345,7 +5353,6 @@ struct BVH<BE, PR, BVHMODE::SCENE, BVHPRIMITIVE::OBJECT> {
                     // narrow kernel can directly use as statesOffsets[]
                     // subscripts.
                     objTrees[t].queryPoints(q, margin);
-                    checked.insert({a, b});
                 }
             }
         }
@@ -12573,6 +12580,60 @@ static int runSelfTest() {
                  + " restoredOk=" + std::to_string((int)restoredOk)
                  + " actuallyDiff=" + std::to_string((int)actuallyDiff));
         }
+    }
+
+    // ---- Block COL-ORDER: collision response is creation-order agnostic. --
+    // Two overlapping non-Float meshes (cloth+cloth) must BOTH be registered
+    // as a collision query (point provider) so both receive a response.
+    // Before the bidirectional-registration fix the old `checked` set deduped
+    // each pair to a single direction (query == the lower / earlier mesh
+    // index), so the later-created mesh was detected-but-never-responded —
+    // collision response then depended on creation order. The witness here
+    // is direction-symmetric: regardless of which cloth is added first, the
+    // pair {0,1} must yield narrow collisions with objPair.query == 0 AND
+    // objPair.query == 1 across the stepped frames.
+    {
+        auto bothMeshesQueried = [&](bool swapOrder) -> bool {
+            resetScene();
+            // Two 4x4 cloth grids in the XY plane, ~half a thickness apart
+            // in Z so every point sits inside the other sheet's contact
+            // band → guaranteed point-triangle pairs both ways.
+            tinym::vec3 cA(0.0f, 0.0f, 0.000f);
+            tinym::vec3 cB(0.0f, 0.0f, 0.005f);
+            if (!swapOrder) {
+                sim.addCloth(4, 0.5f, cA, 1e3, 1e3, 1e3, 0.01f, 0.1f);
+                sim.addCloth(4, 0.5f, cB, 1e3, 1e3, 1e3, 0.01f, 0.1f);
+            } else {
+                sim.addCloth(4, 0.5f, cB, 1e3, 1e3, 1e3, 0.01f, 0.1f);
+                sim.addCloth(4, 0.5f, cA, 1e3, 1e3, 1e3, 0.01f, 0.1f);
+            }
+            sim.initialize();
+            // Zero gravity: keep the sheets overlapping deterministically so
+            // contacts fire every frame instead of free-falling apart.
+            Scene<Backend, Precision>::environment.gravity = tinym::vec3(0.f);
+            Scene<Backend, Precision>::environment.wind    = tinym::vec3(0.f);
+            bool seen0 = false, seen1 = false;
+            auto& pc = Scene<Backend, Precision>::packedCollisionData;
+            for (int f = 0; f < 6; ++f) {
+                sim.update();
+                for (Index i = 0; i < pc.numNarrowCollisions[0]; ++i) {
+                    Index qy = pc.narrowCollisions[i].objPair.query;
+                    if (qy == 0) seen0 = true;
+                    if (qy == 1) seen1 = true;
+                }
+            }
+            return seen0 && seen1;
+        };
+        if (bothMeshesQueried(false))
+            pass("COL-ORDER A / both meshes responded (cloth0 then cloth1)");
+        else
+            fail("COL-ORDER A / both meshes responded (cloth0 then cloth1)",
+                 "only one mesh registered as collision query");
+        if (bothMeshesQueried(true))
+            pass("COL-ORDER B / both meshes responded (cloth1 then cloth0)");
+        else
+            fail("COL-ORDER B / both meshes responded (cloth1 then cloth0)",
+                 "only one mesh registered as collision query");
     }
 
     // ---- Block FG-SCALE: FastGridCloth rest lengths must track scale. -----
