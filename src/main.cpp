@@ -1897,10 +1897,26 @@ struct ClothBehaviorParams {
     PR thickness;
 };
 
+// FastGridCloth rest lengths are PER DIRECTION (6 values), not 3 scalars.
+// A single stretch/shear/bend scalar only holds for a uniformly scaled
+// grid; a non-uniform scale (e.g. 3x on X, 1x on Y) gives the column
+// edges, row edges, the two cell diagonals, and the two bend spans all
+// different rest lengths. Grid layout (MeshGridInitializer, row-major,
+// idx = row*pn1D + col):
+//   stretchRestX : idx 0  -> idx 1            (col +1, horizontal edge)
+//   stretchRestY : idx 0  -> idx pn1D         (row +1, vertical edge)
+//   shearRestA   : idx 0  -> idx pn1D+1       ("\" diagonal, +row +col)
+//   shearRestB   : idx 1  -> idx pn1D         ("/" diagonal, +row -col)
+//   bendRestX    : idx 0  -> idx 2            (col +2, horizontal bend)
+//   bendRestY    : idx 0  -> idx 2*pn1D       (row +2, vertical bend)
+// Field order MUST stay byte-identical to physics.metal's ClothGridParams
+// (sent verbatim via setBytes; all members are 4-byte scalars, no pad).
 template <typename PR>
 struct FastGridClothBehaviorParams {
     uint particleNum1D;
-    PR stretchRest, shearRest, bendRest;
+    PR stretchRestX, stretchRestY;
+    PR shearRestA,   shearRestB;
+    PR bendRestX,    bendRestY;
     PR kstretch, kshear, kbend;
     PR thickness;
 };
@@ -1910,10 +1926,46 @@ struct FloatBehaviorParams {};
 
 template <typename PR>
 using BehaviorParams = std::variant<
-    ClothBehaviorParams<PR>, 
+    ClothBehaviorParams<PR>,
     FastGridClothBehaviorParams<PR>,
     FloatBehaviorParams<PR>
 >;
+
+// Derive FastGridCloth's 6 directional rest lengths from the LIVE grid
+// geometry. FastGridCloth physics reads these scalars directly (the
+// metal kernel routes each spring to its matching field), NOT the
+// adjacency restEdgeLengths arrays — so recomputeRestLengths() alone
+// leaves a scaled FastGrid sheet pre-stressed. Measuring from the
+// post-transform coordinates makes a uniformly OR non-uniformly scaled
+// sheet's rest config fall out naturally. Each value is only written
+// when its sample indices are in range and the measured length is
+// non-degenerate, so a collapsed axis can't zero out a rest length and
+// a too-small grid leaves the constructed defaults intact.
+template <typename PR>
+inline void recomputeFastGridRest(const PR* x, Index numPoints,
+                                  FastGridClothBehaviorParams<PR>& p) {
+    uint pn = p.particleNum1D;
+    if (pn < 2 || x == nullptr) return;
+    auto dist = [&](Index a, Index b) {
+        PR dx = x[a*3+0] - x[b*3+0];
+        PR dy = x[a*3+1] - x[b*3+1];
+        PR dz = x[a*3+2] - x[b*3+2];
+        return std::sqrt(dx*dx + dy*dy + dz*dz);
+    };
+    auto set = [&](PR& dst, Index a, Index b) {
+        if (a < numPoints && b < numPoints) {
+            PR d = dist(a, b);
+            if (d > PR(1e-9)) dst = d;
+        }
+    };
+    const Index P = (Index)pn;
+    set(p.stretchRestX, 0, 1);        // col +1
+    set(p.stretchRestY, 0, P);        // row +1
+    set(p.shearRestA,   0, P + 1);    // "\" diagonal
+    set(p.shearRestB,   1, P);        // "/" diagonal
+    set(p.bendRestX,    0, 2);        // col +2
+    set(p.bendRestY,    0, 2 * P);    // row +2
+}
 
 //! Force accumulator
 template <typename BE, typename PR>
@@ -2502,6 +2554,30 @@ struct Scene {
         VectorBase<BE, NarrowCollision> vertColFacets;
         VectorBase<BE, Index> vertColFacetsOffsets;
 
+        // Segmented (per-threadgroup) detect+reduce scratch — used by
+        // BVH::queryPointsSegmented (paper-inspired alternative to the
+        // baseline per-leaf-hit global atomic). Allocated alongside
+        // broadCollisions in pack(). Worst-case size: ceil(numPoints
+        // / segTGSize) threadgroups, each holding up to segPerTGCap
+        // BroadCollisions. Reused across all (q,t) calls in one
+        // detectCollisionsSegmented frame; the global numBroadCollisions
+        // counter (above) accumulates across calls as in the baseline.
+        Index segTGSize     = 256;
+        // Per-TG private slice budget multiplier on top of the global
+        // per-point average (approxColsPerPoints). The baseline path
+        // shares one global budget so hot-spot hits "borrow" capacity
+        // from cold TGs; the segmented path partitions the budget
+        // per-TG so hot TGs (Morton-clustered cloth points piling onto
+        // the same ground patch) overflow well before the global cap.
+        // 4× covers typical hot/cold ratio in the funnel/cloth-ball
+        // benchmarks; raise if [queryPointsSegmented] still warns.
+        Index segPerTGCapFactor = 4;
+        Index segPerTGCap   = 0;   // = approxColsPerPoints * segTGSize * factor, set in pack
+        Index segMaxTGs     = 0;   // = ceil(numPoints / segTGSize),    set in pack
+        VectorBase<BE, BroadCollision> segPrivateCollisions;
+        VectorBase<BE, uint32_t>       segPrivateCount;
+        VectorBase<BE, uint32_t>       segPrivateOffset;
+
         void resetNarrow() {
             std::memset(narrowCollisions.ptr, 0, sizeof(NarrowCollision)*numNarrowCollisions[0]);
             std::memset(vertColFacets.ptr, 0, sizeof(NarrowCollision)*numNarrowCollisions[0]);
@@ -2701,6 +2777,14 @@ struct Scene {
             } else if (auto* f  = dynamic_cast<MeshFileInitializer  <BE, PR>*>(req.initializer)) {
                 meshes[i].transformPosition = f->params.offset;
                 meshes[i].shapeType = ShapeType::Mesh;
+            } else if (auto* a  = dynamic_cast<AssimpMeshFileInitializer<BE, PR>*>(req.initializer)) {
+                // AssimpMeshFileInitializer is a SIBLING of MeshFileInitializer
+                // (both derive from GeneralMeshInitializer), so the cast above
+                // does not match it. Without this branch a re-pack on reset
+                // reseeds transformPosition to (0,0,0) and drops imported-mesh
+                // position.
+                meshes[i].transformPosition = a->params.offset;
+                meshes[i].shapeType = ShapeType::Mesh;
             } else {
                 meshes[i].shapeType = ShapeType::Mesh;
             }
@@ -2800,6 +2884,23 @@ struct Scene {
             MeshAdjacencyInitializer<BE, PR>::recomputeRestLengths(
                 meshes[i].state, meshes[i].adjacency);
 
+            // recomputeRestLengths only fixes the adjacency arrays
+            // (TriangularCloth). FastGridCloth's solver instead reads
+            // the scalar rest lengths in its behavior params, so a
+            // scaled/rotated grid would stay pre-stressed without this.
+            // state.x here is the fully transformed geometry, so derive
+            // the scalars from it and keep the request copy in lock-step
+            // (a later non-dirty re-pack reuses req.behaviorParams).
+            if (meshes[i].behaviorType == BehaviorType::FastGridCloth) {
+                if (auto* fp = std::get_if<FastGridClothBehaviorParams<PR>>(
+                        &meshes[i].behaviorParams)) {
+                    recomputeFastGridRest<PR>(meshes[i].state.x.ptr,
+                                              meshes[i].state.x.size / 3,
+                                              *fp);
+                    req.behaviorParams = meshes[i].behaviorParams;
+                }
+            }
+
             // Seed xPrev with the initial position so the first substep's
             // swept-CCD narrow check (D-013) sees a degenerate segment
             // (xPrev == x) rather than dangling zeros, which would
@@ -2881,6 +2982,21 @@ struct Scene {
         packedCollisionData.numNarrowCollisions = VectorBase<BE, Index>(1, 0);
         packedCollisionData.vertColFacets = VectorBase<BE, NarrowCollision>(packedCollisionData.maxNumCollisions);
         packedCollisionData.vertColFacetsOffsets = VectorBase<BE, Index>(numPoints+1, 0);
+
+        // Segmented variant scratch (paper-inspired alternative path).
+        // Sized so a single queryPointsSegmented dispatch over ANY mesh
+        // fits: segMaxTGs uses TOTAL numPoints as an upper bound on any
+        // single mesh's point count, segPerTGCap mirrors the global
+        // per-point estimate scaled to one threadgroup.
+        packedCollisionData.segPerTGCap = packedCollisionData.approxColsPerPoints
+                                        * packedCollisionData.segTGSize
+                                        * packedCollisionData.segPerTGCapFactor;
+        packedCollisionData.segMaxTGs   = std::max<Index>(1,
+            (numPoints + packedCollisionData.segTGSize - 1) / packedCollisionData.segTGSize);
+        packedCollisionData.segPrivateCollisions = VectorBase<BE, BroadCollision>(
+            packedCollisionData.segMaxTGs * packedCollisionData.segPerTGCap);
+        packedCollisionData.segPrivateCount  = VectorBase<BE, uint32_t>(packedCollisionData.segMaxTGs, 0);
+        packedCollisionData.segPrivateOffset = VectorBase<BE, uint32_t>(packedCollisionData.segMaxTGs, 0);
 
 
         // allocate ray traced data
@@ -4214,6 +4330,14 @@ struct BVH<BE, PR, BVHMODE::LINEAR, PRIMITIVE> {
     MTL::ComputePipelineState* agglomerativeBuildPSO;     // Apetrei 2014
     MTL::ComputePipelineState* agglomerativeSwapRootPSO;  // Apetrei 2014
     MTL::ComputePipelineState* queryPointsPSO;
+    // Segmented (per-threadgroup) detect+reduce variant — three PSOs
+    // matching bvh.metal's queryPointsSegmented → scanReserveSegmented
+    // → compactSegmented pipeline. Loaded unconditionally so a runtime
+    // A/B toggle (Simulator::useSegmentedBVHQuery) can flip paths
+    // without rebuilding pipelines.
+    MTL::ComputePipelineState* queryPointsSegmentedPSO;
+    MTL::ComputePipelineState* scanReserveSegmentedPSO;
+    MTL::ComputePipelineState* compactSegmentedPSO;
 
     //MTL::ComputePipelineState* radixCountBlocksPSO;
     //MTL::ComputePipelineState* radixComputeOffsetsPSO;
@@ -4250,6 +4374,9 @@ struct BVH<BE, PR, BVHMODE::LINEAR, PRIMITIVE> {
         zeroVisitCountsPSO = MetalKernelContext::getPSO("zeroVisitCounts"); // D-029
         agglomerativeSwapRootPSO = MetalKernelContext::getPSO("agglomerativeSwapRoot");
         queryPointsPSO = MetalKernelContext::getPSO("queryPoints");
+        queryPointsSegmentedPSO = MetalKernelContext::getPSO("queryPointsSegmented");
+        scanReserveSegmentedPSO = MetalKernelContext::getPSO("scanReserveSegmented");
+        compactSegmentedPSO     = MetalKernelContext::getPSO("compactSegmented");
 
         //radixCountBlocksPSO     = MetalKernelContext::getPSO("radixCountMortonBlocks");
         //radixComputeOffsetsPSO  = MetalKernelContext::getPSO("radixComputeOffsets");
@@ -5137,6 +5264,106 @@ struct BVH<BE, PR, BVHMODE::LINEAR, PRIMITIVE> {
         // D-041 turn-3: self-pair uses this tree's INDEX (not mesh.id).
         queryPoints(objIndex, queryMargin);
     }
+
+    // ===== Segmented (per-threadgroup) detect+reduce variant =====
+    // Paper-inspired alternative to `queryPoints` above. See bvh.metal
+    // doc-block (queryPointsSegmented) for the algorithmic motivation:
+    // replaces per-leaf-hit device-global atomicAdd with a threadgroup-
+    // local atomic + per-TG private slice in device memory, then a
+    // single device atomic to reserve the dispatch's `globalBase`
+    // during the reduce step.
+    //
+    // Layout-compatible host struct for QuerySegParams in bvh.metal —
+    // same 9 32-bit fields, only field [4] differs in meaning (perTGCap
+    // vs maxNumCollisions). Kept as a separate type to make the wiring
+    // intent obvious at call sites and to avoid silently reusing the
+    // baseline QueryPointsParams.
+    struct QuerySegParams {
+        float    queryMargin;
+        uint32_t numPoints;
+        uint32_t qObjId;
+        uint32_t tObjId;
+        uint32_t perTGCap;
+        uint32_t qBehavior;
+        uint32_t tBehavior;
+        uint32_t qShape;
+        uint32_t tShape;
+    };
+    struct SegScanParams {
+        uint32_t numTGs;
+        uint32_t maxNumCollisions;
+    };
+    struct SegCompactParams {
+        uint32_t numTGs;
+        uint32_t perTGCap;
+        uint32_t tgSize;
+        uint32_t maxNumCollisions;
+    };
+
+    void queryPointsSegmented(Index qIndex, PR queryMargin) {
+        if (qIndex < 0 || qIndex >= (Index)Scene<METAL, PR>::meshes.size()) return;
+        auto& qmesh = Scene<METAL, PR>::meshes[qIndex];
+        auto& qpos  = qmesh.state.x;
+        Index qnumPoints = qpos.size / 3;
+        if (qnumPoints == 0) return;
+
+        typename Scene<METAL, PR>::PackedCollisionData& packedCol =
+            Scene<METAL, PR>::packedCollisionData;
+
+        const uint32_t tgSize   = (uint32_t)packedCol.segTGSize;
+        const uint32_t perTGCap = (uint32_t)packedCol.segPerTGCap;
+        const uint32_t numTGs   = ((uint32_t)qnumPoints + tgSize - 1) / tgSize;
+        if (numTGs > (uint32_t)packedCol.segMaxTGs) {
+            std::cerr << "[queryPointsSegmented] numTGs=" << numTGs
+                      << " exceeds segMaxTGs=" << packedCol.segMaxTGs
+                      << " (skip; re-pack needed)\n";
+            return;
+        }
+
+        // (1) detection: per-TG private writes via threadgroup atomics.
+        QuerySegParams qParams = {
+            (float)queryMargin, (uint32_t)qnumPoints,
+            (uint32_t)qIndex, (uint32_t)objIndex,
+            perTGCap,
+            (uint32_t)qmesh.behaviorType, (uint32_t)objBehavior,
+            (uint32_t)qmesh.shapeType,    (uint32_t)objShape
+        };
+        MetalGlobalContext::setBuffer(qpos, 0);
+        MetalGlobalContext::setBuffer(primitives, 1);
+        MetalGlobalContext::setBuffer(tree, 2);
+        MetalGlobalContext::setBytes(qParams, 3);
+        MetalGlobalContext::setBuffer(packedCol.segPrivateCollisions, 4);
+        MetalGlobalContext::setBuffer(packedCol.segPrivateCount, 5);
+        MetalGlobalContext::setBuffer(qFlag, 6);
+        MetalGlobalContext::dispatchThreads(
+            queryPointsSegmentedPSO, numTGs * tgSize, tgSize);
+
+        // (2) reduce: serial exclusive scan of per-TG counts + one
+        // device atomic on the shared numBroadCollisions for globalBase.
+        SegScanParams scanParams = { numTGs, (uint32_t)packedCol.maxNumCollisions };
+        MetalGlobalContext::setBuffer(packedCol.segPrivateCount, 0);
+        MetalGlobalContext::setBuffer(packedCol.segPrivateOffset, 1);
+        MetalGlobalContext::setBuffer(packedCol.numBroadCollisions, 2);
+        MetalGlobalContext::setBytes(scanParams, 3);
+        MetalGlobalContext::setBuffer(qFlag, 4);
+        MetalGlobalContext::dispatchThreads(scanReserveSegmentedPSO, 1);
+
+        // (3) compact: scatter per-TG slices into the global
+        // broadCollisions at biased offsets.
+        SegCompactParams cmpParams = {
+            numTGs, perTGCap, tgSize, (uint32_t)packedCol.maxNumCollisions };
+        MetalGlobalContext::setBuffer(packedCol.segPrivateCollisions, 0);
+        MetalGlobalContext::setBuffer(packedCol.segPrivateCount, 1);
+        MetalGlobalContext::setBuffer(packedCol.segPrivateOffset, 2);
+        MetalGlobalContext::setBytes(cmpParams, 3);
+        MetalGlobalContext::setBuffer(packedCol.broadCollisions, 4);
+        MetalGlobalContext::dispatchThreads(
+            compactSegmentedPSO, numTGs * tgSize, tgSize);
+    }
+    void checkSelfCollisionsSegmented(PR queryMargin) {
+        queryPointsSegmented(objIndex, queryMargin);
+    }
+
     void queryEnd() {
         MetalGlobalContext::commitAndWait();
         std::cout << "found\n";
@@ -5370,6 +5597,52 @@ struct BVH<BE, PR, BVHMODE::SCENE, BVHPRIMITIVE::OBJECT> {
     void detectCollisions(PR margin, bool enableSelfCollisions=true) {
         queryBegin();
 
+        // Bidirectional registration. The old `std::set<IndexPair> checked`
+        // deduped on the SORTED pair {min,max}, so a colliding pair {A,B}
+        // was queried in ONE direction only — points from whichever mesh
+        // the outer loop reached first (== the lower mesh index == the
+        // EARLIER-created mesh). narrowAndSortByVertices keys collision
+        // response solely off objPair.query, so the other mesh (target /
+        // facet provider) was detected-but-never-responded. That made
+        // collision response depend on creation order (import-then-plane
+        // vs plane-then-import). The double loop already visits every
+        // ordered (q,t) exactly once, so simply NOT deduping yields both
+        // directions when both meshes are non-Float; a Float mesh is
+        // still skipped as a query (line above) so Float/non-Float pairs
+        // keep their single valid direction — no extra work, no change.
+        for(Index q = 0; q < objTrees.size(); ++q) {
+            auto& queryTree = objTrees[q];
+            if(queryTree.objBehavior == BehaviorType::Float) continue;
+
+            for(Index t = 0; t < objTrees.size(); ++t) {
+                if(q == t) {
+                    if(!enableSelfCollisions) continue;
+                    queryTree.checkSelfCollisions(margin);
+                    continue;
+                }
+                auto& qa = queryTree.tree[0].aabb;
+                auto& ta = objTrees[t].tree[0].aabb;
+                bool hit = ta.intersect(qa);
+                if(hit) {
+                    // D-041 turn-3: pass query INDEX (q, not queryTree.objid)
+                    // so broadCollisions.objPair stores indices that the
+                    // narrow kernel can directly use as statesOffsets[]
+                    // subscripts.
+                    objTrees[t].queryPoints(q, margin);
+                }
+            }
+        }
+        queryEnd();
+    }
+
+    // Segmented (per-threadgroup) variant: same broad-phase loop shape
+    // as detectCollisions above, but each per-tree dispatch goes through
+    // queryPointsSegmented (paper Alg.2 stream registration). Kept as a
+    // SEPARATE method so the baseline path stays bench-compatible and
+    // can be deprecated cleanly once the segmented path is proven.
+    void detectCollisionsSegmented(PR margin, bool enableSelfCollisions=true) {
+        queryBegin();
+
         std::set<IndexPair> checked;
         for(Index q = 0; q < objTrees.size(); ++q) {
             auto& queryTree = objTrees[q];
@@ -5380,20 +5653,15 @@ struct BVH<BE, PR, BVHMODE::SCENE, BVHPRIMITIVE::OBJECT> {
                 Index b = std::max(q, t);
                 if(q == t) {
                     if(!enableSelfCollisions) continue;
-                    queryTree.checkSelfCollisions(margin);
+                    queryTree.checkSelfCollisionsSegmented(margin);
                     checked.insert({a, b});
                     continue;
                 }
                 if(checked.find({a, b}) != checked.end()) continue;
                 auto& qa = queryTree.tree[0].aabb;
                 auto& ta = objTrees[t].tree[0].aabb;
-                bool hit = ta.intersect(qa);
-                if(hit) {
-                    // D-041 turn-3: pass query INDEX (q, not queryTree.objid)
-                    // so broadCollisions.objPair stores indices that the
-                    // narrow kernel can directly use as statesOffsets[]
-                    // subscripts.
-                    objTrees[t].queryPoints(q, margin);
+                if(ta.intersect(qa)) {
+                    objTrees[t].queryPointsSegmented(q, margin);
                     checked.insert({a, b});
                 }
             }
@@ -5778,6 +6046,16 @@ struct Simulator {
     SpatialHashing<METAL, PR> shBroadPhase;
     bool useSpatialHashing = false;
 
+    // BVH path A/B toggle (only meaningful when useSpatialHashing == false).
+    //   false (default) -> baseline queryPoints (per-leaf-hit global atomicAdd)
+    //   true            -> queryPointsSegmented (per-TG private + reduce)
+    // Both paths share the same broad-phase outer loop and feed the same
+    // packedCollisionData.broadCollisions/numBroadCollisions, so the narrow
+    // phase consumes identical output regardless of toggle. Kept here so a
+    // hotkey can flip it at runtime for side-by-side comparison without a
+    // re-pack (PSOs + scratch buffers are allocated unconditionally).
+    bool useSegmentedBVHQuery = false;
+
     // Slice (c) A/B toggle. false (default) = ORIGINAL pipeline:
     // spheres collide via the triangle-soup narrow_pt_tri exactly as
     // before c-1 (narrow_pt_analytic not dispatched, no sphere gate).
@@ -6077,14 +6355,17 @@ struct Simulator {
                 true
             }),
             BehaviorType::FastGridCloth,
+            // Freshly built grid is uniform: X==Y stretch, A==B shear,
+            // X==Y bend. size1D/(particleNum1D-1): pn points → pn-1
+            // segments, matching MeshGridInitializer's grid spacing.
             FastGridClothBehaviorParams<PR>{
                 particleNum1D,
-                // size1D/(particleNum1D-1): pn points → pn-1 segments.
-                // Matches MeshGridInitializer's grid spacing; the prior
-                // /particleNum1D under-shot every rest length.
-                size1D/(particleNum1D-1),
-                size1D/(particleNum1D-1)*std::sqrtf(2),
-                size1D/(particleNum1D-1)*2,
+                size1D/(particleNum1D-1),                  // stretchRestX
+                size1D/(particleNum1D-1),                  // stretchRestY
+                size1D/(particleNum1D-1)*std::sqrtf(2),    // shearRestA
+                size1D/(particleNum1D-1)*std::sqrtf(2),    // shearRestB
+                size1D/(particleNum1D-1)*2,                // bendRestX
+                size1D/(particleNum1D-1)*2,                // bendRestY
                 kstretch,
                 kshear,
                 kbend,
@@ -6237,6 +6518,12 @@ struct Simulator {
             cy->params.center = newPos;
         } else if (auto* f  = dynamic_cast<MeshFileInitializer  <BE, PR>*>(mesh->initializer)) {
             f->params.offset = newPos;
+        } else if (auto* a  = dynamic_cast<AssimpMeshFileInitializer<BE, PR>*>(mesh->initializer)) {
+            // Sibling of MeshFileInitializer (see Scene::pack cascade): the
+            // cast above won't catch it. Write back so a subsequent re-pack
+            // (reset/import/load) rebuilds state.x at the translated pose
+            // instead of the stale (0,0,0) import offset.
+            a->params.offset = newPos;
         }
         // D-023: refit the BVH so click-pick reads the new pose
         // immediately, even on a paused sim before the next sim.update().
@@ -6400,6 +6687,25 @@ struct Simulator {
          || mesh->behaviorType == BehaviorType::FastGridCloth) {
             MeshAdjacencyInitializer<BE, PR>::recomputeRestLengths(
                 mesh->state, mesh->adjacency);
+        }
+        // FastGridCloth solves against the scalar rest lengths in its
+        // behavior params, which recomputeRestLengths above does NOT
+        // touch (it only rewrites the adjacency arrays). state.x/xPrev
+        // were just scaled in place, so re-derive the scalars from the
+        // scaled grid and sync both the live mesh and its request copy
+        // (so a dirty-triggered re-pack rebuilds with the new rest).
+        if (mesh->behaviorType == BehaviorType::FastGridCloth) {
+            if (auto* fp = std::get_if<FastGridClothBehaviorParams<PR>>(
+                    &mesh->behaviorParams)) {
+                recomputeFastGridRest<PR>(mesh->state.x.ptr,
+                                          mesh->state.x.size / 3, *fp);
+                for (auto& req : Scene<BE, PR>::requestsGeneralMeshes) {
+                    if (req.id == meshId) {
+                        req.behaviorParams = mesh->behaviorParams;
+                        break;
+                    }
+                }
+            }
         }
         // D-023 parity: refit the BVH so click-pick reads the new extent
         // immediately, even on a paused sim before the next sim.update().
@@ -6937,10 +7243,17 @@ struct Simulator {
                 // step and never settled. Mirrors MeshGridInitializer's
                 // `length = size1D/(particleNum1D-1)` at construction.
                 PR rest = size1D / PR(pn1D - 1);
+                PR restD = rest * std::sqrt(PR(2));
+                PR restB = rest * PR(2);
                 mesh->behaviorType = BehaviorType::FastGridCloth;
+                // Seed uniform (X==Y, A==B); the dirty-pack that follows
+                // re-derives all 6 from the actual (possibly scaled)
+                // geometry via recomputeFastGridRest.
                 mesh->behaviorParams = FastGridClothBehaviorParams<PR>{
                     static_cast<uint>(pn1D),
-                    rest, rest * std::sqrt(PR(2)), rest * PR(2),
+                    rest,  rest,
+                    restD, restD,
+                    restB, restB,
                     PR(1e5), PR(1e5), PR(3e5), PR(0.001)
                 };
                 syncBroadPhaseCaches(BehaviorType::FastGridCloth);
@@ -7359,9 +7672,15 @@ struct Simulator {
                     }
                     if (profiler) {
                         auto scope = profiler->scoped("broad_detect");
-                        collisionPipeline.broadPhase.detectCollisions(margin, enableSelfCollisions);
+                        if (useSegmentedBVHQuery)
+                            collisionPipeline.broadPhase.detectCollisionsSegmented(margin, enableSelfCollisions);
+                        else
+                            collisionPipeline.broadPhase.detectCollisions(margin, enableSelfCollisions);
                     } else {
-                        collisionPipeline.broadPhase.detectCollisions(margin, enableSelfCollisions);
+                        if (useSegmentedBVHQuery)
+                            collisionPipeline.broadPhase.detectCollisionsSegmented(margin, enableSelfCollisions);
+                        else
+                            collisionPipeline.broadPhase.detectCollisions(margin, enableSelfCollisions);
                     }
                 }
 
@@ -7782,6 +8101,16 @@ struct Simulator {
                 o.source.import.scale = (double)f->params.scale;
                 o.source.import.mass = (double)f->params.mass;
                 o.transform.position = {f->params.offset.x, f->params.offset.y, f->params.offset.z};
+            } else if (auto* a = dynamic_cast<AssimpMeshFileInitializer<BE,PR>*>(init)) {
+                // Sibling of MeshFileInitializer; needs its own case so
+                // saveScene persists the imported model's path and position.
+                o.source.kind = Source::Kind::Import;
+                std::string p = a->params.prefix;
+                if (!p.empty() && p.back() != '/') p.push_back('/');
+                o.source.import.path = p + a->params.fileName;
+                o.source.import.scale = (double)a->params.scale;
+                o.source.import.mass = (double)a->params.mass;
+                o.transform.position = {a->params.offset.x, a->params.offset.y, a->params.offset.z};
             }
             // Realized-mesh path overrides the initializer-derived position
             // with the live GeneralMesh::transformPosition so BDD-003 edits
@@ -7805,9 +8134,12 @@ struct Simulator {
                     o.behavior.params["thickness"] = p.thickness;
                 } else if constexpr (std::is_same_v<P, FastGridClothBehaviorParams<PR>>) {
                     o.behavior.params["particle_num_1d"] = p.particleNum1D;
-                    o.behavior.params["stretch_rest"] = p.stretchRest;
-                    o.behavior.params["shear_rest"]   = p.shearRest;
-                    o.behavior.params["bend_rest"]    = p.bendRest;
+                    o.behavior.params["stretch_rest_x"] = p.stretchRestX;
+                    o.behavior.params["stretch_rest_y"] = p.stretchRestY;
+                    o.behavior.params["shear_rest_a"]   = p.shearRestA;
+                    o.behavior.params["shear_rest_b"]   = p.shearRestB;
+                    o.behavior.params["bend_rest_x"]    = p.bendRestX;
+                    o.behavior.params["bend_rest_y"]    = p.bendRestY;
                     o.behavior.params["k_stretch"]    = p.kstretch;
                     o.behavior.params["k_shear"]      = p.kshear;
                     o.behavior.params["k_bend"]       = p.kbend;
@@ -7977,9 +8309,18 @@ struct Simulator {
                 btype = BehaviorType::FastGridCloth;
                 FastGridClothBehaviorParams<PR> p{};
                 p.particleNum1D = o.behavior.params.value("particle_num_1d", 0u);
-                p.stretchRest   = o.behavior.params.value("stretch_rest", PR(0));
-                p.shearRest     = o.behavior.params.value("shear_rest",   PR(0));
-                p.bendRest      = o.behavior.params.value("bend_rest",    PR(0));
+                // Back-compat: pre-6-value scenes only stored the single
+                // stretch_rest/shear_rest/bend_rest scalars — fan them out
+                // to X==Y / A==B. Newer scenes carry all 6 directly.
+                PR legacyS = o.behavior.params.value("stretch_rest", PR(0));
+                PR legacyShear = o.behavior.params.value("shear_rest", PR(0));
+                PR legacyBend  = o.behavior.params.value("bend_rest",  PR(0));
+                p.stretchRestX = o.behavior.params.value("stretch_rest_x", legacyS);
+                p.stretchRestY = o.behavior.params.value("stretch_rest_y", legacyS);
+                p.shearRestA   = o.behavior.params.value("shear_rest_a", legacyShear);
+                p.shearRestB   = o.behavior.params.value("shear_rest_b", legacyShear);
+                p.bendRestX    = o.behavior.params.value("bend_rest_x", legacyBend);
+                p.bendRestY    = o.behavior.params.value("bend_rest_y", legacyBend);
                 p.kstretch      = o.behavior.params.value("k_stretch",    PR(0));
                 p.kshear        = o.behavior.params.value("k_shear",      PR(0));
                 p.kbend         = o.behavior.params.value("k_bend",       PR(0));
@@ -8408,7 +8749,9 @@ struct ExplicitSystem<METAL, PR> {
 
     struct ClothGridParams {
         uint particleNum1D;
-        float stretchRest, shearRest, bendRest;
+        float stretchRestX, stretchRestY;
+        float shearRestA,   shearRestB;
+        float bendRestX,    bendRestY;
         float kstretch, kshear, kbend;
         float thickness;
     };
@@ -12565,6 +12908,131 @@ static int runSelfTest() {
         }
     }
 
+    // ---- Block COL-ORDER: collision response is creation-order agnostic. --
+    // Two overlapping non-Float meshes (cloth+cloth) must BOTH be registered
+    // as a collision query (point provider) so both receive a response.
+    // Before the bidirectional-registration fix the old `checked` set deduped
+    // each pair to a single direction (query == the lower / earlier mesh
+    // index), so the later-created mesh was detected-but-never-responded —
+    // collision response then depended on creation order. The witness here
+    // is direction-symmetric: regardless of which cloth is added first, the
+    // pair {0,1} must yield narrow collisions with objPair.query == 0 AND
+    // objPair.query == 1 across the stepped frames.
+    {
+        auto bothMeshesQueried = [&](bool swapOrder) -> bool {
+            resetScene();
+            // Two 4x4 cloth grids in the XY plane, ~half a thickness apart
+            // in Z so every point sits inside the other sheet's contact
+            // band → guaranteed point-triangle pairs both ways.
+            tinym::vec3 cA(0.0f, 0.0f, 0.000f);
+            tinym::vec3 cB(0.0f, 0.0f, 0.005f);
+            if (!swapOrder) {
+                sim.addCloth(4, 0.5f, cA, 1e3, 1e3, 1e3, 0.01f, 0.1f);
+                sim.addCloth(4, 0.5f, cB, 1e3, 1e3, 1e3, 0.01f, 0.1f);
+            } else {
+                sim.addCloth(4, 0.5f, cB, 1e3, 1e3, 1e3, 0.01f, 0.1f);
+                sim.addCloth(4, 0.5f, cA, 1e3, 1e3, 1e3, 0.01f, 0.1f);
+            }
+            sim.initialize();
+            // Zero gravity: keep the sheets overlapping deterministically so
+            // contacts fire every frame instead of free-falling apart.
+            Scene<Backend, Precision>::environment.gravity = tinym::vec3(0.f);
+            Scene<Backend, Precision>::environment.wind    = tinym::vec3(0.f);
+            bool seen0 = false, seen1 = false;
+            auto& pc = Scene<Backend, Precision>::packedCollisionData;
+            for (int f = 0; f < 6; ++f) {
+                sim.update();
+                for (Index i = 0; i < pc.numNarrowCollisions[0]; ++i) {
+                    Index qy = pc.narrowCollisions[i].objPair.query;
+                    if (qy == 0) seen0 = true;
+                    if (qy == 1) seen1 = true;
+                }
+            }
+            return seen0 && seen1;
+        };
+        if (bothMeshesQueried(false))
+            pass("COL-ORDER A / both meshes responded (cloth0 then cloth1)");
+        else
+            fail("COL-ORDER A / both meshes responded (cloth0 then cloth1)",
+                 "only one mesh registered as collision query");
+        if (bothMeshesQueried(true))
+            pass("COL-ORDER B / both meshes responded (cloth1 then cloth0)");
+        else
+            fail("COL-ORDER B / both meshes responded (cloth1 then cloth0)",
+                 "only one mesh registered as collision query");
+    }
+
+    // ---- Block FG-SCALE: FastGridCloth rest lengths must track scale. -----
+    // A grid plane turned into FastGridCloth then scaled must have ALL 6
+    // directional rest lengths follow the scaled geometry. The non-uniform
+    // case (3x X, 1x Y) is the one a single-scalar model could not express:
+    // stretchRestX != stretchRestY and bendRestX != bendRestY.
+    {
+        const Precision S = 0.6f;
+        const int       N = 4;                          // 4x4 grid
+        const Precision base = S / Precision(N - 1);     // 0.2 grid spacing
+        const Precision tol  = 1e-3f;
+        // Expected per-direction rest for column spacing dx, row spacing dy.
+        auto checkRest = [&](const char* name, Precision dx, Precision dy) {
+            auto* m = Scene<Backend, Precision>::findById(0);
+            if (!m) { fail(name, "mesh id 0 missing"); return; }
+            auto* fp = std::get_if<FastGridClothBehaviorParams<Precision>>(
+                           &m->behaviorParams);
+            if (!fp) { fail(name, "behaviorParams not FastGridCloth"); return; }
+            Precision wsX = dx,            wsY = dy;
+            Precision wsh = std::sqrt(dx*dx + dy*dy);     // both diagonals
+            Precision wbX = 2*dx,          wbY = 2*dy;
+            auto near = [&](Precision a, Precision b){ return std::abs(a-b) < tol; };
+            bool ok = near(fp->stretchRestX, wsX) && near(fp->stretchRestY, wsY)
+                   && near(fp->shearRestA, wsh)   && near(fp->shearRestB, wsh)
+                   && near(fp->bendRestX, wbX)    && near(fp->bendRestY, wbY);
+            if (ok) pass(name);
+            else fail(name,
+                "sX=" + std::to_string(fp->stretchRestX) + "/" + std::to_string(wsX)
+                + " sY=" + std::to_string(fp->stretchRestY) + "/" + std::to_string(wsY)
+                + " shA=" + std::to_string(fp->shearRestA) + "/" + std::to_string(wsh)
+                + " shB=" + std::to_string(fp->shearRestB) + "/" + std::to_string(wsh)
+                + " bX=" + std::to_string(fp->bendRestX) + "/" + std::to_string(wbX)
+                + " bY=" + std::to_string(fp->bendRestY) + "/" + std::to_string(wbY));
+        };
+        auto freshGrid = [&]() {
+            resetScene();
+            sim.addPlane(PlaneDirection::XYPlane, tinym::vec3(0.0f), N, S);
+            sim.initialize();
+        };
+
+        // Order A: plane → 옷감(FastGridCloth) → uniform scale 3x.
+        freshGrid();
+        sim.changeBehavior(0, BehaviorType::FastGridCloth);
+        sim.initialize();                       // dirty pack consumes the toggle
+        checkRest("FG-SCALE A0 / rest == grid spacing before scale", base, base);
+        sim.scaleObject(0, tinym::vec3(3.0f, 3.0f, 3.0f));
+        checkRest("FG-SCALE A1 / uniform 3x after changeBehavior->scale",
+                  base*3, base*3);
+        sim.initialize();                       // re-pack must keep scaled rest
+        checkRest("FG-SCALE A2 / scaled rest survives a re-pack",
+                  base*3, base*3);
+
+        // Order B: plane → scale(while Float) → 옷감(FastGridCloth).
+        freshGrid();
+        sim.scaleObject(0, tinym::vec3(3.0f, 3.0f, 3.0f));
+        sim.changeBehavior(0, BehaviorType::FastGridCloth);
+        sim.initialize();                       // dirty pack builds scaled grid
+        checkRest("FG-SCALE B / uniform 3x after scale->changeBehavior",
+                  base*3, base*3);
+
+        // Order C: NON-UNIFORM scale (X 3x, Y 1x) — the 6-value witness.
+        freshGrid();
+        sim.changeBehavior(0, BehaviorType::FastGridCloth);
+        sim.initialize();
+        sim.scaleObject(0, tinym::vec3(3.0f, 1.0f, 1.0f));
+        checkRest("FG-SCALE C1 / non-uniform 3x/1x (changeBehavior->scale)",
+                  base*3, base*1);
+        sim.initialize();
+        checkRest("FG-SCALE C2 / non-uniform survives re-pack",
+                  base*3, base*1);
+    }
+
     if (failures == 0) {
         std::cerr << "[self-test] all checks passed\n";
         return 0;
@@ -13159,6 +13627,17 @@ int main(int argc, char** argv) {
             std::cout << "[main] useAnalyticPrimitive = "
                       << (simulator->useAnalyticPrimitive ? "on (analytic)" : "off (original)")
                       << "\n";
+        } else if(key == GLFW_KEY_G && action == GLFW_PRESS) {
+            // BVH detect+reduce A/B toggle: baseline queryPoints
+            // (per-leaf-hit global atomicAdd) vs queryPointsSegmented
+            // (per-threadgroup private + reduce). Only affects the BVH
+            // path; the SpatialHashing path is unchanged.
+            simulator->useSegmentedBVHQuery = !(simulator->useSegmentedBVHQuery);
+            std::cout << "[main] useSegmentedBVHQuery = "
+                      << (simulator->useSegmentedBVHQuery
+                          ? "on (segmented per-TG)"
+                          : "off (baseline atomicAdd)")
+                      << "\n";
         }
         // NOTE: ESC-deselect is handled in the early block above
         // (before the WantCaptureKeyboard guard), not here — see the
@@ -13219,6 +13698,7 @@ int main(int argc, char** argv) {
                 if (dynamic_cast<MeshCubeInitializer    <Backend, Precision>*>(in)) return "정육면체";
                 if (dynamic_cast<MeshCylinderInitializer<Backend, Precision>*>(in)) return "원기둥";
                 if (dynamic_cast<MeshFileInitializer    <Backend, Precision>*>(in)) return "OBJ 파일";
+                if (dynamic_cast<AssimpMeshFileInitializer<Backend, Precision>*>(in)) return "모델 파일";
                 if (dynamic_cast<MeshGridInitializer    <Backend, Precision>*>(in)) return "평면";
                 return "물체";
             };
@@ -13317,6 +13797,44 @@ int main(int argc, char** argv) {
                             if (auto* r = simulator.findRequest(id))
                                 r->clothStiffnessScale = (Precision)v;
                         };
+                }
+                // Per-type stiffness coefficients next to "팽팽함". The
+                // GPU upload reads behaviorParams live each frame (the
+                // setBytes paths multiply by clothStiffnessScale), so a
+                // slider edit takes effect next frame with no re-pack —
+                // we only mirror mesh + request so it survives a rebuild.
+                if (auto* cp = std::get_if<ClothBehaviorParams<Precision>>(
+                        &selectedMesh->behaviorParams)) {
+                    auto setT = [&simulator](int id, Precision ClothBehaviorParams<Precision>::* mem, float v) {
+                        if (auto* m = Scene<Backend, Precision>::findById(id))
+                            if (auto* p = std::get_if<ClothBehaviorParams<Precision>>(&m->behaviorParams))
+                                p->*mem = (Precision)v;
+                        if (auto* r = simulator.findRequest(id))
+                            if (auto* p = std::get_if<ClothBehaviorParams<Precision>>(&r->behaviorParams))
+                                p->*mem = (Precision)v;
+                    };
+                    target.cloth_stretch = &cp->stretch;
+                    target.on_cloth_stretch = [setT](int id, float v){ setT(id, &ClothBehaviorParams<Precision>::stretch, v); };
+                    target.cloth_shear = &cp->shear;
+                    target.on_cloth_shear = [setT](int id, float v){ setT(id, &ClothBehaviorParams<Precision>::shear, v); };
+                    target.cloth_bend = &cp->bend;
+                    target.on_cloth_bend = [setT](int id, float v){ setT(id, &ClothBehaviorParams<Precision>::bend, v); };
+                } else if (auto* fp = std::get_if<FastGridClothBehaviorParams<Precision>>(
+                        &selectedMesh->behaviorParams)) {
+                    auto setF = [&simulator](int id, Precision FastGridClothBehaviorParams<Precision>::* mem, float v) {
+                        if (auto* m = Scene<Backend, Precision>::findById(id))
+                            if (auto* p = std::get_if<FastGridClothBehaviorParams<Precision>>(&m->behaviorParams))
+                                p->*mem = (Precision)v;
+                        if (auto* r = simulator.findRequest(id))
+                            if (auto* p = std::get_if<FastGridClothBehaviorParams<Precision>>(&r->behaviorParams))
+                                p->*mem = (Precision)v;
+                    };
+                    // FastGridCloth: stretch + bend only (shear left null →
+                    // hidden), per the requested per-type knob set.
+                    target.cloth_stretch = &fp->kstretch;
+                    target.on_cloth_stretch = [setF](int id, float v){ setF(id, &FastGridClothBehaviorParams<Precision>::kstretch, v); };
+                    target.cloth_bend = &fp->kbend;
+                    target.on_cloth_bend = [setF](int id, float v){ setF(id, &FastGridClothBehaviorParams<Precision>::kbend, v); };
                 }
                 // D-027: material inspector path. base_color is set above;
                 // wire the other 4 material fields + the commit callback so
@@ -14420,7 +14938,8 @@ int main(int argc, char** argv) {
                 &debugSceneBox,
                 &debugCollisions,
                 &meshInspectorWindowState.open,
-                sceneCounts
+                sceneCounts,
+                &simulator.useSegmentedBVHQuery
             );
             scene_log::drawSceneActionLogWindow(sceneLogWindowState);
             ImGui::Render();
@@ -14434,7 +14953,8 @@ int main(int argc, char** argv) {
                 &debugSceneBox,
                 &debugCollisions,
                 &meshInspectorWindowState.open,
-                sceneCounts
+                sceneCounts,
+                &simulator.useSegmentedBVHQuery
             );
             scene_log::drawSceneActionLogWindow(sceneLogWindowState);
             ImGui::Render();

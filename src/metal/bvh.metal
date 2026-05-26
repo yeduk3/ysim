@@ -990,3 +990,193 @@ kernel void queryPoints(
 
     queryAABB(qmin, qmax, facets, tree, qParams, broadCollisions, numBroadCollisions, qFlag, id);
 }
+
+
+// ============================================================
+// Segmented (per-threadgroup) detect + reduce variant.
+//
+// Motivation (Tang et al. 2011, "Collision-Streams", §3.4 / Alg.2):
+// the baseline `queryPoints` does a device-global `atomic_fetch_add`
+// on `numBroadCollisions` for EVERY leaf hit — hot, contended, and
+// dominates the kernel's wall time on dense scenes. The paper's
+// "segmented locking" replaces this with a threadgroup-local atomic
+// + per-TG private slice in device memory, then a separate compact
+// pass that uses one device atomic for the WHOLE dispatch (to
+// reserve `globalBase`) instead of one-per-hit.
+//
+// Pipeline per `queryPointsSegmented` call:
+//   (1) queryPointsSegmented — detection. Each TG: threadgroup
+//       atomic_uint claims slots into a per-TG slice of
+//       `tgPrivateCollisions`; lid==0 publishes the final TG count.
+//   (2) scanReserveSegmented — single-thread serial exclusive
+//       scan of `tgPrivateCount[0..numTGs]`, then ONE device
+//       atomic_fetch_add on the shared `numBroadCollisions` to
+//       reserve `globalBase`; biases per-TG offsets by base.
+//   (3) compactSegmented    — scatters each TG slice into the
+//       global `broadCollisions` at `tgPrivateOffset[gid] + i`.
+//
+// Kept as separate kernels (not a flag-parameterized extension of
+// `queryPoints`) so the baseline path remains callable / benchable
+// unchanged, per slice goal of A/B comparison before deprecation.
+// ============================================================
+
+struct QuerySegParams {
+    float queryMargin;
+    uint numPoints;
+    uint qObjId;
+    uint tObjId;
+    uint perTGCap;       // capacity (in BroadCollisions) of each TG's private slice
+    uint qBehavior;
+    uint tBehavior;
+    uint qShape;
+    uint tShape;
+};
+
+void queryAABBSegmented(
+    const float3 qmin,
+    const float3 qmax,
+    device const packed_uint3* facets,
+    device const BVHNode* tree,
+    constant QuerySegParams& qParams,
+    device BroadCollision* tgPrivateCollisions,
+    threadgroup atomic_uint* tgCount,
+    device QueryFlag* qFlag,
+    uint gid,
+    uint id
+) {
+    const int stackDepth = 64;
+    int stack[stackDepth];
+    int sp = 0;
+    stack[sp++] = 0;
+
+    while(sp > 0) {
+        int nodeid = stack[--sp];
+        BVHNode node = tree[nodeid];
+
+        if (!intersectAABB(qmin, qmax, node)) continue;
+
+        if (node.childA < 0) { // leaf
+            uint fid = (uint)node.childB;
+            uint3 facet = facets[fid];
+            if(qParams.qObjId == qParams.tObjId && (id == facet.x || id == facet.y || id == facet.z)) continue;
+
+            // Threadgroup-local atomic (paper's "segmented locking"):
+            // only TG_SIZE threads contend here, vs all device threads
+            // contending on the global counter in the baseline.
+            uint local = atomic_fetch_add_explicit(tgCount, 1u, memory_order_relaxed);
+            if (local >= qParams.perTGCap) {
+                qFlag[0].collisionOverflow = 1u;
+                continue;
+            }
+            uint slot = gid * qParams.perTGCap + local;
+            tgPrivateCollisions[slot].indexPair    = {id, fid};
+            tgPrivateCollisions[slot].objPair      = {qParams.qObjId, qParams.tObjId};
+            tgPrivateCollisions[slot].behaviorPair = {qParams.qBehavior, qParams.tBehavior};
+            tgPrivateCollisions[slot].shapePair    = {qParams.qShape, qParams.tShape};
+            continue;
+        }
+        if (sp + 2 > stackDepth) {
+            qFlag[0].stackOverflow = 1u;
+            continue;
+        }
+        stack[sp++] = node.childA;
+        stack[sp++] = node.childB;
+    }
+}
+
+kernel void queryPointsSegmented(
+    device const packed_float3* x [[buffer(0)]],
+    device const packed_uint3* facets [[buffer(1)]],
+    device const BVHNode* tree [[buffer(2)]],
+    constant QuerySegParams& qParams [[buffer(3)]],
+    device BroadCollision* tgPrivateCollisions [[buffer(4)]],
+    device uint* tgPrivateCount [[buffer(5)]],
+    device QueryFlag* qFlag [[buffer(6)]],
+    uint id  [[thread_position_in_grid]],
+    uint lid [[thread_index_in_threadgroup]],
+    uint gid [[threadgroup_position_in_grid]]
+) {
+    threadgroup atomic_uint localCount;
+    if (lid == 0) atomic_store_explicit(&localCount, 0u, memory_order_relaxed);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (id < qParams.numPoints) {
+        float3 pos    = x[id];
+        float3 margin = float3(qParams.queryMargin);
+        float3 qmin   = pos - margin;
+        float3 qmax   = pos + margin;
+        queryAABBSegmented(qmin, qmax, facets, tree, qParams,
+                           tgPrivateCollisions, &localCount, qFlag, gid, id);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Publish this TG's hit count (clamped to capacity so compact
+    // never reads past the private slice).
+    if (lid == 0) {
+        uint c = atomic_load_explicit(&localCount, memory_order_relaxed);
+        tgPrivateCount[gid] = min(c, qParams.perTGCap);
+    }
+}
+
+struct SegScanParams {
+    uint numTGs;
+    uint maxNumCollisions;
+};
+
+// Single-thread serial exclusive scan over tgPrivateCount[0..numTGs],
+// followed by ONE device-level atomic to reserve `globalBase` in the
+// shared `numBroadCollisions`. numTGs is typically O(numPoints/256)
+// — small enough that serial scan dwarfs the kernel-launch cost of a
+// parallel scan, and avoids needing a separate scan algorithm.
+kernel void scanReserveSegmented(
+    device const uint* tgPrivateCount [[buffer(0)]],
+    device uint* tgPrivateOffset [[buffer(1)]],
+    device atomic_uint* numBroadCollisions [[buffer(2)]],
+    constant SegScanParams& sp [[buffer(3)]],
+    device QueryFlag* qFlag [[buffer(4)]],
+    uint tid [[thread_position_in_grid]]
+) {
+    if (tid != 0) return;
+
+    uint running = 0;
+    for (uint i = 0; i < sp.numTGs; ++i) {
+        tgPrivateOffset[i] = running;
+        running += tgPrivateCount[i];
+    }
+    // One device atomic for the entire dispatch (vs one-per-hit in
+    // the baseline). Accumulates across successive queryPointsSegmented
+    // calls so the global `broadCollisions` packs all (q,t) pairs.
+    uint base = atomic_fetch_add_explicit(numBroadCollisions, running, memory_order_relaxed);
+    if (base + running > sp.maxNumCollisions) qFlag[0].collisionOverflow = 1u;
+    for (uint i = 0; i < sp.numTGs; ++i) {
+        tgPrivateOffset[i] += base;
+    }
+}
+
+struct SegCompactParams {
+    uint numTGs;
+    uint perTGCap;
+    uint tgSize;
+    uint maxNumCollisions;
+};
+
+kernel void compactSegmented(
+    device const BroadCollision* tgPrivateCollisions [[buffer(0)]],
+    device const uint* tgPrivateCount [[buffer(1)]],
+    device const uint* tgPrivateOffset [[buffer(2)]],
+    constant SegCompactParams& cp [[buffer(3)]],
+    device BroadCollision* broadCollisions [[buffer(4)]],
+    uint lid [[thread_index_in_threadgroup]],
+    uint gid [[threadgroup_position_in_grid]]
+) {
+    if (gid >= cp.numTGs) return;
+    uint count   = tgPrivateCount[gid];
+    uint dstBase = tgPrivateOffset[gid];
+    uint srcBase = gid * cp.perTGCap;
+
+    for (uint i = lid; i < count; i += cp.tgSize) {
+        uint dst = dstBase + i;
+        if (dst >= cp.maxNumCollisions) return; // overflow already flagged in scan
+        broadCollisions[dst] = tgPrivateCollisions[srcBase + i];
+    }
+}

@@ -357,6 +357,25 @@ void drawMeshInspectorWindow(MeshInspectorWindowState& st, const MeshInspectorTa
         float sc=*t.cloth_stiffness_scale;float k=(sc>0)?std::log10(sc):0;if(k<-2)k=-2;if(k>2)k=2;
         ImGui::Dummy({0,kP});ImGui::Indent(kP);
         if(InlineSlider("팽팽함",&k,-2,2)){float ns=std::pow(10.f,k);*t.cloth_stiffness_scale=ns;t.on_cloth_stiffness_scale(t.mesh_id,ns);}
+        // Per-type stiffness coefficients (log10 slider, 1e2..1e7).
+        // A null pointer keeps that row hidden — FastGridCloth omits
+        // shear, TriangularCloth shows all three.
+        auto clothK=[&](const char* lbl,float* val,
+                        const std::function<void(int,float)>& cb){
+            if(!val||!cb) return;
+            float lk=(*val>0)?std::log10(*val):2.f;
+            if(lk<2)lk=2;if(lk>7)lk=7;
+            if(InlineSlider(lbl,&lk,2,7)){
+                float nv=std::pow(10.f,lk);*val=nv;cb(t.mesh_id,nv);}
+            ImGui::Dummy({0,8});
+        };
+        if(t.cloth_stretch){ImGui::Dummy({0,12});
+            ImGui::PushStyleColor(ImGuiCol_Text,kG60);
+            ImGui::TextUnformatted("강성");ImGui::PopStyleColor();
+            ImGui::Dummy({0,8});}
+        clothK("스트레치",t.cloth_stretch,t.on_cloth_stretch);
+        clothK("시어",    t.cloth_shear,  t.on_cloth_shear);
+        clothK("벤드",    t.cloth_bend,   t.on_cloth_bend);
         ImGui::Unindent(kP);ImGui::Dummy({0,kP});
     }
 

@@ -59,7 +59,8 @@ void drawProfilerWindow(
     bool* debug_scene_box,
     bool* debug_collisions,
     bool* mesh_inspector_open,
-    SceneCounts scene_counts = {}
+    SceneCounts scene_counts = {},
+    bool* use_segmented_bvh_query = nullptr
 );
 
 } // namespace profiler

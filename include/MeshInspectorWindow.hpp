@@ -180,6 +180,17 @@ struct MeshInspectorTarget {
     // the callback (which writes the live mesh + request mirror).
     float* cloth_stiffness_scale = nullptr;
     std::function<void(int, float)> on_cloth_stiffness_scale;
+    // Per-type cloth stiffness coefficients shown alongside "팽팽함".
+    // Each pointer reads the live behavior-param field; the callback
+    // commits to the mesh + request mirror. A null pointer hides that
+    // slider (same convention as cloth_stiffness_scale): FastGridCloth
+    // binds stretch+bend only, TriangularCloth binds stretch+shear+bend.
+    float* cloth_stretch = nullptr;
+    std::function<void(int, float)> on_cloth_stretch;
+    float* cloth_shear = nullptr;
+    std::function<void(int, float)> on_cloth_shear;
+    float* cloth_bend = nullptr;
+    std::function<void(int, float)> on_cloth_bend;
     // FR-005 / D-027 inspector material path. The 4 scalar/vec3 pointers
     // read the mesh's material fields (D-005's v1 OpenPBR subset: base_color,
     // metallic, roughness, specular_weight, emission_color). Widgets mutate
