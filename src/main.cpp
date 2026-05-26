@@ -4820,13 +4820,16 @@ struct BVH<BE, PR, BVHMODE::LINEAR, PRIMITIVE> {
         } else {
             buildTreeGPU();
 
-            // D-030 — hybrid: GPU combines the first
-            // `bottomUpHybridDepth` levels (from leaf side); CPU
-            // finishes the top-of-tree via bottomUpCombineWithSkip.
-            // bottomUpHybrid itself does the commitAndWait between
-            // GPU and CPU phases, so tree.ptr is CPU-visible by the
-            // time this returns.
-            bottomUpHybrid(sceneBox, bottomUpHybridDepth);
+            // Pure-GPU walk-to-root. 이전엔 `bottomUpHybrid` 의
+            // bottomUpBoxesPartialGPU + bottomUpCombineWithSkip(CPU)
+            // 조합을 썼는데 depth=30 으로 사실상 풀-GPU 임에도 CPU
+            // 마무리 단계의 short-circuit 루프가 substep 누적시
+            // stall 을 만들어 매-substep rebuild 가 refit 보다 가벼워지는
+            // 측정 아티팩트를 만들었음 (profiles/experiment/bvh-build-modes-fixed-2026-05-26).
+            // bottomUpBoxesGPU 직접 호출로 D-029 walk-to-root 경로 복귀.
+            // (`bottomUpHybrid` 자체는 bench 에서 depth 스윕에 사용되므로 유지.)
+            bottomUpBoxesGPU(sceneBox);
+            MetalGlobalContext::commitAndWait();
         }
     }
 
@@ -5111,10 +5114,9 @@ struct BVH<BE, PR, BVHMODE::LINEAR, PRIMITIVE> {
         sceneBox.i0 = numPrimitives;
 
         buildLeafGPU();
-        // D-030: hybrid GPU+CPU bottom-up. Internal commitAndWait
-        // happens inside bottomUpHybrid between the GPU partial
-        // dispatch and the CPU completion.
-        bottomUpHybrid(sceneBox, bottomUpHybridDepth);
+        // Pure-GPU walk-to-root. build() 의 같은 swap 참고.
+        bottomUpBoxesGPU(sceneBox);
+        MetalGlobalContext::commitAndWait();
     }
 
     void enlargeTrajectory(PR dt) {
@@ -9067,6 +9069,154 @@ static int runRefitBench(const BenchConfig& cfg) {
     csv.flush();
     csv.close();
     std::cerr << "[refit-bench DONE] wrote " << cfg.outCsvPath << "\n";
+    return 0;
+}
+
+// BVH 빌드 모드 3-way 스윕 bench. `runRefitBench` 의 골격을 따르며
+// 세 가지 simulator 설정 (refit ON / Karras 매번 rebuild / Apetrei 매번
+// rebuild) 을 particle count 4 단계 (1k/10k/100k/500k) × 30 프레임 ×
+// 60 substep 로 측정. CSV columns: case, particle_count, frame_index,
+// bvh_build_ms, broad_refit_ms.
+enum class BVHBuildCase {
+    RefitWithRebuild,              // case 1: enableRefit=true (10프레임 rebuild + refit)
+    RebuildEverySubstepKarras,     // case 2: enableRefit=false + Karras
+    RebuildEverySubstepApetrei,    // case 3: enableRefit=false + Apetrei
+};
+
+inline const char* labelForBVHBuildCase(BVHBuildCase c) {
+    switch (c) {
+        case BVHBuildCase::RefitWithRebuild:           return "RefitON_Karras";
+        case BVHBuildCase::RebuildEverySubstepKarras:  return "RebuildKarras";
+        case BVHBuildCase::RebuildEverySubstepApetrei: return "RebuildApetrei";
+    }
+    return "Unknown";
+}
+
+struct BuildBenchConfig {
+    std::vector<BVHBuildCase> cases;
+    std::vector<int> particleNum1Ds;
+    int warmupFrames = 1;
+    int measuredFrames = 30;
+    std::string outCsvPath;
+};
+
+static int runBuildBench(const BuildBenchConfig& cfg) {
+    using Backend = METAL;
+    using SystemT = ExplicitSystem<Backend, Precision>;
+
+    auto* device = MetalGlobalContext::getDevice();
+    if (!device) {
+        std::cerr << "[build-bench SKIP] metal-device: null\n";
+        return 0;
+    }
+    auto* lib = MetalKernelContext::getLibrary();
+    if (!lib) {
+        std::cerr << "[build-bench SKIP] metal-library: default.metallib not loadable\n";
+        return 0;
+    }
+
+    namespace fs = std::filesystem;
+    fs::path csvPath(cfg.outCsvPath);
+    if (csvPath.has_parent_path()) {
+        std::error_code ec;
+        fs::create_directories(csvPath.parent_path(), ec);
+        if (ec) {
+            std::cerr << "[build-bench FAIL] mkdir " << csvPath.parent_path()
+                      << ": " << ec.message() << "\n";
+            return 1;
+        }
+    }
+    std::ofstream csv(csvPath);
+    if (!csv) {
+        std::cerr << "[build-bench FAIL] open " << cfg.outCsvPath << "\n";
+        return 1;
+    }
+    csv << "case,particle_count,frame_index,bvh_build_ms,broad_refit_ms\n";
+
+    auto resetScene = []() {
+        for (auto& m : Scene<Backend, Precision>::meshes) m.initializer = nullptr;
+        Scene<Backend, Precision>::meshes.clear();
+        for (auto& r : Scene<Backend, Precision>::requestsGeneralMeshes)
+            delete r.initializer;
+        Scene<Backend, Precision>::requestsGeneralMeshes.clear();
+        Scene<Backend, Precision>::numMeshes = 0;
+        Scene<Backend, Precision>::nextMeshId = 0;
+        Scene<Backend, Precision>::dirty = true;
+        Scene<Backend, Precision>::environment = SceneEnvironment{};
+    };
+
+    for (auto caseId : cfg.cases) {
+        for (int particleNum1D : cfg.particleNum1Ds) {
+            int64_t particleCount = (int64_t)particleNum1D * particleNum1D;
+
+            resetScene();
+            Precision h = Precision(1) / Precision(60);
+            Index subSteps = 60;
+            SystemT system(h, subSteps);
+            Simulator<Backend, Precision, SystemT> sim(system);
+            sim.pause = false;
+
+            sim.addClothGridFast(particleNum1D, Precision(1.0));
+            sim.initialize();
+
+            // 케이스별 플래그 적용 — initialize() 안의 첫 build 는 default 로
+            // 진행되지만, 이후 매 sim.update() 가 frame%10==0 일 때 build 를
+            // 다시 호출하면서 새 플래그를 본다. warmupFrames=1 로 1 프레임을
+            // 버려 default-flag 결과는 측정에서 제외.
+            auto& bp = sim.collisionPipeline.broadPhase;
+            switch (caseId) {
+                case BVHBuildCase::RefitWithRebuild:
+                    bp.enableRefit = true;
+                    bp.useAgglomerative = false;
+                    break;
+                case BVHBuildCase::RebuildEverySubstepKarras:
+                    bp.enableRefit = false;
+                    bp.useAgglomerative = false;
+                    break;
+                case BVHBuildCase::RebuildEverySubstepApetrei:
+                    bp.enableRefit = false;
+                    bp.useAgglomerative = true;
+                    break;
+            }
+
+            profiler::FrameProfiler localProfiler(
+                static_cast<std::size_t>(cfg.warmupFrames + cfg.measuredFrames + 4));
+            sim.profiler = &localProfiler;
+
+            int totalFrames = cfg.warmupFrames + cfg.measuredFrames;
+            for (int f = 0; f < totalFrames; ++f) {
+                localProfiler.beginFrame(static_cast<uint64_t>(f),
+                                         static_cast<double>(f) * (double)h);
+                sim.update();
+                localProfiler.endFrame();
+
+                if (f >= cfg.warmupFrames) {
+                    int frameIdx = f - cfg.warmupFrames;
+                    auto getMs = [&](const char* name) -> double {
+                        int sidx = localProfiler.history().sectionIndex(name);
+                        const auto* snap = localProfiler.history().latestFrame();
+                        if (snap && sidx >= 0
+                            && static_cast<std::size_t>(sidx) < snap->section_ms.size()) {
+                            return static_cast<double>(snap->section_ms[sidx]);
+                        }
+                        return -1.0;
+                    };
+                    double buildMs = getMs("bvh_build");
+                    double refitMs = getMs("broad_refit");
+                    csv << labelForBVHBuildCase(caseId) << ','
+                        << particleCount << ','
+                        << frameIdx << ','
+                        << buildMs << ','
+                        << refitMs << '\n';
+                }
+            }
+            sim.profiler = nullptr;
+        }
+    }
+
+    csv.flush();
+    csv.close();
+    std::cerr << "[build-bench DONE] wrote " << cfg.outCsvPath << "\n";
     return 0;
 }
 
@@ -13090,6 +13240,23 @@ int main(int argc, char** argv) {
         cfg.outCsvPath = "profiles/experiment/bvh-refit-2026-05-12/refit_bench.csv";
 #endif
         return runRefitBench(cfg);
+    }
+    if (argc > 1 && std::string(argv[1]) == "--bench-bvh-build") {
+        BuildBenchConfig cfg;
+        cfg.cases = {BVHBuildCase::RefitWithRebuild,
+                     BVHBuildCase::RebuildEverySubstepKarras,
+                     BVHBuildCase::RebuildEverySubstepApetrei};
+        // Vertex counts ~ {1k, 10k, 100k, 500k} (NxN grid).
+        cfg.particleNum1Ds  = {32, 100, 316, 707};
+        cfg.warmupFrames    = 1;
+        cfg.measuredFrames  = 30;
+#ifdef YSIM_PROJECT_ROOT
+        cfg.outCsvPath = std::string(YSIM_PROJECT_ROOT)
+                       + "/profiles/experiment/bvh-build-sweep-2026-05-26/build_bench.csv";
+#else
+        cfg.outCsvPath = "profiles/experiment/bvh-build-sweep-2026-05-26/build_bench.csv";
+#endif
+        return runBuildBench(cfg);
     }
 
     std::cout << "Run simulator" << std::endl;
