@@ -2554,6 +2554,30 @@ struct Scene {
         VectorBase<BE, NarrowCollision> vertColFacets;
         VectorBase<BE, Index> vertColFacetsOffsets;
 
+        // Segmented (per-threadgroup) detect+reduce scratch — used by
+        // BVH::queryPointsSegmented (paper-inspired alternative to the
+        // baseline per-leaf-hit global atomic). Allocated alongside
+        // broadCollisions in pack(). Worst-case size: ceil(numPoints
+        // / segTGSize) threadgroups, each holding up to segPerTGCap
+        // BroadCollisions. Reused across all (q,t) calls in one
+        // detectCollisionsSegmented frame; the global numBroadCollisions
+        // counter (above) accumulates across calls as in the baseline.
+        Index segTGSize     = 256;
+        // Per-TG private slice budget multiplier on top of the global
+        // per-point average (approxColsPerPoints). The baseline path
+        // shares one global budget so hot-spot hits "borrow" capacity
+        // from cold TGs; the segmented path partitions the budget
+        // per-TG so hot TGs (Morton-clustered cloth points piling onto
+        // the same ground patch) overflow well before the global cap.
+        // 4× covers typical hot/cold ratio in the funnel/cloth-ball
+        // benchmarks; raise if [queryPointsSegmented] still warns.
+        Index segPerTGCapFactor = 4;
+        Index segPerTGCap   = 0;   // = approxColsPerPoints * segTGSize * factor, set in pack
+        Index segMaxTGs     = 0;   // = ceil(numPoints / segTGSize),    set in pack
+        VectorBase<BE, BroadCollision> segPrivateCollisions;
+        VectorBase<BE, uint32_t>       segPrivateCount;
+        VectorBase<BE, uint32_t>       segPrivateOffset;
+
         void resetNarrow() {
             std::memset(narrowCollisions.ptr, 0, sizeof(NarrowCollision)*numNarrowCollisions[0]);
             std::memset(vertColFacets.ptr, 0, sizeof(NarrowCollision)*numNarrowCollisions[0]);
@@ -2958,6 +2982,21 @@ struct Scene {
         packedCollisionData.numNarrowCollisions = VectorBase<BE, Index>(1, 0);
         packedCollisionData.vertColFacets = VectorBase<BE, NarrowCollision>(packedCollisionData.maxNumCollisions);
         packedCollisionData.vertColFacetsOffsets = VectorBase<BE, Index>(numPoints+1, 0);
+
+        // Segmented variant scratch (paper-inspired alternative path).
+        // Sized so a single queryPointsSegmented dispatch over ANY mesh
+        // fits: segMaxTGs uses TOTAL numPoints as an upper bound on any
+        // single mesh's point count, segPerTGCap mirrors the global
+        // per-point estimate scaled to one threadgroup.
+        packedCollisionData.segPerTGCap = packedCollisionData.approxColsPerPoints
+                                        * packedCollisionData.segTGSize
+                                        * packedCollisionData.segPerTGCapFactor;
+        packedCollisionData.segMaxTGs   = std::max<Index>(1,
+            (numPoints + packedCollisionData.segTGSize - 1) / packedCollisionData.segTGSize);
+        packedCollisionData.segPrivateCollisions = VectorBase<BE, BroadCollision>(
+            packedCollisionData.segMaxTGs * packedCollisionData.segPerTGCap);
+        packedCollisionData.segPrivateCount  = VectorBase<BE, uint32_t>(packedCollisionData.segMaxTGs, 0);
+        packedCollisionData.segPrivateOffset = VectorBase<BE, uint32_t>(packedCollisionData.segMaxTGs, 0);
 
 
         // allocate ray traced data
@@ -4255,6 +4294,14 @@ struct BVH<BE, PR, BVHMODE::LINEAR, PRIMITIVE> {
     MTL::ComputePipelineState* bottomUpBoxesPartialPSO;   // D-030
     MTL::ComputePipelineState* zeroVisitCountsPSO;    // D-029
     MTL::ComputePipelineState* queryPointsPSO;
+    // Segmented (per-threadgroup) detect+reduce variant — three PSOs
+    // matching bvh.metal's queryPointsSegmented → scanReserveSegmented
+    // → compactSegmented pipeline. Loaded unconditionally so a runtime
+    // A/B toggle (Simulator::useSegmentedBVHQuery) can flip paths
+    // without rebuilding pipelines.
+    MTL::ComputePipelineState* queryPointsSegmentedPSO;
+    MTL::ComputePipelineState* scanReserveSegmentedPSO;
+    MTL::ComputePipelineState* compactSegmentedPSO;
 
     //MTL::ComputePipelineState* radixCountBlocksPSO;
     //MTL::ComputePipelineState* radixComputeOffsetsPSO;
@@ -4288,6 +4335,9 @@ struct BVH<BE, PR, BVHMODE::LINEAR, PRIMITIVE> {
         bottomUpBoxesPartialPSO = MetalKernelContext::getPSO("bottomUpBoxesPartial"); // D-030
         zeroVisitCountsPSO = MetalKernelContext::getPSO("zeroVisitCounts"); // D-029
         queryPointsPSO = MetalKernelContext::getPSO("queryPoints");
+        queryPointsSegmentedPSO = MetalKernelContext::getPSO("queryPointsSegmented");
+        scanReserveSegmentedPSO = MetalKernelContext::getPSO("scanReserveSegmented");
+        compactSegmentedPSO     = MetalKernelContext::getPSO("compactSegmented");
 
         //radixCountBlocksPSO     = MetalKernelContext::getPSO("radixCountMortonBlocks");
         //radixComputeOffsetsPSO  = MetalKernelContext::getPSO("radixComputeOffsets");
@@ -5088,6 +5138,106 @@ struct BVH<BE, PR, BVHMODE::LINEAR, PRIMITIVE> {
         // D-041 turn-3: self-pair uses this tree's INDEX (not mesh.id).
         queryPoints(objIndex, queryMargin);
     }
+
+    // ===== Segmented (per-threadgroup) detect+reduce variant =====
+    // Paper-inspired alternative to `queryPoints` above. See bvh.metal
+    // doc-block (queryPointsSegmented) for the algorithmic motivation:
+    // replaces per-leaf-hit device-global atomicAdd with a threadgroup-
+    // local atomic + per-TG private slice in device memory, then a
+    // single device atomic to reserve the dispatch's `globalBase`
+    // during the reduce step.
+    //
+    // Layout-compatible host struct for QuerySegParams in bvh.metal —
+    // same 9 32-bit fields, only field [4] differs in meaning (perTGCap
+    // vs maxNumCollisions). Kept as a separate type to make the wiring
+    // intent obvious at call sites and to avoid silently reusing the
+    // baseline QueryPointsParams.
+    struct QuerySegParams {
+        float    queryMargin;
+        uint32_t numPoints;
+        uint32_t qObjId;
+        uint32_t tObjId;
+        uint32_t perTGCap;
+        uint32_t qBehavior;
+        uint32_t tBehavior;
+        uint32_t qShape;
+        uint32_t tShape;
+    };
+    struct SegScanParams {
+        uint32_t numTGs;
+        uint32_t maxNumCollisions;
+    };
+    struct SegCompactParams {
+        uint32_t numTGs;
+        uint32_t perTGCap;
+        uint32_t tgSize;
+        uint32_t maxNumCollisions;
+    };
+
+    void queryPointsSegmented(Index qIndex, PR queryMargin) {
+        if (qIndex < 0 || qIndex >= (Index)Scene<METAL, PR>::meshes.size()) return;
+        auto& qmesh = Scene<METAL, PR>::meshes[qIndex];
+        auto& qpos  = qmesh.state.x;
+        Index qnumPoints = qpos.size / 3;
+        if (qnumPoints == 0) return;
+
+        typename Scene<METAL, PR>::PackedCollisionData& packedCol =
+            Scene<METAL, PR>::packedCollisionData;
+
+        const uint32_t tgSize   = (uint32_t)packedCol.segTGSize;
+        const uint32_t perTGCap = (uint32_t)packedCol.segPerTGCap;
+        const uint32_t numTGs   = ((uint32_t)qnumPoints + tgSize - 1) / tgSize;
+        if (numTGs > (uint32_t)packedCol.segMaxTGs) {
+            std::cerr << "[queryPointsSegmented] numTGs=" << numTGs
+                      << " exceeds segMaxTGs=" << packedCol.segMaxTGs
+                      << " (skip; re-pack needed)\n";
+            return;
+        }
+
+        // (1) detection: per-TG private writes via threadgroup atomics.
+        QuerySegParams qParams = {
+            (float)queryMargin, (uint32_t)qnumPoints,
+            (uint32_t)qIndex, (uint32_t)objIndex,
+            perTGCap,
+            (uint32_t)qmesh.behaviorType, (uint32_t)objBehavior,
+            (uint32_t)qmesh.shapeType,    (uint32_t)objShape
+        };
+        MetalGlobalContext::setBuffer(qpos, 0);
+        MetalGlobalContext::setBuffer(primitives, 1);
+        MetalGlobalContext::setBuffer(tree, 2);
+        MetalGlobalContext::setBytes(qParams, 3);
+        MetalGlobalContext::setBuffer(packedCol.segPrivateCollisions, 4);
+        MetalGlobalContext::setBuffer(packedCol.segPrivateCount, 5);
+        MetalGlobalContext::setBuffer(qFlag, 6);
+        MetalGlobalContext::dispatchThreads(
+            queryPointsSegmentedPSO, numTGs * tgSize, tgSize);
+
+        // (2) reduce: serial exclusive scan of per-TG counts + one
+        // device atomic on the shared numBroadCollisions for globalBase.
+        SegScanParams scanParams = { numTGs, (uint32_t)packedCol.maxNumCollisions };
+        MetalGlobalContext::setBuffer(packedCol.segPrivateCount, 0);
+        MetalGlobalContext::setBuffer(packedCol.segPrivateOffset, 1);
+        MetalGlobalContext::setBuffer(packedCol.numBroadCollisions, 2);
+        MetalGlobalContext::setBytes(scanParams, 3);
+        MetalGlobalContext::setBuffer(qFlag, 4);
+        MetalGlobalContext::dispatchThreads(scanReserveSegmentedPSO, 1);
+
+        // (3) compact: scatter per-TG slices into the global
+        // broadCollisions at biased offsets.
+        SegCompactParams cmpParams = {
+            numTGs, perTGCap, tgSize, (uint32_t)packedCol.maxNumCollisions };
+        MetalGlobalContext::setBuffer(packedCol.segPrivateCollisions, 0);
+        MetalGlobalContext::setBuffer(packedCol.segPrivateCount, 1);
+        MetalGlobalContext::setBuffer(packedCol.segPrivateOffset, 2);
+        MetalGlobalContext::setBytes(cmpParams, 3);
+        MetalGlobalContext::setBuffer(packedCol.broadCollisions, 4);
+        MetalGlobalContext::dispatchThreads(
+            compactSegmentedPSO, numTGs * tgSize, tgSize);
+    }
+    void checkSelfCollisionsSegmented(PR queryMargin) {
+        queryPointsSegmented(objIndex, queryMargin);
+    }
+
     void queryEnd() {
         MetalGlobalContext::commitAndWait();
         std::cout << "found\n";
@@ -5353,6 +5503,40 @@ struct BVH<BE, PR, BVHMODE::SCENE, BVHPRIMITIVE::OBJECT> {
                     // narrow kernel can directly use as statesOffsets[]
                     // subscripts.
                     objTrees[t].queryPoints(q, margin);
+                }
+            }
+        }
+        queryEnd();
+    }
+
+    // Segmented (per-threadgroup) variant: same broad-phase loop shape
+    // as detectCollisions above, but each per-tree dispatch goes through
+    // queryPointsSegmented (paper Alg.2 stream registration). Kept as a
+    // SEPARATE method so the baseline path stays bench-compatible and
+    // can be deprecated cleanly once the segmented path is proven.
+    void detectCollisionsSegmented(PR margin, bool enableSelfCollisions=true) {
+        queryBegin();
+
+        std::set<IndexPair> checked;
+        for(Index q = 0; q < objTrees.size(); ++q) {
+            auto& queryTree = objTrees[q];
+            if(queryTree.objBehavior == BehaviorType::Float) continue;
+
+            for(Index t = 0; t < objTrees.size(); ++t) {
+                Index a = std::min(q, t);
+                Index b = std::max(q, t);
+                if(q == t) {
+                    if(!enableSelfCollisions) continue;
+                    queryTree.checkSelfCollisionsSegmented(margin);
+                    checked.insert({a, b});
+                    continue;
+                }
+                if(checked.find({a, b}) != checked.end()) continue;
+                auto& qa = queryTree.tree[0].aabb;
+                auto& ta = objTrees[t].tree[0].aabb;
+                if(ta.intersect(qa)) {
+                    objTrees[t].queryPointsSegmented(q, margin);
+                    checked.insert({a, b});
                 }
             }
         }
@@ -5735,6 +5919,16 @@ struct Simulator {
     // SpatialHashing is broadphase-only.
     SpatialHashing<METAL, PR> shBroadPhase;
     bool useSpatialHashing = false;
+
+    // BVH path A/B toggle (only meaningful when useSpatialHashing == false).
+    //   false (default) -> baseline queryPoints (per-leaf-hit global atomicAdd)
+    //   true            -> queryPointsSegmented (per-TG private + reduce)
+    // Both paths share the same broad-phase outer loop and feed the same
+    // packedCollisionData.broadCollisions/numBroadCollisions, so the narrow
+    // phase consumes identical output regardless of toggle. Kept here so a
+    // hotkey can flip it at runtime for side-by-side comparison without a
+    // re-pack (PSOs + scratch buffers are allocated unconditionally).
+    bool useSegmentedBVHQuery = false;
 
     // Slice (c) A/B toggle. false (default) = ORIGINAL pipeline:
     // spheres collide via the triangle-soup narrow_pt_tri exactly as
@@ -7352,9 +7546,15 @@ struct Simulator {
                     }
                     if (profiler) {
                         auto scope = profiler->scoped("broad_detect");
-                        collisionPipeline.broadPhase.detectCollisions(margin, enableSelfCollisions);
+                        if (useSegmentedBVHQuery)
+                            collisionPipeline.broadPhase.detectCollisionsSegmented(margin, enableSelfCollisions);
+                        else
+                            collisionPipeline.broadPhase.detectCollisions(margin, enableSelfCollisions);
                     } else {
-                        collisionPipeline.broadPhase.detectCollisions(margin, enableSelfCollisions);
+                        if (useSegmentedBVHQuery)
+                            collisionPipeline.broadPhase.detectCollisionsSegmented(margin, enableSelfCollisions);
+                        else
+                            collisionPipeline.broadPhase.detectCollisions(margin, enableSelfCollisions);
                     }
                 }
 
@@ -13301,6 +13501,17 @@ int main(int argc, char** argv) {
             std::cout << "[main] useAnalyticPrimitive = "
                       << (simulator->useAnalyticPrimitive ? "on (analytic)" : "off (original)")
                       << "\n";
+        } else if(key == GLFW_KEY_G && action == GLFW_PRESS) {
+            // BVH detect+reduce A/B toggle: baseline queryPoints
+            // (per-leaf-hit global atomicAdd) vs queryPointsSegmented
+            // (per-threadgroup private + reduce). Only affects the BVH
+            // path; the SpatialHashing path is unchanged.
+            simulator->useSegmentedBVHQuery = !(simulator->useSegmentedBVHQuery);
+            std::cout << "[main] useSegmentedBVHQuery = "
+                      << (simulator->useSegmentedBVHQuery
+                          ? "on (segmented per-TG)"
+                          : "off (baseline atomicAdd)")
+                      << "\n";
         }
         // NOTE: ESC-deselect is handled in the early block above
         // (before the WantCaptureKeyboard guard), not here — see the
@@ -14563,7 +14774,8 @@ int main(int argc, char** argv) {
                 &debugSceneBox,
                 &debugCollisions,
                 &meshInspectorWindowState.open,
-                sceneCounts
+                sceneCounts,
+                &simulator.useSegmentedBVHQuery
             );
             scene_log::drawSceneActionLogWindow(sceneLogWindowState);
             ImGui::Render();
@@ -14577,7 +14789,8 @@ int main(int argc, char** argv) {
                 &debugSceneBox,
                 &debugCollisions,
                 &meshInspectorWindowState.open,
-                sceneCounts
+                sceneCounts,
+                &simulator.useSegmentedBVHQuery
             );
             scene_log::drawSceneActionLogWindow(sceneLogWindowState);
             ImGui::Render();

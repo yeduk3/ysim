@@ -31,7 +31,8 @@ void drawProfilerWindow(
     bool* debug_scene_box,
     bool* debug_collisions,
     bool* mesh_inspector_open,
-    SceneCounts scene_counts
+    SceneCounts scene_counts,
+    bool* use_segmented_bvh_query
 ) {
     if (!state.open) return;
 
@@ -70,6 +71,11 @@ void drawProfilerWindow(
     if (debug_scene_box) ImGui::Checkbox("Debug Scene Box", debug_scene_box);
     if (debug_collisions) ImGui::Checkbox("Debug Collisions", debug_collisions);
     if (mesh_inspector_open) ImGui::Checkbox("Mesh Inspector", mesh_inspector_open);
+    if (use_segmented_bvh_query) {
+        ImGui::Checkbox("BVH Segmented Query (G)", use_segmented_bvh_query);
+        ImGui::SameLine();
+        ImGui::TextDisabled(*use_segmented_bvh_query ? "[per-TG + scan]" : "[baseline atomicAdd]");
+    }
 
     ImGui::Separator();
 
