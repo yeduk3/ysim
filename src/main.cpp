@@ -4809,12 +4809,14 @@ struct BVH<BE, PR, BVHMODE::LINEAR, PRIMITIVE> {
         if (useAgglomerative) {
             agglomerativeBuildGPU();
             agglomerativeSwapRootGPU();
-            // tree.ptr is GPU-side after this; downstream callers that
-            // need CPU-visible data (CPU debug paths) must
-            // commitAndWait themselves. The Karras path's
-            // `bottomUpHybrid` historically committed implicitly via
-            // its CPU completion step — the agglomerative path has no
-            // CPU step, so this stays pure-GPU.
+            // **프로파일링 공정성**을 위한 강제 sync — 원래 agglomerative
+            // 경로는 commitAndWait 없이 pure-GPU 라 dispatch 만 호스트에서
+            // 리턴하고 실제 GPU 워크는 다음 sync(브로드 쿼리 등)에서 흡수돼
+            // 이 스코프(`bvh_build` / `broad_refit`)에 계산 비용이 잡히지
+            // 않았다 — 다른 케이스(Karras `bottomUpHybrid` 는 CPU 단계에서
+            // 암시적 commit) 와 같은 sync 기준으로 측정하기 위해 명시 commit.
+            // (전체 파이프라인 효율을 측정하려면 이 줄을 빼야 함.)
+            MetalGlobalContext::commitAndWait();
         } else {
             buildTreeGPU();
 
