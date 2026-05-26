@@ -9220,6 +9220,157 @@ static int runBuildBench(const BuildBenchConfig& cfg) {
     return 0;
 }
 
+// Segmented-query vs single-atomic broad-phase 비교 bench. `runBuildBench`
+// 의 골격을 따르며 분할수 n 4 단계 × 두 가지 query mode × 30 프레임 ×
+// 60 substep 으로 측정. 씬: 1x1 XZ-plane cloth (subdiv n) 위로 직경 1
+// 의 구 (subdiv n, 중심 원점, Rigid+applyGravity=false→Bullet static)
+// 를 깔아 cloth 가 그 위로 떨어지게 한다. 두 path 모두 같은 broad_detect
+// 스코프로 timing 이 기록되므로 한 컬럼에 그대로 누적된다. CSV columns:
+// query_mode, particle_count, frame_index, broad_detect_ms,
+// broad_collisions, narrow_collisions.
+enum class BVHQueryMode {
+    Atomic,
+    Segmented,
+};
+
+inline const char* labelForBVHQueryMode(BVHQueryMode m) {
+    switch (m) {
+        case BVHQueryMode::Atomic:    return "Atomic";
+        case BVHQueryMode::Segmented: return "Segmented";
+    }
+    return "Unknown";
+}
+
+struct SegQueryBenchConfig {
+    std::vector<BVHQueryMode> modes;
+    std::vector<int> particleNum1Ds;
+    int warmupFrames = 1;
+    int measuredFrames = 30;
+    std::string outCsvPath;
+};
+
+static int runSegQueryBench(const SegQueryBenchConfig& cfg) {
+    using Backend = METAL;
+    using SystemT = ExplicitSystem<Backend, Precision>;
+
+    auto* device = MetalGlobalContext::getDevice();
+    if (!device) {
+        std::cerr << "[segquery-bench SKIP] metal-device: null\n";
+        return 0;
+    }
+    auto* lib = MetalKernelContext::getLibrary();
+    if (!lib) {
+        std::cerr << "[segquery-bench SKIP] metal-library: default.metallib not loadable\n";
+        return 0;
+    }
+
+    namespace fs = std::filesystem;
+    fs::path csvPath(cfg.outCsvPath);
+    if (csvPath.has_parent_path()) {
+        std::error_code ec;
+        fs::create_directories(csvPath.parent_path(), ec);
+        if (ec) {
+            std::cerr << "[segquery-bench FAIL] mkdir " << csvPath.parent_path()
+                      << ": " << ec.message() << "\n";
+            return 1;
+        }
+    }
+    std::ofstream csv(csvPath);
+    if (!csv) {
+        std::cerr << "[segquery-bench FAIL] open " << cfg.outCsvPath << "\n";
+        return 1;
+    }
+    csv << "query_mode,particle_count,frame_index,broad_detect_ms,"
+        << "broad_collisions,narrow_collisions\n";
+
+    auto resetScene = []() {
+        for (auto& m : Scene<Backend, Precision>::meshes) m.initializer = nullptr;
+        Scene<Backend, Precision>::meshes.clear();
+        for (auto& r : Scene<Backend, Precision>::requestsGeneralMeshes)
+            delete r.initializer;
+        Scene<Backend, Precision>::requestsGeneralMeshes.clear();
+        Scene<Backend, Precision>::numMeshes = 0;
+        Scene<Backend, Precision>::nextMeshId = 0;
+        Scene<Backend, Precision>::dirty = true;
+        Scene<Backend, Precision>::environment = SceneEnvironment{};
+    };
+
+    for (auto mode : cfg.modes) {
+        for (int particleNum1D : cfg.particleNum1Ds) {
+            int64_t particleCount = (int64_t)particleNum1D * particleNum1D;
+
+            resetScene();
+            Precision h = Precision(1) / Precision(60);
+            Index subSteps = 60;
+            SystemT system(h, subSteps);
+            Simulator<Backend, Precision, SystemT> sim(system);
+            sim.pause = false;
+            sim.useSegmentedBVHQuery = (mode == BVHQueryMode::Segmented);
+
+            // Cloth: XZ-plane, size 1x1, subdivided n×n, center y=0.7 so
+            // gravity pulls it onto the sphere's top (y=+0.5).
+            sim.addCloth(particleNum1D, Precision(1.0),
+                         tinym::vec3(0, Precision(0.7), 0));
+
+            // Sphere: diameter 1 (radius 0.5), subdivided n, Rigid behavior.
+            // Pre-set request.applyGravity=false + applyWind=false BEFORE
+            // initialize() so ensureRigidBackendBody picks mass=0 (Bullet
+            // static body) — keeps the sphere pinned and silently ignores
+            // wind. Sphere stays at origin so its top surface is at y=+0.5.
+            sim.addSphere(tinym::vec3(0, 0, 0),
+                          particleNum1D,
+                          Precision(1.0),
+                          Precision(1.0),
+                          BehaviorType::Rigid);
+            auto& sphereReq = Scene<Backend, Precision>::requestsGeneralMeshes.back();
+            sphereReq.applyGravity = false;
+            sphereReq.applyWind    = false;
+
+            sim.initialize();
+
+            profiler::FrameProfiler localProfiler(
+                static_cast<std::size_t>(cfg.warmupFrames + cfg.measuredFrames + 4));
+            sim.profiler = &localProfiler;
+
+            int totalFrames = cfg.warmupFrames + cfg.measuredFrames;
+            for (int f = 0; f < totalFrames; ++f) {
+                localProfiler.beginFrame(static_cast<uint64_t>(f),
+                                         static_cast<double>(f) * (double)h);
+                sim.update();
+                localProfiler.endFrame();
+
+                if (f >= cfg.warmupFrames) {
+                    int frameIdx = f - cfg.warmupFrames;
+                    int sidx = localProfiler.history().sectionIndex("broad_detect");
+                    double detectMs = -1.0;
+                    uint64_t broadN = 0, narrowN = 0;
+                    const auto* snap = localProfiler.history().latestFrame();
+                    if (snap) {
+                        if (sidx >= 0
+                            && static_cast<std::size_t>(sidx) < snap->section_ms.size()) {
+                            detectMs = snap->section_ms[sidx];
+                        }
+                        broadN  = snap->broad_collisions;
+                        narrowN = snap->narrow_collisions;
+                    }
+                    csv << labelForBVHQueryMode(mode) << ','
+                        << particleCount << ','
+                        << frameIdx << ','
+                        << detectMs << ','
+                        << broadN << ','
+                        << narrowN << '\n';
+                }
+            }
+            sim.profiler = nullptr;
+        }
+    }
+
+    csv.flush();
+    csv.close();
+    std::cerr << "[segquery-bench DONE] wrote " << cfg.outCsvPath << "\n";
+    return 0;
+}
+
 static int runSelfTest() {
     using Backend = METAL;
     int failures = 0;
@@ -13257,6 +13408,20 @@ int main(int argc, char** argv) {
         cfg.outCsvPath = "profiles/experiment/bvh-build-sweep-2026-05-26/build_bench.csv";
 #endif
         return runBuildBench(cfg);
+    }
+    if (argc > 1 && std::string(argv[1]) == "--bench-bvh-segquery") {
+        SegQueryBenchConfig cfg;
+        cfg.modes          = {BVHQueryMode::Atomic, BVHQueryMode::Segmented};
+        cfg.particleNum1Ds = {20, 50, 100};
+        cfg.warmupFrames   = 1;
+        cfg.measuredFrames = 30;
+#ifdef YSIM_PROJECT_ROOT
+        cfg.outCsvPath = std::string(YSIM_PROJECT_ROOT)
+                       + "/profiles/experiment/bvh-segquery-2026-05-26/segquery_bench.csv";
+#else
+        cfg.outCsvPath = "profiles/experiment/bvh-segquery-2026-05-26/segquery_bench.csv";
+#endif
+        return runSegQueryBench(cfg);
     }
 
     std::cout << "Run simulator" << std::endl;
