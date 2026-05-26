@@ -5482,6 +5482,11 @@ struct BVH<BE, PR, BVHMODE::SCENE, BVHPRIMITIVE::OBJECT> {
     VectorBase<METAL, Index> indices;
     EDGE_LBVH tree;
 
+    // SCENE-level A/B 토글. Simulator::useAgglomerativeBVH가 매 빌드/리핏
+    // 직전에 이 값을 덮어쓰고, 여기에서 per-mesh TRI_LBVH와 top-level EDGE_LBVH
+    // 모두에게 푸시한다. 기본 false = 기존 Karras 경로 그대로 유지.
+    bool useAgglomerative = false;
+
     //BVH(SceneObject<METAL, PR>& scene) 
     //    : objTrees(scene.numMeshes), positions(scene.numMeshes*3), indices(scene.numMeshes*2) {}
 
@@ -5508,6 +5513,7 @@ struct BVH<BE, PR, BVHMODE::SCENE, BVHPRIMITIVE::OBJECT> {
                 objTrees[i].objIndex = (int)i;
                 continue;
             }
+            objTrees[i].useAgglomerative = useAgglomerative;
             objTrees[i].build(scene.meshes[i]);
             objTrees[i].objIndex = (int)i;  // D-041 turn-3
             Index pbase = i*6;
@@ -5522,6 +5528,7 @@ struct BVH<BE, PR, BVHMODE::SCENE, BVHPRIMITIVE::OBJECT> {
             indices[ibase+1] = ibase+1;
         }
 
+        tree.useAgglomerative = useAgglomerative;
         tree.build(-1, positions, indices);
         //print(tree.tree[0]);
     }
@@ -5539,6 +5546,7 @@ struct BVH<BE, PR, BVHMODE::SCENE, BVHPRIMITIVE::OBJECT> {
 
     void refit() {
         for(Index i = 0; i < objTrees.size(); ++i) {
+            objTrees[i].useAgglomerative = useAgglomerative;
             objTrees[i].refit();
             //std::cout << "[objTree root before scene build] id " << i
             //  << " min=" << objTrees[i].tree[0].min
@@ -5555,14 +5563,16 @@ struct BVH<BE, PR, BVHMODE::SCENE, BVHPRIMITIVE::OBJECT> {
             indices[ibase+1] = ibase+1;
         }
 
+        tree.useAgglomerative = useAgglomerative;
         tree.build(-1, positions, indices);
-        //    std::cout << "[tree root before scene build] scene tree " 
+        //    std::cout << "[tree root before scene build] scene tree "
         //      << " min=" << tree.tree[0].min
         //      << " max=" << tree.tree[0].max << std::endl;
     }
 
     void enlargeTrajectory(PR dt) {
         for(Index i = 0; i < objTrees.size(); ++i) {
+            objTrees[i].useAgglomerative = useAgglomerative;
             objTrees[i].enlargeTrajectory(dt);
             Index pbase = i*6;
             positions[pbase  ] = objTrees[i].tree[0].min.x;
@@ -5576,10 +5586,11 @@ struct BVH<BE, PR, BVHMODE::SCENE, BVHPRIMITIVE::OBJECT> {
             indices[ibase+1] = ibase+1;
         }
 
+        tree.useAgglomerative = useAgglomerative;
         tree.build(-1, positions, indices);
     }
 
-    void checkSelfCollisions(PR margin) { 
+    void checkSelfCollisions(PR margin) {
         for(auto& tree : objTrees) {
             if(tree.objBehavior == BehaviorType::Float) continue;
             tree.checkSelfCollisions(margin);
@@ -14939,7 +14950,8 @@ int main(int argc, char** argv) {
                 &debugCollisions,
                 &meshInspectorWindowState.open,
                 sceneCounts,
-                &simulator.useSegmentedBVHQuery
+                &simulator.useSegmentedBVHQuery,
+                &simulator.collisionPipeline.broadPhase.useAgglomerative
             );
             scene_log::drawSceneActionLogWindow(sceneLogWindowState);
             ImGui::Render();
@@ -14954,7 +14966,8 @@ int main(int argc, char** argv) {
                 &debugCollisions,
                 &meshInspectorWindowState.open,
                 sceneCounts,
-                &simulator.useSegmentedBVHQuery
+                &simulator.useSegmentedBVHQuery,
+                &simulator.collisionPipeline.broadPhase.useAgglomerative
             );
             scene_log::drawSceneActionLogWindow(sceneLogWindowState);
             ImGui::Render();

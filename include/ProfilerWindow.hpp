@@ -60,7 +60,8 @@ void drawProfilerWindow(
     bool* debug_collisions,
     bool* mesh_inspector_open,
     SceneCounts scene_counts = {},
-    bool* use_segmented_bvh_query = nullptr
+    bool* use_segmented_bvh_query = nullptr,
+    bool* use_agglomerative_bvh = nullptr
 );
 
 } // namespace profiler

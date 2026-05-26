@@ -32,7 +32,8 @@ void drawProfilerWindow(
     bool* debug_collisions,
     bool* mesh_inspector_open,
     SceneCounts scene_counts,
-    bool* use_segmented_bvh_query
+    bool* use_segmented_bvh_query,
+    bool* use_agglomerative_bvh
 ) {
     if (!state.open) return;
 
@@ -75,6 +76,11 @@ void drawProfilerWindow(
         ImGui::Checkbox("BVH Segmented Query (G)", use_segmented_bvh_query);
         ImGui::SameLine();
         ImGui::TextDisabled(*use_segmented_bvh_query ? "[per-TG + scan]" : "[baseline atomicAdd]");
+    }
+    if (use_agglomerative_bvh) {
+        ImGui::Checkbox("BVH Agglomerative Build", use_agglomerative_bvh);
+        ImGui::SameLine();
+        ImGui::TextDisabled(*use_agglomerative_bvh ? "[Apetrei 2014]" : "[Karras 2012]");
     }
 
     ImGui::Separator();
