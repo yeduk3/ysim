@@ -4127,6 +4127,40 @@ struct BVH<BE, PR, BVHMODE::LINEAR, PRIMITIVE> {
     // multi-pass approach.
     VectorBase<METAL, uint32_t> treeVisitCounts;      // numNodes
 
+    // Apetrei (2014) agglomerative LBVH path: temporaries for the
+    // single-kernel build (`agglomerativeBuild_*`).
+    //
+    //   nodeVisitFlags : per-internal-node atomic gate (numInternals = N-1).
+    //                    Zeroed before each agglomerative dispatch via the
+    //                    existing `zeroVisitCounts` kernel.
+    //   nodeRangeLeft  : per-internal-node left  endpoint of covered key
+    //   nodeRangeRight :                    right endpoint
+    //                    Written by the first/second arrivals on opposite
+    //                    sides; second arrival reads both to recover the
+    //                    parent's full range when walking up.
+    //   rootIndexBuf   : single-int buffer; the agglomerative kernel
+    //                    writes the natural slot of the root (which may
+    //                    be any internal slot in [0, N-2]). The follow-up
+    //                    `agglomerativeSwapRoot` kernel reads it and
+    //                    relocates the root to slot 0 so the rest of the
+    //                    code (queryPoints / queryClickRay / SCENE reads)
+    //                    keeps its `tree[0] is root` invariant.
+    //
+    // Only allocated/used when `useAgglomerative == true`. Karras path
+    // (the default) leaves these buffers idle so the original behavior
+    // is preserved bit-for-bit.
+    VectorBase<METAL, uint32_t> nodeVisitFlags;       // numInternals
+    VectorBase<METAL, int> nodeRangeLeft;             // numInternals
+    VectorBase<METAL, int> nodeRangeRight;            // numInternals
+    VectorBase<METAL, int> rootIndexBuf;              // 1
+
+    // Runtime toggle between the two BVH construction paths. Default is
+    // the existing Karras pipeline (`buildTree_*` + `bottomUpBoxes`); set
+    // to true to use the Apetrei agglomerative single-kernel build
+    // followed by the swap-root post-pass. Designed so either side can be
+    // deprecated later by dropping the relevant code paths only.
+    bool useAgglomerative = false;
+
     // D-030: hybrid bottom-up depth knob. GPU combines the first
     // `bottomUpHybridDepth` levels (from leaf side); CPU finishes
     // the remaining top-of-tree. Runtime-tunable so the user can
@@ -4177,6 +4211,8 @@ struct BVH<BE, PR, BVHMODE::LINEAR, PRIMITIVE> {
     MTL::ComputePipelineState* bottomUpBoxesPSO;
     MTL::ComputePipelineState* bottomUpBoxesPartialPSO;   // D-030
     MTL::ComputePipelineState* zeroVisitCountsPSO;    // D-029
+    MTL::ComputePipelineState* agglomerativeBuildPSO;     // Apetrei 2014
+    MTL::ComputePipelineState* agglomerativeSwapRootPSO;  // Apetrei 2014
     MTL::ComputePipelineState* queryPointsPSO;
 
     //MTL::ComputePipelineState* radixCountBlocksPSO;
@@ -4202,14 +4238,17 @@ struct BVH<BE, PR, BVHMODE::LINEAR, PRIMITIVE> {
             fillMortonsPSO = MetalKernelContext::getPSO("fillMortons_Tri");
             buildTreePSO = MetalKernelContext::getPSO("buildTree_Tri");
             buildLeafPSO = MetalKernelContext::getPSO("buildLeaf_Tri");
+            agglomerativeBuildPSO = MetalKernelContext::getPSO("agglomerativeBuild_Tri");
         } else if constexpr (PRIMITIVE == BVHPRIMITIVE::EDGE) {
             fillMortonsPSO = MetalKernelContext::getPSO("fillMortons_Edge");
             buildTreePSO = MetalKernelContext::getPSO("buildTree_Edge");
             buildLeafPSO = MetalKernelContext::getPSO("buildLeaf_Edge");
+            agglomerativeBuildPSO = MetalKernelContext::getPSO("agglomerativeBuild_Edge");
         }
         bottomUpBoxesPSO = MetalKernelContext::getPSO("bottomUpBoxes");
         bottomUpBoxesPartialPSO = MetalKernelContext::getPSO("bottomUpBoxesPartial"); // D-030
         zeroVisitCountsPSO = MetalKernelContext::getPSO("zeroVisitCounts"); // D-029
+        agglomerativeSwapRootPSO = MetalKernelContext::getPSO("agglomerativeSwapRoot");
         queryPointsPSO = MetalKernelContext::getPSO("queryPoints");
 
         //radixCountBlocksPSO     = MetalKernelContext::getPSO("radixCountMortonBlocks");
@@ -4233,6 +4272,15 @@ struct BVH<BE, PR, BVHMODE::LINEAR, PRIMITIVE> {
         radixBucketBase      = VectorBase<METAL, uint32_t>(256);
 
         treeVisitCounts      = VectorBase<METAL, uint32_t>(numNodes); // D-029
+
+        // Apetrei agglomerative path. Sized by numInternals = N-1; for
+        // N == 1 (single-leaf degenerate) numInternals is 0 and we allocate
+        // length 1 to keep VectorBase happy / kernel buffer binding valid.
+        Index numInternals = (numPrimitives > 1) ? (numPrimitives - 1) : 1;
+        nodeVisitFlags = VectorBase<METAL, uint32_t>(numInternals);
+        nodeRangeLeft  = VectorBase<METAL, int>(numInternals);
+        nodeRangeRight = VectorBase<METAL, int>(numInternals);
+        rootIndexBuf   = VectorBase<METAL, int>(1);
     }
 
     void build(GeneralMesh<METAL, PR>& mesh) {
@@ -4398,6 +4446,68 @@ struct BVH<BE, PR, BVHMODE::LINEAR, PRIMITIVE> {
         bottomUpCombineWithSkip();
     }
 
+    // Apetrei (2014) agglomerative LBVH path. Replaces the
+    // `buildTreeGPU` + `bottomUpHybrid` pair in one kernel launch
+    // (plus a 1-thread root-swap follow-up). See bvh.metal's
+    // `agglomerativeBuild_*` and `agglomerativeSwapRoot` doc-blocks
+    // for the algorithm and synchronization details.
+    //
+    // Pre-condition: `mortons` sorted by code (Stages 1-3 done).
+    // Post-condition: `tree[]` + `treeParent[]` fully populated with
+    // valid AABBs, root at slot 0, same shape contract as the Karras
+    // path so downstream readers (queryPoints, queryClickRay,
+    // SCENE-level reads) don't need any change.
+    //
+    // N == 1 guard mirrors the Karras path: the single leaf at slot 0
+    // is itself the root; the kernel writes the leaf AABB and exits
+    // early, and `agglomerativeSwapRootGPU` is a no-op for that case.
+    void agglomerativeBuildGPU() {
+        int numPrimitives = primitives.size / PRIMITIVE;
+        if (numPrimitives == 0) return;
+
+        Index numInternals = (numPrimitives > 1) ? (numPrimitives - 1) : 1;
+
+        // Zero the visit-flag gate before the single-pass build.
+        // Reuses the existing `zeroVisitCounts` kernel — it just
+        // zeroes a uint buffer of a caller-given length.
+        uint32_t flagCount = (uint32_t)numInternals;
+        MetalGlobalContext::setBuffer(nodeVisitFlags, 0);
+        MetalGlobalContext::setBytes(flagCount, 1);
+        MetalGlobalContext::dispatchThreads(zeroVisitCountsPSO, numInternals);
+
+        MetalGlobalContext::setBuffer(positions, 0);
+        MetalGlobalContext::setBuffer(primitives, 1);
+        MetalGlobalContext::setBytes(numPrimitives, 2);
+        MetalGlobalContext::setBuffer(mortons, 3);
+        MetalGlobalContext::setBuffer(tree, 4);
+        MetalGlobalContext::setBuffer(treeParent, 5);
+        MetalGlobalContext::setBuffer(nodeVisitFlags, 6);
+        MetalGlobalContext::setBuffer(nodeRangeLeft, 7);
+        MetalGlobalContext::setBuffer(nodeRangeRight, 8);
+        MetalGlobalContext::setBuffer(rootIndexBuf, 9);
+
+        MetalGlobalContext::dispatchThreads(agglomerativeBuildPSO, numPrimitives);
+    }
+
+    // Relocate the root to slot 0 after `agglomerativeBuildGPU`. Kept
+    // as a separate dispatch so cross-dispatch memory visibility is
+    // handled by Metal's command-queue barrier; the kernel itself is
+    // single-threaded and reads `rootIndexBuf[0]` written by the
+    // preceding agglomerative build. No-op if the root already lands
+    // at slot 0 (kernel checks internally) or for N <= 1.
+    void agglomerativeSwapRootGPU() {
+        int numPrimitives = primitives.size / PRIMITIVE;
+        if (numPrimitives <= 1) return;
+
+        MetalGlobalContext::setBuffer(tree, 0);
+        MetalGlobalContext::setBuffer(treeParent, 1);
+        MetalGlobalContext::setBuffer(rootIndexBuf, 2);
+        MetalGlobalContext::setBytes(numPrimitives, 3);
+
+        // Single-threaded swap — dispatch with 1 thread.
+        MetalGlobalContext::dispatchThreads(agglomerativeSwapRootPSO, 1);
+    }
+
 
     void buildLeafGPU() {
         int numPrimitives = primitives.size / PRIMITIVE;
@@ -4561,18 +4671,34 @@ struct BVH<BE, PR, BVHMODE::LINEAR, PRIMITIVE> {
         radixSortGPU();
         //MetalGlobalContext::commitAndWait();
 
-        // [stage 4] build tree
-        // input: sorted array of elements' morton code
-        // output: linear bvh tree + treeParent up-links
-        buildTreeGPU();
+        // [stage 4 + 5] tree build + bottom-up AABB combine.
+        //
+        // Two paths share stages 1–3 (scene box + Morton + sort) and
+        // diverge here. The default Karras path runs `buildTreeGPU`
+        // (hierarchy) followed by `bottomUpHybrid` (AABB reduction);
+        // the Apetrei agglomerative path collapses both into a single
+        // kernel launch plus a 1-thread root-swap. Either side can be
+        // deprecated independently by removing its branch.
+        if (useAgglomerative) {
+            agglomerativeBuildGPU();
+            agglomerativeSwapRootGPU();
+            // tree.ptr is GPU-side after this; downstream callers that
+            // need CPU-visible data (CPU debug paths) must
+            // commitAndWait themselves. The Karras path's
+            // `bottomUpHybrid` historically committed implicitly via
+            // its CPU completion step — the agglomerative path has no
+            // CPU step, so this stays pure-GPU.
+        } else {
+            buildTreeGPU();
 
-        // [stage 5] bottom-up AABB combine. D-030 — hybrid: GPU
-        // combines the first `bottomUpHybridDepth` levels (from
-        // leaf side); CPU finishes the top-of-tree via
-        // bottomUpCombineWithSkip. bottomUpHybrid itself does the
-        // commitAndWait between GPU and CPU phases, so tree.ptr is
-        // CPU-visible by the time this returns.
-        bottomUpHybrid(sceneBox, bottomUpHybridDepth);
+            // D-030 — hybrid: GPU combines the first
+            // `bottomUpHybridDepth` levels (from leaf side); CPU
+            // finishes the top-of-tree via bottomUpCombineWithSkip.
+            // bottomUpHybrid itself does the commitAndWait between
+            // GPU and CPU phases, so tree.ptr is CPU-visible by the
+            // time this returns.
+            bottomUpHybrid(sceneBox, bottomUpHybridDepth);
+        }
     }
 
     void buildCPU(int oid, VectorBase<METAL, PR>& pos, VectorBase<METAL, Index>& prim) {

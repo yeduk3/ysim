@@ -497,6 +497,324 @@ kernel void bottomUpBoxes(
     }
 }
 
+// Apetrei (2014) "Fast and Simple Agglomerative LBVH Construction".
+// Single-kernel replacement for buildTree_* + bottomUpBoxes. Each thread
+// starts from a leaf and walks toward the root, deciding the parent at
+// each step via Apetrei's δ rule while combining AABBs.
+//
+// Node layout — same buffer shape as the Karras path:
+//   leaves     : slots [N-1, 2N-2]   (leafSlot = N - 1 + sortedId)
+//   internals  : slots [0, N-2]      (Apetrei internal i ↔ slot i)
+// Apetrei's internal node i splits between sorted keys i and i+1.
+//
+// Parent rule for a node covering [L, R] (L,R in leaf-index space):
+//   if L == 0          → parent = R,    current is childA
+//   else if R == N-1   → parent = L-1,  current is childB
+//   else compare δ(R) vs δ(L-1) (smaller = closer ancestor):
+//        δ(R)  < δ(L-1) → parent = R,    childA
+//        else            → parent = L-1, childB
+// Special case L==0 && R==N-1: current node is the root.
+//
+// δ(i) := highest differing bit between mortons[i].code and mortons[i+1].code.
+// Implemented as raw XOR (monotonic in bit position). Ties broken by
+// (index XOR) — same convention as the Karras `delta()` helper above.
+//
+// Synchronization mirrors bottomUpBoxes: relaxed atomic_fetch_add on
+// `nodeVisitFlags[parent]` gates first/second arrival; seq_cst device
+// fences acquire the sibling's writes and release this thread's writes
+// before the next iteration's atomic.
+//
+// Pre-condition: nodeVisitFlags[] zeroed; mortons[] sorted.
+// Post-condition: tree[] + treeParent[] populated; rootIndexOut holds
+// the slot of the actual root (which may be any slot in [0, N-2]).
+// Caller follows up with `agglomerativeSwapRoot` to relocate the root
+// to slot 0 if needed.
+kernel void agglomerativeBuild_Tri(
+    device const packed_float3* x [[buffer(0)]],
+    device const packed_uint3* facets [[buffer(1)]],
+    constant int& numPrimitives [[buffer(2)]],
+    device const MortonNode* mortons [[buffer(3)]],
+    device BVHNode* tree [[buffer(4)]],
+    device int* treeParent [[buffer(5)]],
+    device atomic_uint* nodeVisitFlags [[buffer(6)]],
+    device int* nodeRangeLeft [[buffer(7)]],
+    device int* nodeRangeRight [[buffer(8)]],
+    device atomic_int* rootIndexOut [[buffer(9)]],
+    uint id [[thread_position_in_grid]]
+) {
+    int N = numPrimitives;
+    if ((int)id >= N) return;
+
+    int fid = mortons[id].index;
+    uint3 facet = facets[fid];
+    float3 v0 = x[facet.x];
+    float3 v1 = x[facet.y];
+    float3 v2 = x[facet.z];
+    int leafSlot = N + (int)id - 1;
+    tree[leafSlot].min = min3(v0, v1, v2);
+    tree[leafSlot].childA = -1;
+    tree[leafSlot].max = max3(v0, v1, v2);
+    tree[leafSlot].childB = fid;
+
+    if (N <= 1) {
+        // Single-leaf degenerate: leaf IS the root (slot 0 since N-1==0).
+        atomic_store_explicit(rootIndexOut, leafSlot, memory_order_relaxed);
+        return;
+    }
+
+    int currentNode = leafSlot;
+    int L = (int)id;
+    int R = (int)id;
+
+    while (true) {
+        if (L == 0 && R == N - 1) {
+            atomic_store_explicit(rootIndexOut, currentNode, memory_order_relaxed);
+            return;
+        }
+
+        bool goRight;
+        if (L == 0) {
+            goRight = true;
+        } else if (R == N - 1) {
+            goRight = false;
+        } else {
+            uint dR_code = mortons[R].code ^ mortons[R + 1].code;
+            uint dL_code = mortons[L - 1].code ^ mortons[L].code;
+            if (dR_code != dL_code) {
+                goRight = (dR_code < dL_code);
+            } else {
+                // Tie on codes — fall back to index XOR (same convention
+                // as Karras `delta()` above, where tied codes are
+                // disambiguated via mortons[*].index).
+                uint dR_idx = mortons[R].index ^ mortons[R + 1].index;
+                uint dL_idx = mortons[L - 1].index ^ mortons[L].index;
+                goRight = (dR_idx < dL_idx);
+            }
+        }
+
+        int parent;
+        if (goRight) {
+            parent = R;
+            tree[parent].childA = currentNode;
+            nodeRangeLeft[parent] = L;
+        } else {
+            parent = L - 1;
+            tree[parent].childB = currentNode;
+            nodeRangeRight[parent] = R;
+        }
+        treeParent[currentNode] = parent;
+
+        uint old = atomic_fetch_add_explicit(
+            &nodeVisitFlags[parent],
+            1u,
+            memory_order_relaxed
+        );
+        if (old == 0u) return;
+
+        // (a) Acquire sibling's writes (child AABBs + the opposite-side
+        //     range entry) before reading them.
+        atomic_thread_fence(mem_flags::mem_device,
+                            memory_order_seq_cst,
+                            thread_scope_device);
+
+        int childA = tree[parent].childA;
+        int childB = tree[parent].childB;
+
+        float3 minA = float3(tree[childA].min);
+        float3 maxA = float3(tree[childA].max);
+        float3 minB = float3(tree[childB].min);
+        float3 maxB = float3(tree[childB].max);
+
+        tree[parent].min = packed_float3(min(minA, minB));
+        tree[parent].max = packed_float3(max(maxA, maxB));
+
+        // (b) Release this thread's parent-AABB write before the next
+        //     iteration's atomic at the grandparent.
+        atomic_thread_fence(mem_flags::mem_device,
+                            memory_order_seq_cst,
+                            thread_scope_device);
+
+        currentNode = parent;
+        L = nodeRangeLeft[parent];
+        R = nodeRangeRight[parent];
+    }
+}
+
+kernel void agglomerativeBuild_Edge(
+    device const packed_float3* x [[buffer(0)]],
+    device const packed_uint2* edges [[buffer(1)]],
+    constant int& numPrimitives [[buffer(2)]],
+    device const MortonNode* mortons [[buffer(3)]],
+    device BVHNode* tree [[buffer(4)]],
+    device int* treeParent [[buffer(5)]],
+    device atomic_uint* nodeVisitFlags [[buffer(6)]],
+    device int* nodeRangeLeft [[buffer(7)]],
+    device int* nodeRangeRight [[buffer(8)]],
+    device atomic_int* rootIndexOut [[buffer(9)]],
+    uint id [[thread_position_in_grid]]
+) {
+    int N = numPrimitives;
+    if ((int)id >= N) return;
+
+    int eid = mortons[id].index;
+    uint2 edge = edges[eid];
+    float3 v0 = x[edge.x];
+    float3 v1 = x[edge.y];
+    int leafSlot = N + (int)id - 1;
+    tree[leafSlot].min = min(v0, v1);
+    tree[leafSlot].childA = -1;
+    tree[leafSlot].max = max(v0, v1);
+    tree[leafSlot].childB = eid;
+
+    if (N <= 1) {
+        atomic_store_explicit(rootIndexOut, leafSlot, memory_order_relaxed);
+        return;
+    }
+
+    int currentNode = leafSlot;
+    int L = (int)id;
+    int R = (int)id;
+
+    while (true) {
+        if (L == 0 && R == N - 1) {
+            atomic_store_explicit(rootIndexOut, currentNode, memory_order_relaxed);
+            return;
+        }
+
+        bool goRight;
+        if (L == 0) {
+            goRight = true;
+        } else if (R == N - 1) {
+            goRight = false;
+        } else {
+            uint dR_code = mortons[R].code ^ mortons[R + 1].code;
+            uint dL_code = mortons[L - 1].code ^ mortons[L].code;
+            if (dR_code != dL_code) {
+                goRight = (dR_code < dL_code);
+            } else {
+                uint dR_idx = mortons[R].index ^ mortons[R + 1].index;
+                uint dL_idx = mortons[L - 1].index ^ mortons[L].index;
+                goRight = (dR_idx < dL_idx);
+            }
+        }
+
+        int parent;
+        if (goRight) {
+            parent = R;
+            tree[parent].childA = currentNode;
+            nodeRangeLeft[parent] = L;
+        } else {
+            parent = L - 1;
+            tree[parent].childB = currentNode;
+            nodeRangeRight[parent] = R;
+        }
+        treeParent[currentNode] = parent;
+
+        uint old = atomic_fetch_add_explicit(
+            &nodeVisitFlags[parent],
+            1u,
+            memory_order_relaxed
+        );
+        if (old == 0u) return;
+
+        atomic_thread_fence(mem_flags::mem_device,
+                            memory_order_seq_cst,
+                            thread_scope_device);
+
+        int childA = tree[parent].childA;
+        int childB = tree[parent].childB;
+
+        float3 minA = float3(tree[childA].min);
+        float3 maxA = float3(tree[childA].max);
+        float3 minB = float3(tree[childB].min);
+        float3 maxB = float3(tree[childB].max);
+
+        tree[parent].min = packed_float3(min(minA, minB));
+        tree[parent].max = packed_float3(max(maxA, maxB));
+
+        atomic_thread_fence(mem_flags::mem_device,
+                            memory_order_seq_cst,
+                            thread_scope_device);
+
+        currentNode = parent;
+        L = nodeRangeLeft[parent];
+        R = nodeRangeRight[parent];
+    }
+}
+
+// Post-pass for agglomerativeBuild_*: relocates the root from its natural
+// Apetrei slot (rootIndexBuf[0]) to slot 0 so downstream traversal code
+// (queryPoints, queryClickRay, SCENE-level reads) can keep its `tree[0]
+// is root` assumption intact. Single-threaded — dispatched with 1 thread.
+//
+// Swap semantics (k := rootIndexBuf[0]):
+//   tree[0] gets the root's content (with any 0-references retargeted to k).
+//   tree[k] gets the original tree[0]'s content (the displaced Apetrei
+//   internal node, "OldNode0").
+// Then treeParent and parent-child pointers are patched so the tree is
+// internally consistent — every node's children point to the correct
+// post-swap slot, and every node's treeParent points to the correct
+// post-swap slot.
+kernel void agglomerativeSwapRoot(
+    device BVHNode* tree [[buffer(0)]],
+    device int* treeParent [[buffer(1)]],
+    device const int* rootIndexBuf [[buffer(2)]],
+    constant int& numPrimitives [[buffer(3)]],
+    uint id [[thread_position_in_grid]]
+) {
+    if (id != 0) return;
+    if (numPrimitives <= 1) return;  // single leaf; already at slot 0
+
+    int k = rootIndexBuf[0];
+    if (k == 0) return;
+
+    BVHNode R = tree[k];   // root content
+    BVHNode O = tree[0];   // OldNode0 content (Apetrei's slot-0 internal)
+    int p0 = treeParent[0];
+
+    int OA = O.childA;
+    int OB = O.childB;
+
+    // If root's child pointed to slot 0 (OldNode0 was root's direct child),
+    // retarget to slot k where OldNode0 lands after swap.
+    int RA = (R.childA == 0) ? k : R.childA;
+    int RB = (R.childB == 0) ? k : R.childB;
+
+    tree[0].min = R.min;
+    tree[0].max = R.max;
+    tree[0].childA = RA;
+    tree[0].childB = RB;
+    tree[k] = O;
+
+    // OldNode0's children: parent was 0, now k (OldNode0's new slot).
+    // OldNode0 is internal (slot in [0, N-2]), so OA, OB are valid slots.
+    treeParent[OA] = k;
+    treeParent[OB] = k;
+
+    // Root's children: parent was k, now 0 (root's new slot).
+    // If RA == k or RB == k (the root-had-OldNode0-as-child case), this
+    // also correctly sets treeParent[k] = 0 — OldNode0's parent is now
+    // the root at slot 0.
+    treeParent[RA] = 0;
+    treeParent[RB] = 0;
+
+    // If OldNode0's parent (p0) is NOT the root, we still need to:
+    //   (i)  retarget tree[p0]'s childA/B pointer from 0 to k, and
+    //   (ii) write treeParent[k] = p0 (OldNode0 retains its parent).
+    // If p0 == k (OldNode0's parent IS the root), tree[0] (the root) was
+    // already patched above (R.childA/B → k), and treeParent[k] = 0 was
+    // set by the treeParent[RA]/[RB] = 0 line that covers the case where
+    // RA == k or RB == k. Either way, we're done in the p0 == k branch.
+    if (p0 != k) {
+        if (tree[p0].childA == 0) tree[p0].childA = k;
+        else                      tree[p0].childB = k;
+        treeParent[k] = p0;
+    }
+
+    // Root has no parent; sentinel for clarity.
+    treeParent[0] = -1;
+}
+
 // D-030: partial-depth variant of `bottomUpBoxes`. Each thread walks
 // up via treeParent and combines AABBs identically to bottomUpBoxes,
 // but stops after writing `maxDepth` levels from the leaf side. The
