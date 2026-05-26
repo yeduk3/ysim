@@ -5487,6 +5487,11 @@ struct BVH<BE, PR, BVHMODE::SCENE, BVHPRIMITIVE::OBJECT> {
     // 모두에게 푸시한다. 기본 false = 기존 Karras 경로 그대로 유지.
     bool useAgglomerative = false;
 
+    // Refit ON/OFF 토글. 기본 true = 기존 동작(증분 AABB 갱신).
+    // false 일 때 refit() 호출이 자동으로 build()로 폴백되어 토폴로지부터
+    // 다시 만든다 — 큰 변형 후 트리 품질 회복용 비교 모드.
+    bool enableRefit = true;
+
     //BVH(SceneObject<METAL, PR>& scene) 
     //    : objTrees(scene.numMeshes), positions(scene.numMeshes*3), indices(scene.numMeshes*2) {}
 
@@ -5545,6 +5550,13 @@ struct BVH<BE, PR, BVHMODE::SCENE, BVHPRIMITIVE::OBJECT> {
     }
 
     void refit() {
+        // Refit OFF → full rebuild. Scene<>의 모든 필드가 inline static
+        // 이므로 더미 인스턴스로 build() 본체를 재실행해도 비용이 없다.
+        if (!enableRefit) {
+            Scene<METAL, PR> sceneRef;
+            build(sceneRef);
+            return;
+        }
         for(Index i = 0; i < objTrees.size(); ++i) {
             objTrees[i].useAgglomerative = useAgglomerative;
             objTrees[i].refit();
@@ -14951,7 +14963,8 @@ int main(int argc, char** argv) {
                 &meshInspectorWindowState.open,
                 sceneCounts,
                 &simulator.useSegmentedBVHQuery,
-                &simulator.collisionPipeline.broadPhase.useAgglomerative
+                &simulator.collisionPipeline.broadPhase.useAgglomerative,
+                &simulator.collisionPipeline.broadPhase.enableRefit
             );
             scene_log::drawSceneActionLogWindow(sceneLogWindowState);
             ImGui::Render();
@@ -14967,7 +14980,8 @@ int main(int argc, char** argv) {
                 &meshInspectorWindowState.open,
                 sceneCounts,
                 &simulator.useSegmentedBVHQuery,
-                &simulator.collisionPipeline.broadPhase.useAgglomerative
+                &simulator.collisionPipeline.broadPhase.useAgglomerative,
+                &simulator.collisionPipeline.broadPhase.enableRefit
             );
             scene_log::drawSceneActionLogWindow(sceneLogWindowState);
             ImGui::Render();

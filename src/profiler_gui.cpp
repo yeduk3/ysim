@@ -33,7 +33,8 @@ void drawProfilerWindow(
     bool* mesh_inspector_open,
     SceneCounts scene_counts,
     bool* use_segmented_bvh_query,
-    bool* use_agglomerative_bvh
+    bool* use_agglomerative_bvh,
+    bool* enable_refit
 ) {
     if (!state.open) return;
 
@@ -81,6 +82,11 @@ void drawProfilerWindow(
         ImGui::Checkbox("BVH Agglomerative Build", use_agglomerative_bvh);
         ImGui::SameLine();
         ImGui::TextDisabled(*use_agglomerative_bvh ? "[Apetrei 2014]" : "[Karras 2012]");
+    }
+    if (enable_refit) {
+        ImGui::Checkbox("BVH Refit", enable_refit);
+        ImGui::SameLine();
+        ImGui::TextDisabled(*enable_refit ? "[incremental]" : "[full rebuild]");
     }
 
     ImGui::Separator();
