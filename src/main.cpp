@@ -13672,6 +13672,44 @@ int main(int argc, char** argv) {
                                 r->clothStiffnessScale = (Precision)v;
                         };
                 }
+                // Per-type stiffness coefficients next to "팽팽함". The
+                // GPU upload reads behaviorParams live each frame (the
+                // setBytes paths multiply by clothStiffnessScale), so a
+                // slider edit takes effect next frame with no re-pack —
+                // we only mirror mesh + request so it survives a rebuild.
+                if (auto* cp = std::get_if<ClothBehaviorParams<Precision>>(
+                        &selectedMesh->behaviorParams)) {
+                    auto setT = [&simulator](int id, Precision ClothBehaviorParams<Precision>::* mem, float v) {
+                        if (auto* m = Scene<Backend, Precision>::findById(id))
+                            if (auto* p = std::get_if<ClothBehaviorParams<Precision>>(&m->behaviorParams))
+                                p->*mem = (Precision)v;
+                        if (auto* r = simulator.findRequest(id))
+                            if (auto* p = std::get_if<ClothBehaviorParams<Precision>>(&r->behaviorParams))
+                                p->*mem = (Precision)v;
+                    };
+                    target.cloth_stretch = &cp->stretch;
+                    target.on_cloth_stretch = [setT](int id, float v){ setT(id, &ClothBehaviorParams<Precision>::stretch, v); };
+                    target.cloth_shear = &cp->shear;
+                    target.on_cloth_shear = [setT](int id, float v){ setT(id, &ClothBehaviorParams<Precision>::shear, v); };
+                    target.cloth_bend = &cp->bend;
+                    target.on_cloth_bend = [setT](int id, float v){ setT(id, &ClothBehaviorParams<Precision>::bend, v); };
+                } else if (auto* fp = std::get_if<FastGridClothBehaviorParams<Precision>>(
+                        &selectedMesh->behaviorParams)) {
+                    auto setF = [&simulator](int id, Precision FastGridClothBehaviorParams<Precision>::* mem, float v) {
+                        if (auto* m = Scene<Backend, Precision>::findById(id))
+                            if (auto* p = std::get_if<FastGridClothBehaviorParams<Precision>>(&m->behaviorParams))
+                                p->*mem = (Precision)v;
+                        if (auto* r = simulator.findRequest(id))
+                            if (auto* p = std::get_if<FastGridClothBehaviorParams<Precision>>(&r->behaviorParams))
+                                p->*mem = (Precision)v;
+                    };
+                    // FastGridCloth: stretch + bend only (shear left null →
+                    // hidden), per the requested per-type knob set.
+                    target.cloth_stretch = &fp->kstretch;
+                    target.on_cloth_stretch = [setF](int id, float v){ setF(id, &FastGridClothBehaviorParams<Precision>::kstretch, v); };
+                    target.cloth_bend = &fp->kbend;
+                    target.on_cloth_bend = [setF](int id, float v){ setF(id, &FastGridClothBehaviorParams<Precision>::kbend, v); };
+                }
                 // D-027: material inspector path. base_color is set above;
                 // wire the other 4 material fields + the commit callback so
                 // each widget change routes through Simulator::setMaterial
