@@ -604,6 +604,20 @@ kernel void agglomerativeBuild_Tri(
         }
         treeParent[currentNode] = parent;
 
+        // **Release fence** — bug-fix for repeated-rebuild hangs.
+        // 이 라인 위에서 쓴 값들 (leaf AABB 첫 진입 + tree[parent].childA/B
+        // + nodeRangeLeft/Right[parent] + treeParent[currentNode]) 는 다른
+        // 스레드의 second-arrival 쪽에서 atomic_fetch_add 후 seq_cst fence (a)
+        // 다음에 읽힌다. T1 쪽에 release semantics 가 없으면 (relaxed atomic
+        // 하나뿐이면) 그 happens-before edge 가 형성되지 않아 T2 가 stale
+        // 값을 읽을 수 있다 — 특히 매 프레임 재빌드 시 이전 프레임의
+        // nodeRangeLeft/Right 가 그대로 보이면 L/R 가 엉뚱한 값이 되고
+        // 루프가 L==0&&R==N-1 종료 조건에 도달 못해 GPU 무한 루프 →
+        // 10~20 프레임 후 워치독 stall.
+        atomic_thread_fence(mem_flags::mem_device,
+                            memory_order_seq_cst,
+                            thread_scope_device);
+
         uint old = atomic_fetch_add_explicit(
             &nodeVisitFlags[parent],
             1u,
@@ -709,6 +723,11 @@ kernel void agglomerativeBuild_Edge(
             nodeRangeRight[parent] = R;
         }
         treeParent[currentNode] = parent;
+
+        // Release fence — 동일 버그 수정. _Tri 쪽 주석 참고.
+        atomic_thread_fence(mem_flags::mem_device,
+                            memory_order_seq_cst,
+                            thread_scope_device);
 
         uint old = atomic_fetch_add_explicit(
             &nodeVisitFlags[parent],
