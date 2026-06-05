@@ -2578,6 +2578,23 @@ struct Scene {
         VectorBase<BE, uint32_t>       segPrivateCount;
         VectorBase<BE, uint32_t>       segPrivateOffset;
 
+        // Slice (c-2) — analytic-primitive broad markers. The BVH broad
+        // phase, when the analytic toggle is on, finds (cloth query,
+        // sphere target) object pairs whose top-level AABBs overlap and
+        // records them HERE instead of descending the sphere's triangle
+        // BVH (which would emit thousands of vertex×triangle BroadCollisions
+        // that narrow_pt_tri then skips). narrowAnalytic() consumes these
+        // — one dispatch per pair — so the analytic narrow phase only fires
+        // when objects actually overlap (zero cost during the fall) and
+        // tests one sphere per cloth instead of all clouds × all shapes.
+        // clothObj = object/statesOffsets INDEX (D-041); shapeObjId = the
+        // sphere mesh id, resolved to a compact AnalyticShape[] index in
+        // narrowAnalytic. Cleared at the top of each broad detect and again
+        // after narrow consumes it (so a later SH-broad frame, which does
+        // not populate this, can't re-dispatch stale pairs).
+        struct AnalyticBroadPair { Index clothObj; Index shapeObjId; };
+        std::vector<AnalyticBroadPair> analyticPairs;
+
         void resetNarrow() {
             std::memset(narrowCollisions.ptr, 0, sizeof(NarrowCollision)*numNarrowCollisions[0]);
             std::memset(vertColFacets.ptr, 0, sizeof(NarrowCollision)*numNarrowCollisions[0]);
@@ -2620,8 +2637,12 @@ struct Scene {
             if (!isPrimitiveShape(m.shapeType)) continue;
 
             // Intrinsic radius / half-extent (scale 1) from the
-            // initializer; scaled into world units below. Spheres are
-            // forced-uniform (Q3) so scale.x is authoritative.
+            // initializer; scaled into world units below. The analytic
+            // sphere narrow path is an ELLIPSOID test, so per-axis
+            // scale (+ rotQuat) is honoured via halfExtHeight; non-
+            // uniform scale stretches the collision shape to match the
+            // baked vertices. centerRadius.w stays the nominal (x-axis)
+            // radius for any uniform-radius consumer.
             PR sz = PR(0);
             if (auto* sp = dynamic_cast<MeshSphereInitializer  <BE,PR>*>(m.initializer)) sz = sp->params.size;
             else if (auto* cb = dynamic_cast<MeshCubeInitializer    <BE,PR>*>(m.initializer)) sz = cb->params.size;
@@ -2629,13 +2650,17 @@ struct Scene {
 
             const tinym::vec3 c = m.transformPosition;
             const tinym::vec3 s = m.scale;
+            // primitive::sphere/cube/cylinder build geometry with
+            // r = size*0.5, so the world half-extent is size*0.5*scale.
+            // (`sz` is the initializer's `size` = full diameter/edge.)
+            const PR hsz = sz * PR(0.5);
 
             AnalyticShape a{};
-            a.centerRadius  = tinym::vec4(c.x, c.y, c.z, (float)(sz * s.x));
-            a.halfExtHeight = tinym::vec4((float)(sz * s.x),
-                                          (float)(sz * s.y),
-                                          (float)(sz * s.z),
-                                          (float)(sz * s.y));
+            a.centerRadius  = tinym::vec4(c.x, c.y, c.z, (float)(hsz * s.x));
+            a.halfExtHeight = tinym::vec4((float)(hsz * s.x),
+                                          (float)(hsz * s.y),
+                                          (float)(hsz * s.z),
+                                          (float)(hsz * s.y));
             a.rotQuat       = tinym::vec4(m.rotationQuat.w, m.rotationQuat.x,
                                           m.rotationQuat.y, m.rotationQuat.z);
             a.prevCenterPad = tinym::vec4(c.x, c.y, c.z, 0.0f);
@@ -4755,12 +4780,17 @@ struct BVH<BE, PR, BVHMODE::LINEAR, PRIMITIVE> {
         auto* mesh = Scene<METAL, PR>::findById(objid);
         positions = pos;
         primitives = prim;
+        objShape = ShapeType::Mesh;
         if(mesh) {
             velocities = mesh->state.v;
             objBehavior = mesh->behaviorType;
             builtForLifetimeId = mesh->lifetimeId;  // D-026
+            // Slice (c-2): cache the authored primitive type so the broad
+            // phase can recognize spheres and route them to the analytic
+            // narrow path (skip triangle-BVH descent) instead of always
+            // treating every object as a triangle soup.
+            objShape = mesh->shapeType;
         }
-        objShape = ShapeType::Mesh;
         //std::cout << "[BVH Build] positions and primitives are assigned" << std::endl;
         Index numPrimitives = primitives.size/PRIMITIVE;
         // Reallocate when buffers are missing OR sized for a different
@@ -5621,8 +5651,11 @@ struct BVH<BE, PR, BVHMODE::SCENE, BVHPRIMITIVE::OBJECT> {
         }
         Scene<METAL, PR>::packedCollisionData.numBroadCollisions[0] = 0;
     }
-    void detectCollisions(PR margin, bool enableSelfCollisions=true) {
+    void detectCollisions(PR margin, bool enableSelfCollisions=true,
+                          bool analyticEnabled=false) {
         queryBegin();
+        // Slice (c-2): fresh analytic markers each broad detect.
+        Scene<METAL, PR>::packedCollisionData.analyticPairs.clear();
 
         // Bidirectional registration. The old `std::set<IndexPair> checked`
         // deduped on the SORTED pair {min,max}, so a colliding pair {A,B}
@@ -5651,11 +5684,34 @@ struct BVH<BE, PR, BVHMODE::SCENE, BVHPRIMITIVE::OBJECT> {
                 auto& ta = objTrees[t].tree[0].aabb;
                 bool hit = ta.intersect(qa);
                 if(hit) {
-                    // D-041 turn-3: pass query INDEX (q, not queryTree.objid)
-                    // so broadCollisions.objPair stores indices that the
-                    // narrow kernel can directly use as statesOffsets[]
-                    // subscripts.
-                    objTrees[t].queryPoints(q, margin);
+                    // Slice (c-2): when the analytic toggle is on and either
+                    // side is a Sphere, DON'T descend the sphere's triangle
+                    // BVH (queryPoints) — that traversal + the vertex×triangle
+                    // BroadCollisions it emits are pure waste because
+                    // narrow_pt_tri skips every sphere pair anyway (skipSphere).
+                    // Instead record one analytic marker, but only for the
+                    // (cloth query → sphere target) direction: the reciprocal
+                    // ordered visit (sphere q → cloth t) is the SAME object
+                    // pair, so marking once avoids a double dispatch. sphere→
+                    // sphere and sphere→cloth visits just skip (matching the
+                    // old both-direction skipSphere drop). Cube/Cylinder still
+                    // use triangle soup until c-3, so only Sphere is gated.
+                    if (analyticEnabled
+                        && (objTrees[t].objShape == ShapeType::Sphere
+                         || queryTree.objShape   == ShapeType::Sphere)) {
+                        bool qCloth =
+                            queryTree.objBehavior == BehaviorType::TriangularCloth
+                         || queryTree.objBehavior == BehaviorType::FastGridCloth;
+                        if (objTrees[t].objShape == ShapeType::Sphere && qCloth)
+                            Scene<METAL, PR>::packedCollisionData.analyticPairs
+                                .push_back({ q, (Index)objTrees[t].objid });
+                    } else {
+                        // D-041 turn-3: pass query INDEX (q, not queryTree.objid)
+                        // so broadCollisions.objPair stores indices that the
+                        // narrow kernel can directly use as statesOffsets[]
+                        // subscripts.
+                        objTrees[t].queryPoints(q, margin);
+                    }
                 }
             }
         }
@@ -5667,8 +5723,11 @@ struct BVH<BE, PR, BVHMODE::SCENE, BVHPRIMITIVE::OBJECT> {
     // queryPointsSegmented (paper Alg.2 stream registration). Kept as a
     // SEPARATE method so the baseline path stays bench-compatible and
     // can be deprecated cleanly once the segmented path is proven.
-    void detectCollisionsSegmented(PR margin, bool enableSelfCollisions=true) {
+    void detectCollisionsSegmented(PR margin, bool enableSelfCollisions=true,
+                                   bool analyticEnabled=false) {
         queryBegin();
+        // Slice (c-2): fresh analytic markers each broad detect.
+        Scene<METAL, PR>::packedCollisionData.analyticPairs.clear();
 
         std::set<IndexPair> checked;
         for(Index q = 0; q < objTrees.size(); ++q) {
@@ -5688,7 +5747,29 @@ struct BVH<BE, PR, BVHMODE::SCENE, BVHPRIMITIVE::OBJECT> {
                 auto& qa = queryTree.tree[0].aabb;
                 auto& ta = objTrees[t].tree[0].aabb;
                 if(ta.intersect(qa)) {
-                    objTrees[t].queryPointsSegmented(q, margin);
+                    // Slice (c-2): mirror detectCollisions — skip sphere
+                    // triangle-BVH descent, record analytic marker instead.
+                    // Unlike the non-segmented path this loop DEDUPS each
+                    // unordered pair (`checked`), so it visits a (cloth,
+                    // sphere) pair in only ONE ordering — handle BOTH so the
+                    // marker doesn't depend on which index is smaller.
+                    bool tSphere = objTrees[t].objShape == ShapeType::Sphere;
+                    bool qSphere = queryTree.objShape  == ShapeType::Sphere;
+                    if (analyticEnabled && (tSphere || qSphere)) {
+                        auto isCloth = [](BehaviorType bt) {
+                            return bt == BehaviorType::TriangularCloth
+                                || bt == BehaviorType::FastGridCloth;
+                        };
+                        auto& pairs =
+                            Scene<METAL, PR>::packedCollisionData.analyticPairs;
+                        if (tSphere && isCloth(queryTree.objBehavior))
+                            pairs.push_back({ q, (Index)objTrees[t].objid });
+                        else if (qSphere && isCloth(objTrees[t].objBehavior))
+                            pairs.push_back({ t, (Index)queryTree.objid });
+                        // sphere-sphere: skip (no analytic cloth-vs-sphere test)
+                    } else {
+                        objTrees[t].queryPointsSegmented(q, margin);
+                    }
                     checked.insert({a, b});
                 }
             }
@@ -5772,7 +5853,7 @@ struct BruteForce<METAL, PR> {
     struct AnalyticNarrowParams {
         uint32_t oid;
         uint32_t numVerts;
-        uint32_t numShapes;
+        uint32_t shapeIndex;
         uint32_t maxNumCollisions;
         uint32_t clothBehavior;
         float    radius;
@@ -5823,24 +5904,47 @@ struct BruteForce<METAL, PR> {
     // Per-cloth-mesh dispatch (mirrors the integrator dispatch loop):
     // CPU knows the mesh is cloth, so no GPU behavior buffer needed.
     // Returns true if at least one dispatch was issued.
+    // Slice (c-2) — broad-marker-driven analytic narrow phase. Consumes
+    // the (cloth, sphere) pairs the BVH broad phase left in
+    // packedCol.analyticPairs (object AABBs overlapped). One dispatch per
+    // pair, each testing a single AnalyticShape — so nothing fires while
+    // the cloth is still falling (no overlap ⇒ no marker ⇒ no dispatch),
+    // and a cloth that overlaps multiple spheres gets one dispatch each.
+    // Appends into the SAME shared narrowCollisions / numNarrowCollisions
+    // the triangle path uses (narrow() already resetNarrow'd), so the CPU
+    // sort + unchanged integrators consume it. No commit here — the caller
+    // (narrowAndSortByVertices) encodes this into the SAME command buffer
+    // as narrow_pt_tri and commits ONCE (kills the c-1 per-substep extra
+    // commitAndWait). Returns true if at least one dispatch was issued.
     bool narrowAnalytic(PR radius, PR thickness) {
         if (Scene<METAL, PR>::numAnalytic == 0
             || !Scene<METAL, PR>::meshAnalytic.ptr) return false;
         auto& packedMesh = Scene<METAL, PR>::packedMeshData;
         auto& packedCol  = Scene<METAL, PR>::packedCollisionData;
+        if (packedCol.analyticPairs.empty()) return false;
         bool dispatched = false;
-        for (auto& mesh : Scene<METAL, PR>::meshes) {
-            if (mesh.behaviorType != BehaviorType::TriangularCloth
-             && mesh.behaviorType != BehaviorType::FastGridCloth) continue;
-            uint32_t numVerts = (uint32_t)(mesh.state.x.size / 3);
+        for (auto& pr : packedCol.analyticPairs) {
+            // Resolve the sphere's mesh id → compact AnalyticShape[] index
+            // (numAnalytic is tiny; linear scan is cheaper than a map).
+            Index sIdx = -1;
+            for (Index k = 0; k < Scene<METAL, PR>::numAnalytic; ++k) {
+                if (Scene<METAL, PR>::meshAnalytic[k].objId
+                        == (uint32_t)pr.shapeObjId) { sIdx = k; break; }
+            }
+            if (sIdx < 0) continue;
+            if ((Scene<METAL, PR>::meshAnalytic[sIdx].flags & 1u) == 0u)
+                continue;   // not collidable — kernel would no-op anyway
+
+            auto& clothMesh = Scene<METAL, PR>::meshes[pr.clothObj];
+            uint32_t numVerts = (uint32_t)(clothMesh.state.x.size / 3);
             if (numVerts == 0) continue;
 
             AnalyticNarrowParams ap{};
-            ap.oid              = (uint32_t)mesh.id;
+            ap.oid              = (uint32_t)pr.clothObj;  // statesOffsets index
             ap.numVerts         = numVerts;
-            ap.numShapes        = (uint32_t)Scene<METAL, PR>::numAnalytic;
+            ap.shapeIndex       = (uint32_t)sIdx;
             ap.maxNumCollisions = (uint32_t)packedCol.maxNumCollisions;
-            ap.clothBehavior    = (uint32_t)mesh.behaviorType;
+            ap.clothBehavior    = (uint32_t)clothMesh.behaviorType;
             ap.radius           = (float)radius;
             ap.thickness        = (float)thickness;
 
@@ -5859,18 +5963,26 @@ struct BruteForce<METAL, PR> {
     void narrowAndSortByVertices(PR radius, PR thickness,
                                   bool analyticEnabled = false) {
 
-        // narrow() resets the shared narrow buffers, then dispatches
-        // the triangle path (only when broad pairs exist). When the
-        // analytic toggle is on, the analytic path appends afterward
-        // into the same buffers (no reset) and narrow() skips sphere
-        // pairs so they are not double-fed. Toggle OFF (default) =
-        // original pipeline: narrow_pt_tri handles spheres, analytic
-        // not dispatched. Each dispatch is committed+waited before the
-        // next so the shared atomic counter / array are coherent.
+        // narrow() resets the shared narrow buffers (always), then
+        // dispatches the triangle path (only when broad pairs exist).
+        // When the analytic toggle is on, narrowAnalytic appends afterward
+        // into the same buffers (no reset) from the broad markers. Toggle
+        // OFF (default) = original pipeline: narrow_pt_tri handles spheres,
+        // analytic not dispatched.
+        //
+        // Slice (c-2): both dispatches are encoded into the SAME command
+        // buffer and committed ONCE here. A compute encoder runs its
+        // dispatches serially with an implicit barrier between them, so the
+        // shared atomic counter / array stay coherent (tri appends first,
+        // analytic continues). This removes the per-substep second
+        // commitAndWait the c-1 path paid (the dominant analytic-ON
+        // overhead the bvh-vs-analytic experiment measured).
         bool tri = narrow(radius, thickness, analyticEnabled);
-        if (tri) MetalGlobalContext::commitAndWait();
         bool ana = analyticEnabled && narrowAnalytic(radius, thickness);
-        if (ana) MetalGlobalContext::commitAndWait();
+        if (tri || ana) MetalGlobalContext::commitAndWait();
+        // Markers consumed; clear so a later SH-broad frame (which does not
+        // populate analyticPairs) can't re-dispatch this frame's pairs.
+        Scene<METAL, PR>::packedCollisionData.analyticPairs.clear();
         if (!tri && !ana) return;
         // Cumulative narrow-contact counter for the harness — `numNarrowCollisions`
         // resets between substeps, so a per-frame harness sample misses contacts
@@ -6385,6 +6497,44 @@ struct Simulator {
             // Freshly built grid is uniform: X==Y stretch, A==B shear,
             // X==Y bend. size1D/(particleNum1D-1): pn points → pn-1
             // segments, matching MeshGridInitializer's grid spacing.
+            FastGridClothBehaviorParams<PR>{
+                particleNum1D,
+                size1D/(particleNum1D-1),                  // stretchRestX
+                size1D/(particleNum1D-1),                  // stretchRestY
+                size1D/(particleNum1D-1)*std::sqrtf(2),    // shearRestA
+                size1D/(particleNum1D-1)*std::sqrtf(2),    // shearRestB
+                size1D/(particleNum1D-1)*2,                // bendRestX
+                size1D/(particleNum1D-1)*2,                // bendRestY
+                kstretch,
+                kshear,
+                kbend,
+                thickness
+            }
+        );
+        registerPreviewBindingForLastRequest();
+    }
+
+    // FastGridCloth on a HORIZONTAL (XZ) plane centered at `center`,
+    // so it can fall under gravity onto a primitive below — addClothGridFast
+    // hardwires an XY (vertical) plane at the origin, which is unusable for
+    // a drape/collision scene. Same FastGridCloth rest-length derivation as
+    // addClothGridFast; only the plane orientation + center differ. Added
+    // (not widened) so the original keeps its callers/behavior.
+    void addClothGridFastAt(Index particleNum1D, PR size1D, tinym::vec3 center,
+                            PR kstretch=1e5, PR kshear=1e5, PR kbend=3e5,
+                            PR thickness=0.001, PR mass=0.1) {
+        uint32_t seed = static_cast<uint32_t>(Scene<BE, PR>::numMeshes);
+        scene.addGeneralMesh(
+            new MeshGridInitializer<BE, PR>({
+                PlaneDirection::XZPlane,
+                center,
+                particleNum1D,
+                size1D,
+                mass,
+                true, // jiggle
+                seed
+            }),
+            BehaviorType::FastGridCloth,
             FastGridClothBehaviorParams<PR>{
                 particleNum1D,
                 size1D/(particleNum1D-1),                  // stretchRestX
@@ -7700,22 +7850,30 @@ struct Simulator {
                     if (profiler) {
                         auto scope = profiler->scoped("broad_detect");
                         if (useSegmentedBVHQuery)
-                            collisionPipeline.broadPhase.detectCollisionsSegmented(margin, enableSelfCollisions);
+                            collisionPipeline.broadPhase.detectCollisionsSegmented(margin, enableSelfCollisions, useAnalyticPrimitive);
                         else
-                            collisionPipeline.broadPhase.detectCollisions(margin, enableSelfCollisions);
+                            collisionPipeline.broadPhase.detectCollisions(margin, enableSelfCollisions, useAnalyticPrimitive);
                     } else {
                         if (useSegmentedBVHQuery)
-                            collisionPipeline.broadPhase.detectCollisionsSegmented(margin, enableSelfCollisions);
+                            collisionPipeline.broadPhase.detectCollisionsSegmented(margin, enableSelfCollisions, useAnalyticPrimitive);
                         else
-                            collisionPipeline.broadPhase.detectCollisions(margin, enableSelfCollisions);
+                            collisionPipeline.broadPhase.detectCollisions(margin, enableSelfCollisions, useAnalyticPrimitive);
                     }
                 }
 
+                // Slice (c-2): the analytic narrow path is driven by broad
+                // markers that ONLY the BVH broad phase emits. Under the SH
+                // broad path no markers exist, so disable analytic there and
+                // let spheres fall back to the (correct) triangle-soup
+                // narrow_pt_tri path (skipSphere stays 0). BVH path = full
+                // analytic. Default broad is BVH, so the toggle behaves as
+                // expected in normal use.
+                const bool analyticNarrow = useAnalyticPrimitive && !useSpatialHashing;
                 if (profiler) {
                     auto scope = profiler->scoped("narrow_phase");
-                    collisionPipeline.narrowPhase.narrowAndSortByVertices(radius, margin, useAnalyticPrimitive);
+                    collisionPipeline.narrowPhase.narrowAndSortByVertices(radius, margin, analyticNarrow);
                 } else {
-                    collisionPipeline.narrowPhase.narrowAndSortByVertices(radius, margin, useAnalyticPrimitive);
+                    collisionPipeline.narrowPhase.narrowAndSortByVertices(radius, margin, analyticNarrow);
                 }
 
                 if (profiler) {
@@ -9368,6 +9526,162 @@ static int runSegQueryBench(const SegQueryBenchConfig& cfg) {
     csv.flush();
     csv.close();
     std::cerr << "[segquery-bench DONE] wrote " << cfg.outCsvPath << "\n";
+    return 0;
+}
+
+// Analytic-primitive on/off 비교 bench. runSegQueryBench 의 씬 골격을
+// 따르되 (1) cloth(분할수 a)·sphere(분할수 b) 를 독립적으로 스윕하고
+// (2) 모드를 useAnalyticPrimitive on/off 로 둔다. 목적: analytic narrow
+// 경로 활성화가 BVH broad 비용 대비 얼마나 유의미한 영향을 주는지 본다.
+// 씬: 1x1 XZ-plane FastGridCloth(분할수 a, 중심 (0,0.7,0)) 가 직경 1 구
+// (분할수 b, 원점, Rigid + gravity/wind off → Bullet static) 위로 떨어
+// 진다. analytic ON 이면 sphere 충돌쌍이 narrow_pt_tri 에서 skip 되고
+// per-vertex 타원체 테스트(narrow_pt_analytic)로 처리된다 — broad(BVH)는
+// 두 모드 동일(구가 BVH 에 그대로 남음). CSV columns: analytic, cloth_n,
+// sphere_n, frame_index, broad_detect_ms, narrow_phase_ms,
+// physics_total_ms, broad_collisions, narrow_collisions.
+struct AnalyticBenchConfig {
+    std::vector<int> analyticModes;   // 0 = Off, 1 = On
+    std::vector<int> clothNum1Ds;     // a
+    std::vector<int> sphereNum1Ds;    // b
+    int warmupFrames = 1;
+    int measuredFrames = 30;
+    std::string outCsvPath;
+};
+
+static int runAnalyticBench(const AnalyticBenchConfig& cfg) {
+    using Backend = METAL;
+    using SystemT = ExplicitSystem<Backend, Precision>;
+
+    auto* device = MetalGlobalContext::getDevice();
+    if (!device) {
+        std::cerr << "[analytic-bench SKIP] metal-device: null\n";
+        return 0;
+    }
+    auto* lib = MetalKernelContext::getLibrary();
+    if (!lib) {
+        std::cerr << "[analytic-bench SKIP] metal-library: default.metallib not loadable\n";
+        return 0;
+    }
+
+    namespace fs = std::filesystem;
+    fs::path csvPath(cfg.outCsvPath);
+    if (csvPath.has_parent_path()) {
+        std::error_code ec;
+        fs::create_directories(csvPath.parent_path(), ec);
+        if (ec) {
+            std::cerr << "[analytic-bench FAIL] mkdir " << csvPath.parent_path()
+                      << ": " << ec.message() << "\n";
+            return 1;
+        }
+    }
+    std::ofstream csv(csvPath);
+    if (!csv) {
+        std::cerr << "[analytic-bench FAIL] open " << cfg.outCsvPath << "\n";
+        return 1;
+    }
+    csv << "analytic,cloth_n,sphere_n,frame_index,broad_detect_ms,"
+        << "narrow_phase_ms,physics_total_ms,broad_collisions,narrow_collisions\n";
+
+    auto resetScene = []() {
+        for (auto& m : Scene<Backend, Precision>::meshes) m.initializer = nullptr;
+        Scene<Backend, Precision>::meshes.clear();
+        for (auto& r : Scene<Backend, Precision>::requestsGeneralMeshes)
+            delete r.initializer;
+        Scene<Backend, Precision>::requestsGeneralMeshes.clear();
+        Scene<Backend, Precision>::numMeshes = 0;
+        Scene<Backend, Precision>::nextMeshId = 0;
+        Scene<Backend, Precision>::dirty = true;
+        Scene<Backend, Precision>::environment = SceneEnvironment{};
+    };
+
+    for (int analytic : cfg.analyticModes) {
+        for (int clothN : cfg.clothNum1Ds) {
+            for (int sphereN : cfg.sphereNum1Ds) {
+                resetScene();
+                Precision h = Precision(1) / Precision(60);
+                Index subSteps = 60;
+                SystemT system(h, subSteps);
+                Simulator<Backend, Precision, SystemT> sim(system);
+                sim.pause = false;
+                sim.useAnalyticPrimitive = (analytic != 0);
+
+                // Cloth: FastGridCloth on XZ-plane, size 1x1, subdiv a,
+                // center y=0.7 so gravity pulls it onto the sphere top.
+                sim.addClothGridFastAt(clothN, Precision(1.0),
+                                       tinym::vec3(0, Precision(0.7), 0));
+
+                // Sphere: diameter 1 (radius 0.5), subdiv b, Rigid static
+                // (gravity/wind off → Bullet mass=0). Top surface y=+0.5.
+                sim.addSphere(tinym::vec3(0, 0, 0),
+                              sphereN,
+                              Precision(1.0),
+                              Precision(1.0),
+                              BehaviorType::Rigid);
+                auto& sphereReq = Scene<Backend, Precision>::requestsGeneralMeshes.back();
+                sphereReq.applyGravity = false;
+                sphereReq.applyWind    = false;
+
+                sim.initialize();
+
+                profiler::FrameProfiler localProfiler(
+                    static_cast<std::size_t>(cfg.warmupFrames + cfg.measuredFrames + 4));
+                sim.profiler = &localProfiler;
+
+                auto getMs = [&](const char* name) -> double {
+                    int sidx = localProfiler.history().sectionIndex(name);
+                    const auto* snap = localProfiler.history().latestFrame();
+                    if (snap && sidx >= 0
+                        && static_cast<std::size_t>(sidx) < snap->section_ms.size())
+                        return snap->section_ms[sidx];
+                    return -1.0;
+                };
+
+                int totalFrames = cfg.warmupFrames + cfg.measuredFrames;
+                for (int f = 0; f < totalFrames; ++f) {
+                    localProfiler.beginFrame(static_cast<uint64_t>(f),
+                                             static_cast<double>(f) * (double)h);
+                    {
+                        // Mirror the interactive loop's wrapping so
+                        // physics_total covers the whole sim.update().
+                        auto scope = localProfiler.scoped("physics_total");
+                        sim.update();
+                    }
+                    localProfiler.endFrame();
+
+                    if (f >= cfg.warmupFrames) {
+                        int frameIdx = f - cfg.warmupFrames;
+                        double broadMs   = getMs("broad_detect");
+                        double narrowMs  = getMs("narrow_phase");
+                        double physicsMs = getMs("physics_total");
+                        uint64_t broadN = 0, narrowN = 0;
+                        const auto* snap = localProfiler.history().latestFrame();
+                        if (snap) {
+                            broadN  = snap->broad_collisions;
+                            narrowN = snap->narrow_collisions;
+                        }
+                        csv << (analytic ? "On" : "Off") << ','
+                            << clothN << ','
+                            << sphereN << ','
+                            << frameIdx << ','
+                            << broadMs << ','
+                            << narrowMs << ','
+                            << physicsMs << ','
+                            << broadN << ','
+                            << narrowN << '\n';
+                    }
+                }
+                sim.profiler = nullptr;
+                std::cerr << "[analytic-bench] analytic=" << (analytic ? "On " : "Off")
+                          << " cloth_n=" << clothN
+                          << " sphere_n=" << sphereN << " done\n";
+            }
+        }
+    }
+
+    csv.flush();
+    csv.close();
+    std::cerr << "[analytic-bench DONE] wrote " << cfg.outCsvPath << "\n";
     return 0;
 }
 
@@ -13423,6 +13737,23 @@ int main(int argc, char** argv) {
 #endif
         return runSegQueryBench(cfg);
     }
+    if (argc > 1 && std::string(argv[1]) == "--bench-analytic") {
+        // analytic on/off × cloth subdiv a × sphere subdiv b, each over
+        // a,b ∈ {20,50,100} → 2×3×3 = 18 cases, 30 measured frames each.
+        AnalyticBenchConfig cfg;
+        cfg.analyticModes  = {0, 1};            // Off, On
+        cfg.clothNum1Ds    = {20, 50, 100};     // a
+        cfg.sphereNum1Ds   = {20, 50, 100};     // b
+        cfg.warmupFrames   = 1;
+        cfg.measuredFrames = 30;
+#ifdef YSIM_PROJECT_ROOT
+        cfg.outCsvPath = std::string(YSIM_PROJECT_ROOT)
+                       + "/profiles/experiment/analytic-collision-2026-06-04/analytic_bench.csv";
+#else
+        cfg.outCsvPath = "profiles/experiment/analytic-collision-2026-06-04/analytic_bench.csv";
+#endif
+        return runAnalyticBench(cfg);
+    }
 
     std::cout << "Run simulator" << std::endl;
 
@@ -15298,7 +15629,8 @@ int main(int argc, char** argv) {
                 sceneCounts,
                 &simulator.useSegmentedBVHQuery,
                 &simulator.collisionPipeline.broadPhase.useAgglomerative,
-                &simulator.collisionPipeline.broadPhase.enableRefit
+                &simulator.collisionPipeline.broadPhase.enableRefit,
+                &simulator.useAnalyticPrimitive
             );
             scene_log::drawSceneActionLogWindow(sceneLogWindowState);
             ImGui::Render();
@@ -15315,7 +15647,8 @@ int main(int argc, char** argv) {
                 sceneCounts,
                 &simulator.useSegmentedBVHQuery,
                 &simulator.collisionPipeline.broadPhase.useAgglomerative,
-                &simulator.collisionPipeline.broadPhase.enableRefit
+                &simulator.collisionPipeline.broadPhase.enableRefit,
+                &simulator.useAnalyticPrimitive
             );
             scene_log::drawSceneActionLogWindow(sceneLogWindowState);
             ImGui::Render();

@@ -34,7 +34,8 @@ void drawProfilerWindow(
     SceneCounts scene_counts,
     bool* use_segmented_bvh_query,
     bool* use_agglomerative_bvh,
-    bool* enable_refit
+    bool* enable_refit,
+    bool* use_analytic_primitive
 ) {
     if (!state.open) return;
 
@@ -87,6 +88,11 @@ void drawProfilerWindow(
         ImGui::Checkbox("BVH Refit", enable_refit);
         ImGui::SameLine();
         ImGui::TextDisabled(*enable_refit ? "[incremental]" : "[full rebuild]");
+    }
+    if (use_analytic_primitive) {
+        ImGui::Checkbox("Analytic Primitive (A)", use_analytic_primitive);
+        ImGui::SameLine();
+        ImGui::TextDisabled(*use_analytic_primitive ? "[analytic]" : "[triangle-soup]");
     }
 
     ImGui::Separator();

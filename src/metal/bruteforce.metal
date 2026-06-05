@@ -183,14 +183,25 @@ kernel void fill_vf_offsets(
     atomic_fetch_add_explicit(&vertColFacetsOffsets[ppid+1], 1u, memory_order_relaxed);
 }
 
-// Slice (c-1) — analytic cloth-vertex vs primitive narrow phase.
-// One thread per cloth vertex of ONE cloth mesh (oid). Loops the
-// compact AnalyticShape array and, for spheres (c-1 scope), emits a
-// NarrowCollision into the SAME shared narrowCollisions buffer the
-// triangle path uses, so the existing CPU sort + unchanged cloth
-// integrators consume it transparently. DCD only (Q2): tests the
-// current position, no swept xPrev. Cube/Cylinder are skipped here
-// (still triangle-soup) until c-3.
+// Rotate vector v by unit quaternion (scalar qw, vector qv). Forward
+// (local→world) uses qv as-is; inverse (world→local) passes -qv (the
+// conjugate of a unit quaternion). v + 2·qv×(qv×v + qw·v).
+inline float3 quatRotate(float qw, float3 qv, float3 v) {
+    return v + 2.0f * cross(qv, cross(qv, v) + qw * v);
+}
+
+// Slice (c-2) — analytic cloth-vertex vs ONE sphere narrow phase.
+// One thread per cloth vertex of ONE cloth mesh (oid). The BVH broad
+// phase already found this (cloth, sphere) object pair overlaps and
+// skipped descending the sphere's triangle BVH, so this kernel tests
+// exactly ONE AnalyticShape (p.shapeIndex) — no whole-array loop, no
+// per-frame all-cloth×all-shape scan. Emits a NarrowCollision into the
+// SAME shared narrowCollisions buffer the triangle path uses, so the
+// existing CPU sort + unchanged cloth integrators consume it
+// transparently. The sphere mesh may be non-uniformly scaled + rotated,
+// so it is treated as a general ELLIPSOID (3 semi-axes halfExtHeight +
+// rotQuat); a uniform sphere reduces to it exactly. DCD only (Q2):
+// tests the current position, no swept xPrev. Cube/Cylinder c-3.
 kernel void narrow_pt_analytic(
     device atomic_uint*          numNarrowCollisions [[buffer(0)]],
     device NarrowCollision*      narrowCollisions    [[buffer(1)]],
@@ -205,35 +216,55 @@ kernel void narrow_pt_analytic(
     uint gid = scenePackedPositionsOffsets[p.oid] + id;
     float3 pos = float3(scenePackedPositions[gid]);
 
-    for (uint s = 0u; s < p.numShapes; ++s) {
-        AnalyticShape sh = shapes[s];
-        if ((sh.flags & 1u) == 0u) continue;        // not collidable
-        if (sh.shapeType != YSIM_SHAPE_SPHERE) continue; // c-1: sphere only
+    AnalyticShape sh = shapes[p.shapeIndex];
+    if ((sh.flags & 1u) == 0u) return;            // not collidable
+    if (sh.shapeType != YSIM_SHAPE_SPHERE) return; // cube/cyl: c-3
 
-        float3 c = sh.centerRadius.xyz;
-        float  r = sh.centerRadius.w;
+    float3 c  = sh.centerRadius.xyz;
+    // Ellipsoid semi-axes = world half-extents (sz·scale per axis);
+    // floor to avoid /0 on a collapsed axis (scaleObject clamps to
+    // 1e-4, so this only guards numerics). qw/qv = packed (w,x,y,z).
+    float3 e  = max(sh.halfExtHeight.xyz, float3(1e-8f));
+    float  qw = sh.rotQuat.x;
+    float3 qv = sh.rotQuat.yzw;
 
-        float3 dir = pos - c;
-        float  len = length(dir);
+    // World point → ellipsoid-local frame (axis-aligned there).
+    float3 lp = quatRotate(qw, -qv, pos - c);
 
-        // Signed surface distance; gate matches narrow_pt_tri
-        // (radius + thickness band). Negative ⇒ penetrating.
-        float d = len - r;
-        if (d >= p.radius + p.thickness) continue;
-
-        // Outward radial normal. Degenerate at the exact center —
-        // pick +Y so the contact is still well-formed.
-        float3 n = (len > 1e-6f) ? (dir / len) : float3(0.0f, 1.0f, 0.0f);
-
-        uint outIdx = atomic_fetch_add_explicit(
-            numNarrowCollisions, 1u, memory_order_relaxed);
-        if (outIdx >= p.maxNumCollisions) return;
-
-        narrowCollisions[outIdx].indexPair = uint2(id, 0u);
-        narrowCollisions[outIdx].objPair   = uint2(p.oid, sh.objId);
-        narrowCollisions[outIdx].collisionNormalAndDistance = float4(n, d);
-        narrowCollisions[outIdx].behaviorPair = uint2(p.clothBehavior,
-                                                      sh.behaviorType);
-        narrowCollisions[outIdx].shapePair = uint2(0u, sh.shapeType);
+    float3 nLocal;
+    float  d;
+    if (length(lp) < 1e-6f) {
+        // At the exact center: deepest contact is the shortest
+        // semi-axis; normal undefined, pick local +Y.
+        nLocal = float3(0.0f, 1.0f, 0.0f);
+        d = -min(e.x, min(e.y, e.z));
+    } else {
+        // IQ ellipsoid signed-distance (1st-order; EXACT for the
+        // uniform sphere e=(r,r,r) ⇒ d = |lp| - r). Outward normal
+        // is the implicit-surface gradient ∇Σ(lp/e)² ∝ lp/e².
+        float3 pe  = lp / e;
+        float3 pe2 = lp / (e * e);
+        float  k0  = length(pe);
+        float  k1  = length(pe2);
+        d = k0 * (k0 - 1.0f) / k1;
+        nLocal = pe2;
     }
+
+    // Gate matches narrow_pt_tri (radius + thickness band).
+    // Negative d ⇒ penetrating.
+    if (d >= p.radius + p.thickness) return;
+
+    // Normal back to world (identity quat ⇒ old radial behaviour).
+    float3 n = normalize(quatRotate(qw, qv, nLocal));
+
+    uint outIdx = atomic_fetch_add_explicit(
+        numNarrowCollisions, 1u, memory_order_relaxed);
+    if (outIdx >= p.maxNumCollisions) return;
+
+    narrowCollisions[outIdx].indexPair = uint2(id, 0u);
+    narrowCollisions[outIdx].objPair   = uint2(p.oid, sh.objId);
+    narrowCollisions[outIdx].collisionNormalAndDistance = float4(n, d);
+    narrowCollisions[outIdx].behaviorPair = uint2(p.clothBehavior,
+                                                  sh.behaviorType);
+    narrowCollisions[outIdx].shapePair = uint2(0u, sh.shapeType);
 }

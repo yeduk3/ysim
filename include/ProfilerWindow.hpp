@@ -62,7 +62,8 @@ void drawProfilerWindow(
     SceneCounts scene_counts = {},
     bool* use_segmented_bvh_query = nullptr,
     bool* use_agglomerative_bvh = nullptr,
-    bool* enable_refit = nullptr
+    bool* enable_refit = nullptr,
+    bool* use_analytic_primitive = nullptr
 );
 
 } // namespace profiler

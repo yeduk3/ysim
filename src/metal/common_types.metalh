@@ -37,11 +37,14 @@ struct AnalyticShape {
     uint flags;            // bit0 = collidable
 };
 
-// Per-(cloth-mesh) dispatch params for narrow_pt_analytic.
+// Per-(cloth-mesh, sphere) dispatch params for narrow_pt_analytic.
+// Slice (c-2): one dispatch per broad-marked (cloth, sphere) object
+// pair, so the kernel tests a SINGLE AnalyticShape (shapeIndex) instead
+// of looping the whole array — broad phase already decided the overlap.
 struct AnalyticNarrowParams {
-    uint  oid;             // owning cloth mesh id (== objPair.query)
+    uint  oid;             // owning cloth mesh INDEX (== objPair.query subscript)
     uint  numVerts;        // cloth vertex count (thread domain)
-    uint  numShapes;       // entries in the AnalyticShape array
+    uint  shapeIndex;      // compact AnalyticShape[] index for this pair
     uint  maxNumCollisions;
     uint  clothBehavior;   // BehaviorType for behaviorPair (debug/A5)
     float radius;
