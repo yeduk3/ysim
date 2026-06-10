@@ -35,7 +35,10 @@ void drawProfilerWindow(
     bool* use_segmented_bvh_query,
     bool* use_agglomerative_bvh,
     bool* enable_refit,
-    bool* use_analytic_primitive
+    bool* use_analytic_primitive,
+    bool* use_spatial_hashing,
+    std::uint32_t* refit_substep_period,
+    std::uint32_t* cd_substep_period
 ) {
     if (!state.open) return;
 
@@ -74,6 +77,11 @@ void drawProfilerWindow(
     if (debug_scene_box) ImGui::Checkbox("Debug Scene Box", debug_scene_box);
     if (debug_collisions) ImGui::Checkbox("Debug Collisions", debug_collisions);
     if (mesh_inspector_open) ImGui::Checkbox("Mesh Inspector", mesh_inspector_open);
+    if (use_spatial_hashing) {
+        ImGui::Checkbox("Spatial Hashing", use_spatial_hashing);
+        ImGui::SameLine();
+        ImGui::TextDisabled(*use_spatial_hashing ? "[uniform grid]" : "[BVH broadphase]");
+    }
     if (use_segmented_bvh_query) {
         ImGui::Checkbox("BVH Segmented Query (G)", use_segmented_bvh_query);
         ImGui::SameLine();
@@ -93,6 +101,28 @@ void drawProfilerWindow(
         ImGui::Checkbox("Analytic Primitive (A)", use_analytic_primitive);
         ImGui::SameLine();
         ImGui::TextDisabled(*use_analytic_primitive ? "[analytic]" : "[triangle-soup]");
+    }
+
+    if (refit_substep_period || cd_substep_period) {
+        ImGui::Separator();
+        ImGui::TextDisabled("Collision cadence (per substep, 1 = every substep)");
+        const ImU32 lo = 1, hi = 60;
+        if (refit_substep_period) {
+            if (*refit_substep_period < 1) *refit_substep_period = 1;
+            ImGui::SliderScalar("Refit period", ImGuiDataType_U32,
+                                refit_substep_period, &lo, &hi, "%u");
+            ImGui::SameLine();
+            ImGui::TextDisabled(*refit_substep_period <= 1 ? "[every substep]"
+                                                           : "[BVH AABB refresh]");
+        }
+        if (cd_substep_period) {
+            if (*cd_substep_period < 1) *cd_substep_period = 1;
+            ImGui::SliderScalar("CD period", ImGuiDataType_U32,
+                                cd_substep_period, &lo, &hi, "%u");
+            ImGui::SameLine();
+            ImGui::TextDisabled(*cd_substep_period <= 1 ? "[every substep]"
+                                                        : "[broad pair refresh; narrow every substep]");
+        }
     }
 
     ImGui::Separator();

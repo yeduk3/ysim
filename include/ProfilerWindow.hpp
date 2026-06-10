@@ -3,6 +3,7 @@
 #include "FrameProfiler.hpp"
 
 #include <chrono>
+#include <cstdint>
 #include <cstdio>
 #include <ctime>
 #include <string>
@@ -63,7 +64,12 @@ void drawProfilerWindow(
     bool* use_segmented_bvh_query = nullptr,
     bool* use_agglomerative_bvh = nullptr,
     bool* enable_refit = nullptr,
-    bool* use_analytic_primitive = nullptr
+    bool* use_analytic_primitive = nullptr,
+    bool* use_spatial_hashing = nullptr,
+    // Substep cadence knobs (Simulator::refitSubstepPeriod / cdSubstepPeriod,
+    // both Index == uint32_t). 1 = every substep. Live-editable sliders.
+    std::uint32_t* refit_substep_period = nullptr,
+    std::uint32_t* cd_substep_period = nullptr
 );
 
 } // namespace profiler

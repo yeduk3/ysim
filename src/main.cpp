@@ -6202,6 +6202,22 @@ struct Simulator {
     // key for side-by-side comparison.
     bool useAnalyticPrimitive = false;
 
+    // Substep-cadence knobs for the BVH collision path. 1 == today's
+    // behavior (refit + broad + narrow every substep). i % period == 0
+    // fires at i==0 for ANY period, so even period == subSteps runs once
+    // per frame (substep 0). The two are independent:
+    //   refitSubstepPeriod — how often the BVH leaf AABBs are refit.
+    //   cdSubstepPeriod    — how often the broad phase RE-TRAVERSES to
+    //                        refresh the candidate vertex-triangle pair set.
+    // Between broad detections the pair set is HELD; the narrow phase still
+    // runs EVERY substep on that held set, recomputing penetration depth
+    // from current positions so the contact response stays stable ("keep
+    // previous info" = keep the PAIRS, recompute the geometry — naive
+    // whole-contact reuse explodes in the fixed-push integrator). Used by
+    // --bench-cadence to sweep the cost/penetration tradeoff.
+    Index refitSubstepPeriod = 1;  // refit (+ enlargeTrajectory) every N substeps
+    Index cdSubstepPeriod    = 1;  // broad re-traversal (pair refresh) every N substeps
+
     // Per-substep stdout log for the SH path. Toggling this on also enables
     // shBroadPhase.verbose (forces a commit after the broad-phase dispatch so
     // the broad-phase ms is faithful). Useful when the GUI window can't keep
@@ -7805,59 +7821,91 @@ struct Simulator {
             if(Scene<BE, PR>::numMeshes > 0 && checkCollision) {
                 //MetalGlobalContext::commitAndWait();
 
-
+                // Substep-cadence gates. Clamp to >=1; both fire at i==0 of
+                // every frame (0 % p == 0 for any p) so the BVH is valid
+                // before the first query and period==subSteps == once/frame.
+                //
+                // Temporal-coherence pair reuse (the STABLE "keep previous
+                // info" — naive whole-contact reuse explodes because the
+                // integrator re-applies a STORED penetration push every
+                // substep, accumulating energy):
+                //   * doRefit → BVH AABB maintenance every refitP.
+                //   * doBroad → re-traverse the BVH to refresh the candidate
+                //               vertex-triangle PAIR set every cdP. Between
+                //               detections the pair set (broadCollisions) is
+                //               HELD: only a fresh broad detect resets
+                //               numBroadCollisions, so skipping preserves it.
+                //   * narrow  → runs EVERY substep on the held pairs,
+                //               recomputing penetration depth+normal from the
+                //               CURRENT positions, so the contact push is
+                //               always fresh (self-limiting) and the response
+                //               is stable. Penetration appears only when the
+                //               held pair set stops covering the true contacts
+                //               (cloth drifted onto triangles not in the set).
+                const Index refitP = (refitSubstepPeriod < 1) ? Index(1) : refitSubstepPeriod;
+                const Index cdP    = (cdSubstepPeriod    < 1) ? Index(1) : cdSubstepPeriod;
+                const bool doRefit = (i % refitP == 0);
+                const bool doBroad = (i % cdP    == 0);
 
                 if (useSpatialHashing) {
                     // Mirror the toggle into the SH instance so detectCollisions
                     // commits the broad-phase dispatch and fills heavy-cell stats.
                     shBroadPhase.verbose = logSHPerSubstep;
                     //shBroadPhase.cellSizeFactor = shCellSizeFactor;
-                    if (profiler) {
-                        auto scope = profiler->scoped("broad_refit");
-                        shBroadPhase.refit();
-                    } else {
-                        shBroadPhase.refit();
+                    if (doRefit) {
+                        if (profiler) {
+                            auto scope = profiler->scoped("broad_refit");
+                            shBroadPhase.refit();
+                        } else {
+                            shBroadPhase.refit();
+                        }
                     }
                     // detectCollisions emits its own per-stage sh_* scopes.
-                    if (profiler) {
-                        auto scope = profiler->scoped("broad_detect");
-                        shBroadPhase.detectCollisions(margin, enableSelfCollisions);
-                    } else {
-                        shBroadPhase.detectCollisions(margin, enableSelfCollisions);
-                    }
-                    if (logSHPerSubstep) {
-                        shBroadPhase.printLastStats(std::cout, frame, i);
+                    if (doBroad) {
+                        if (profiler) {
+                            auto scope = profiler->scoped("broad_detect");
+                            shBroadPhase.detectCollisions(margin, enableSelfCollisions);
+                        } else {
+                            shBroadPhase.detectCollisions(margin, enableSelfCollisions);
+                        }
+                        if (logSHPerSubstep) {
+                            shBroadPhase.printLastStats(std::cout, frame, i);
+                        }
                     }
                 } else {
-                    if (profiler) {
-                        auto scope = profiler->scoped("broad_refit");
-                        collisionPipeline.broadPhase.refit();
-                    } else {
-                        collisionPipeline.broadPhase.refit();
+                    if (doRefit) {
+                        if (profiler) {
+                            auto scope = profiler->scoped("broad_refit");
+                            collisionPipeline.broadPhase.refit();
+                        } else {
+                            collisionPipeline.broadPhase.refit();
+                        }
+                        // Inflate per-mesh AABBs by velocity * subh so a thin
+                        // mesh moving a full substep's distance still overlaps
+                        // its target's AABB in the broad-phase intersect test.
+                        // Without this, a flat cloth (~zero-thickness Y AABB)
+                        // crossing a flat ground in one substep is missed —
+                        // CM-005's root cause.
+                        if (profiler) {
+                            auto scope = profiler->scoped("broad_enlarge_trajectory");
+                            collisionPipeline.broadPhase.enlargeTrajectory(system.subh);
+                        } else {
+                            collisionPipeline.broadPhase.enlargeTrajectory(system.subh);
+                        }
                     }
-                    // Inflate per-mesh AABBs by velocity * subh so a thin
-                    // mesh moving a full substep's distance still overlaps
-                    // its target's AABB in the broad-phase intersect test.
-                    // Without this, a flat cloth (~zero-thickness Y AABB)
-                    // crossing a flat ground in one substep is missed —
-                    // CM-005's root cause.
-                    if (profiler) {
-                        auto scope = profiler->scoped("broad_enlarge_trajectory");
-                        collisionPipeline.broadPhase.enlargeTrajectory(system.subh);
-                    } else {
-                        collisionPipeline.broadPhase.enlargeTrajectory(system.subh);
-                    }
-                    if (profiler) {
-                        auto scope = profiler->scoped("broad_detect");
-                        if (useSegmentedBVHQuery)
-                            collisionPipeline.broadPhase.detectCollisionsSegmented(margin, enableSelfCollisions, useAnalyticPrimitive);
-                        else
-                            collisionPipeline.broadPhase.detectCollisions(margin, enableSelfCollisions, useAnalyticPrimitive);
-                    } else {
-                        if (useSegmentedBVHQuery)
-                            collisionPipeline.broadPhase.detectCollisionsSegmented(margin, enableSelfCollisions, useAnalyticPrimitive);
-                        else
-                            collisionPipeline.broadPhase.detectCollisions(margin, enableSelfCollisions, useAnalyticPrimitive);
+                    if (doBroad) {
+                        if (profiler) {
+                            auto scope = profiler->scoped("broad_detect");
+                            if (useSegmentedBVHQuery)
+                                collisionPipeline.broadPhase.detectCollisionsSegmented(margin, enableSelfCollisions, useAnalyticPrimitive);
+                            else
+                                collisionPipeline.broadPhase.detectCollisions(margin, enableSelfCollisions, useAnalyticPrimitive);
+                        } else {
+                            if (useSegmentedBVHQuery)
+                                collisionPipeline.broadPhase.detectCollisionsSegmented(margin, enableSelfCollisions, useAnalyticPrimitive);
+                            else
+                                collisionPipeline.broadPhase.detectCollisions(margin, enableSelfCollisions, useAnalyticPrimitive);
+                        }
                     }
                 }
 
@@ -7868,6 +7916,10 @@ struct Simulator {
                 // narrow_pt_tri path (skipSphere stays 0). BVH path = full
                 // analytic. Default broad is BVH, so the toggle behaves as
                 // expected in normal use.
+                //
+                // Narrow runs EVERY substep on the held broad pair set,
+                // recomputing contact geometry from current positions → the
+                // response stays fresh/stable regardless of cdP.
                 const bool analyticNarrow = useAnalyticPrimitive && !useSpatialHashing;
                 if (profiler) {
                     auto scope = profiler->scoped("narrow_phase");
@@ -7877,12 +7929,12 @@ struct Simulator {
                 }
 
                 if (profiler) {
-                    // Per-substep totals — packed counters reset on the next
-                    // substep's broad/narrow dispatch, so read them now and
-                    // accumulate into the frame snapshot.
+                    // Broad pairs counted only on a fresh detect (numBroad
+                    // persists between, would double-count otherwise); narrow
+                    // contacts counted every substep since narrow runs always.
                     auto& packedCol = Scene<BE, PR>::packedCollisionData;
                     profiler->addCollisionCounts(
-                        static_cast<uint64_t>(packedCol.numBroadCollisions[0]),
+                        doBroad ? static_cast<uint64_t>(packedCol.numBroadCollisions[0]) : uint64_t(0),
                         static_cast<uint64_t>(packedCol.numNarrowCollisions[0]));
                 }
             }
@@ -9682,6 +9734,240 @@ static int runAnalyticBench(const AnalyticBenchConfig& cfg) {
     csv.flush();
     csv.close();
     std::cerr << "[analytic-bench DONE] wrote " << cfg.outCsvPath << "\n";
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// --bench-cadence : refit/CD substep-cadence sweep + analytic penetration.
+//
+// For each (scene, refitPeriod, cdPeriod) the cloth-on-sphere scene runs with
+// the triangle-soup collision path (useAnalyticPrimitive=false) so the cadence
+// actually drives cost AND correctness. refit/CD are thinned out per
+// Simulator::refitSubstepPeriod / cdSubstepPeriod. Penetration is measured
+// analytically on the final frame against the static sphere (origin, r=0.5),
+// independent of the response path.
+//
+// Three artifacts:
+//   * outCsvPath        — per-frame time series (108 cases x measuredFrames)
+//   * penSummaryCsvPath — one penetration summary row per case (108)
+//   * particlesCsvPath  — final-frame cloth vertices per case (the spatial
+//                         dump chart.py renders the "last frame picture" from)
+// ---------------------------------------------------------------------------
+struct CadenceBenchConfig {
+    std::vector<int> sceneNum1Ds;   // clothN == sphereN
+    std::vector<int> refitPeriods;  // substep units
+    std::vector<int> cdPeriods;     // substep units
+    int warmupFrames = 1;
+    int measuredFrames = 30;
+    std::string outCsvPath;
+    std::string penSummaryCsvPath;
+    std::string particlesCsvPath;
+};
+
+static int runCadenceBench(const CadenceBenchConfig& cfg) {
+    using Backend = METAL;
+    using SystemT = ExplicitSystem<Backend, Precision>;
+
+    auto* device = MetalGlobalContext::getDevice();
+    if (!device) {
+        std::cerr << "[cadence-bench SKIP] metal-device: null\n";
+        return 0;
+    }
+    auto* lib = MetalKernelContext::getLibrary();
+    if (!lib) {
+        std::cerr << "[cadence-bench SKIP] metal-library: default.metallib not loadable\n";
+        return 0;
+    }
+
+    namespace fs = std::filesystem;
+    auto ensureParent = [](const std::string& p) -> bool {
+        fs::path path(p);
+        if (!path.has_parent_path()) return true;
+        std::error_code ec;
+        fs::create_directories(path.parent_path(), ec);
+        if (ec) {
+            std::cerr << "[cadence-bench FAIL] mkdir " << path.parent_path()
+                      << ": " << ec.message() << "\n";
+            return false;
+        }
+        return true;
+    };
+    if (!ensureParent(cfg.outCsvPath) || !ensureParent(cfg.penSummaryCsvPath)
+        || !ensureParent(cfg.particlesCsvPath))
+        return 1;
+
+    std::ofstream csv(cfg.outCsvPath);
+    std::ofstream pen(cfg.penSummaryCsvPath);
+    std::ofstream par(cfg.particlesCsvPath);
+    if (!csv || !pen || !par) {
+        std::cerr << "[cadence-bench FAIL] open output csv\n";
+        return 1;
+    }
+    csv << "scene_n,refit_period,cd_period,frame_index,broad_refit_ms,"
+        << "broad_detect_ms,narrow_phase_ms,collision_detection_ms,"
+        << "physics_total_ms,broad_collisions,narrow_collisions,"
+        << "cd_passes,refit_passes\n";
+    pen << "scene_n,refit_period,cd_period,n_particles,n_penetrating,"
+        << "pen_fraction,max_pen_depth,mean_pen_depth,n_below_south,min_d\n";
+    par << "scene_n,refit_period,cd_period,vid,x,y,z,signed_dist\n";
+
+    auto resetScene = []() {
+        for (auto& m : Scene<Backend, Precision>::meshes) m.initializer = nullptr;
+        Scene<Backend, Precision>::meshes.clear();
+        for (auto& r : Scene<Backend, Precision>::requestsGeneralMeshes)
+            delete r.initializer;
+        Scene<Backend, Precision>::requestsGeneralMeshes.clear();
+        Scene<Backend, Precision>::numMeshes = 0;
+        Scene<Backend, Precision>::nextMeshId = 0;
+        Scene<Backend, Precision>::dirty = true;
+        Scene<Backend, Precision>::environment = SceneEnvironment{};
+    };
+
+    // Static sphere ground truth: addSphere(center, tess, size=1.0) => radius 0.5.
+    const Precision sphereR = Precision(0.5);
+    const Precision penEps  = Precision(1e-4);
+
+    for (int sceneN : cfg.sceneNum1Ds) {
+        for (int refitP : cfg.refitPeriods) {
+            for (int cdP : cfg.cdPeriods) {
+                resetScene();
+                Precision h = Precision(1) / Precision(60);
+                Index subSteps = 60;
+                SystemT system(h, subSteps);
+                Simulator<Backend, Precision, SystemT> sim(system);
+                sim.pause = false;
+                sim.useAnalyticPrimitive = false;          // triangle-soup path
+                sim.refitSubstepPeriod = static_cast<Index>(refitP);
+                sim.cdSubstepPeriod    = static_cast<Index>(cdP);
+                sim.targetFrames = cfg.warmupFrames + cfg.measuredFrames + 5;
+
+                // Cloth above sphere top (y=0.5) so gravity drapes it on.
+                sim.addClothGridFastAt(sceneN, Precision(1.0),
+                                       tinym::vec3(0, Precision(0.7), 0));
+                // Sphere: diameter 1 (radius 0.5), Rigid static (mass=0).
+                sim.addSphere(tinym::vec3(0, 0, 0),
+                              sceneN, Precision(1.0), Precision(1.0),
+                              BehaviorType::Rigid);
+                auto& sphereReq = Scene<Backend, Precision>::requestsGeneralMeshes.back();
+                sphereReq.applyGravity = false;
+                sphereReq.applyWind    = false;
+
+                sim.initialize();
+
+                profiler::FrameProfiler localProfiler(
+                    static_cast<std::size_t>(cfg.warmupFrames + cfg.measuredFrames + 4));
+                sim.profiler = &localProfiler;
+
+                auto getMs = [&](const char* name) -> double {
+                    int sidx = localProfiler.history().sectionIndex(name);
+                    const auto* snap = localProfiler.history().latestFrame();
+                    if (snap && sidx >= 0
+                        && static_cast<std::size_t>(sidx) < snap->section_ms.size())
+                        return snap->section_ms[sidx];
+                    return -1.0;
+                };
+                auto ms0 = [](double v) { return v < 0.0 ? 0.0 : v; };
+
+                // Deterministic pass counts: i in [0,subSteps) with i%period==0.
+                auto passCount = [&](int period) -> int {
+                    int p = period < 1 ? 1 : period;
+                    int n = 0;
+                    for (int i = 0; i < (int)subSteps; ++i) if (i % p == 0) ++n;
+                    return n;
+                };
+                const int cdPasses    = passCount(cdP);
+                const int refitPasses = passCount(refitP);
+
+                int totalFrames = cfg.warmupFrames + cfg.measuredFrames;
+                for (int f = 0; f < totalFrames; ++f) {
+                    localProfiler.beginFrame(static_cast<uint64_t>(f),
+                                             static_cast<double>(f) * (double)h);
+                    {
+                        auto scope = localProfiler.scoped("physics_total");
+                        sim.update();
+                    }
+                    localProfiler.endFrame();
+
+                    if (f >= cfg.warmupFrames) {
+                        int frameIdx = f - cfg.warmupFrames;
+                        double refitMs  = ms0(getMs("broad_refit"));
+                        double enlMs    = ms0(getMs("broad_enlarge_trajectory"));
+                        double broadMs  = ms0(getMs("broad_detect"));
+                        double narrowMs = ms0(getMs("narrow_phase"));
+                        double physMs   = ms0(getMs("physics_total"));
+                        double cdMs     = refitMs + enlMs + broadMs + narrowMs;
+                        uint64_t broadN = 0, narrowN = 0;
+                        const auto* snap = localProfiler.history().latestFrame();
+                        if (snap) {
+                            broadN  = snap->broad_collisions;
+                            narrowN = snap->narrow_collisions;
+                        }
+                        csv << sceneN << ',' << refitP << ',' << cdP << ','
+                            << frameIdx << ',' << refitMs << ',' << broadMs << ','
+                            << narrowMs << ',' << cdMs << ',' << physMs << ','
+                            << broadN << ',' << narrowN << ','
+                            << cdPasses << ',' << refitPasses << '\n';
+                    }
+                }
+                sim.profiler = nullptr;
+
+                // ---- Analytic penetration on the final frame ----
+                const Precision* clothX = nullptr;
+                Index clothVerts = 0;
+                for (auto& m : Scene<Backend, Precision>::meshes) {
+                    if (m.behaviorType == BehaviorType::FastGridCloth
+                        && m.state.x.ptr && m.state.x.size > 0) {
+                        clothX = m.state.x.ptr;
+                        clothVerts = m.state.x.size / 3;
+                        break;
+                    }
+                }
+                // n_penetrating: verts INSIDE the sphere (d < r) — surface
+                //   penetration. n_below_south: verts past the south pole
+                //   (y < -r) — caught the catastrophic full-tunnel case that
+                //   "inside" misses (a tunneled vert exits below, d > r).
+                //   min_d: closest any vert got to the center (deepest dig).
+                Index nPen = 0, nBelow = 0;
+                double maxDepth = 0.0, sumDepth = 0.0, minD = 1e30;
+                for (Index v = 0; v < clothVerts; ++v) {
+                    double x = (double)clothX[v*3+0];
+                    double y = (double)clothX[v*3+1];
+                    double z = (double)clothX[v*3+2];
+                    double d = std::sqrt(x*x + y*y + z*z);
+                    double signed_d = d - (double)sphereR;
+                    par << sceneN << ',' << refitP << ',' << cdP << ',' << v << ','
+                        << x << ',' << y << ',' << z << ',' << signed_d << '\n';
+                    if (d < minD) minD = d;
+                    if (y < -(double)sphereR) ++nBelow;   // tunneled past south pole
+                    if (signed_d < -(double)penEps) {
+                        ++nPen;
+                        double depth = -signed_d;
+                        sumDepth += depth;
+                        if (depth > maxDepth) maxDepth = depth;
+                    }
+                }
+                if (clothVerts == 0) minD = 0.0;
+                double frac = clothVerts > 0 ? (double)nPen / (double)clothVerts : 0.0;
+                double meanDepth = nPen > 0 ? sumDepth / (double)nPen : 0.0;
+                pen << sceneN << ',' << refitP << ',' << cdP << ','
+                    << clothVerts << ',' << nPen << ',' << frac << ','
+                    << maxDepth << ',' << meanDepth << ',' << nBelow << ','
+                    << minD << '\n';
+
+                std::cerr << "[cadence-bench] scene=" << sceneN
+                          << " refitP=" << refitP << " cdP=" << cdP
+                          << " | nPen=" << nPen << "/" << clothVerts
+                          << " maxDepth=" << maxDepth << "\n";
+            }
+        }
+    }
+
+    csv.flush();  csv.close();
+    pen.flush();  pen.close();
+    par.flush();  par.close();
+    std::cerr << "[cadence-bench DONE] wrote\n  " << cfg.outCsvPath
+              << "\n  " << cfg.penSummaryCsvPath
+              << "\n  " << cfg.particlesCsvPath << "\n";
     return 0;
 }
 
@@ -13754,6 +14040,26 @@ int main(int argc, char** argv) {
 #endif
         return runAnalyticBench(cfg);
     }
+    if (argc > 1 && std::string(argv[1]) == "--bench-cadence") {
+        // refit/CD substep-cadence sweep: scene {20,50,100} (clothN==sphereN)
+        // × refitP × cdP ∈ {1,5,10,20,40,60} → 3×6×6 = 108 cases, 30 frames.
+        CadenceBenchConfig cfg;
+        cfg.sceneNum1Ds   = {20, 50, 100};
+        cfg.refitPeriods  = {1, 5, 10, 20, 40, 60};
+        cfg.cdPeriods     = {1, 5, 10, 20, 40, 60};
+        cfg.warmupFrames  = 1;
+        cfg.measuredFrames = 30;
+#ifdef YSIM_PROJECT_ROOT
+        const std::string dir = std::string(YSIM_PROJECT_ROOT)
+                              + "/profiles/experiment/refit-cd-cadence-2026-06-05/";
+#else
+        const std::string dir = "profiles/experiment/refit-cd-cadence-2026-06-05/";
+#endif
+        cfg.outCsvPath        = dir + "cadence_bench.csv";
+        cfg.penSummaryCsvPath = dir + "penetration_summary.csv";
+        cfg.particlesCsvPath  = dir + "last_frame_particles.csv";
+        return runCadenceBench(cfg);
+    }
 
     std::cout << "Run simulator" << std::endl;
 
@@ -15630,7 +15936,10 @@ int main(int argc, char** argv) {
                 &simulator.useSegmentedBVHQuery,
                 &simulator.collisionPipeline.broadPhase.useAgglomerative,
                 &simulator.collisionPipeline.broadPhase.enableRefit,
-                &simulator.useAnalyticPrimitive
+                &simulator.useAnalyticPrimitive,
+                &simulator.useSpatialHashing,
+                &simulator.refitSubstepPeriod,
+                &simulator.cdSubstepPeriod
             );
             scene_log::drawSceneActionLogWindow(sceneLogWindowState);
             ImGui::Render();
@@ -15648,7 +15957,10 @@ int main(int argc, char** argv) {
                 &simulator.useSegmentedBVHQuery,
                 &simulator.collisionPipeline.broadPhase.useAgglomerative,
                 &simulator.collisionPipeline.broadPhase.enableRefit,
-                &simulator.useAnalyticPrimitive
+                &simulator.useAnalyticPrimitive,
+                &simulator.useSpatialHashing,
+                &simulator.refitSubstepPeriod,
+                &simulator.cdSubstepPeriod
             );
             scene_log::drawSceneActionLogWindow(sceneLogWindowState);
             ImGui::Render();
