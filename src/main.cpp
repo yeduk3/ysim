@@ -6972,6 +6972,11 @@ struct Simulator {
             cy->params.center = newPos;
         } else if (auto* f  = dynamic_cast<MeshFileInitializer  <BE, PR>*>(mesh->initializer)) {
             f->params.offset = newPos;
+        } else if (auto* kb = dynamic_cast<MeshKinematicInitializer<BE, PR>*>(mesh->initializer)) {
+            // Without this, reset/re-pack reseeds transformPosition from
+            // the stale authored center and drops the user's translation
+            // (Scene::pack's kinematic branch reads params.center).
+            kb->params.center = newPos;
         } else if (auto* a  = dynamic_cast<AssimpMeshFileInitializer<BE, PR>*>(mesh->initializer)) {
             // Sibling of MeshFileInitializer (see Scene::pack cascade): the
             // cast above won't catch it. Write back so a subsequent re-pack
@@ -14534,6 +14539,28 @@ static int runSelfTest() {
                                      "swapped=" + std::to_string((int)swapped));
                     } else {
                         skip("KIN-4", "jogCurve.bvh missing");
+                    }
+
+                    // 5) User translation survives reset (translateObject
+                    //    must write back params.center — the re-pack in
+                    //    reset() reseeds transformPosition from it).
+                    {
+                        sim.translateObject(0, tinym::vec3(2.0f, 0.0f, -1.0f));
+                        sim.reset();
+                        MetalGlobalContext::commitAndWait();
+                        auto* m5 = Scene<Backend, Precision>::findById(0);
+                        auto* kin5 = sim.kinematicOf(0);
+                        bool posKept = m5
+                            && std::fabs(m5->transformPosition.x - 2.0f) < 1e-5f
+                            && std::fabs(m5->transformPosition.y - 0.0f) < 1e-5f
+                            && std::fabs(m5->transformPosition.z + 1.0f) < 1e-5f;
+                        bool timeReset = kin5 && kin5->localTime == 0.0;
+                        if (posKept && timeReset)
+                            pass("KIN-5 / translate survives reset + time rewinds");
+                        else
+                            fail("KIN-5 / translate survives reset + time rewinds",
+                                 std::string("posKept=") + std::to_string((int)posKept)
+                                 + " timeReset=" + std::to_string((int)timeReset));
                     }
                 }
             }
