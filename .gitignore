@@ -7,9 +7,7 @@ compile_commands.json
 .DS_Store
 
 codex/
-profiles/*
-!profiles/experiment/
-!profiles/experiment/**
+profiles/
 
 .claude/settings.local.json
 CLAUDE.md
@@ -17,3 +15,8 @@ CLAUDE.md
 uml/
 
 .obsidian/
+
+.claude/worktrees/
+docs/references/**/*.pdf
+docs/references/**/*.html
+assets/BVH/
