@@ -7774,6 +7774,13 @@ struct Simulator {
     // configuration; transforms/pins/constraints are preserved because
     // they live on the request).
     void reset() {
+        // Kinematic playback rewinds to frame 0 on reset. The clock lives
+        // on the initializer precisely so it SURVIVES ordinary re-packs
+        // (file swap, mesh add); reset is the one path that explicitly
+        // rewinds it — initialize() then bakes the t=0 pose into state.x.
+        for (auto& req : Scene<BE, PR>::requestsGeneralMeshes)
+            if (auto* kin = dynamic_cast<MeshKinematicInitializer<BE, PR>*>(req.initializer))
+                kin->localTime = 0.0;
         initialize();
     }
 
@@ -14688,7 +14695,7 @@ int main(int argc, char** argv) {
     //simulator.addFloatMesh("src/assets", "horse-gallop-01.obj", {0, -1, 0}, 1.2);
     //simulator.addFloatMesh("src/assets", "camel-gallop-reference.obj", {0, -1, 0}, 1.2);
     simulator.addFloatMesh("assets", "Human.obj", {0, -0.65, 0}, 0.04);
-    simulator.addGround(PlaneDirection::XZPlane, tinym::vec3(0, -1, 0), 5);
+    simulator.addGround(PlaneDirection::XZPlane, tinym::vec3(0, 0, 0), 5);
 
     std::cout << "[Main] mesh added to scene" << std::endl;
 
@@ -15608,9 +15615,14 @@ int main(int argc, char** argv) {
         static float planePos[3] = {0.f, 0.f, 0.f};
         static int planeDirIdx = 2; // 0:XY, 1:YZ, 2:XZ (default ground)
         static int planeTess = 20; // particleNum1D; >=2. higher = cloth-ready
-        // Wall-clock ↔ sim-time sync toggle (보기 menu). On: fixed-h steps
-        // are paced by the accumulated wall dt; off: legacy 1 step/frame.
+        // Wall-clock ↔ sim-time sync toggle (좌측 시뮬레이션 환경 패널).
+        // On: fixed-h steps are paced by the accumulated wall dt; off:
+        // legacy 1 step/frame.
         static bool realtimeSimSync = true;
+        // Shadow pass toggle (좌측 조명 패널). Gates both the depth pass
+        // and the shadowsOn frag uniform; shadowOk (FBO health) still
+        // wins when false.
+        static bool shadowsEnabled = true;
 
         // ─── Top bar: h≈56, 파일/보기(px=12) + 우측 선택모드 탭(hug) ──
         {
@@ -15631,7 +15643,6 @@ int main(int argc, char** argv) {
                     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(8, 12));
                     if (ImGui::MenuItem("프로파일러")) profilerWindowState.open = true;
                     if (ImGui::MenuItem("씬 동작 로그")) sceneLogWindowState.open = true;
-                    ImGui::MenuItem("실시간 동기화", nullptr, &realtimeSimSync);
                     ImGui::PopStyleVar();
                     ImGui::EndMenu();
                 }
@@ -15940,6 +15951,34 @@ int main(int argc, char** argv) {
                 ImGui::Dummy({0, P});
             }
 
+            // Label-left / pill-right toggle row, mirroring the
+            // inspector's PillToggle look (42x24, dark=on).
+            auto panelToggleRow = [&](const char* id, const char* label,
+                                      bool* v) -> bool {
+                bool changed = false;
+                ImGui::PushID(id);
+                ImGui::PushStyleColor(ImGuiCol_Text,
+                                      ImVec4(0.420f, 0.463f, 0.518f, 1.0f));
+                ImGui::TextUnformatted(label);
+                ImGui::PopStyleColor();
+                const float w = 42, h = 24, r = h / 2;
+                ImGui::SameLine();
+                ImGui::SetCursorPosX(ImGui::GetCursorPosX() +
+                    ImGui::GetContentRegionAvail().x - w - P);
+                ImVec2 pos = ImGui::GetCursorScreenPos();
+                ImDrawList* dl = ImGui::GetWindowDrawList();
+                if (ImGui::InvisibleButton("##t", {w, h})) { *v = !*v; changed = true; }
+                dl->AddRectFilled(pos, {pos.x + w, pos.y + h},
+                    ImGui::ColorConvertFloat4ToU32(*v
+                        ? ImVec4(0.063f, 0.078f, 0.102f, 1.0f)
+                        : ImVec4(0.886f, 0.906f, 0.922f, 1.0f)), r);
+                float tr = 10, tx = *v ? pos.x + w - 2 - tr : pos.x + 2 + tr;
+                dl->AddCircleFilled({tx, pos.y + h / 2}, tr,
+                                    IM_COL32(255, 255, 255, 255), 16);
+                ImGui::PopID();
+                return changed;
+            };
+
             // ── 시뮬레이션 환경 Simulation ───────────────────────
             // Edits the live ExplicitSystem driving the sim: `h` is
             // the per-frame time step (default 1/60 s), `subSteps` the
@@ -15981,6 +16020,9 @@ int main(int argc, char** argv) {
                     system.subh = system.h / (Precision)system.subSteps;
                 }
 
+                ImGui::Dummy({0, 20});
+                panelToggleRow("rtSync", "실시간 동기화", &realtimeSimSync);
+
                 ImGui::Unindent(P);
                 ImGui::Dummy({0, P});
             }
@@ -16014,6 +16056,9 @@ int main(int argc, char** argv) {
                 ImGui::SliderFloat("##lightInt", &env.lightIntensity, 0.0f, 10.0f, "");
                 ImGui::PopStyleVar();
                 ImGui::PopStyleColor(3);
+
+                ImGui::Dummy({0, 16});
+                panelToggleRow("shadows", "그림자", &shadowsEnabled);
 
                 ImGui::Unindent(P);
                 ImGui::Dummy({0, P});
@@ -16414,7 +16459,7 @@ int main(int argc, char** argv) {
         // (50, 50, 30); the ortho box covers the authoring area around
         // the origin — fragments outside it sample as lit (border=1).
         tinym::mat4 lightVP(1);
-        if (shadowOk) {
+        if (shadowOk && shadowsEnabled) {
             const tinym::vec3 lightDir =
                 tinym::vec3(50.0f, 50.0f, 30.0f).normalize();
             const float R = 8.0f, zn = 1.0f, zf = 80.0f;
@@ -16441,7 +16486,7 @@ int main(int argc, char** argv) {
             // sharing unit 0 with the idBuffer sampler2D makes every draw
             // GL_INVALID_OPERATION on macOS even when neither is sampled.
             shader.setUniform("shadowMap", 2);
-            if (!shadowOk) {
+            if (!shadowOk || !shadowsEnabled) {
                 shader.setUniform("shadowsOn", 0);
                 return;
             }
