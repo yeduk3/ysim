@@ -8358,6 +8358,14 @@ struct Simulator {
         }
     }
 
+    // Shadow-pass driver: depth-only draw of every mesh into the
+    // caller's shadow FBO (caller binds FBO, sets viewport + LightVP).
+    void drawDepth() {
+        for(auto& mesh : scene.meshes) {
+            renderState.getOrCreate(mesh).drawDepthOnly();
+        }
+    }
+
     // Point-id pass driver (point selection mode). Caller binds the id
     // FBO, runs a depth-only triangle pre-pass, sets glPointSize +
     // GL_LEQUAL, then calls this. mesh.id == compacted slot so the .r
@@ -12588,6 +12596,11 @@ static int runSelfTest() {
                 // spread-out lower-magnitude glow — discriminating
                 // across the image.
                 fboShader.use();
+                // shadowMap (sampler2DShadow) must not share unit 0 with
+                // idBuffer (sampler2D) — same-unit mixed sampler types make
+                // every draw GL_INVALID_OPERATION on macOS. Shadows stay
+                // off (shadowsOn defaults 0); only the unit is separated.
+                fboShader.setUniform("shadowMap", 2);
                 tinym::mat4 M(1.0f);
                 tinym::mat4 V = tinym::lookAt(
                     tinym::vec3(0.7f, 0.7f, 3.0f),
@@ -12659,6 +12672,184 @@ static int runSelfTest() {
                          + " — shader did not visibly respond to roughness "
                          "uniform change between 0.1 and 0.9");
                 }
+            }
+        }
+    }
+
+    // ---- Block 25b: SHADOW — directional shadow map darkens the receiver. --
+    // Same HiddenGLContext + readback discipline as Block 25. Renders a
+    // ground quad + a floating cube twice: once with shadowsOn=0, once with
+    // a real depth pass bound and shadowsOn=1 (the exact light-VP math the
+    // render loop uses). The shadowed render must be measurably darker on
+    // average (shadows only ever REMOVE direct light) yet not black (the
+    // ambient term survives). Catches: broken light VP, depth-compare
+    // misconfiguration, bias/projection errors that shadow everything.
+    {
+        HiddenGLContext glctx(256, 256);
+        if (!glctx.ok) {
+            skip("shadow-glfw-init", "no GL on this host");
+        } else {
+            Program mainSh, depthSh;
+            mainSh.loadShader("shader.vert", "shader.geom", "shader.frag");
+            depthSh.loadShader("shadow.vert", "shadow.frag");
+            if (!mainSh.programID || !depthSh.programID) {
+                skip("shadow-shader-load",
+                     "shader/shadow programs not loadable from cwd");
+            } else {
+                // Ground quad y=0 (±3) + cube (side 1) centered at y=0.8.
+                const float g = 3.0f;
+                float planeVerts[4 * 3] = {
+                    -g, 0,  g,   g, 0,  g,   g, 0, -g,  -g, 0, -g,
+                };
+                unsigned int planeIdx[6] = {0, 1, 2, 0, 2, 3};
+                float planeNormals[4 * 3] = {0};
+                MeshGL<CPU> planeMesh(4, planeVerts, 2, planeIdx, planeNormals);
+                planeMesh.computeNormal();
+                planeMesh.updateBuffer();
+
+                const float s = 0.5f, cy = 0.8f;
+                float cubeVerts[24 * 3] = {
+                    -s, cy-s,  s,   s, cy-s,  s,   s, cy+s,  s,  -s, cy+s,  s,
+                     s, cy-s, -s,  -s, cy-s, -s,  -s, cy+s, -s,   s, cy+s, -s,
+                     s, cy-s,  s,   s, cy-s, -s,   s, cy+s, -s,   s, cy+s,  s,
+                    -s, cy-s, -s,  -s, cy-s,  s,  -s, cy+s,  s,  -s, cy+s, -s,
+                    -s, cy+s,  s,   s, cy+s,  s,   s, cy+s, -s,  -s, cy+s, -s,
+                    -s, cy-s, -s,   s, cy-s, -s,   s, cy-s,  s,  -s, cy-s,  s,
+                };
+                unsigned int cubeIdx[12 * 3];
+                for (int f = 0; f < 6; ++f) {
+                    unsigned int b = f * 4;
+                    cubeIdx[f*6+0] = b+0; cubeIdx[f*6+1] = b+1; cubeIdx[f*6+2] = b+2;
+                    cubeIdx[f*6+3] = b+0; cubeIdx[f*6+4] = b+2; cubeIdx[f*6+5] = b+3;
+                }
+                float cubeNormals[24 * 3] = {0};
+                MeshGL<CPU> cubeMesh(24, cubeVerts, 12, cubeIdx, cubeNormals);
+                cubeMesh.computeNormal();
+                cubeMesh.updateBuffer();
+
+                // Shadow depth FBO — mirrors the render loop's setup.
+                const int kRes = 512;
+                GLuint sFbo = 0, sTex = 0;
+                glGenTextures(1, &sTex);
+                glBindTexture(GL_TEXTURE_2D, sTex);
+                glTexImage2D(GL_TEXTURE_2D, 0, GL_DEPTH_COMPONENT24, kRes,
+                             kRes, 0, GL_DEPTH_COMPONENT, GL_FLOAT, nullptr);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_BORDER);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_BORDER);
+                const float kBorder[4] = {1, 1, 1, 1};
+                glTexParameterfv(GL_TEXTURE_2D, GL_TEXTURE_BORDER_COLOR, kBorder);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_COMPARE_MODE,
+                                GL_COMPARE_REF_TO_TEXTURE);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_COMPARE_FUNC, GL_LEQUAL);
+                glGenFramebuffers(1, &sFbo);
+                glBindFramebuffer(GL_FRAMEBUFFER, sFbo);
+                glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT,
+                                       GL_TEXTURE_2D, sTex, 0);
+                glDrawBuffer(GL_NONE);
+                glReadBuffer(GL_NONE);
+                bool fboOk = glCheckFramebufferStatus(GL_FRAMEBUFFER)
+                             == GL_FRAMEBUFFER_COMPLETE;
+                glBindFramebuffer(GL_FRAMEBUFFER, 0);
+
+                if (!fboOk) {
+                    skip("shadow-fbo", "depth-only FBO incomplete on this host");
+                } else {
+                    // Light VP — identical math to the render loop.
+                    const tinym::vec3 lightDir =
+                        tinym::vec3(50.0f, 50.0f, 30.0f).normalize();
+                    const float R = 8.0f, zn = 1.0f, zf = 80.0f;
+                    tinym::mat4 lightView = tinym::lookAt(
+                        lightDir * 40.0f, tinym::vec3(0, 0, 0),
+                        tinym::vec3(0, 1, 0));
+                    tinym::mat4 lightProj(
+                        tinym::vec4(1.0f / R, 0.0f, 0.0f, 0.0f),
+                        tinym::vec4(0.0f, 1.0f / R, 0.0f, 0.0f),
+                        tinym::vec4(0.0f, 0.0f, -2.0f / (zf - zn), 0.0f),
+                        tinym::vec4(0.0f, 0.0f, -(zf + zn) / (zf - zn), 1.0f));
+                    tinym::mat4 lightVP = lightProj * lightView;
+
+                    Framebuffer fbo;
+                    fbo.init(glctx.window, 256, 256);
+                    TextureFormat tf;
+                    tf.internalFormat = GL_RGBA8;
+                    tf.format         = GL_RGBA;
+                    tf.type           = GL_UNSIGNED_BYTE;
+                    fbo.attachTexture2D(1, tf, 256, 256);
+                    fbo.attachRenderBuffer(GL_DEPTH_COMPONENT24);
+
+                    auto renderScene = [&](int shadowsOn) -> double {
+                        if (shadowsOn) {
+                            glBindFramebuffer(GL_FRAMEBUFFER, sFbo);
+                            glViewport(0, 0, kRes, kRes);
+                            glEnable(GL_DEPTH_TEST);
+                            glClear(GL_DEPTH_BUFFER_BIT);
+                            depthSh.use();
+                            depthSh.setUniform("LightVP", lightVP);
+                            planeMesh.drawDepthOnly();
+                            cubeMesh.drawDepthOnly();
+                            glBindFramebuffer(GL_FRAMEBUFFER, 0);
+                        }
+                        fbo.bind();
+                        glViewport(0, 0, 256, 256);
+                        glEnable(GL_DEPTH_TEST);
+                        glClearColor(0, 0, 0, 1);
+                        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+                        mainSh.use();
+                        tinym::mat4 M(1.0f);
+                        tinym::mat4 V = tinym::lookAt(
+                            tinym::vec3(0.0f, 4.0f, 4.0f),
+                            tinym::vec3(0.0f, 0.0f, 0.0f),
+                            tinym::vec3(0.0f, 1.0f, 0.0f));
+                        tinym::mat4 P = tinym::perspective(0.7854f, 1.0f,
+                                                           0.1f, 100.0f);
+                        mainSh.setUniform("M", M);
+                        mainSh.setUniform("V", V);
+                        mainSh.setUniform("P", P);
+                        mainSh.setUniform("LightVP", lightVP);
+                        mainSh.setUniform("lightColor", tinym::vec3(3, 3, 3));
+                        // Outline path off (no id buffer bound).
+                        mainSh.setUniform("hoveredId", -1);
+                        mainSh.setUniform("selectedId", -1);
+                        glActiveTexture(GL_TEXTURE2);
+                        glBindTexture(GL_TEXTURE_2D, sTex);
+                        mainSh.setUniform("shadowMap", 2);
+                        mainSh.setUniform("shadowsOn", shadowsOn);
+                        auto drawBoth = [&]() {
+                            planeMesh.draw(mainSh, tinym::vec3(0.8f, 0.8f, 0.8f),
+                                           0.0f, 0.8f, 1.0f, tinym::vec3(0.0f));
+                            cubeMesh.draw(mainSh, tinym::vec3(0.8f, 0.8f, 0.8f),
+                                          0.0f, 0.8f, 1.0f, tinym::vec3(0.0f));
+                        };
+                        drawBoth();
+                        glFinish();
+                        std::vector<uint8_t> px(256 * 256 * 4);
+                        glReadPixels(0, 0, 256, 256, GL_RGBA, GL_UNSIGNED_BYTE,
+                                     px.data());
+                        fbo.unbind();
+                        double sum = 0.0;
+                        for (size_t i = 0; i < px.size(); i += 4)
+                            sum += (px[i] + px[i+1] + px[i+2]) / 3.0;
+                        return sum / (256.0 * 256.0);
+                    };
+
+                    const double meanLit    = renderScene(0);
+                    const double meanShadow = renderScene(1);
+                    const bool darker   = meanShadow < meanLit - 1.0;
+                    const bool notBlack = meanShadow > 2.0;
+                    if (darker && notBlack) {
+                        pass("SHADOW-1 / depth pass darkens receiver (ambient survives)");
+                    } else {
+                        fail("SHADOW-1 / depth pass darkens receiver (ambient survives)",
+                             "meanLit=" + std::to_string(meanLit)
+                             + " meanShadow=" + std::to_string(meanShadow)
+                             + " darker=" + std::to_string((int)darker)
+                             + " notBlack=" + std::to_string((int)notBlack));
+                    }
+                }
+                glDeleteFramebuffers(1, &sFbo);
+                glDeleteTextures(1, &sTex);
             }
         }
     }
@@ -14552,6 +14743,45 @@ int main(int argc, char** argv) {
     pointShader.loadShader("point.vert", "point.frag");
     const bool pointShaderOk = pointShader.programID != 0;
 
+    // Directional shadow map. Depth-only program + depth-texture FBO,
+    // rendered once per frame from the light's ortho frustum and sampled
+    // by shader.frag (sampler2DShadow, unit 2 — unit 1 is the id buffer).
+    // Non-fatal if anything fails: shadowsOn stays 0 and lighting is
+    // exactly the pre-shadow output.
+    Program shadowShader;
+    shadowShader.loadShader("shadow.vert", "shadow.frag");
+    bool shadowOk = shadowShader.programID != 0;
+    GLuint shadowFbo = 0, shadowTex = 0;
+    const int kShadowRes = 2048;
+    if (shadowOk) {
+        glGenTextures(1, &shadowTex);
+        glBindTexture(GL_TEXTURE_2D, shadowTex);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_DEPTH_COMPONENT24, kShadowRes,
+                     kShadowRes, 0, GL_DEPTH_COMPONENT, GL_FLOAT, nullptr);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        // Border = max depth → fragments outside the map sample as lit.
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_BORDER);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_BORDER);
+        const float kBorder[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+        glTexParameterfv(GL_TEXTURE_2D, GL_TEXTURE_BORDER_COLOR, kBorder);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_COMPARE_MODE,
+                        GL_COMPARE_REF_TO_TEXTURE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_COMPARE_FUNC, GL_LEQUAL);
+        glGenFramebuffers(1, &shadowFbo);
+        glBindFramebuffer(GL_FRAMEBUFFER, shadowFbo);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT,
+                               GL_TEXTURE_2D, shadowTex, 0);
+        glDrawBuffer(GL_NONE);
+        glReadBuffer(GL_NONE);
+        if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+            std::cerr << "[ysim] shadow FBO incomplete — shadows disabled\n";
+            shadowOk = false;
+        }
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        glBindTexture(GL_TEXTURE_2D, 0);
+    }
+
     // Offscreen R32I framebuffer that the id pass writes to, sampled
     // both by the cursor callback (hover read-back) and by shader.frag
     // (5×5 neighborhood outline test). Built inline rather than via the
@@ -15378,6 +15608,9 @@ int main(int argc, char** argv) {
         static float planePos[3] = {0.f, 0.f, 0.f};
         static int planeDirIdx = 2; // 0:XY, 1:YZ, 2:XZ (default ground)
         static int planeTess = 20; // particleNum1D; >=2. higher = cloth-ready
+        // Wall-clock ↔ sim-time sync toggle (보기 menu). On: fixed-h steps
+        // are paced by the accumulated wall dt; off: legacy 1 step/frame.
+        static bool realtimeSimSync = true;
 
         // ─── Top bar: h≈56, 파일/보기(px=12) + 우측 선택모드 탭(hug) ──
         {
@@ -15398,6 +15631,7 @@ int main(int argc, char** argv) {
                     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(8, 12));
                     if (ImGui::MenuItem("프로파일러")) profilerWindowState.open = true;
                     if (ImGui::MenuItem("씬 동작 로그")) sceneLogWindowState.open = true;
+                    ImGui::MenuItem("실시간 동기화", nullptr, &realtimeSimSync);
                     ImGui::PopStyleVar();
                     ImGui::EndMenu();
                 }
@@ -16136,13 +16370,86 @@ int main(int argc, char** argv) {
             modalEnd();
         }
 
-        if (collectProfileFrame) {
-            auto scope = frameProfiler.scoped("physics_total");
-            simulator.update();
-        } else {
-            simulator.update();
+        // Real-time sync: the integrator's h is fixed (1/60), but the render
+        // loop is vsync-paced (60/120/144Hz displays all occur), so stepping
+        // once per render frame makes simulated time run faster or slower
+        // than the wall clock. Accumulate wall dt and run floor(acc/h) fixed
+        // steps per render frame instead (kinematic playback rides sim time,
+        // so motion speed stays correct too). Hitch/debt clamp at 4 steps —
+        // beyond that the debt is dropped (slow-motion beats a death spiral).
+        // While paused the accumulator drains and a single update() call
+        // keeps the dirty-init path responsive (it early-returns on pause).
+        static double simStepAccum = 0.0;
+        static double lastWallTime = -1.0;
+        {
+            if (lastWallTime < 0.0) lastWallTime = currentTime;
+            double wallDt = currentTime - lastWallTime;
+            lastWallTime = currentTime;
+            if (wallDt < 0.0) wallDt = 0.0;
+            if (wallDt > 0.25) wallDt = 0.25;
+
+            int steps = 1;
+            if (realtimeSimSync && !simulator.pause) {
+                simStepAccum += wallDt;
+                const double hSec = (double)system.h;
+                steps = (int)(simStepAccum / hSec);
+                if (steps > 4) { steps = 4; simStepAccum = 0.0; }
+                else simStepAccum -= (double)steps * hSec;
+            } else {
+                simStepAccum = 0.0;
+            }
+
+            if (collectProfileFrame) {
+                auto scope = frameProfiler.scoped("physics_total");
+                for (int s = 0; s < steps; ++s) simulator.update();
+            } else {
+                for (int s = 0; s < steps; ++s) simulator.update();
+            }
         }
         simulator.uploadMeshes();
+
+        // ─── Pass 0: directional shadow map (offscreen) ───────────────
+        // Renders scene depth from the light's view into shadowTex.
+        // Light direction matches shader.frag's lightPosition default
+        // (50, 50, 30); the ortho box covers the authoring area around
+        // the origin — fragments outside it sample as lit (border=1).
+        tinym::mat4 lightVP(1);
+        if (shadowOk) {
+            const tinym::vec3 lightDir =
+                tinym::vec3(50.0f, 50.0f, 30.0f).normalize();
+            const float R = 8.0f, zn = 1.0f, zf = 80.0f;
+            tinym::mat4 lightView = tinym::lookAt(
+                lightDir * 40.0f, tinym::vec3(0, 0, 0), tinym::vec3(0, 1, 0));
+            tinym::mat4 lightProj(
+                tinym::vec4(1.0f / R, 0.0f, 0.0f, 0.0f),
+                tinym::vec4(0.0f, 1.0f / R, 0.0f, 0.0f),
+                tinym::vec4(0.0f, 0.0f, -2.0f / (zf - zn), 0.0f),
+                tinym::vec4(0.0f, 0.0f, -(zf + zn) / (zf - zn), 1.0f));
+            lightVP = lightProj * lightView;
+
+            glBindFramebuffer(GL_FRAMEBUFFER, shadowFbo);
+            glViewport(0, 0, kShadowRes, kShadowRes);
+            glEnable(GL_DEPTH_TEST);
+            glClear(GL_DEPTH_BUFFER_BIT);
+            shadowShader.use();
+            shadowShader.setUniform("LightVP", lightVP);
+            simulator.drawDepth();
+            glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        }
+        auto applyShadowUniforms = [&]() {
+            // shadowMap must ALWAYS sit on its own unit: a sampler2DShadow
+            // sharing unit 0 with the idBuffer sampler2D makes every draw
+            // GL_INVALID_OPERATION on macOS even when neither is sampled.
+            shader.setUniform("shadowMap", 2);
+            if (!shadowOk) {
+                shader.setUniform("shadowsOn", 0);
+                return;
+            }
+            glActiveTexture(GL_TEXTURE2);
+            glBindTexture(GL_TEXTURE_2D, shadowTex);
+            shader.setUniform("LightVP", lightVP);
+            shader.setUniform("shadowsOn", 1);
+        };
 
         // ─── Pass 1: id buffer (offscreen) ────────────────────────────
         // Paints each mesh's id into idTex (R32I). Sampled later by
@@ -16283,6 +16590,7 @@ int main(int argc, char** argv) {
                 Scene<Backend, Precision>::environment.lightColor
                 * Scene<Backend, Precision>::environment.lightIntensity);
             applyOutlineUniforms();
+            applyShadowUniforms();
 
             {
                 auto drawScope = frameProfiler.scoped("scene_draw");
@@ -16331,6 +16639,7 @@ int main(int argc, char** argv) {
                 Scene<Backend, Precision>::environment.lightColor
                 * Scene<Backend, Precision>::environment.lightIntensity);
             applyOutlineUniforms();
+            applyShadowUniforms();
 
             simulator.draw(shader);
             drawPointOverlay(V, P);

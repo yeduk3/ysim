@@ -121,6 +121,16 @@ configure_file(
     ${CMAKE_BINARY_DIR}/point.frag
     COPYONLY
 )
+configure_file(
+    ${CMAKE_SOURCE_DIR}/src/shader/shadow.vert
+    ${CMAKE_BINARY_DIR}/shadow.vert
+    COPYONLY
+)
+configure_file(
+    ${CMAKE_SOURCE_DIR}/src/shader/shadow.frag
+    ${CMAKE_BINARY_DIR}/shadow.frag
+    COPYONLY
+)
 # Asset sync. A standalone custom *target* (no OUTPUT) is always considered
 # out-of-date, so the copy runs on every `cmake --build` — even when only
 # files under assets/ changed and ysim itself was not relinked. (A

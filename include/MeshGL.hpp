@@ -171,6 +171,15 @@ struct MeshGL<CPU> {
         glDrawElements(GL_TRIANGLES, facetNum*3, GL_UNSIGNED_INT, 0);
     }
 
+    // Depth-only draw for the directional shadow pass: no per-mesh
+    // uniforms at all (shadow.vert reads only LightVP, set once by the
+    // caller). Same VAO — position at location 0.
+    void drawDepthOnly() {
+        glBindVertexArray(vao);
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, facetBuffer);
+        glDrawElements(GL_TRIANGLES, facetNum*3, GL_UNSIGNED_INT, 0);
+    }
+
     // Vertex-id pass: one GL_POINTS per render vertex; idpoint.frag
     // writes (meshId, depth, gl_VertexID) into the RGBA32F attachment.
     // Host sets glPointSize + depth func before calling. Same VAO as

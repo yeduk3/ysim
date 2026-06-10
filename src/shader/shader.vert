@@ -5,15 +5,21 @@ layout(location = 1) in vec3 in_Normal;
 
 out vec4 VPosition;
 out vec3 VNormal;
+out vec4 VShadowCoord;
 
 uniform mat4 M;
 uniform mat4 V;
 uniform mat4 P;
+// Light-space clip transform for shadow mapping (identity-safe: when the
+// host never sets it, the coord degenerates and the frag shader's
+// shadowsOn gate keeps shadows off anyway).
+uniform mat4 LightVP;
 
 
 void main() {
     VPosition = (V*M * vec4(in_Position, 1));
     VNormal = mat3(V*M)*in_Normal;
+    VShadowCoord = LightVP * M * vec4(in_Position, 1);
     gl_Position = P*V*M * vec4(in_Position, 1);
 }
 

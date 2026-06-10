@@ -2,6 +2,7 @@
 
 in vec3 GNormal;
 in vec4 GPosition;
+in vec4 GShadowCoord;
 noperspective in vec3 GEdgeDistance;
 
 out vec4 FragColor;
@@ -21,6 +22,30 @@ uniform float specularWeight = 1.0;
 uniform vec3  emissionColor  = vec3(0.0);
 
 const float PI = 3.14159265359;
+
+// Directional shadow map (depth pass rendered from the light each frame).
+// shadowsOn gates sampling so legacy users of this program (e.g. the GUI
+// FBO preview path) that never bind the map keep their old output.
+uniform int shadowsOn = 0;
+uniform sampler2DShadow shadowMap;
+
+float shadowFactor() {
+    if (shadowsOn == 0) return 1.0;
+    vec3 pc = GShadowCoord.xyz / GShadowCoord.w;
+    pc = pc * 0.5 + 0.5;
+    // Outside the light frustum -> lit (the ortho box covers the
+    // authoring area around the origin; beyond it we don't darken).
+    if (pc.z > 1.0 || pc.x < 0.0 || pc.x > 1.0 || pc.y < 0.0 || pc.y > 1.0)
+        return 1.0;
+    float bias = 0.0020;
+    vec2 texel = 1.0 / vec2(textureSize(shadowMap, 0));
+    float sum = 0.0;
+    for (int dx = -1; dx <= 1; ++dx)
+        for (int dy = -1; dy <= 1; ++dy)
+            sum += texture(shadowMap,
+                           vec3(pc.xy + vec2(dx, dy) * texel, pc.z - bias));
+    return sum / 9.0;
+}
 
 vec3 fresnelSchlick(float cosTheta, vec3 F0) {
     return F0 + (1.0 - F0) * pow(1.0 - cosTheta, 5.0);
@@ -81,7 +106,12 @@ vec4 pbrPreview() {
     // baseColor keeps the shadowed side readable.
     vec3 Li      = lightColor;
     vec3 ambient = vec3(0.10) * baseColor;
-    vec3 color   = ambient + (kD * baseColor / PI + specular) * Li * NdotL + emissionColor;
+    // Shadow attenuates the DIRECT term only; ambient + emission stay,
+    // keeping the occluded side readable.
+    float shadow = shadowFactor();
+    vec3 color   = ambient
+                 + (kD * baseColor / PI + specular) * Li * NdotL * shadow
+                 + emissionColor;
 
     return vec4(pow(color, vec3(1.0 / 2.2)), 1.0);
 }
