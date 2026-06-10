@@ -74,8 +74,12 @@ struct Motion {
     // World-space pose at `timeSec`. Channel values are linearly
     // interpolated between the two neighboring frames (fine for mocap's
     // small per-frame deltas; avoids stair-stepping at slow playback).
-    // With loop=true time wraps over duration() and the last->first frame
-    // gap interpolates; otherwise time clamps to the final frame.
+    // With loop=true time wraps over duration(); across the last->first
+    // seam ROTATIONS interpolate (shortest arc) but POSITIONS snap —
+    // locomotion clips translate the root over the clip (WalkLoopA drifts
+    // ~11 units in Z), and lerping that across the seam sweeps the body
+    // backward over one frame interval. Otherwise time clamps to the
+    // final frame.
     void evaluate(float timeSec, bool loop, Pose& out) const;
 
     // Vertical extent (Y) of the rest skeleton (frame-0 translation,
@@ -84,7 +88,10 @@ struct Motion {
     float restHeight() const;
 
   private:
-    void evaluateFrameLerp(Index f0, Index f1, float a, Pose& out) const;
+    // seamWrap=true marks the looped last->first interval: position
+    // channels hold f0's value instead of lerping.
+    void evaluateFrameLerp(Index f0, Index f1, float a, Pose& out,
+                           bool seamWrap = false) const;
 };
 
 // Parses `path`. On failure returns a Motion with valid() == false and, if
@@ -124,8 +131,8 @@ inline void axisRotation(Channel ch, float deg, std::array<float, 9>& out) {
 
 }  // namespace detail
 
-inline void Motion::evaluateFrameLerp(Index f0, Index f1, float a,
-                                      Pose& out) const {
+inline void Motion::evaluateFrameLerp(Index f0, Index f1, float a, Pose& out,
+                                      bool seamWrap) const {
     out.world.resize(joints.size());
     const float* row0 = data.data() + size_t(f0) * numChannels;
     const float* row1 = data.data() + size_t(f1) * numChannels;
@@ -137,7 +144,23 @@ inline void Motion::evaluateFrameLerp(Index f0, Index f1, float a,
         local.t = jt.offset;
         for (size_t k = 0; k < jt.channels.size(); ++k) {
             const size_t col = jt.channelStart + k;
-            const float v = row0[col] + (row1[col] - row0[col]) * a;
+            const bool isPos = jt.channels[k] == Channel::Xpos ||
+                               jt.channels[k] == Channel::Ypos ||
+                               jt.channels[k] == Channel::Zpos;
+            float v;
+            if (isPos) {
+                // Across the loop seam a clip's accumulated root drift
+                // (last vs first frame) is not motion — hold f0.
+                v = seamWrap ? row0[col]
+                             : row0[col] + (row1[col] - row0[col]) * a;
+            } else {
+                // Shortest-arc lerp: a 358° -> 2° pair must rotate +4°,
+                // not -356° (Euler channels can wrap mid-clip too).
+                float d = std::fmod(row1[col] - row0[col], 360.0f);
+                if (d > 180.0f) d -= 360.0f;
+                if (d < -180.0f) d += 360.0f;
+                v = row0[col] + d * a;
+            }
             switch (jt.channels[k]) {
                 case Channel::Xpos: local.t[0] += v; break;
                 case Channel::Ypos: local.t[1] += v; break;
@@ -175,7 +198,8 @@ inline void Motion::evaluate(float timeSec, bool loop, Pose& out) const {
         const float ff = t / frameTime;
         const Index f0 = Index(ff) % numFrames;
         const Index f1 = (f0 + 1) % numFrames;  // wrap last -> first
-        evaluateFrameLerp(f0, f1, ff - std::floor(ff), out);
+        evaluateFrameLerp(f0, f1, ff - std::floor(ff), out,
+                          /*seamWrap=*/f1 < f0);
     } else {
         if (t <= 0.0f) { evaluateFrameLerp(0, 0, 0.0f, out); return; }
         const float ff = t / frameTime;

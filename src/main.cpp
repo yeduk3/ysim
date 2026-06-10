@@ -14562,6 +14562,39 @@ static int runSelfTest() {
                                  std::string("posKept=") + std::to_string((int)posKept)
                                  + " timeReset=" + std::to_string((int)timeReset));
                     }
+
+                    // 6) Loop seam: positions snap (no backward root sweep),
+                    //    rotations still interpolate. Mid-seam pose must
+                    //    match the last frame's root position, not the
+                    //    last/first average.
+                    {
+                        auto* kin6 = sim.kinematicOf(0);
+                        const auto& mo = kin6->motion;
+                        const float dur = mo.duration();
+                        const float ft = mo.frameTime;
+                        bvh::Pose lastP, midSeam, firstP;
+                        mo.evaluate(dur - ft, true, lastP);          // frame N-1
+                        mo.evaluate(dur - 0.5f * ft, true, midSeam); // seam a=0.5
+                        mo.evaluate(0.0f, true, firstP);             // frame 0
+                        const auto& rL = lastP.world[0].t;
+                        const auto& rM = midSeam.world[0].t;
+                        const auto& rF = firstP.world[0].t;
+                        // Clip drift makes last/first root differ; mid-seam
+                        // must sit on the LAST frame, not between them.
+                        float drift = 0, toLast = 0;
+                        for (int c = 0; c < 3; ++c) {
+                            drift += std::fabs(rL[c] - rF[c]);
+                            toLast += std::fabs(rM[c] - rL[c]);
+                        }
+                        bool meaningful = drift > 1e-3f;  // WalkLoopA: ~11 in Z
+                        bool snapped = toLast < 1e-4f;
+                        if (meaningful && snapped)
+                            pass("KIN-6 / loop seam holds root position (no backward sweep)");
+                        else
+                            fail("KIN-6 / loop seam holds root position (no backward sweep)",
+                                 "drift=" + std::to_string(drift)
+                                 + " toLast=" + std::to_string(toLast));
+                    }
                 }
             }
         }
