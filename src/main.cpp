@@ -14689,12 +14689,12 @@ int main(int argc, char** argv) {
     //simulator.addClothGridFast(100, 1, kstretch, kshear, kbend, thickness, mass);
     //for(int i = 0; i < 1; i++) 
     //    simulator.addCloth(particleNum1D, size1D, tinym::vec3(0, 0.15+(float)i*0.05f, 0), kstretch, kshear, kbend, thickness, mass);
-    simulator.addCloth(50, 1, tinym::vec3(0, 0.25, 0), kstretch, kshear, kbend, thickness, mass);
+    simulator.addCloth(50, 1, tinym::vec3(0, 1.25, 0), kstretch, kshear, kbend, thickness, mass);
     //simulator.addClothFile("src/assets", "teapot.obj", {0,0,0} 15, 1e4, 0, 2e4, thickness mass);
     //simulator.addClothFile("src/assets", "horse-gallop-01.obj", {0,0,0}, 80, 1e4, 0, 2e4, thickness mass);
     //simulator.addFloatMesh("src/assets", "horse-gallop-01.obj", {0, -1, 0}, 1.2);
     //simulator.addFloatMesh("src/assets", "camel-gallop-reference.obj", {0, -1, 0}, 1.2);
-    simulator.addFloatMesh("assets", "Human.obj", {0, -0.65, 0}, 0.04);
+    simulator.addFloatMesh("assets", "Human.obj", {0, 0.35, 0}, 0.04);
     simulator.addGround(PlaneDirection::XZPlane, tinym::vec3(0, 0, 0), 5);
 
     std::cout << "[Main] mesh added to scene" << std::endl;
@@ -14846,6 +14846,11 @@ int main(int argc, char** argv) {
 
 
     camera.setPosition(tinym::vec3(0, 0, 5));
+    // Ground moved to y=0 (scene content sits above it), so raise the
+    // orbit/pan pivot by the same +1: curPosition follows via
+    // rotatePosition (identity rotation at startup → camera at (0,1,5)).
+    camera.look = tinym::vec3(0, 1, 0);
+    camera.rotatePosition();
 
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
