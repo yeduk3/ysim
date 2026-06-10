@@ -252,15 +252,39 @@ struct MeshInspectorTarget {
     std::function<void(int /*meshId*/, bool /*applyGravity*/, bool /*applyWind*/)>
         on_env_toggle_change;
 
+    // ── Kinematic body (BVH motion) panel ────────────────────────────
+    // kin_panel=true renders the playback section: play/pause, speed,
+    // loop, a time scrub over [0, kin_duration], and a motion-file combo
+    // fed by kin_file_list (file names relative to the BVH asset dir).
+    // Values are snapshots rebuilt each frame by production; edits commit
+    // through the callbacks. The behavior segment tabs are hidden for
+    // kinematic targets (production passes current_behavior_index = -1).
+    bool kin_panel = false;
+    bool kin_playing = false;
+    float kin_speed = 1.0f;
+    bool kin_loop = true;
+    float kin_time = 0.0f;      // seconds
+    float kin_duration = 0.0f;  // seconds
+    std::string kin_file;       // currently loaded file (display name)
+    std::vector<std::string> kin_file_list;
+    std::function<void(int /*meshId*/, bool /*playing*/)> on_kin_play;
+    std::function<void(int /*meshId*/, float /*speed*/)> on_kin_speed;
+    std::function<void(int /*meshId*/, bool /*loop*/)> on_kin_loop;
+    std::function<void(int /*meshId*/, float /*timeSec*/)> on_kin_scrub;
+    std::function<void(int /*meshId*/, const std::string& /*file*/)> on_kin_file;
+
     // No-selection branch: when mesh_id < 0 the right panel renders these
-    // three Add-Object buttons instead of the per-mesh editors. Callbacks
+    // Add-Object buttons instead of the per-mesh editors. Callbacks
     // are owned by main.cpp; they open the same Sphere / Cube / Import
     // modals that used to live behind the Create + File menus.
+    // on_request_add_kinematic adds a BVH kinematic body directly (no
+    // modal — the file is switchable in the inspector afterwards).
     std::function<void()> on_request_add_cube;
     std::function<void()> on_request_add_sphere;
     std::function<void()> on_request_add_cylinder;
     std::function<void()> on_request_add_plane;
     std::function<void()> on_request_add_import;
+    std::function<void()> on_request_add_kinematic;
 
     // No-selection branch: the scene's objects, one entry per
     // RequestGeneralMesh (the canonical, pack-surviving list).

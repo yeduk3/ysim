@@ -153,6 +153,7 @@ static void IcoCube(ImDrawList* d,float x,float y,float s){float c=x+s/2,m=y+s/2
 static void IcoSphere(ImDrawList* d,float x,float y,float s){float c=x+s/2,m=y+s/2;d->AddCircleFilled({c,m},11,IM_COL32(220,226,233,255),24);d->AddCircleFilled({c-3,m-3},5,IM_COL32(240,243,247,255),12);}
 static void IcoCyl(ImDrawList* d,float x,float y,float s){float c=x+s/2,m=y+s/2;d->AddRectFilled({c-8,m-9},{c+8,m+9},IM_COL32(220,226,233,255));d->AddEllipseFilled({c,m-9},{8,4},IM_COL32(210,217,224,255),0,16);d->AddEllipseFilled({c,m+9},{8,4},IM_COL32(210,217,224,255),0,16);}
 static void IcoPlane(ImDrawList* d,float x,float y,float s){float c=x+s/2,m=y+s/2;ImVec2 p[4]={{c,m-8},{c+14,m},{c,m+8},{c-14,m}};d->AddConvexPolyFilled(p,4,IM_COL32(215,222,229,255));}
+static void IcoSkeleton(ImDrawList* d,float x,float y,float s){float c=x+s/2,m=y+s/2;ImU32 co=IM_COL32(195,202,210,255);d->AddCircleFilled({c,m-9},4,co,12);d->AddLine({c,m-5},{c,m+2},co,2);d->AddLine({c,m-3},{c-6,m+1},co,2);d->AddLine({c,m-3},{c+6,m+1},co,2);d->AddLine({c,m+2},{c-4,m+9},co,2);d->AddLine({c,m+2},{c+4,m+9},co,2);}
 
 // DrawTrash icon helper
 static void DrawTrash(ImDrawList* dl, float cx, float cy) {
@@ -230,7 +231,8 @@ void drawMeshInspectorWindow(MeshInspectorWindowState& st, const MeshInspectorTa
         if(CardButton("cube","정육면체",IcoCube)&&t.on_request_add_cube)t.on_request_add_cube();ImGui::Dummy({0,4});
         if(CardButton("sphere","구",IcoSphere)&&t.on_request_add_sphere)t.on_request_add_sphere();ImGui::Dummy({0,4});
         if(CardButton("cyl","원기둥",IcoCyl)&&t.on_request_add_cylinder)t.on_request_add_cylinder();ImGui::Dummy({0,4});
-        if(CardButton("plane","평면",IcoPlane)&&t.on_request_add_plane)t.on_request_add_plane();
+        if(CardButton("plane","평면",IcoPlane)&&t.on_request_add_plane)t.on_request_add_plane();ImGui::Dummy({0,4});
+        if(CardButton("kin","BVH 모션 (키네마틱)",IcoSkeleton)&&t.on_request_add_kinematic)t.on_request_add_kinematic();
         ImGui::Unindent(kP);ImGui::PopStyleVar(2);ImGui::End();return;
     }
 
@@ -327,6 +329,58 @@ void drawMeshInspectorWindow(MeshInspectorWindowState& st, const MeshInspectorTa
                 float s[3]={t.scale->x,t.scale->y,t.scale->z};
                 ImGui::PushStyleColor(ImGuiCol_Text,kG60);ImGui::TextUnformatted("스케일");ImGui::PopStyleColor();ImGui::Dummy({0,4});
                 if(InputXYZ("scale",s))t.on_scale(t.mesh_id,tinym::vec3(s[0],s[1],s[2]));
+            }
+            ImGui::Unindent(kP);ImGui::Dummy({0,kP});
+        }
+    }
+
+    // ─── 모션 Kinematic playback ─────────────────────────────────────
+    if(t.kin_panel){
+        if(AccordionHeader("모션","BVH Motion")){
+            ImGui::Dummy({0,kP});ImGui::Indent(kP);
+            // File combo
+            ImGui::PushStyleColor(ImGuiCol_Text,kG60);ImGui::TextUnformatted("모션 파일");ImGui::PopStyleColor();ImGui::Dummy({0,4});
+            ImGui::SetNextItemWidth(CW());
+            if(ImGui::BeginCombo("##kinfile",t.kin_file.c_str())){
+                for(const auto& f:t.kin_file_list){
+                    bool sel=(f==t.kin_file);
+                    if(ImGui::Selectable(f.c_str(),sel)&&!sel&&t.on_kin_file)
+                        t.on_kin_file(t.mesh_id,f);
+                    if(sel)ImGui::SetItemDefaultFocus();
+                }
+                ImGui::EndCombo();
+            }
+            ImGui::Dummy({0,16});
+            // Play / pause + loop
+            {
+                bool playing=t.kin_playing;
+                if(playing){ImGui::PushStyleColor(ImGuiCol_Button,kG90);ImGui::PushStyleColor(ImGuiCol_Text,kW);}
+                if(ImGui::Button(playing?"일시정지":"재생",{96,36})&&t.on_kin_play)
+                    t.on_kin_play(t.mesh_id,!playing);
+                if(playing)ImGui::PopStyleColor(2);
+                ImGui::SameLine(0,16);
+                ImGui::PushStyleColor(ImGuiCol_Text,kG60);ImGui::TextUnformatted("반복");ImGui::PopStyleColor();
+                ImGui::SameLine();
+                bool lp=t.kin_loop;
+                if(PillToggle("##kloop",&lp)&&t.on_kin_loop)t.on_kin_loop(t.mesh_id,lp);
+            }
+            ImGui::Dummy({0,16});
+            // Time scrub
+            {
+                float tm=t.kin_time;
+                ImGui::PushStyleColor(ImGuiCol_Text,kG60);
+                ImGui::Text("시간  %.2fs / %.2fs",tm,t.kin_duration);
+                ImGui::PopStyleColor();ImGui::Dummy({0,4});
+                ImGui::SetNextItemWidth(CW());
+                if(ImGui::SliderFloat("##ktime",&tm,0.0f,t.kin_duration>0?t.kin_duration:1.0f,"")&&t.on_kin_scrub)
+                    t.on_kin_scrub(t.mesh_id,tm);
+            }
+            ImGui::Dummy({0,12});
+            // Speed
+            {
+                float sp=t.kin_speed;
+                if(InlineSlider("재생 속도",&sp,0.0f,3.0f)&&t.on_kin_speed)
+                    t.on_kin_speed(t.mesh_id,sp);
             }
             ImGui::Unindent(kP);ImGui::Dummy({0,kP});
         }

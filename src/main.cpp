@@ -16,6 +16,8 @@
 #include "MeshGL.hpp"
 #include "MeshRenderState.hpp"
 #include "HiddenGLContext.hpp"
+#include "bvh_motion.hpp"
+#include "kinematic_body.hpp"
 
 #include "imgui.h"
 #include "imgui_impl_glfw.h"
@@ -52,6 +54,7 @@ struct METAL : Backend {};
 #include <algorithm>
 #include <chrono>
 #include <cstring>
+#include <filesystem>
 #include <random>
 #include <unordered_map>
 #include <vector>
@@ -755,6 +758,11 @@ enum struct BehaviorType : Index {
     Float,
     Fluid,
     Generator,
+    // BVH-driven kinematic body: prescribed motion, one-way coupling.
+    // Collision-wise it acts like Float (query-skipped, target-only) but
+    // its vertices are rewritten every frame from the FK pose. Appended
+    // last — scene_format serializes the enum by value.
+    Kinematic,
 };
 
 enum struct InitializerType : Index {
@@ -1804,8 +1812,36 @@ const char* behaviorTypeName(BehaviorType behaviorType) {
         case BehaviorType::Float: return "Float";
         case BehaviorType::Fluid: return "Fluid";
         case BehaviorType::Generator: return "Generator";
+        case BehaviorType::Kinematic: return "Kinematic";
         default: return "Unknown";
     }
+}
+
+// BVH motion asset directory. The run cwd varies (repo root vs build/ —
+// copy_assets syncs assets/ into the build tree), so prefer the relative
+// path and fall back to the CMake-defined source root.
+inline std::string bvhAssetDir() {
+    namespace fs = std::filesystem;
+    if (fs::exists("assets/BVH")) return "assets/BVH";
+#ifdef YSIM_PROJECT_ROOT
+    return std::string(YSIM_PROJECT_ROOT) + "/assets/BVH";
+#else
+    return "assets/BVH";
+#endif
+}
+
+// Sorted *.bvh file names (no directory) in bvhAssetDir().
+inline std::vector<std::string> listBVHFiles() {
+    namespace fs = std::filesystem;
+    std::vector<std::string> out;
+    std::error_code ec;
+    for (const auto& e : fs::directory_iterator(bvhAssetDir(), ec)) {
+        if (!e.is_regular_file()) continue;
+        if (e.path().extension() != ".bvh") continue;
+        out.push_back(e.path().filename().string());
+    }
+    std::sort(out.begin(), out.end());
+    return out;
 }
 
 const char* shapeTypeName(ShapeType shapeType) {
@@ -2252,6 +2288,153 @@ inline void quatToEulerXYZ(const Quat& q, float& outX, float& outY,
                           1.0f - 2.0f * (q.y * q.y + q.z * q.z));
     }
 }
+
+// Row-major 3x3 from a unit quaternion — the body-rotation input of
+// kinematic::BodyProxy::writeVertices (which is Quat/tinym-free).
+inline std::array<float, 9> quatToMat3(const Quat& q) {
+    const float w = q.w, x = q.x, y = q.y, z = q.z;
+    return {1 - 2 * (y * y + z * z), 2 * (x * y - w * z), 2 * (x * z + w * y),
+            2 * (x * y + w * z), 1 - 2 * (x * x + z * z), 2 * (y * z - w * x),
+            2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)};
+}
+
+// ---- BVH kinematic body ----------------------------------------------------
+
+template <typename PR>
+struct MeshKinematicInitializerParams : InitializerParams<PR> {
+    std::string filePath;   // source .bvh
+    tinym::vec3 center;
+    // Normalized body height in scene units; the FK pose (whose raw units
+    // vary ~7x across assets/BVH) is uniformly scaled so its rest height
+    // equals this BEFORE the user transform applies.
+    PR targetHeight;
+
+    MeshKinematicInitializerParams(std::string filePath, tinym::vec3 center,
+                                   Index numPoints, Index numFacets,
+                                   Index numEdges, PR targetHeight, PR mass)
+        : InitializerParams<PR>(numPoints, numFacets, numEdges, mass),
+          filePath(std::move(filePath)), center(center),
+          targetHeight(targetHeight) {}
+};
+
+// One GeneralMesh per kinematic body: the concatenated sphere(joint) +
+// cylinder(link) proxy carries a single mesh id, so picking any part
+// selects the whole body and its triangles ride the existing collision
+// pipeline. The initializer owns motion + proxy + playback state because
+// the initializer object (held by the request) is the only per-mesh
+// state that survives Scene::pack rebuilds.
+template <typename BE, typename PR>
+struct MeshKinematicInitializer : GeneralMeshInitializer<BE, PR> {
+    using ParamsType = MeshKinematicInitializerParams<PR>;
+    ParamsType params;
+
+    bvh::Motion motion;
+    kinematic::BodyProxy proxy;
+
+    // Playback state (driven by Simulator::update with the sim step h, so
+    // motion time IS simulation time — pausing the sim pauses the body).
+    bool playing = true;
+    float playSpeed = 1.0f;
+    bool loop = true;
+    double localTime = 0.0;
+
+    explicit MeshKinematicInitializer(ParamsType p) : params(std::move(p)) {}
+
+    // Factory: loads + builds first because InitializerParams needs the
+    // vertex/facet/edge counts at construction. Returns nullptr (with
+    // `err` filled) on parse failure.
+    static MeshKinematicInitializer* create(const std::string& path,
+                                            tinym::vec3 center,
+                                            PR targetHeight, PR mass,
+                                            std::string* err = nullptr) {
+        bvh::Motion m = bvh::load(path, err);
+        if (!m.valid()) return nullptr;
+        kinematic::BodyProxy proxy;
+        proxy.build(m);
+        auto* init = new MeshKinematicInitializer(ParamsType(
+            path, center, proxy.numVerts, proxy.numFacets(), proxy.numEdges,
+            targetHeight, mass));
+        init->motion = std::move(m);
+        init->proxy = std::move(proxy);
+        return init;
+    }
+
+    // Swap the motion source in place. Topology may change (different
+    // skeleton), so the caller must mark the scene dirty for a re-pack.
+    bool reloadMotion(const std::string& path, std::string* err = nullptr) {
+        bvh::Motion m = bvh::load(path, err);
+        if (!m.valid()) return false;
+        kinematic::BodyProxy p;
+        p.build(m);
+        motion = std::move(m);
+        proxy = std::move(p);
+        params.filePath = path;
+        params.numPoints = proxy.numVerts;
+        params.numFacets = proxy.numFacets();
+        params.numEdges = proxy.numEdges;
+        localTime = 0.0;
+        return true;
+    }
+
+    float normScale() const {
+        const float h = motion.restHeight();
+        return h > 1e-6f ? float(params.targetHeight) / h : 1.0f;
+    }
+
+    // FK pose at `timeSec` → `out` (3*numPoints PR). Base variant used by
+    // initialize/populatePreview: pose normalized + translated to center,
+    // NO user scale/rotation — Scene::pack bakes those afterwards, same
+    // as every other initializer.
+    void writePoseBase(double timeSec, PR* out) {
+        writePose(timeSec, tinym::vec3(1, 1, 1), Quat{}, params.center, out);
+    }
+
+    // Full variant used by the per-frame update, which overwrites the
+    // pack-baked geometry and therefore must apply the user transform
+    // itself (scale → rotate → translate around the FK origin).
+    void writePose(double timeSec, tinym::vec3 userScale, const Quat& rot,
+                   tinym::vec3 position, PR* out) {
+        bvh::Pose pose;
+        motion.evaluate(float(timeSec), loop, pose);
+        scratch_.resize(size_t(proxy.numVerts) * 3);
+        proxy.writeVertices(
+            pose, normScale(),
+            {float(userScale.x), float(userScale.y), float(userScale.z)},
+            quatToMat3(rot),
+            {float(position.x), float(position.y), float(position.z)},
+            scratch_.data());
+        for (size_t i = 0; i < scratch_.size(); ++i) out[i] = PR(scratch_[i]);
+    }
+
+    void initialize(MeshState<BE, PR>& state,
+                    MeshAdjacency<BE, PR>& adjacency) override {
+        state.memoryAllocation(params);
+        adjacency.memoryAllocation(params);
+
+        // Current localTime (not 0) so a structural re-pack mid-playback
+        // realizes the frame the user is looking at.
+        writePoseBase(localTime, state.x.ptr);
+
+        if (adjacency.vertexAdjFacets.ptr) return;
+        for (Index f = 0; f < params.numFacets * 3; ++f)
+            adjacency.facets[f] = proxy.facets[f];
+
+        MeshAdjacencyInitializer<BE, PR>::initialize(state, adjacency);
+    }
+
+    void populatePreview(PreviewState<PR>& preview) override {
+        std::vector<PR> x(size_t(params.numPoints) * 3);
+        writePoseBase(localTime, x.data());
+        preview.x.assign(x.begin(), x.end());
+        preview.facets.assign(proxy.facets.begin(), proxy.facets.end());
+        preview.recomputeNormals();
+    }
+
+    InitializerParams<PR>* getParams() override { return &params; }
+
+  private:
+    std::vector<float> scratch_;
+};
 
 template <typename BE, typename PR>
 struct GeneralMesh {
@@ -2799,6 +2982,9 @@ struct Scene {
             } else if (auto* cy = dynamic_cast<MeshCylinderInitializer<BE, PR>*>(req.initializer)) {
                 meshes[i].transformPosition = cy->params.center;
                 meshes[i].shapeType = ShapeType::Cylinder;
+            } else if (auto* kb = dynamic_cast<MeshKinematicInitializer<BE, PR>*>(req.initializer)) {
+                meshes[i].transformPosition = kb->params.center;
+                meshes[i].shapeType = ShapeType::Mesh;
             } else if (auto* f  = dynamic_cast<MeshFileInitializer  <BE, PR>*>(req.initializer)) {
                 meshes[i].transformPosition = f->params.offset;
                 meshes[i].shapeType = ShapeType::Mesh;
@@ -5638,7 +5824,8 @@ struct BVH<BE, PR, BVHMODE::SCENE, BVHPRIMITIVE::OBJECT> {
 
     void checkSelfCollisions(PR margin) {
         for(auto& tree : objTrees) {
-            if(tree.objBehavior == BehaviorType::Float) continue;
+            if(tree.objBehavior == BehaviorType::Float
+            || tree.objBehavior == BehaviorType::Kinematic) continue;
             tree.checkSelfCollisions(margin);
         }
     }
@@ -5672,7 +5859,8 @@ struct BVH<BE, PR, BVHMODE::SCENE, BVHPRIMITIVE::OBJECT> {
         // keep their single valid direction — no extra work, no change.
         for(Index q = 0; q < objTrees.size(); ++q) {
             auto& queryTree = objTrees[q];
-            if(queryTree.objBehavior == BehaviorType::Float) continue;
+            if(queryTree.objBehavior == BehaviorType::Float
+            || queryTree.objBehavior == BehaviorType::Kinematic) continue;
 
             for(Index t = 0; t < objTrees.size(); ++t) {
                 if(q == t) {
@@ -5732,7 +5920,8 @@ struct BVH<BE, PR, BVHMODE::SCENE, BVHPRIMITIVE::OBJECT> {
         std::set<IndexPair> checked;
         for(Index q = 0; q < objTrees.size(); ++q) {
             auto& queryTree = objTrees[q];
-            if(queryTree.objBehavior == BehaviorType::Float) continue;
+            if(queryTree.objBehavior == BehaviorType::Float
+            || queryTree.objBehavior == BehaviorType::Kinematic) continue;
 
             for(Index t = 0; t < objTrees.size(); ++t) {
                 Index a = std::min(q, t);
@@ -6621,6 +6810,78 @@ struct Simulator {
         registerPreviewBindingForLastRequest();
         scene_log::logObject("원기둥 추가 (id " +
             std::to_string((int)Scene<BE, PR>::numMeshes - 1) + ")");
+    }
+
+    // BVH kinematic body: sphere-joint / cylinder-link proxy driven by
+    // the motion file. One mesh = one id, so any part selects the body.
+    // Returns false (and leaves the scene untouched) on a parse failure.
+    bool addKinematicBody(const std::string& bvhPath, tinym::vec3 center,
+                          PR targetHeight = PR(1.8), PR mass = PR(0.1)) {
+        std::string err;
+        auto* init = MeshKinematicInitializer<BE, PR>::create(
+            bvhPath, center, targetHeight, mass, &err);
+        if (!init) {
+            std::cerr << "[addKinematicBody] " << err << std::endl;
+            return false;
+        }
+        scene.addGeneralMesh(init, BehaviorType::Kinematic,
+                             FloatBehaviorParams<PR>{});
+        registerPreviewBindingForLastRequest();
+        scene_log::logObject("키네마틱 바디 추가 (id " +
+            std::to_string((int)Scene<BE, PR>::numMeshes - 1) + ")");
+        return true;
+    }
+
+    // The kinematic initializer for `meshId`, or nullptr when the mesh
+    // doesn't exist / isn't Kinematic. The initializer pointer is owned by
+    // the request (shared with the live mesh), so it is stable across
+    // re-packs — playback state lives there for exactly that reason.
+    MeshKinematicInitializer<BE, PR>* kinematicOf(int meshId) {
+        auto* m = Scene<BE, PR>::findById(meshId);
+        if (!m || m->behaviorType != BehaviorType::Kinematic) return nullptr;
+        return dynamic_cast<MeshKinematicInitializer<BE, PR>*>(m->initializer);
+    }
+
+    // Scrub: jump playback to `timeSec` and re-pose immediately so a
+    // paused sim still shows the frame under the slider (update() is
+    // gated on !pause and would otherwise apply it only on resume).
+    // xPrev is snapped to the new pose — a scrub is a teleport, not a
+    // swept motion the narrow phase should respond to.
+    void setKinematicTime(int meshId, double timeSec) {
+        auto* m = Scene<BE, PR>::findById(meshId);
+        auto* kin = kinematicOf(meshId);
+        if (!m || !kin || !m->state.x.ptr) return;
+        kin->localTime = timeSec;
+        kin->writePose(timeSec, m->scale, m->rotationQuat,
+                       m->transformPosition, m->state.x.ptr);
+        if (m->state.xPrev.ptr)
+            std::memcpy(m->state.xPrev.ptr, m->state.x.ptr,
+                        m->state.x.size * sizeof(PR));
+    }
+
+    // Swap the BVH file behind a kinematic body. Topology changes with
+    // the skeleton, so: reload into the (request-owned) initializer,
+    // regenerate the request preview + its render binding, drop the GL
+    // cache entry, and mark dirty for a full re-pack.
+    bool setKinematicFile(int meshId, const std::string& path) {
+        auto* kin = kinematicOf(meshId);
+        if (!kin) return false;
+        std::string err;
+        if (!kin->reloadMotion(path, &err)) {
+            std::cerr << "[setKinematicFile] " << err << std::endl;
+            return false;
+        }
+        for (auto& r : Scene<BE, PR>::requestsGeneralMeshes) {
+            if (r.id != meshId) continue;
+            r.initializer->populatePreview(r.preview);
+            registerPreviewBindingFor(r);
+            break;
+        }
+        renderState.removeById(meshId);
+        Scene<BE, PR>::dirty = true;
+        scene_log::logObject("키네마틱 모션 변경 (id " +
+            std::to_string(meshId) + "): " + path);
+        return true;
     }
 
     void addGround(PlaneDirection dir, tinym::vec3 center, PR size1D, PR mass=0.1) {
@@ -7628,7 +7889,8 @@ struct Simulator {
             if (!ext) continue;
             const Index numPoints = mesh.state.x.size / 3;
             if (mesh.behaviorType == BehaviorType::Float ||
-                mesh.behaviorType == BehaviorType::Rigid) {
+                mesh.behaviorType == BehaviorType::Rigid ||
+                mesh.behaviorType == BehaviorType::Kinematic) {
                 // D-039: Rigid bodies are integrated by the rigid backend;
                 // the cloth-side externalForces buffer is unused. Zero
                 // matches Float's pattern + retires BDD-006-RIGID-DISPATCH
@@ -7812,6 +8074,38 @@ struct Simulator {
             m.rigidLastBodyPos = now;
         }
 
+        // Kinematic bodies: prescribed BVH motion, one-way coupling. Once
+        // per outer frame (like the Rigid block above): advance playback
+        // by the frame step h — motion time IS simulation time, so the
+        // pause gate above freezes playback and a slow sim slows the body
+        // in lockstep with the cloth it pushes — then rewrite the proxy
+        // verts from the FK pose. xPrev gets the PREVIOUS pose (the
+        // substep snapshot loop skips Kinematic) so the swept narrow
+        // phase sees the true frame motion. The user transform must be
+        // re-applied here every frame because these writes replace the
+        // pack-baked geometry; params/transformPosition are the same
+        // sources pack reads (D-015: inspector edits write back to the
+        // initializer).
+        for (auto& m : Scene<BE, PR>::meshes) {
+            if (m.behaviorType != BehaviorType::Kinematic) continue;
+            auto* kin = dynamic_cast<MeshKinematicInitializer<BE, PR>*>(m.initializer);
+            if (!kin || !m.state.x.ptr) continue;
+            if (kin->playing && kin->motion.valid()) {
+                kin->localTime += (double)system.h * kin->playSpeed;
+                if (!kin->loop)
+                    kin->localTime = std::min(kin->localTime,
+                                              (double)kin->motion.duration());
+                else if (kin->motion.duration() > 0.0f)
+                    kin->localTime = std::fmod(kin->localTime,
+                                               (double)kin->motion.duration());
+            }
+            if (m.state.xPrev.ptr)
+                std::memcpy(m.state.xPrev.ptr, m.state.x.ptr,
+                            m.state.x.size * sizeof(PR));
+            kin->writePose(kin->localTime, m.scale, m.rotationQuat,
+                           m.transformPosition, m.state.x.ptr);
+        }
+
         for(int i = 0; i < system.subSteps; i++) {
 
             //if(i % 10 == 0) checkCollision = true;
@@ -7947,6 +8241,11 @@ struct Simulator {
             // particles back before the cloth drifts further than thickness.
             for (auto& m : Scene<BE, PR>::meshes) {
                 if (m.behaviorType == BehaviorType::Float) continue;
+                // Kinematic keeps the per-FRAME xPrev written by the
+                // kinematic update block (previous pose), so the swept
+                // narrow phase sees the body's real frame motion instead
+                // of a degenerate x==xPrev snapshot.
+                if (m.behaviorType == BehaviorType::Kinematic) continue;
                 if (!m.state.x.ptr || !m.state.xPrev.ptr) continue;
                 std::memcpy(m.state.xPrev.ptr,
                             m.state.x.ptr,
@@ -13959,6 +14258,90 @@ static int runSelfTest() {
                   base*3, base*1);
     }
 
+    // ---- Block KIN: BVH kinematic body — load, sim-time playback, scrub,
+    //                  motion-file swap. Skips when the asset dir is absent
+    //                  (e.g. a stripped checkout).
+    {
+        const std::string dir = bvhAssetDir();
+        if (!std::filesystem::exists(dir + "/WalkLoopA.bvh")) {
+            skip("KIN", "no WalkLoopA.bvh under " + dir);
+        } else {
+            resetScene();
+            sim.pause = false;
+            if (!sim.addKinematicBody(dir + "/WalkLoopA.bvh",
+                                      tinym::vec3(0, 0, 0), 1.8f)) {
+                fail("KIN-1 / addKinematicBody loads WalkLoopA.bvh", "load failed");
+            } else {
+                sim.initialize();
+                auto* m = Scene<Backend, Precision>::findById(0);
+                auto* kin = sim.kinematicOf(0);
+                if (!m || !kin || !m->state.x.ptr) {
+                    fail("KIN-1 / kinematic mesh realized after pack",
+                         "mesh or initializer missing");
+                } else {
+                    // 1) Playback: verts move across frames and stay finite.
+                    auto x0 = snapshot_array(m->state.x.ptr, m->state.x.size);
+                    pumpFrames(sim, 2);
+                    MetalGlobalContext::commitAndWait();
+                    bool moved = false, finite = true;
+                    for (size_t i = 0; i < x0.size(); ++i) {
+                        if (m->state.x.ptr[i] != x0[i]) moved = true;
+                        if (!std::isfinite((double)m->state.x.ptr[i])) finite = false;
+                    }
+                    if (moved && finite)
+                        pass("KIN-1 / FK playback advances proxy verts (finite)");
+                    else
+                        fail("KIN-1 / FK playback advances proxy verts (finite)",
+                             "moved=" + std::to_string((int)moved)
+                             + " finite=" + std::to_string((int)finite));
+
+                    // 2) playing=false freezes the body even while the sim runs.
+                    kin->playing = false;
+                    pumpFrames(sim, 1);
+                    MetalGlobalContext::commitAndWait();
+                    auto x1 = snapshot_array(m->state.x.ptr, m->state.x.size);
+                    pumpFrames(sim, 2);
+                    MetalGlobalContext::commitAndWait();
+                    bool frozen = true;
+                    for (size_t i = 0; i < x1.size(); ++i)
+                        if (m->state.x.ptr[i] != x1[i]) { frozen = false; break; }
+                    if (frozen) pass("KIN-2 / playing=false freezes pose");
+                    else        fail("KIN-2 / playing=false freezes pose", "verts drifted");
+
+                    // 3) Scrub re-poses immediately (paused sim included).
+                    sim.pause = true;
+                    sim.setKinematicTime(0, 0.5);
+                    bool scrubbed = false;
+                    for (size_t i = 0; i < x1.size(); ++i)
+                        if (m->state.x.ptr[i] != x1[i]) { scrubbed = true; break; }
+                    if (scrubbed) pass("KIN-3 / scrub re-poses while paused");
+                    else          fail("KIN-3 / scrub re-poses while paused", "pose unchanged");
+                    sim.pause = false;
+
+                    // 4) Motion-file swap reloads + re-packs cleanly.
+                    if (std::filesystem::exists(dir + "/jogCurve.bvh")) {
+                        bool swapped = sim.setKinematicFile(0, dir + "/jogCurve.bvh");
+                        sim.initialize();
+                        auto* m2 = Scene<Backend, Precision>::findById(0);
+                        auto* kin2 = sim.kinematicOf(0);
+                        bool ok = swapped && m2 && kin2
+                               && kin2->motion.valid()
+                               && kin2->params.filePath == dir + "/jogCurve.bvh"
+                               && m2->state.x.size
+                                    == (Index)kin2->params.numPoints * 3;
+                        pumpFrames(sim, 1);
+                        MetalGlobalContext::commitAndWait();
+                        if (ok) pass("KIN-4 / motion-file swap re-packs + steps");
+                        else    fail("KIN-4 / motion-file swap re-packs + steps",
+                                     "swapped=" + std::to_string((int)swapped));
+                    } else {
+                        skip("KIN-4", "jogCurve.bvh missing");
+                    }
+                }
+            }
+        }
+    }
+
     if (failures == 0) {
         std::cerr << "[self-test] all checks passed\n";
         return 0;
@@ -14672,6 +15055,23 @@ int main(int argc, char** argv) {
         bool openCylinderModal = false;
         bool openPlaneModal = false;
 
+        // Adds a BVH kinematic body directly (no modal): default file is
+        // WalkLoopA.bvh when present, else the first listing entry. The
+        // file is switchable afterwards from the inspector's 모션 combo.
+        auto addKinematicFromAssets = [&simulator]() {
+            auto files = listBVHFiles();
+            if (files.empty()) {
+                std::cerr << "[addKinematic] no .bvh files in "
+                          << bvhAssetDir() << std::endl;
+                return;
+            }
+            std::string pick = files.front();
+            for (const auto& f : files)
+                if (f == "WalkLoopA.bvh") { pick = f; break; }
+            simulator.addKinematicBody(bvhAssetDir() + "/" + pick,
+                                       tinym::vec3(0, 0, 0));
+        };
+
         auto buildSelectedMeshTarget = [&]() {
             mesh_inspector::MeshInspectorTarget target;
 
@@ -14694,9 +15094,11 @@ int main(int argc, char** argv) {
                 if (dynamic_cast<MeshFileInitializer    <Backend, Precision>*>(in)) return "OBJ 파일";
                 if (dynamic_cast<AssimpMeshFileInitializer<Backend, Precision>*>(in)) return "모델 파일";
                 if (dynamic_cast<MeshGridInitializer    <Backend, Precision>*>(in)) return "평면";
+                if (dynamic_cast<MeshKinematicInitializer<Backend, Precision>*>(in)) return "키네마틱";
                 return "물체";
             };
             auto behaviorBucket = [](BehaviorType b) -> const char* {
+                if (b == BehaviorType::Kinematic) return "모션";
                 return (b == BehaviorType::TriangularCloth
                      || b == BehaviorType::FastGridCloth) ? "옷감" : "강체";
             };
@@ -14759,6 +15161,7 @@ int main(int argc, char** argv) {
                 target.on_request_add_cylinder = [&openCylinderModal]() { openCylinderModal = true; };
                 target.on_request_add_plane  = [&openPlaneModal]()  { openPlaneModal  = true; };
                 target.on_request_add_import = [&openImportModal]() { openImportModal = true; };
+                target.on_request_add_kinematic = addKinematicFromAssets;
                 return target;
             }
 
@@ -14909,6 +15312,40 @@ int main(int argc, char** argv) {
                         break;
                     }
                 };
+                // Kinematic body: playback panel. Snapshots are rebuilt
+                // each frame; commits go through the Simulator helpers /
+                // the request-owned initializer (pack-stable). The
+                // gravity/wind toggles and behavior tabs are meaningless
+                // for prescribed motion — hide them again.
+                if (auto* kin = simulator.kinematicOf(selectedMesh->id)) {
+                    target.kin_panel = true;
+                    target.kin_playing = kin->playing;
+                    target.kin_speed = kin->playSpeed;
+                    target.kin_loop = kin->loop;
+                    target.kin_time = (float)kin->localTime;
+                    target.kin_duration = kin->motion.duration();
+                    target.kin_file = std::filesystem::path(
+                        kin->params.filePath).filename().string();
+                    target.kin_file_list = listBVHFiles();
+                    target.apply_gravity = nullptr;
+                    target.apply_wind = nullptr;
+                    target.current_behavior_index = -1;
+                    target.on_kin_play = [&simulator](int id, bool playing) {
+                        if (auto* k = simulator.kinematicOf(id)) k->playing = playing;
+                    };
+                    target.on_kin_speed = [&simulator](int id, float speed) {
+                        if (auto* k = simulator.kinematicOf(id)) k->playSpeed = speed;
+                    };
+                    target.on_kin_loop = [&simulator](int id, bool loop) {
+                        if (auto* k = simulator.kinematicOf(id)) k->loop = loop;
+                    };
+                    target.on_kin_scrub = [&simulator](int id, float timeSec) {
+                        simulator.setKinematicTime(id, (double)timeSec);
+                    };
+                    target.on_kin_file = [&simulator](int id, const std::string& f) {
+                        simulator.setKinematicFile(id, bvhAssetDir() + "/" + f);
+                    };
+                }
             }
             // Add-Object callbacks are wired regardless of selection — they
             // are only rendered when the no-selection branch fires inside
@@ -14919,6 +15356,7 @@ int main(int argc, char** argv) {
             target.on_request_add_cylinder = [&openCylinderModal]() { openCylinderModal = true; };
             target.on_request_add_plane  = [&openPlaneModal]()  { openPlaneModal  = true; };
             target.on_request_add_import = [&openImportModal]() { openImportModal = true; };
+            target.on_request_add_kinematic = addKinematicFromAssets;
             return target;
         };
 
