@@ -6836,6 +6836,15 @@ struct Simulator {
     // doesn't exist / isn't Kinematic. The initializer pointer is owned by
     // the request (shared with the live mesh), so it is stable across
     // re-packs — playback state lives there for exactly that reason.
+    // Self-test probe: live backend body position for a Rigid mesh
+    // (zero vector when the mesh/handle is missing).
+    tinym::vec3 rigidBodyPositionOf(int meshId) {
+        auto* m = Scene<BE, PR>::findById(meshId);
+        if (!m || m->rigidBodyHandle == ysim::physics::kInvalidBodyHandle)
+            return tinym::vec3(0.0f, 0.0f, 0.0f);
+        return rigid_.getPosition(m->rigidBodyHandle);
+    }
+
     MeshKinematicInitializer<BE, PR>* kinematicOf(int meshId) {
         auto* m = Scene<BE, PR>::findById(meshId);
         if (!m || m->behaviorType != BehaviorType::Kinematic) return nullptr;
@@ -8051,14 +8060,37 @@ struct Simulator {
                 if (m.rigidBodyHandle == ysim::physics::kInvalidBodyHandle) continue;
             }
             const tinym::vec3 now = rigid_.getPosition(m.rigidBodyHandle);
-            const tinym::vec3 dp{
-                now.x - m.rigidLastBodyPos.x,
-                now.y - m.rigidLastBodyPos.y,
-                now.z - m.rigidLastBodyPos.z
-            };
+            // Snap the mesh CENTROID to the backend body instead of
+            // accumulating per-frame deltas. The narrow-phase response
+            // also writes Rigid verts (they are broad-phase queries), and
+            // those displacements are invisible to Bullet — with the old
+            // incremental delta they accumulated forever, so a kinematic
+            // body walking through a rigid shoved its mesh permanently
+            // off its Bullet body (the "floats up until reset" report;
+            // reset only looked like a fix because it rewound the walker
+            // to frame 0). Centroid snap re-rigidifies every frame: the
+            // pack bakes verts centered on transformPosition == the
+            // body's spawn position, so body-now minus current centroid
+            // IS the correction (translation-only, like the old delta).
             const Index nVerts = m.state.x.size / 3;
             PR* xp = m.state.x.ptr;
             PR* xPrev = m.state.xPrev.ptr;
+            tinym::vec3 centroid{0, 0, 0};
+            for (Index vi = 0; vi < nVerts; ++vi) {
+                centroid.x += (float)xp[vi*3+0];
+                centroid.y += (float)xp[vi*3+1];
+                centroid.z += (float)xp[vi*3+2];
+            }
+            if (nVerts > 0) {
+                centroid.x /= (float)nVerts;
+                centroid.y /= (float)nVerts;
+                centroid.z /= (float)nVerts;
+            }
+            const tinym::vec3 dp{
+                now.x - centroid.x,
+                now.y - centroid.y,
+                now.z - centroid.z
+            };
             for (Index vi = 0; vi < nVerts; ++vi) {
                 xp[vi*3+0] += static_cast<PR>(dp.x);
                 xp[vi*3+1] += static_cast<PR>(dp.y);
@@ -14600,6 +14632,43 @@ static int runSelfTest() {
         }
     }
 
+    // ---- Block RIG: rigid mesh stays glued to its Bullet body even when ----
+    // the narrow-phase response shoves its verts (kinematic walker overlap).
+    {
+        resetScene();
+        sim.addPlane(PlaneDirection::XZPlane, tinym::vec3(0, 0, 0), 20, 50.0f);
+        bool haveKin = sim.addKinematicBody(bvhAssetDir() + "/WalkLoopA.bvh",
+                                            tinym::vec3(0, 0, 0));
+        if (haveKin) {
+            // Rigid cube spawned inside the walker's path.
+            sim.addCube(tinym::vec3(0.0f, 0.6f, 0.0f), 2, 0.4f, 0.1f,
+                        BehaviorType::Rigid);
+            sim.initialize();
+            MetalGlobalContext::commitAndWait();
+            pumpFrames(sim, 60);
+            MetalGlobalContext::commitAndWait();
+            auto* m = Scene<Backend, Precision>::findById(2);
+            tinym::vec3 c{0, 0, 0};
+            const Index n = m->state.x.size / 3;
+            for (Index i = 0; i < n; ++i) {
+                c.x += (float)m->state.x.ptr[i*3+0];
+                c.y += (float)m->state.x.ptr[i*3+1];
+                c.z += (float)m->state.x.ptr[i*3+2];
+            }
+            c.x /= (float)n; c.y /= (float)n; c.z /= (float)n;
+            const tinym::vec3 body = sim.rigidBodyPositionOf(2);
+            const float err = std::fabs(c.x - body.x) + std::fabs(c.y - body.y)
+                            + std::fabs(c.z - body.z);
+            if (err < 1e-3f)
+                pass("RIG-1 / rigid mesh centroid tracks Bullet body under contact response");
+            else
+                fail("RIG-1 / rigid mesh centroid tracks Bullet body under contact response",
+                     "err=" + std::to_string(err));
+        } else {
+            skip("RIG-1", "WalkLoopA.bvh missing");
+        }
+    }
+
     if (failures == 0) {
         std::cerr << "[self-test] all checks passed\n";
         return 0;
@@ -14755,7 +14824,7 @@ int main(int argc, char** argv) {
     //simulator.addFloatMesh("src/assets", "horse-gallop-01.obj", {0, -1, 0}, 1.2);
     //simulator.addFloatMesh("src/assets", "camel-gallop-reference.obj", {0, -1, 0}, 1.2);
     simulator.addFloatMesh("assets", "Human.obj", {0, 0.35, 0}, 0.04);
-    simulator.addGround(PlaneDirection::XZPlane, tinym::vec3(0, 0, 0), 5);
+    simulator.addGround(PlaneDirection::XZPlane, tinym::vec3(0, 0, 0), 50);
 
     std::cout << "[Main] mesh added to scene" << std::endl;
 
