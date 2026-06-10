@@ -6,10 +6,8 @@
 // primitive_geometry.hpp pairs with the primitive initializers.
 //
 // A kinematic body renders/collides as ONE concatenated triangle mesh:
-//   - a sphere per real joint (End Sites are offset markers, not joints —
-//     no sphere), and
-//   - a cylinder per parent→child link (End Site offsets still produce
-//     their terminal bone cylinder; degenerate links skipped),
+//   - a sphere per joint (End Sites included), and
+//   - a cylinder per parent→child link (degenerate links skipped),
 // so it carries a single mesh id (whole-body selection for free) and its
 // triangles ride the existing broad/narrow collision pipeline unchanged.
 //
@@ -99,10 +97,6 @@ struct BodyProxy {
         };
 
         for (size_t j = 0; j < motion.joints.size(); ++j) {
-            // End Sites are terminal offset markers in the BVH format, not
-            // joints — they get no sphere. Their parent→site cylinder below
-            // still renders the terminal bone they define.
-            if (motion.joints[j].isEndSite) continue;
             appendPart(sphereGeom, sphereV, int(j), -1,
                        cfg.sphereTessellation, true);
         }
