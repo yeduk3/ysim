@@ -142,6 +142,11 @@ void main() {
     // Wireframe overlay (unchanged from the prior Phong path).
     float d = min( GEdgeDistance.x, GEdgeDistance.y );
     d = min( d, GEdgeDistance.z );
+    // Near-plane-clipped triangles feed garbage/NaN through the
+    // noperspective GEdgeDistance interpolators (large floors at grazing
+    // camera angles); a NaN d makes mix() return LineColor and paints the
+    // whole face black. Treat any non-finite distance as "far from edge".
+    if (isnan(d) || isinf(d)) d = 1e7;
     float mixVal = smoothstep( LineWidth - 1, LineWidth + 1, d);
     FragColor = mix( LineColor, FragColor, mixVal );
 

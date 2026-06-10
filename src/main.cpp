@@ -12891,12 +12891,87 @@ static int runSelfTest() {
                              + " darker=" + std::to_string((int)darker)
                              + " notBlack=" + std::to_string((int)notBlack));
                     }
+
+                    // GEOM-1: large floor stays lit at grazing camera
+                    // angles. Regression for the shader.geom edge-distance
+                    // NaN — a 50-unit quad viewed from inside its footprint
+                    // puts vertices behind / barely in front of the near
+                    // plane; the projected coordinates blow up and a NaN in
+                    // GEdgeDistance painted whole faces LineColor (black).
+                    {
+                        const float bg = 25.0f;
+                        float bigVerts[4 * 3] = {
+                            -bg, 0,  bg,   bg, 0,  bg,
+                             bg, 0, -bg,  -bg, 0, -bg,
+                        };
+                        unsigned int bigIdx[6] = {0, 1, 2, 0, 2, 3};
+                        float bigNormals[4 * 3] = {0};
+                        MeshGL<CPU> bigMesh(4, bigVerts, 2, bigIdx, bigNormals);
+                        bigMesh.computeNormal();
+                        bigMesh.updateBuffer();
+
+                        auto grazeMean = [&](tinym::vec3 eye,
+                                             tinym::vec3 look) {
+                            fbo.bind();
+                            glViewport(0, 0, 256, 256);
+                            glEnable(GL_DEPTH_TEST);
+                            glClearColor(0, 0, 0, 1);
+                            glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+                            mainSh.use();
+                            tinym::mat4 M(1.0f);
+                            tinym::mat4 V = tinym::lookAt(
+                                eye, look, tinym::vec3(0, 1, 0));
+                            tinym::mat4 P = tinym::perspective(
+                                0.7854f, 1.0f, 0.1f, 1000.0f);
+                            mainSh.setUniform("M", M);
+                            mainSh.setUniform("V", V);
+                            mainSh.setUniform("P", P);
+                            mainSh.setUniform("LightVP", lightVP);
+                            mainSh.setUniform("lightColor", tinym::vec3(3, 3, 3));
+                            mainSh.setUniform("hoveredId", -1);
+                            mainSh.setUniform("selectedId", -1);
+                            glActiveTexture(GL_TEXTURE2);
+                            glBindTexture(GL_TEXTURE_2D, sTex);
+                            mainSh.setUniform("shadowMap", 2);
+                            mainSh.setUniform("shadowsOn", 0);
+                            bigMesh.draw(mainSh, tinym::vec3(0.8f, 0.8f, 0.8f),
+                                         0.0f, 0.8f, 1.0f, tinym::vec3(0.0f));
+                            glFinish();
+                            std::vector<uint8_t> px(256 * 256 * 4);
+                            glReadPixels(0, 0, 256, 256, GL_RGBA,
+                                         GL_UNSIGNED_BYTE, px.data());
+                            fbo.unbind();
+                            double sum = 0.0;
+                            for (size_t i = 0; i < px.size(); i += 4)
+                                sum += (px[i] + px[i+1] + px[i+2]) / 3.0;
+                            return sum / (256.0 * 256.0);
+                        };
+
+                        // Inside the floor footprint, low, looking outward
+                        // — corners land behind / hugging the near plane.
+                        const double m1 = grazeMean({0, 1, 5}, {0, 0, -10});
+                        const double m2 = grazeMean({10, 0.5f, 10},
+                                                    {-20, 0, -20});
+                        const double m3 = grazeMean({0, 0.3f, 0}, {25, 0, 0});
+                        const double worst = std::min(m1, std::min(m2, m3));
+                        // Floor fills roughly the lower half of the frame;
+                        // lit gray averaged with black sky clears this
+                        // easily. NaN-black floors measured ~0-3 here.
+                        if (worst > 20.0)
+                            pass("GEOM-1 / large floor lit at grazing angles (no NaN blackout)");
+                        else
+                            fail("GEOM-1 / large floor lit at grazing angles (no NaN blackout)",
+                                 "means " + std::to_string(m1) + " "
+                                 + std::to_string(m2) + " "
+                                 + std::to_string(m3));
+                    }
                 }
                 glDeleteFramebuffers(1, &sFbo);
                 glDeleteTextures(1, &sTex);
             }
         }
     }
+
 
     // ---- Block 26: BDD-018 — Inspector edits propagate live. ----------------
     // TESTS.md#BDD-018 wording (verbatim, *not* the matrix-row label):

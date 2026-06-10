@@ -24,10 +24,23 @@ void main() {
     // (huge edge distance == no line), and clamp the acos domain
     // against float round-off for healthy triangles.
     float ha, hb, hc;
-    if (gl_in[0].gl_Position.w <= 0.0 ||
-        gl_in[1].gl_Position.w <= 0.0 ||
-        gl_in[2].gl_Position.w <= 0.0) {
+    bool degenerate = false;
+    // w must be comfortably positive, not just nonzero: a vertex barely in
+    // front of the near plane (w = +epsilon) projects to enormous viewport
+    // coordinates whose squares overflow float -> inf/inf = NaN below, and
+    // clamp(NaN) stays NaN on macOS. A 50-unit floor puts some vertex in
+    // that state at almost every camera angle.
+    if (gl_in[0].gl_Position.w <= 1e-3 ||
+        gl_in[1].gl_Position.w <= 1e-3 ||
+        gl_in[2].gl_Position.w <= 1e-3) {
+        // No line for this triangle. NOTE: the per-vertex zero components
+        // below must ALSO be suppressed — clipping interpolates varyings
+        // toward the offending vertex, and a (1e7, 0, 0)-style vector
+        // still yields min(GEdgeDistance) ~ 0 over most of the clipped
+        // region, painting it LineColor. degenerate=true emits all-huge
+        // vectors instead.
         ha = hb = hc = 1e7;
+        degenerate = true;
     } else {
         // Transform each vertex into viewport space
         vec3 p0 = vec3(ViewportMatrix * (gl_in[0].gl_Position / gl_in[0].gl_Position.w));
@@ -42,21 +55,28 @@ void main() {
         ha = abs( c * sin( beta ) );
         hb = abs( c * sin( alpha ) );
         hc = abs( b * sin( alpha ) );
+        // Belt-and-suspenders: any residual non-finite value (overflowed
+        // lengths from extreme projections) must not reach the fragment
+        // interpolators — one NaN paints the whole face LineColor.
+        if (isnan(ha) || isinf(ha) || isnan(hb) || isinf(hb) ||
+            isnan(hc) || isinf(hc)) {
+            ha = hb = hc = 1e7;
+        }
     }
     // Send the triangle along with the edge distances
-    GEdgeDistance = vec3( ha, 0, 0 );
+    GEdgeDistance = degenerate ? vec3(1e7) : vec3( ha, 0, 0 );
     GNormal = VNormal[0];
     GPosition = VPosition[0];
     GShadowCoord = VShadowCoord[0];
     gl_Position = gl_in[0].gl_Position;
     EmitVertex();
-    GEdgeDistance = vec3( 0, hb, 0);
+    GEdgeDistance = degenerate ? vec3(1e7) : vec3( 0, hb, 0);
     GNormal = VNormal[1];
     GPosition = VPosition[1];
     GShadowCoord = VShadowCoord[1];
     gl_Position = gl_in[1].gl_Position;
     EmitVertex();
-    GEdgeDistance = vec3( 0, 0, hc );
+    GEdgeDistance = degenerate ? vec3(1e7) : vec3( 0, 0, hc );
     GNormal = VNormal[2];
     GPosition = VPosition[2];
     GShadowCoord = VShadowCoord[2];
