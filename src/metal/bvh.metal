@@ -451,7 +451,16 @@ kernel void bottomUpBoxes(
 
     int child = int(id + numPrimitives - 1); // leaf node index
 
-    while (true) {
+    // WEDGE GUARD: a legitimate leaf→root walk visits at most numNodes
+    // (= 2N-1) parents. If buildTree produced a corrupted topology (a
+    // parent cycle — observed with degenerate/exploded vertex data), an
+    // unbounded walk spins this kernel forever; a wedged GPU kernel
+    // survives kill -9 of the host and needs a reboot. Bail out instead:
+    // the worst case is a stale/wrong parent AABB, which the broad phase
+    // tolerates (over/under-report), unlike a frozen GPU.
+    uint maxSteps = 2u * numPrimitives;
+
+    for (uint step = 0; step < maxSteps; ++step) {
         int parent = treeParent[child];
 
         // Atomics are relaxed-only in MSL; fences carry the
@@ -566,7 +575,13 @@ kernel void agglomerativeBuild_Tri(
     int L = (int)id;
     int R = (int)id;
 
-    while (true) {
+    // WEDGE GUARD: a valid agglomerative walk widens [L, R] by at least
+    // one leaf per iteration, so it takes at most N steps to reach the
+    // root. Corrupted mortons (degenerate/exploded vertex data) can break
+    // the δ rule's monotonicity and cycle the walk; bound it so the GPU
+    // can never spin forever (worst case: an unfinished subtree AABB,
+    // which the broad phase tolerates — a frozen GPU is not recoverable).
+    for (int step = 0; step < 2 * N; ++step) {
         if (L == 0 && R == N - 1) {
             atomic_store_explicit(rootIndexOut, currentNode, memory_order_relaxed);
             return;
@@ -689,7 +704,13 @@ kernel void agglomerativeBuild_Edge(
     int L = (int)id;
     int R = (int)id;
 
-    while (true) {
+    // WEDGE GUARD: a valid agglomerative walk widens [L, R] by at least
+    // one leaf per iteration, so it takes at most N steps to reach the
+    // root. Corrupted mortons (degenerate/exploded vertex data) can break
+    // the δ rule's monotonicity and cycle the walk; bound it so the GPU
+    // can never spin forever (worst case: an unfinished subtree AABB,
+    // which the broad phase tolerates — a frozen GPU is not recoverable).
+    for (int step = 0; step < 2 * N; ++step) {
         if (L == 0 && R == N - 1) {
             atomic_store_explicit(rootIndexOut, currentNode, memory_order_relaxed);
             return;
@@ -957,7 +978,18 @@ void queryAABB(
     int sp = 0;
     stack[sp++] = 0;
 
+    // WEDGE GUARD: a healthy traversal visits at most the node count of
+    // the tree (~2M for a 1M-facet mesh). A corrupted topology (child
+    // pointing back at an ancestor) re-feeds the stack forever; cap the
+    // visit count so the kernel always terminates — reported through the
+    // existing stackOverflow flag (same "incomplete query" semantics).
+    uint visited = 0u;
+
     while(sp > 0) {
+        if (++visited > (1u << 22)) {
+            qFlag[0].stackOverflow = 1u;
+            return;
+        }
         int nodeid = stack[--sp];
         BVHNode node = tree[nodeid];
 
@@ -1068,7 +1100,14 @@ void queryAABBSegmented(
     int sp = 0;
     stack[sp++] = 0;
 
+    // WEDGE GUARD: same visit cap as queryAABB — see comment there.
+    uint visited = 0u;
+
     while(sp > 0) {
+        if (++visited > (1u << 22)) {
+            qFlag[0].stackOverflow = 1u;
+            return;
+        }
         int nodeid = stack[--sp];
         BVHNode node = tree[nodeid];
 

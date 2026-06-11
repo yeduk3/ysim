@@ -7842,6 +7842,14 @@ struct Simulator {
         collisionPipeline.broadPhase.build(scene);
         shBroadPhase.build(scene);
 
+        // Anomaly flag is pool-backed like everything above, so the
+        // GlobalAutoAllocator::reset() at the top of this function turned
+        // any prior allocation into an aliased stale pointer. Re-allocate
+        // fresh every initialize (covers reset / load / changeBehavior
+        // rebuilds) and clear it — a new run starts un-flagged.
+        system.anomalyFlag = VectorBase<BE, uint32_t>(1);
+        system.anomalyFlag[0] = 0u;
+
         //Scene<BE, PR>::initialize();
 
         frame = 0;
@@ -7959,6 +7967,22 @@ struct Simulator {
         // / rigid-body / cloth pipelines until they unpaused.
         if (Scene<BE, PR>::dirty) initialize();
         if(pause) return;
+
+        // Anomaly halt: the integrators' world-bounds guard raised the
+        // flag (a vertex went NaN/Inf or escaped the world box) on a
+        // previous frame's GPU work. Pause so the user sees the scene
+        // frozen at the first bad frame instead of a clamped explosion;
+        // clearing the flag here means unpausing resumes detection afresh
+        // (a still-diverging scene re-pauses on the next frame).
+        if (system.anomalyFlag.ptr && system.anomalyFlag[0] != 0u) {
+            system.anomalyFlag[0] = 0u;
+            pause = true;
+            scene_log::logObject(
+                "시뮬레이션 자동 정지: 비정상 위치/속도 감지 (NaN·폭주) — 적분기 가드 발동");
+            std::cerr << "[Simulator] anomaly halt: non-finite/out-of-box "
+                         "vertex detected; simulation paused\n";
+            return;
+        }
 
         // Slice (c) c-0: keep the analytic-primitive array current.
         // Once per update() suffices for v1 (Q2: primitives static);
@@ -9240,6 +9264,15 @@ struct ExplicitSystem<METAL, PR> {
     MTL::Buffer* refPairBuf = nullptr;
     size_t refPairCap = 0;
 
+    // Anomaly flag (single uint, shared storage). The integrate kernels'
+    // world-bounds guard stores 1 here whenever any vertex had to be
+    // sanitized (NaN/Inf or escaped the world box). Simulator::update
+    // polls it once per frame and auto-pauses — one GPU bool, one host if,
+    // no extra sync (worst case the pause lands a frame late). Allocated
+    // lazily in update() so construction order vs the Metal pool doesn't
+    // matter.
+    VectorBase<METAL, uint32_t> anomalyFlag;
+
     // Sim vars
     PR h = 1/PR(60);
     size_t subSteps = 50;
@@ -9361,6 +9394,10 @@ struct ExplicitSystem<METAL, PR> {
     // With no constraints the two passes are exactly the old per-mesh
     // force-then-integrate sequence (pairCount == 0 skips both copies).
     void update(Scene<METAL, PR>& sceneObjects) {
+        if (!anomalyFlag.ptr) {
+            anomalyFlag = VectorBase<METAL, uint32_t>(1);
+            anomalyFlag[0] = 0u;
+        }
         uint pairCount = buildRefPairs(sceneObjects);
 
         // Step 1-1: position snap before any force computation.
@@ -9408,10 +9445,12 @@ struct ExplicitSystem<METAL, PR> {
             switch(mesh.behaviorType) {
                 case BehaviorType::TriangularCloth:
                     TriangularClothBehavior<METAL, PR>::setBuffer(mesh, params);
+                    MetalGlobalContext::setBuffer(anomalyFlag, 20);
                     MetalGlobalContext::dispatchThreads(integrateClothPSO, mesh.state.x.size/3);
                     break;
                 case BehaviorType::FastGridCloth:
                     FastGridClothBehavior<METAL, PR>::setBuffer(mesh, params);
+                    MetalGlobalContext::setBuffer(anomalyFlag, 12);
                     MetalGlobalContext::dispatchThreads(integrateClothGridPSO, mesh.state.x.size/3);
                     break;
                 case BehaviorType::Float:
@@ -14742,6 +14781,73 @@ static int runSelfTest() {
         } else {
             skip("RIG-1", "WalkLoopA.bvh missing");
         }
+    }
+
+    // ---- Block NAN-GUARD: integrator world-bounds guard keeps an --------
+    // exploding cloth finite so the frame%10 full BVH rebuild can never
+    // see Inf/NaN positions (the GPU-wedge incident: a data-dependent
+    // build loop on NaN spins forever and survives kill -9 — reboot only).
+    // Scene reproduces the original wedge exactly: default kstretch=1e5
+    // cloth explodes under the explicit integrator within one frame.
+    //
+    // WEDGE-SAFE PROTOCOL: assert finiteness at frame 9 — BEFORE the
+    // first frame%10 rebuild at frame 10 — and bail out on failure, so a
+    // regression of the guard fails the suite instead of wedging the GPU.
+    {
+        resetScene();
+        sim.addGround(PlaneDirection::XZPlane, tinym::vec3(0, 0, 0), 4.0f); // id 0
+        sim.addCloth(8, 0.8f, tinym::vec3(0.0f, 0.4f, 0.0f));               // id 1, default 1e5 springs → explodes
+        sim.initialize();
+
+        auto allFiniteInBox = [&](double bound) {
+            auto* cloth = Scene<Backend, Precision>::findById(1);
+            for (Index i = 0; i < cloth->state.x.size; ++i) {
+                const double c = (double)cloth->state.x.ptr[i];
+                if (!std::isfinite(c) || std::fabs(c) > bound) return false;
+            }
+            return true;
+        };
+
+        // The anomaly halt auto-pauses on the first bad frame, so step
+        // with pause forced off each iteration: the explosion then keeps
+        // being driven THROUGH the sanitizer and across frame%10 full
+        // BVH rebuilds (the wedge path), while haltCount records that
+        // the auto-pause actually fired.
+        int haltCount = 0;
+        auto forceStep = [&](int n) {
+            for (int i = 0; i < n; ++i) {
+                sim.pause = false;
+                sim.update();
+                if (sim.pause) ++haltCount;
+            }
+        };
+
+        forceStep(9);
+        MetalGlobalContext::commitAndWait();
+        // Box bound 1e4 must match YSIM_WORLD_BOUND in physics.metal; the
+        // +1 slack covers the post-clamp collision-response push.
+        if (!allFiniteInBox(1.0e4 + 1.0)) {
+            fail("NAN-GUARD-1 / exploding cloth finite+boxed at frame 9 (pre-BVH-rebuild gate)",
+                 "non-finite or out-of-box vertex at frame 9 — guard regressed; "
+                 "skipping further frames to avoid GPU wedge");
+        } else if (haltCount == 0) {
+            fail("NAN-GUARD-1 / anomaly halt auto-pauses on the exploding cloth",
+                 "sim.pause never set across 9 frames of explosion");
+        } else {
+            pass("NAN-GUARD-1 / exploding cloth finite+boxed at frame 9 and anomaly halt fired");
+            // Safe to cross frame%10 rebuilds now. Halt-and-force-unpause
+            // alternates (halted iterations don't step), so 231 forced
+            // iterations ≈ 115 stepped frames ≈ 11 full BVH rebuilds on
+            // the clamped explosion — plenty to prove the wedge is gone.
+            forceStep(231);
+            MetalGlobalContext::commitAndWait();
+            if (allFiniteInBox(1.0e4 + 1.0))
+                pass("NAN-GUARD-2 / finite+boxed through 240 forced frames and the frame%10 full BVH rebuilds");
+            else
+                fail("NAN-GUARD-2 / finite+boxed through 240 forced frames and the frame%10 full BVH rebuilds",
+                     "non-finite or out-of-box vertex after 240 frames");
+        }
+        sim.pause = true;
     }
 
     if (failures == 0) {

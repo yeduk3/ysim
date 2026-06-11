@@ -14,6 +14,65 @@ struct SimParams {
     float acctime;
 };
 
+// ========================================================
+// World-bounds guard — GPU wedge prevention.
+//
+// An exploded solver (over-stiff springs, near-zero mass) emits
+// Inf/NaN positions; the frame%10 full BVH rebuild then computes
+// morton codes / parent links from garbage, and its data-dependent
+// loops (parent-chain walk, range search) can spin forever. A
+// wedged GPU kernel survives even kill -9 of the host process —
+// only a reboot clears it. So the two cloth integrators (the sole
+// GPU writers of x/v on the cloth path) sanitize their output:
+//   - non-finite is detected by BIT PATTERN (exponent all-ones).
+//     xcrun metal compiles with fast-math by default, under which
+//     isnan()/clamp() on NaN are unreliable — bit tests are not.
+//   - a non-finite position snaps back to its pre-substep value
+//     (finite by induction; the guard has run since frame 0), and
+//     a non-finite or out-of-box vertex has its velocity zeroed —
+//     that energy is unphysical anyway.
+//   - finally the position is clamped into the ±YSIM_WORLD_BOUND
+//     box, so even a finite runaway can never push the scene AABB
+//     (and morton normalization) into degenerate scales.
+// The box is intentionally huge: no legitimate scene content
+// approaches it, so normal simulation is bit-identical.
+// ========================================================
+#define YSIM_WORLD_BOUND 1.0e4f
+
+inline bool nonFinite3(float3 p) {
+    uint3 b = as_type<uint3>(p);
+    return ((b.x & 0x7F800000u) == 0x7F800000u)
+        || ((b.y & 0x7F800000u) == 0x7F800000u)
+        || ((b.z & 0x7F800000u) == 0x7F800000u);
+}
+
+// Returns true if anything had to be sanitized — the integrators forward
+// that into the host-visible anomaly flag so Simulator::update can pause
+// the simulation on the first bad frame.
+inline bool sanitizeIntegrateOutput(thread float3& pos,
+                                    thread float3& vel,
+                                    float3 posFallback) {
+    bool touched = false;
+    if (nonFinite3(pos)) {
+        pos = nonFinite3(posFallback) ? float3(0.0f) : posFallback;
+        vel = float3(0.0f);
+        touched = true;
+    }
+    if (nonFinite3(vel)) {
+        vel = float3(0.0f);
+        touched = true;
+    }
+    // pos is finite past this point, so fast-math clamp/compare are exact.
+    float3 boxed = clamp(pos, float3(-YSIM_WORLD_BOUND),
+                              float3(YSIM_WORLD_BOUND));
+    if (any(boxed != pos)) {
+        pos = boxed;
+        vel = float3(0.0f);
+        touched = true;
+    }
+    return touched;
+}
+
 
 // ========================================================
 // [커널 1] 힘만 계산하는 파이프라인
@@ -176,6 +235,7 @@ kernel void integrate_cloth_grid(
     constant ClothGridParams& clothParams [[buffer(9)]],
     device const uint* statesOffsets [[buffer(10)]],
     constant uint& oid [[buffer(11)]],
+    device uint* anomalyFlag [[buffer(12)]],
     uint id [[thread_position_in_grid]]
 ) {
     if (id >= params.vertexNum) return; 
@@ -222,6 +282,15 @@ kernel void integrate_cloth_grid(
     }
 
     pos += (params.subh * vel) * mask;
+
+    // World-bounds guard: x[id] still holds the pre-substep position
+    // (stores below are the kernel's only writes), so it serves as the
+    // finite fallback when this substep produced Inf/NaN. Any sanitize
+    // raises the anomaly flag (benign race — every writer stores 1) so
+    // the host pauses the simulation on the first bad frame.
+    if (sanitizeIntegrateOutput(pos, vel, float3(x[id]))) {
+        anomalyFlag[0] = 1u;
+    }
 
     v[id] = vel;
     x[id] = pos;
@@ -305,6 +374,7 @@ kernel void integrate_cloth(
     constant ClothParams& clothParams [[buffer(9)]],
     device const uint* statesOffsets [[buffer(18)]],
     constant uint& oid [[buffer(19)]],
+    device uint* anomalyFlag [[buffer(20)]],
     uint id [[thread_position_in_grid]]
 ) {
     if (id >= params.vertexNum) return; 
@@ -351,6 +421,15 @@ kernel void integrate_cloth(
     }
 
     pos += (params.subh * vel) * mask;
+
+    // World-bounds guard: x[id] still holds the pre-substep position
+    // (stores below are the kernel's only writes), so it serves as the
+    // finite fallback when this substep produced Inf/NaN. Any sanitize
+    // raises the anomaly flag (benign race — every writer stores 1) so
+    // the host pauses the simulation on the first bad frame.
+    if (sanitizeIntegrateOutput(pos, vel, float3(x[id]))) {
+        anomalyFlag[0] = 1u;
+    }
 
     v[id] = vel;
     x[id] = pos;
