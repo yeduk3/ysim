@@ -252,6 +252,16 @@ struct MeshInspectorTarget {
     std::function<void(int /*meshId*/, bool /*applyGravity*/, bool /*applyWind*/)>
         on_env_toggle_change;
 
+    // Checkerboard render option — non-null only for plane (grid) meshes.
+    // The checkbox aliases GeneralMesh::checkerboard (renderer reads it each
+    // frame); on_checkerboard mirrors the new value onto the request so
+    // Scene::pack rebuilds preserve it. The pattern is a world-space
+    // black/white checker (1 world unit per cell) derived in the plane's
+    // local frame, so it stays fixed to the plane when it translates and
+    // densifies under scale. Both must be set together to enable the row.
+    bool* checkerboard = nullptr;
+    std::function<void(int /*meshId*/, bool /*on*/)> on_checkerboard;
+
     // ── Kinematic body (BVH motion) panel ────────────────────────────
     // kin_panel=true renders the playback section: play/pause, speed,
     // loop, a time scrub over [0, kin_duration], and a motion-file combo
@@ -272,6 +282,60 @@ struct MeshInspectorTarget {
     std::function<void(int /*meshId*/, bool /*loop*/)> on_kin_loop;
     std::function<void(int /*meshId*/, float /*timeSec*/)> on_kin_scrub;
     std::function<void(int /*meshId*/, const std::string& /*file*/)> on_kin_file;
+    // Camera-follow toggle: when on, the viewport orbit pivot tracks this
+    // kinematic body's animated root each frame (production reads the live
+    // root world position from the proxy). kin_camera_follow is a per-frame
+    // snapshot of whether THIS mesh is the followed one; the callback sets
+    // the follow target (true) or clears it (false). Rendered in the 모션
+    // accordion, so it only appears for kinematic targets.
+    bool kin_camera_follow = false;
+    std::function<void(int /*meshId*/, bool /*follow*/)> on_kin_camera_follow;
+
+    // ── Motion-graph sub-panel (Kovar 2002) ──────────────────────────
+    // kin_mode picks which widget set renders inside the 모션 accordion
+    // (mode-exclusive): 0 = single clip (the original playback widgets),
+    // 1 = graph random walk, 2 = graph transition. kin_graph_ready is true
+    // when the active mode's graph build succeeded — gates the playback
+    // widgets of graph modes. kin_status carries the last build report
+    // verbatim; kin_label names what the walk/transition is playing now.
+    // kin_graph_selected parallels kin_file_list (1 = clip in the walk's
+    // graph set). All values are per-frame snapshots like the rest of the
+    // kin_* fields; edits commit through the callbacks only.
+    int kin_mode = 0;
+    bool kin_graph_ready = false;
+    float kin_threshold = 0.10f;
+    float kin_marker_frac = 0.10f;  // joint-axis marker length / body height
+    std::string kin_status;
+    std::string kin_label;
+    std::vector<unsigned char> kin_graph_selected;
+    std::string kin_trans_a, kin_trans_b;
+    std::function<void(int /*meshId*/, int /*mode*/)> on_kin_mode;
+    std::function<void(int /*meshId*/, float /*threshold*/)> on_kin_threshold;
+    std::function<void(int /*meshId*/, float /*markerFrac*/)> on_kin_marker_frac;
+    std::function<void(int /*meshId*/, const std::string& /*file*/, bool /*on*/)>
+        on_kin_graph_toggle;
+    std::function<void(int /*meshId*/, bool /*selectAll*/)> on_kin_graph_all;
+    std::function<void(int /*meshId*/)> on_kin_walk_build;
+    std::function<void(int /*meshId*/)> on_kin_walk_reseed;
+    std::function<void(int /*meshId*/, const std::string& /*file*/)> on_kin_trans_a;
+    std::function<void(int /*meshId*/, const std::string& /*file*/)> on_kin_trans_b;
+    std::function<void(int /*meshId*/)> on_kin_trans_build;
+    // 모션 블렌드 (DTW): reuses kin_trans_a/b for the A/B clip pair.
+    std::function<void(int /*meshId*/)> on_kin_blend_build;
+    // Motion preview: independent per-clip strobe ghosts (1=red, 2=blue) with
+    // user-pickable colors, shown at file-selection time (before build). The
+    // color pointers alias the initializer's rgb arrays (edited in place by
+    // ColorEdit3, same convention as base_color); null when not a kinematic.
+    bool kin_preview_a = false, kin_preview_b = false;
+    float* kin_preview_col_a = nullptr;
+    float* kin_preview_col_b = nullptr;
+    std::function<void(int /*meshId*/, bool /*on*/)> on_kin_preview_a;
+    std::function<void(int /*meshId*/, bool /*on*/)> on_kin_preview_b;
+    // One-shot opaque playback of a preview clip. Paused-only — the button is
+    // disabled while the sim runs (kin_sim_paused mirrors simulator.pause).
+    bool kin_sim_paused = false;
+    std::function<void(int /*meshId*/)> on_kin_preview_play_a;
+    std::function<void(int /*meshId*/)> on_kin_preview_play_b;
 
     // No-selection branch: when mesh_id < 0 the right panel renders these
     // Add-Object buttons instead of the per-mesh editors. Callbacks

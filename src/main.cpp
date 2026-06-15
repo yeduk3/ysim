@@ -18,6 +18,7 @@
 #include "HiddenGLContext.hpp"
 #include "bvh_motion.hpp"
 #include "kinematic_body.hpp"
+#include "motion_graph.hpp"
 
 #include "imgui.h"
 #include "imgui_impl_glfw.h"
@@ -2338,6 +2339,65 @@ struct MeshKinematicInitializer : GeneralMeshInitializer<BE, PR> {
     bool loop = true;
     double localTime = 0.0;
 
+    // ── Motion-graph playback (Kovar 2002, include/motion_graph.hpp) ──
+    // motionMode picks the pose source: 0 = single clip (the original path,
+    // untouched), 1 = graph random walk, 2 = graph transition. A graph mode
+    // only engages once its session build succeeded (graphActive()); until
+    // then the single clip keeps playing, so a half-configured panel never
+    // blanks the body. The staging fields are inspector state that must
+    // survive re-packs, which is why they live here with the playback state.
+    int motionMode = 0;
+    mograph::Session graphSession;
+    std::vector<std::string> graphSelFiles;  // random-walk clip set (file names)
+    std::string transFileA, transFileB;      // transition endpoints (file names)
+    float graphThreshold = 0.10f;            // cost threshold, fraction of height
+    float graphMarkerFrac = 0.10f;           // joint-axis marker length / height
+    uint32_t walkSeed = 12345;
+    std::string graphStatus;                 // last build report for the GUI
+
+    // Blend-mode motion preview: independent per-clip strobe, available before
+    // 블렌드 생성 — samples the selected files directly (cached) rather than the
+    // built session's clips. Colors are user-pickable.
+    bool previewA = false, previewB = false;
+    std::array<float, 3> previewColA{0.95f, 0.25f, 0.25f};  // motion 1 (red)
+    std::array<float, 3> previewColB{0.30f, 0.45f, 0.95f};  // motion 2 (blue)
+    mograph::Clip previewClipA, previewClipB;
+    std::string previewFileA, previewFileB;  // which file each cache holds
+    // One-shot opaque playback (paused-only, render-loop driven): 0 none,
+    // 1 = motion A playing, 2 = motion B playing. Clears itself at clip end.
+    int previewPlay = 0;
+    double previewPlayTime = 0.0;
+
+    // Reference skeleton (the loaded motion's), cached for preview FK + clip
+    // sampling. Invalidated on reloadMotion.
+    mograph::Skeleton skelCache_;
+    bool skelValid_ = false;
+    const mograph::Skeleton& skel() {
+        if (!skelValid_) {
+            skelCache_ = mograph::Skeleton::extract(motion);
+            skelValid_ = true;
+        }
+        return skelCache_;
+    }
+
+    bool graphActive() const {
+        if (!graphSession.ready()) return false;
+        if (motionMode == 1)
+            return graphSession.mode == mograph::Session::Mode::RandomWalk;
+        if (motionMode == 2)
+            return graphSession.mode == mograph::Session::Mode::Transition;
+        if (motionMode == 3)
+            return graphSession.mode == mograph::Session::Mode::Blend;
+        return false;
+    }
+
+    // Playback length of whatever the current mode plays (walks are
+    // effectively unbounded).
+    double activeDuration() const {
+        return graphActive() ? graphSession.duration()
+                             : (double)motion.duration();
+    }
+
     explicit MeshKinematicInitializer(ParamsType p) : params(std::move(p)) {}
 
     // Factory: loads + builds first because InitializerParams needs the
@@ -2373,6 +2433,17 @@ struct MeshKinematicInitializer : GeneralMeshInitializer<BE, PR> {
         params.numFacets = proxy.numFacets();
         params.numEdges = proxy.numEdges;
         localTime = 0.0;
+        // A built graph session references the OLD motion's skeleton/units;
+        // keep it from driving the new proxy. Builders reload first, then
+        // rebuild the session, so this only ever drops stale state.
+        graphSession.clear();
+        // Skeleton + preview caches reference the old motion — drop them.
+        skelValid_ = false;
+        previewFileA.clear();
+        previewFileB.clear();
+        previewClipA.frames.clear();
+        previewClipB.frames.clear();
+        invalidateRebase();
         return true;
     }
 
@@ -2395,7 +2466,8 @@ struct MeshKinematicInitializer : GeneralMeshInitializer<BE, PR> {
     void writePose(double timeSec, tinym::vec3 userScale, const Quat& rot,
                    tinym::vec3 position, PR* out) {
         bvh::Pose pose;
-        motion.evaluate(float(timeSec), loop, pose);
+        sampleWorldPose(timeSec, pose);
+        applyRootRebase(pose);
         scratch_.resize(size_t(proxy.numVerts) * 3);
         proxy.writeVertices(
             pose, normScale(),
@@ -2404,6 +2476,117 @@ struct MeshKinematicInitializer : GeneralMeshInitializer<BE, PR> {
             {float(position.x), float(position.y), float(position.z)},
             scratch_.data());
         for (size_t i = 0; i < scratch_.size(); ++i) out[i] = PR(scratch_[i]);
+    }
+
+    // Sample the active source (graph session when built, else the raw clip)
+    // into a world-space pose. Shared by playback and the frame-0 rebase.
+    void sampleWorldPose(double timeSec, bvh::Pose& pose) {
+        if (graphActive()) {
+            graphSession.samplePose(timeSec, pose);
+            // Joint-count mismatch would mean a session built against a
+            // different skeleton than the proxy — fall back rather than
+            // index out of bounds (builders prevent this; belt+braces).
+            if (pose.world.size() != motion.joints.size())
+                motion.evaluate(float(timeSec), loop, pose);
+        } else {
+            motion.evaluate(float(timeSec), loop, pose);
+        }
+    }
+
+    // Cached live-playback rebase (frame-0 xz + yaw). Cached because for long
+    // random walks WalkBaker evicts old frames, so re-sampling frame 0 later
+    // would shift the origin and jump the body. Invalidated when the playback
+    // source changes (mode/build/file/seed).
+    bool rebaseValid_ = false;
+    float rebaseTh_ = 0.0f, rebaseX0_ = 0.0f, rebaseZ0_ = 0.0f;
+    void invalidateRebase() { rebaseValid_ = false; }
+
+    // Re-root: the BVH frame-0 root xz position + heading (yaw) are removed so
+    // the kinematic object's transform alone places the body (frame-0 root
+    // sits at the object origin). Y is kept so feet stay grounded. Gravity-
+    // preserving — same family as the motion-graph XformXZ.
+    void applyRootRebase(bvh::Pose& pose) {
+        if (pose.world.empty()) return;
+        if (!rebaseValid_) {
+            bvh::Pose p0;
+            sampleWorldPose(0.0, p0);
+            if (p0.world.empty()) return;
+            const auto& R0 = p0.world[0].R;
+            rebaseTh_ = std::atan2(R0[2], R0[0]);
+            rebaseX0_ = p0.world[0].t[0];
+            rebaseZ0_ = p0.world[0].t[2];
+            rebaseValid_ = true;
+        }
+        const float c = std::cos(rebaseTh_), s = std::sin(rebaseTh_);
+        for (auto& jx : pose.world) {
+            const float dx = jx.t[0] - rebaseX0_, dz = jx.t[2] - rebaseZ0_;
+            jx.t[0] = c * dx - s * dz;
+            jx.t[2] = s * dx + c * dz;
+        }
+    }
+
+    // In-place: rotate the whole pose by -yaw(root0) about Y and subtract
+    // root0's xz, leaving Y untouched. (writeVertices only reads joint
+    // positions, so re-rooting positions re-roots the visible body.)
+    static void rebaseXZYaw(bvh::Pose& pose, const bvh::JointXform& root0) {
+        const float th = std::atan2(root0.R[2], root0.R[0]);
+        const float c = std::cos(th), s = std::sin(th);
+        const float x0 = root0.t[0], z0 = root0.t[2];
+        for (auto& jx : pose.world) {
+            const float dx = jx.t[0] - x0, dz = jx.t[2] - z0;
+            jx.t[0] = c * dx - s * dz;
+            jx.t[2] = s * dx + c * dz;
+        }
+    }
+
+    // Motion-preview ghost: proxy world verts for clip `c` frame `f`, re-rooted
+    // exactly like the live body (frame-0 xz+yaw removed, Y kept) and placed by
+    // the body transform — so it rests at the object's position, feet grounded.
+    void writeGhost(const mograph::Clip& c, int f, tinym::vec3 userScale,
+                    const Quat& rot, tinym::vec3 position,
+                    std::vector<float>& out) {
+        if (c.frames.empty()) return;
+        const int nf = int(c.frames.size());
+        const int fi = f < 0 ? 0 : (f >= nf ? nf - 1 : f);
+        bvh::Pose pose, pose0;
+        mograph::fk(skel(), c.frames[fi], pose);
+        mograph::fk(skel(), c.frames[0], pose0);
+        rebaseXZYaw(pose, pose0.world[0]);
+        out.resize(size_t(proxy.numVerts) * 3);
+        proxy.writeVertices(
+            pose, normScale(),
+            {float(userScale.x), float(userScale.y), float(userScale.z)},
+            quatToMat3(rot),
+            {float(position.x), float(position.y), float(position.z)},
+            out.data());
+    }
+
+    // Like writeGhost but samples the clip at a continuous time (lerp between
+    // frames) — for the smooth one-shot preview playback.
+    void writeGhostAtTime(const mograph::Clip& c, double timeSec,
+                          tinym::vec3 userScale, const Quat& rot,
+                          tinym::vec3 position, std::vector<float>& out) {
+        if (c.frames.empty()) return;
+        const int nf = int(c.frames.size());
+        double ff = timeSec / (c.dt > 0 ? c.dt : 1.0);
+        if (ff < 0) ff = 0;
+        if (ff > nf - 1) ff = nf - 1;
+        const int f0 = int(ff);
+        const int f1 = f0 + 1 < nf ? f0 + 1 : f0;
+        const float frac = float(ff - f0);
+        mograph::LocalPose mid;
+        mograph::blendPose(c.frames[f0], c.frames[f1], 1.0f - frac, mid);
+        bvh::Pose pose, pose0;
+        mograph::fk(skel(), mid, pose);
+        mograph::fk(skel(), c.frames[0], pose0);
+        rebaseXZYaw(pose, pose0.world[0]);
+        out.resize(size_t(proxy.numVerts) * 3);
+        proxy.writeVertices(
+            pose, normScale(),
+            {float(userScale.x), float(userScale.y), float(userScale.z)},
+            quatToMat3(rot),
+            {float(position.x), float(position.y), float(position.z)},
+            out.data());
     }
 
     void initialize(MeshState<BE, PR>& state,
@@ -2481,6 +2664,13 @@ struct GeneralMesh {
     bool applyGravity = true;
     bool applyWind = true;
 
+    // Plane checkerboard render option (UI-driven; plane/grid meshes only).
+    // When true the renderer overrides the surface albedo with a world-space
+    // black/white checker (1 world unit per cell) computed in the plane's
+    // local frame — see Simulator::draw and shader.frag's checker* uniforms.
+    // Mirrored on RequestGeneralMesh so it survives Scene::pack rebuilds.
+    bool checkerboard = false;
+
     // D-039: Rigid backend wiring. Set by Simulator::ensureRigidBackendBody
     // on Float→Rigid transition (changeBehavior) or initialize-time sweep.
     // kInvalidBodyHandle (-1) means "no backend body yet"; update() skips.
@@ -2512,7 +2702,8 @@ struct GeneralMesh {
           constraints(std::move(other.constraints)),
           externalForces(std::move(other.externalForces)),
           applyGravity(other.applyGravity),
-          applyWind(other.applyWind)
+          applyWind(other.applyWind),
+          checkerboard(other.checkerboard)
     {
         other.initializer = nullptr;
     }
@@ -2601,6 +2792,11 @@ struct Scene {
         // true (matches GeneralMesh defaults).
         bool applyGravity = true;
         bool applyWind = true;
+        // Mirror of GeneralMesh.checkerboard (plane render option) kept on
+        // the request so the toggle survives Scene::pack rebuilds. pack
+        // copies this onto the realized mesh; the inspector callback writes
+        // here in addition to the live mesh field. Default off.
+        bool checkerboard = false;
         // Mirror of GeneralMesh.rotationQuat kept on the request so the
         // user's orientation survives Scene::pack rebuilds (initialize /
         // reset / loadScene). Without this, pack rebuilds meshes from the
@@ -2944,6 +3140,7 @@ struct Scene {
             // Apply Gravity / Apply Wind selections.
             meshes[i].applyGravity = req.applyGravity;
             meshes[i].applyWind    = req.applyWind;
+            meshes[i].checkerboard = req.checkerboard;
             // Carry the user's orientation through pack. The R-3 preview
             // memcpy below restores the rotated *geometry*; this restores
             // the stored *quaternion* so the inspector keeps showing the
@@ -6432,6 +6629,11 @@ struct Simulator {
 
     // object select
     int selectedObj = -1;
+    // Camera-follow target: when >= 0, the render loop drives the viewport
+    // orbit pivot (camera.look) to this mesh's live animated root every
+    // frame. Toggled per kinematic body in the inspector. Cleared to -1
+    // when the toggle is turned off or the followed mesh disappears.
+    int cameraFollowObjId = -1;
     // Hover state, written by the cursor callback after sampling the id
     // FBO (glReadPixels into the R32I color attachment). -1 means
     // "cursor outside any mesh" — outline pass treats negative ids as
@@ -6457,6 +6659,164 @@ struct Simulator {
     // addX time; the prior clear()-on-initialize band-aid retires because
     // preview buffers are stable across Scene::pack reallocations.
     MeshRenderState renderState;
+
+    // Motion-preview ghost pass: one reusable scratch proxy-mesh GL binding,
+    // re-uploaded per strobe frame. Sized to the previewed body's proxy and
+    // rebuilt only when that size changes (body/skeleton swap).
+    std::vector<float> ghostVerts_, ghostNormals_;
+    std::vector<unsigned int> ghostFacets_;
+    MeshGL<CPU> ghostGL_;
+    bool ghostReady_ = false;
+    size_t ghostNV_ = 0, ghostNF_ = 0;
+
+    void ensureGhostGL(const kinematic::BodyProxy& proxy) {
+        const size_t nv = size_t(proxy.numVerts), nf = size_t(proxy.numFacets());
+        if (ghostReady_ && ghostNV_ == nv && ghostNF_ == nf) return;
+        ghostVerts_.assign(nv * 3, 0.0f);
+        ghostNormals_.assign(nv * 3, 0.0f);
+        ghostFacets_.resize(nf * 3);
+        for (size_t i = 0; i < nf * 3; ++i)
+            ghostFacets_[i] = (unsigned int)proxy.facets[i];
+        // Leaks the prior VAO/buffers on a size change (MeshGL has no dtor);
+        // bounded — only fires on a body/skeleton swap, never per frame.
+        ghostGL_ = MeshGL<CPU>(nv, ghostVerts_.data(), nf, ghostFacets_.data(),
+                               ghostNormals_.data());
+        ghostNV_ = nv;
+        ghostNF_ = nf;
+        ghostReady_ = true;
+    }
+
+    // Load + sample the selected preview files into the body's per-clip cache
+    // (only when stale). Sampled onto the body's own skeleton so the proxy
+    // matches; a joint-count mismatch leaves the cache empty (preview skipped).
+    void ensurePreviewClips(MeshKinematicInitializer<BE, PR>* kin) {
+        const std::string cur =
+            std::filesystem::path(kin->params.filePath).filename().string();
+        auto load = [&](bool want, const std::string& sel, std::string& cached,
+                        mograph::Clip& clip) {
+            if (!want) return;
+            const std::string file = sel.empty() ? cur : sel;
+            if (cached == file && !clip.frames.empty()) return;  // hit
+            cached = file;
+            clip.frames.clear();
+            bvh::Motion m = bvh::load(bvhAssetDir() + "/" + file, nullptr);
+            if (!m.valid() || m.joints.size() != kin->motion.joints.size())
+                return;  // unreadable / incompatible with this proxy
+            mograph::sampleClip(m, kin->skel(), kin->motion.frameTime, file, clip);
+        };
+        load(kin->previewA, kin->transFileA, kin->previewFileA, kin->previewClipA);
+        load(kin->previewB, kin->transFileB, kin->previewFileB, kin->previewClipB);
+    }
+
+    // One-shot preview playback clock. Runs OUTSIDE the physics loop (driven by
+    // the render frame's wall dt) and only while paused — unpausing or leaving
+    // blend mode cancels it; reaching the clip end clears it (so it plays once
+    // and disappears).
+    void advancePreviewPlayback(double dt) {
+        for (auto& mesh : scene.meshes) {
+            auto* kin =
+                dynamic_cast<MeshKinematicInitializer<BE, PR>*>(mesh.initializer);
+            if (!kin || kin->previewPlay == 0) continue;
+            if (!pause || kin->motionMode != 3) { kin->previewPlay = 0; continue; }
+            const mograph::Clip& c =
+                kin->previewPlay == 1 ? kin->previewClipA : kin->previewClipB;
+            const double dur =
+                c.frames.empty() ? 0.0 : double(c.frames.size() - 1) * c.dt;
+            kin->previewPlayTime += dt;
+            if (c.frames.empty() || kin->previewPlayTime >= dur)
+                kin->previewPlay = 0;  // played once → vanish
+        }
+    }
+
+    // Begin a one-shot opaque playback of preview clip `which` (1=A, 2=B).
+    // No-op unless paused (the feature is paused-only by design).
+    void startPreviewPlayback(int meshId, int which) {
+        auto* kin = kinematicOf(meshId);
+        if (!kin || !pause || kin->motionMode != 3) return;
+        ensurePreviewClips(kin);
+        const mograph::Clip& c =
+            which == 1 ? kin->previewClipA : kin->previewClipB;
+        if (c.frames.empty()) return;
+        kin->previewPlay = which;
+        kin->previewPlayTime = 0.0;
+    }
+
+    // Translucent strobe of the selected blend clips (motion 1 + motion 2,
+    // independently toggled, user-colored), N evenly-spaced frames each — plus
+    // the opaque one-shot playback when active. All re-rooted to the body's
+    // transform. Drawn after the opaque pass.
+    void drawGhostPreviews(Program& shader) {
+        for (auto& mesh : scene.meshes) {
+            auto* kin =
+                dynamic_cast<MeshKinematicInitializer<BE, PR>*>(mesh.initializer);
+            if (!kin || kin->motionMode != 3) continue;     // blend mode only
+            const bool wantStrobe = kin->previewA || kin->previewB;
+            const bool wantPlay = kin->previewPlay != 0;
+            if (!wantStrobe && !wantPlay) continue;
+            ensurePreviewClips(kin);
+            ensureGhostGL(kin->proxy);
+
+            shader.setUniform("checkerOn", 0);
+            shader.setUniform("hoveredId", -1);   // keep outline off the ghosts
+            shader.setUniform("selectedId", -1);
+
+            // Strobe pass (translucent). Skip the clip currently playing opaque.
+            if (wantStrobe) {
+                glEnable(GL_BLEND);
+                glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+                glDepthMask(GL_FALSE);
+                shader.setUniform("opacity", 0.30f);
+                const int N = 7;
+                auto strobe = [&](const mograph::Clip& c,
+                                  const std::array<float, 3>& col) {
+                    const int nf = int(c.frames.size());
+                    if (nf <= 0) return;
+                    const tinym::vec3 base(col[0], col[1], col[2]);
+                    const tinym::vec3 emis(col[0] * 0.5f, col[1] * 0.5f,
+                                           col[2] * 0.5f);
+                    for (int i = 0; i < N; ++i) {
+                        const int f = N <= 1 ? 0
+                                             : int(std::lround(double(i) /
+                                                               (N - 1) *
+                                                               (nf - 1)));
+                        kin->writeGhost(c, f, mesh.scale, mesh.rotationQuat,
+                                        mesh.transformPosition, ghostVerts_);
+                        ghostGL_.computeNormal();
+                        ghostGL_.updateBuffer();
+                        ghostGL_.draw(shader, base, 0.0f, 1.0f, 0.0f, emis);
+                    }
+                };
+                if (kin->previewA && kin->previewPlay != 1)
+                    strobe(kin->previewClipA, kin->previewColA);
+                if (kin->previewB && kin->previewPlay != 2)
+                    strobe(kin->previewClipB, kin->previewColB);
+            }
+
+            // One-shot opaque playback (full color, depth-writing).
+            if (wantPlay) {
+                glDisable(GL_BLEND);
+                glDepthMask(GL_TRUE);
+                shader.setUniform("opacity", 1.0f);
+                const mograph::Clip& c = kin->previewPlay == 1
+                                             ? kin->previewClipA
+                                             : kin->previewClipB;
+                const auto& col =
+                    kin->previewPlay == 1 ? kin->previewColA : kin->previewColB;
+                const tinym::vec3 base(col[0], col[1], col[2]);
+                const tinym::vec3 emis(col[0] * 0.5f, col[1] * 0.5f, col[2] * 0.5f);
+                kin->writeGhostAtTime(c, kin->previewPlayTime, mesh.scale,
+                                      mesh.rotationQuat, mesh.transformPosition,
+                                      ghostVerts_);
+                ghostGL_.computeNormal();
+                ghostGL_.updateBuffer();
+                ghostGL_.draw(shader, base, 0.0f, 1.0f, 0.0f, emis);
+            }
+
+            shader.setUniform("opacity", 1.0f);
+            glDepthMask(GL_TRUE);
+            glDisable(GL_BLEND);
+        }
+    }
 
     // D-040: rigid physics backend swapped Euler → Bullet 3.25 (B-3 BLOCK
     // fix-turn). Bullet now ships as a third parallel symbol (Null +
@@ -6851,6 +7211,36 @@ struct Simulator {
         return dynamic_cast<MeshKinematicInitializer<BE, PR>*>(m->initializer);
     }
 
+    // Live world-space position of a kinematic body's animated root, used by
+    // the camera-follow path. Reads the centroid of the root joint's proxy
+    // sphere (proxy.parts[0] — build() appends joint spheres in skeleton
+    // order, so parts[0] is the BVH root joint) straight from the realized
+    // vertex buffer (state.x), which already carries the FK pose plus the
+    // full user transform written each frame in update(). Returns false (out
+    // untouched) when the mesh is missing / not kinematic / not yet realized.
+    bool kinematicRootWorldPos(int meshId, tinym::vec3& out) {
+        auto* m = Scene<BE, PR>::findById(meshId);
+        auto* kin = kinematicOf(meshId);
+        if (!m || !kin || !m->state.x.ptr) return false;
+        if (kin->proxy.parts.empty()) return false;
+        const auto& p = kin->proxy.parts[0];
+        if (p.vertCount == 0) return false;
+        double sx = 0, sy = 0, sz = 0;
+        Index counted = 0;
+        for (Index v = 0; v < p.vertCount; ++v) {
+            const Index idx = (p.vertStart + v) * 3;
+            if (idx + 2 >= m->state.x.size) break;
+            sx += m->state.x[idx];
+            sy += m->state.x[idx + 1];
+            sz += m->state.x[idx + 2];
+            ++counted;
+        }
+        if (counted == 0) return false;
+        const float inv = 1.0f / float(counted);
+        out = tinym::vec3(float(sx) * inv, float(sy) * inv, float(sz) * inv);
+        return true;
+    }
+
     // Scrub: jump playback to `timeSec` and re-pose immediately so a
     // paused sim still shows the frame under the slider (update() is
     // gated on !pause and would otherwise apply it only on resume).
@@ -6861,6 +7251,10 @@ struct Simulator {
         auto* kin = kinematicOf(meshId);
         if (!m || !kin || !m->state.x.ptr) return;
         kin->localTime = timeSec;
+        // A pending re-pack (file swap marked dirty) can leave the live
+        // buffer sized for the OLD proxy; writing the new pose would
+        // overrun it. The pack realizes localTime anyway.
+        if (m->state.x.size != (Index)kin->params.numPoints * 3) return;
         kin->writePose(timeSec, m->scale, m->rotationQuat,
                        m->transformPosition, m->state.x.ptr);
         if (m->state.xPrev.ptr)
@@ -6891,6 +7285,220 @@ struct Simulator {
         scene_log::logObject("키네마틱 모션 변경 (id " +
             std::to_string(meshId) + "): " + path);
         return true;
+    }
+
+    // ── Motion-graph controls (Kovar 2002; include/motion_graph.hpp) ──────
+    // Mode only switches the pose-source dispatch in writePose — geometry,
+    // topology, and the single-clip state stay untouched, so flipping back
+    // to 단일 클립 always works.
+    void setKinematicMode(int meshId, int mode) {
+        auto* kin = kinematicOf(meshId);
+        if (!kin || kin->motionMode == mode) return;
+        kin->motionMode = mode;
+        kin->invalidateRebase();  // graphActive() flips → frame-0 source changes
+        setKinematicTime(meshId, 0.0);
+    }
+
+    // The graph session's reference skeleton must be the proxy's skeleton,
+    // so the reference clip becomes the loaded file first (the normal
+    // file-swap re-pack path) whenever it differs.
+    bool ensureKinematicRefFile(int meshId, const std::string& path) {
+        auto* kin = kinematicOf(meshId);
+        if (!kin) return false;
+        if (kin->params.filePath == path) return true;
+        return setKinematicFile(meshId, path);
+    }
+
+    // Best Kovar transition fileA → fileB baked into a finite, scrubbable
+    // composite. Always leaves graphStatus describing the outcome.
+    bool buildKinematicTransition(int meshId, const std::string& fileA,
+                                  const std::string& fileB) {
+        auto* kin = kinematicOf(meshId);
+        if (!kin) return false;
+        const std::string dir = bvhAssetDir();
+        if (!ensureKinematicRefFile(meshId, dir + "/" + fileA)) {
+            kin->graphStatus = "실패: " + fileA + " 로드 불가";
+            return false;
+        }
+        mograph::SessionParams p;
+        p.thresholdFrac = kin->graphThreshold;
+        p.markerScaleFrac = kin->graphMarkerFrac;
+        std::string err;
+        bool ok;
+        if (fileB == fileA) {
+            ok = kin->graphSession.buildTransition(kin->motion, fileA,
+                                                   kin->motion, fileB, p, &err);
+        } else {
+            std::string lerr;
+            bvh::Motion mb = bvh::load(dir + "/" + fileB, &lerr);
+            if (!mb.valid()) {
+                kin->graphStatus = "실패: " + lerr;
+                return false;
+            }
+            ok = kin->graphSession.buildTransition(kin->motion, fileA, mb,
+                                                   fileB, p, &err);
+        }
+        if (!ok) {
+            kin->graphStatus = "실패: " + err;
+            return false;
+        }
+        kin->motionMode = 2;
+        kin->invalidateRebase();
+        kin->transFileA = fileA;
+        kin->transFileB = fileB;
+        {
+            char buf[192];
+            std::snprintf(buf, sizeof buf,
+                          "%s[%d] → %s[%d] · 비용 %.3f · %.0fms",
+                          fileA.c_str(), kin->graphSession.trans.i,
+                          fileB.c_str(), kin->graphSession.trans.j,
+                          kin->graphSession.trans.cost,
+                          kin->graphSession.buildMs);
+            kin->graphStatus = buf;
+            if (kin->graphSession.trans.aboveThreshold)
+                kin->graphStatus += " · 임계값 초과(최선값 사용)";
+        }
+        setKinematicTime(meshId, 0.0);
+        scene_log::logObject("모션 전환 생성 (id " + std::to_string(meshId) +
+                             "): " + fileA + " → " + fileB);
+        return true;
+    }
+
+    // DTW timewarp blend fileA → fileB baked into a finite, scrubbable track.
+    bool buildKinematicBlend(int meshId, const std::string& fileA,
+                             const std::string& fileB) {
+        auto* kin = kinematicOf(meshId);
+        if (!kin) return false;
+        const std::string dir = bvhAssetDir();
+        if (!ensureKinematicRefFile(meshId, dir + "/" + fileA)) {
+            kin->graphStatus = "실패: " + fileA + " 로드 불가";
+            return false;
+        }
+        mograph::SessionParams p;
+        p.thresholdFrac = kin->graphThreshold;
+        p.markerScaleFrac = kin->graphMarkerFrac;
+        std::string err;
+        bool ok;
+        if (fileB == fileA) {
+            ok = kin->graphSession.buildBlend(kin->motion, fileA, kin->motion,
+                                              fileB, p, &err);
+        } else {
+            std::string lerr;
+            bvh::Motion mb = bvh::load(dir + "/" + fileB, &lerr);
+            if (!mb.valid()) {
+                kin->graphStatus = "실패: " + lerr;
+                return false;
+            }
+            ok = kin->graphSession.buildBlend(kin->motion, fileA, mb, fileB, p,
+                                              &err);
+        }
+        if (!ok) {
+            kin->graphStatus = "실패: " + err;
+            return false;
+        }
+        kin->motionMode = 3;
+        kin->invalidateRebase();
+        kin->transFileA = fileA;
+        kin->transFileB = fileB;
+        {
+            char buf[208];
+            std::snprintf(buf, sizeof buf,
+                          "%s ~DTW~ %s · 블렌드 %d프레임 · 비용 %.3f · %.0fms",
+                          fileA.c_str(), fileB.c_str(),
+                          kin->graphSession.trans.blendFrames,
+                          kin->graphSession.trans.cost,
+                          kin->graphSession.buildMs);
+            kin->graphStatus = buf;
+            if (kin->graphSession.trans.aboveThreshold)
+                kin->graphStatus += " · 임계값 초과(최선값 사용)";
+        }
+        setKinematicTime(meshId, 0.0);
+        scene_log::logObject("모션 블렌드 생성 (id " + std::to_string(meshId) +
+                             "): " + fileA + " ~ " + fileB);
+        return true;
+    }
+
+    // Motion graph + random walk over the initializer's graphSelFiles.
+    bool buildKinematicWalk(int meshId) {
+        auto* kin = kinematicOf(meshId);
+        if (!kin) return false;
+        if (kin->graphSelFiles.empty()) {
+            kin->graphStatus = "실패: 그래프에 넣을 클립을 선택하세요";
+            return false;
+        }
+        const std::string dir = bvhAssetDir();
+        // Reference = the currently loaded file when it is selected,
+        // otherwise the first selection.
+        const std::string curName =
+            std::filesystem::path(kin->params.filePath).filename().string();
+        std::string ref = kin->graphSelFiles.front();
+        for (const auto& f : kin->graphSelFiles)
+            if (f == curName) { ref = f; break; }
+        if (!ensureKinematicRefFile(meshId, dir + "/" + ref)) {
+            kin->graphStatus = "실패: " + ref + " 로드 불가";
+            return false;
+        }
+        std::vector<std::pair<bvh::Motion, std::string>> loaded;
+        std::vector<std::string> unreadable;
+        for (const auto& f : kin->graphSelFiles) {
+            if (f == ref) continue;
+            std::string lerr;
+            bvh::Motion m = bvh::load(dir + "/" + f, &lerr);
+            if (!m.valid()) { unreadable.push_back(f); continue; }
+            loaded.emplace_back(std::move(m), f);
+        }
+        std::vector<const bvh::Motion*> ms{&kin->motion};
+        std::vector<std::string> names{ref};
+        for (const auto& lm : loaded) {
+            ms.push_back(&lm.first);
+            names.push_back(lm.second);
+        }
+        mograph::SessionParams p;
+        p.thresholdFrac = kin->graphThreshold;
+        p.markerScaleFrac = kin->graphMarkerFrac;
+        p.seed = kin->walkSeed;
+        std::string err;
+        std::vector<std::string> incompatible;
+        if (!kin->graphSession.buildRandomWalk(ms, names, p, &err,
+                                               &incompatible)) {
+            kin->graphStatus = "실패: " + err;
+            return false;
+        }
+        kin->motionMode = 1;
+        kin->invalidateRebase();
+        const auto& st = kin->graphSession.graph.stats;
+        {
+            char buf[160];
+            std::snprintf(buf, sizeof buf,
+                          "노드 %d · 엣지 %d · 전환 %d · %.0fms",
+                          st.nodesScc, st.edgesKept, st.transitionsKept,
+                          st.buildMs);
+            kin->graphStatus = buf;
+        }
+        std::string dropped;
+        for (int c : st.clipsDroppedBySCC)
+            dropped += (dropped.empty() ? "" : ", ") +
+                       kin->graphSession.clips[c].name;
+        for (const auto& f : incompatible)
+            dropped += (dropped.empty() ? "" : ", ") + f + "(스켈레톤 불일치)";
+        for (const auto& f : unreadable)
+            dropped += (dropped.empty() ? "" : ", ") + f + "(로드 실패)";
+        if (!dropped.empty())
+            kin->graphStatus += " · 제외: " + dropped;
+        setKinematicTime(meshId, 0.0);
+        scene_log::logObject("모션 그래프 빌드 (id " + std::to_string(meshId) +
+                             "): " + std::to_string(names.size()) + "개 클립");
+        return true;
+    }
+
+    // New random path through the existing graph (no rebuild).
+    void reseedKinematicWalk(int meshId) {
+        auto* kin = kinematicOf(meshId);
+        if (!kin || !kin->graphActive() || kin->motionMode != 1) return;
+        kin->walkSeed = kin->walkSeed * 1664525u + 1013904223u;
+        kin->graphSession.reseed(kin->walkSeed);
+        kin->invalidateRebase();
+        setKinematicTime(meshId, 0.0);
     }
 
     void addGround(PlaneDirection dir, tinym::vec3 center, PR size1D, PR mass=0.1) {
@@ -8160,12 +8768,17 @@ struct Simulator {
             if (!kin || !m.state.x.ptr) continue;
             if (kin->playing && kin->motion.valid()) {
                 kin->localTime += (double)system.h * kin->playSpeed;
-                if (!kin->loop)
-                    kin->localTime = std::min(kin->localTime,
-                                              (double)kin->motion.duration());
-                else if (kin->motion.duration() > 0.0f)
-                    kin->localTime = std::fmod(kin->localTime,
-                                               (double)kin->motion.duration());
+                // Random walks run open-ended (the baker streams frames on
+                // demand); single clips and transition composites wrap or
+                // clamp over their finite duration as before.
+                const bool walking = kin->motionMode == 1 && kin->graphActive();
+                const double dur = kin->activeDuration();
+                if (!walking) {
+                    if (!kin->loop)
+                        kin->localTime = std::min(kin->localTime, dur);
+                    else if (dur > 0.0)
+                        kin->localTime = std::fmod(kin->localTime, dur);
+                }
             }
             if (m.state.xPrev.ptr)
                 std::memcpy(m.state.xPrev.ptr, m.state.x.ptr,
@@ -8403,6 +9016,35 @@ struct Simulator {
 
     void draw(Program& shader) {
         for(auto& mesh : scene.meshes) {
+            // Plane checkerboard render option. Set per mesh (off for all
+            // non-plane meshes). The pattern lives in the plane's LOCAL
+            // frame so it does not slide when the plane translates: origin =
+            // the plane center (transformPosition), and the two in-plane
+            // axes (picked from the grid's PlaneDirection) are rotated by the
+            // mesh orientation and kept unit-length, so shader.frag's floor()
+            // gives 1-world-unit cells (scale enters via the world vertices).
+            bool checkerOn = false;
+            if (mesh.checkerboard) {
+                if (auto* g = dynamic_cast<MeshGridInitializer<BE, PR>*>(mesh.initializer)) {
+                    tinym::vec3 u(1.f, 0.f, 0.f), v(0.f, 0.f, 1.f);
+                    switch (g->params.dir) {
+                        case PlaneDirection::XYPlane: u = tinym::vec3(1.f,0.f,0.f); v = tinym::vec3(0.f,1.f,0.f); break;
+                        case PlaneDirection::YZPlane: u = tinym::vec3(0.f,1.f,0.f); v = tinym::vec3(0.f,0.f,1.f); break;
+                        case PlaneDirection::XZPlane: u = tinym::vec3(1.f,0.f,0.f); v = tinym::vec3(0.f,0.f,1.f); break;
+                    }
+                    const auto R = quatToMat3(mesh.rotationQuat);
+                    auto rot = [&](const tinym::vec3& a) {
+                        return tinym::vec3(R[0]*a.x + R[1]*a.y + R[2]*a.z,
+                                           R[3]*a.x + R[4]*a.y + R[5]*a.z,
+                                           R[6]*a.x + R[7]*a.y + R[8]*a.z);
+                    };
+                    shader.setUniform("checkerOrigin", mesh.transformPosition);
+                    shader.setUniform("checkerU", rot(u));
+                    shader.setUniform("checkerV", rot(v));
+                    checkerOn = true;
+                }
+            }
+            shader.setUniform("checkerOn", checkerOn ? 1 : 0);
             renderState.getOrCreate(mesh).draw(shader,
                 mesh.material.baseColor,
                 mesh.material.metallic,
@@ -8410,6 +9052,10 @@ struct Simulator {
                 mesh.material.specularWeight,
                 mesh.material.emissionColor);  // D-028
         }
+
+        // Translucent strobe of the two blend clips (opaque pass done first so
+        // ghosts depth-test against the scene but don't write depth).
+        drawGhostPreviews(shader);
 
         if(selectedObj >= 0) {
             // Reserved for a future selected-mesh overlay pass.
@@ -14746,6 +15392,352 @@ static int runSelfTest() {
         }
     }
 
+    // ---- Block MG: motion graphs (Kovar 2002) — metric correctness, ----
+    //                transition continuity, random-walk liveness, and the
+    //                mode dispatch end-to-end. Skips without assets.
+    {
+        const std::string dir = bvhAssetDir();
+        if (!std::filesystem::exists(dir + "/WalkLoopA.bvh") ||
+            !std::filesystem::exists(dir + "/walkToJog.bvh") ||
+            !std::filesystem::exists(dir + "/jogCurve.bvh")) {
+            skip("MG", "BVH assets missing under " + dir);
+        } else {
+            std::string lerr;
+            bvh::Motion mWalk = bvh::load(dir + "/WalkLoopA.bvh", &lerr);
+            bvh::Motion mToJog = bvh::load(dir + "/walkToJog.bvh", &lerr);
+
+            // 1) Streaming cost matrix == brute closed form == literal
+            //    point-cloud SSD under the returned alignment (spot grid).
+            {
+                mograph::Skeleton sk = mograph::Skeleton::extract(mWalk);
+                mograph::Clip ca, cb;
+                mograph::sampleClip(mWalk, sk, mWalk.frameTime, "A", ca);
+                mograph::sampleClip(mToJog, sk, mWalk.frameTime, "B", cb);
+                mograph::FrameCloud fa, fb;
+                fa.build(sk, ca);
+                fb.build(sk, cb);
+                const int k = 10;
+                mograph::CostMatrix D;
+                mograph::computeCostMatrix(fa, fb, k, sk.height, D);
+                float worst = -1.0f;
+                if (!D.empty()) {
+                    worst = 0.0f;
+                    for (int i = 0; i < D.ra; i += 5) {
+                        for (int jj = 0; jj < D.rb; jj += 7) {
+                            auto r = mograph::optimalAlign(fa, i, fb,
+                                                           jj + k - 1, k,
+                                                           sk.height);
+                            const float lit = mograph::costDirect(
+                                fa, i, fb, jj + k - 1, k, sk.height, r.xf);
+                            worst = std::max(worst,
+                                             std::fabs(D.at(i, jj) - r.cost));
+                            worst = std::max(worst, std::fabs(lit - r.cost));
+                        }
+                    }
+                }
+                if (worst >= 0.0f && worst < 1e-3f)
+                    pass("MG-1 / cost matrix == closed form == literal SSD");
+                else
+                    fail("MG-1 / cost matrix == closed form == literal SSD",
+                         "worst=" + std::to_string(worst));
+
+                // 2) A known ground-plane transform is recovered (cost → 0).
+                mograph::XformXZ T{0.8f, 3.0f, -2.0f};
+                mograph::Clip ct = ca;
+                for (auto& f : ct.frames) T.applyPose(f);
+                mograph::FrameCloud ftc;
+                ftc.build(sk, ct);
+                auto rec =
+                    mograph::optimalAlign(fa, 3, ftc, 3 + k - 1, k, sk.height);
+                if (rec.cost < 1e-3f)
+                    pass("MG-2 / optimal alignment recovers a known transform");
+                else
+                    fail("MG-2 / optimal alignment recovers a known transform",
+                         "residual cost=" + std::to_string(rec.cost));
+            }
+
+            // 3..6) End-to-end through the Simulator API.
+            resetScene();
+            sim.pause = false;
+            if (!sim.addKinematicBody(dir + "/WalkLoopA.bvh",
+                                      tinym::vec3(0, 0, 0), 1.8f)) {
+                fail("MG-3 / kinematic body for graph tests", "load failed");
+            } else {
+                sim.initialize();
+                auto* m = Scene<Backend, Precision>::findById(0);
+                auto* kin = sim.kinematicOf(0);
+                auto maxRootStep =
+                    [](const std::vector<mograph::LocalPose>& fr) {
+                        float mx = 0.0f;
+                        for (size_t f = 1; f < fr.size(); ++f) {
+                            float d = 0.0f;
+                            for (int c = 0; c < 3; ++c) {
+                                const float e =
+                                    fr[f].rootPos[c] - fr[f - 1].rootPos[c];
+                                d += e * e;
+                            }
+                            mx = std::max(mx, std::sqrt(d));
+                        }
+                        return mx;
+                    };
+
+                // 3) Transition build + composite continuity (no teleport
+                //    bigger than the sources' own frame-to-frame motion).
+                bool built = sim.buildKinematicTransition(0, "WalkLoopA.bvh",
+                                                          "walkToJog.bvh");
+                if (!built || !m || !kin || !kin->graphActive() ||
+                    kin->motionMode != 2) {
+                    fail("MG-3 / transition build A→B engages graph mode",
+                         "status=" + (kin ? kin->graphStatus : "no kin"));
+                } else {
+                    const auto& ses = kin->graphSession;
+                    const float src =
+                        std::max(maxRootStep(ses.clips[0].frames),
+                                 maxRootStep(ses.clips[1].frames));
+                    const float comp = maxRootStep(ses.track);
+                    if (comp < 2.0f * src + 1e-4f)
+                        pass("MG-3 / transition composite is continuous");
+                    else
+                        fail("MG-3 / transition composite is continuous",
+                             "step " + std::to_string(comp) + " vs src " +
+                                 std::to_string(src));
+                }
+
+                // 4) Transition mode animates the proxy (finite) and scrub
+                //    re-poses while paused.
+                if (built && m && kin) {
+                    auto x0 = snapshot_array(m->state.x.ptr, m->state.x.size);
+                    pumpFrames(sim, 2);
+                    MetalGlobalContext::commitAndWait();
+                    bool moved = false, finite = true;
+                    for (size_t i = 0; i < x0.size(); ++i) {
+                        if (m->state.x.ptr[i] != x0[i]) moved = true;
+                        if (!std::isfinite((double)m->state.x.ptr[i]))
+                            finite = false;
+                    }
+                    sim.pause = true;
+                    auto x1 = snapshot_array(m->state.x.ptr, m->state.x.size);
+                    sim.setKinematicTime(0, kin->graphSession.duration() * 0.5);
+                    bool scrubbed = false;
+                    for (size_t i = 0; i < x1.size(); ++i)
+                        if (m->state.x.ptr[i] != x1[i]) { scrubbed = true; break; }
+                    sim.pause = false;
+                    if (moved && finite && scrubbed)
+                        pass("MG-4 / transition playback + paused scrub");
+                    else
+                        fail("MG-4 / transition playback + paused scrub",
+                             "moved=" + std::to_string((int)moved) +
+                                 " finite=" + std::to_string((int)finite) +
+                                 " scrubbed=" + std::to_string((int)scrubbed));
+                }
+
+                // 5) Random walk: build over three clips, animate, and bake
+                //    far ahead without losing finiteness.
+                if (m && kin) {
+                    kin->graphSelFiles = {"WalkLoopA.bvh", "walkToJog.bvh",
+                                          "jogCurve.bvh"};
+                    built = sim.buildKinematicWalk(0);
+                    bool ok = built && kin->graphActive() &&
+                              kin->motionMode == 1 &&
+                              kin->graphSession.graph.stats.transitionsKept > 0;
+                    if (ok) {
+                        auto x0 = snapshot_array(m->state.x.ptr,
+                                                 m->state.x.size);
+                        pumpFrames(sim, 2);
+                        MetalGlobalContext::commitAndWait();
+                        bool moved = false, finite = true;
+                        for (size_t i = 0; i < x0.size(); ++i) {
+                            if (m->state.x.ptr[i] != x0[i]) moved = true;
+                            if (!std::isfinite((double)m->state.x.ptr[i]))
+                                finite = false;
+                        }
+                        sim.setKinematicTime(0, 60.0);  // bake ~1800 frames
+                        for (size_t i = 0; i < m->state.x.size && finite; ++i)
+                            if (!std::isfinite((double)m->state.x.ptr[i]))
+                                finite = false;
+                        const auto& wb = kin->graphSession.walker;
+                        const bool baked =
+                            wb.bakedStart + (long long)wb.baked.size() >= 1800;
+                        ok = moved && finite && baked && !wb.stuck;
+                        if (!ok)
+                            fail("MG-5 / random walk builds + streams",
+                                 "moved=" + std::to_string((int)moved) +
+                                     " finite=" + std::to_string((int)finite) +
+                                     " baked=" + std::to_string((int)baked) +
+                                     " stuck=" + std::to_string((int)wb.stuck));
+                        else
+                            pass("MG-5 / random walk builds + streams");
+                    } else {
+                        fail("MG-5 / random walk builds + streams",
+                             "status=" + kin->graphStatus);
+                    }
+                }
+
+                // 6) Incompatible skeleton is rejected and the body falls
+                //    back to (still working) single-clip playback.
+                if (m && kin &&
+                    std::filesystem::exists(
+                        dir + "/j_Uber_054_SMK_CHANG1_01.bvh")) {
+                    built = sim.buildKinematicTransition(
+                        0, "WalkLoopA.bvh", "j_Uber_054_SMK_CHANG1_01.bvh");
+                    const bool rejected = !built && !kin->graphActive();
+                    sim.setKinematicMode(0, 0);
+                    auto x0 = snapshot_array(m->state.x.ptr, m->state.x.size);
+                    pumpFrames(sim, 2);
+                    MetalGlobalContext::commitAndWait();
+                    bool moved = false, finite = true;
+                    for (size_t i = 0; i < x0.size(); ++i) {
+                        if (m->state.x.ptr[i] != x0[i]) moved = true;
+                        if (!std::isfinite((double)m->state.x.ptr[i]))
+                            finite = false;
+                    }
+                    if (rejected && moved && finite)
+                        pass("MG-6 / incompatible skeleton rejected, single clip intact");
+                    else
+                        fail("MG-6 / incompatible skeleton rejected, single clip intact",
+                             "rejected=" + std::to_string((int)rejected) +
+                                 " moved=" + std::to_string((int)moved) +
+                                 " finite=" + std::to_string((int)finite));
+                } else {
+                    skip("MG-6", "j_Uber asset missing");
+                }
+
+                // 7) Oriented point cloud: a leaf joint's local rotation moves
+                //    no position, so the origins-only metric is blind to it,
+                //    but joint-axis markers register it. The streaming ==
+                //    closed-form == literal identities still hold with markers.
+                {
+                    mograph::Skeleton sk = mograph::Skeleton::extract(mWalk);
+                    mograph::Clip base;
+                    mograph::sampleClip(mWalk, sk, mWalk.frameTime, "base", base);
+                    std::vector<int> childCount(sk.joints.size(), 0);
+                    for (size_t j = 0; j < sk.joints.size(); ++j)
+                        if (sk.joints[j].parent >= 0)
+                            childCount[sk.joints[j].parent]++;
+                    int leaf = -1;
+                    for (size_t j = 0; j < sk.joints.size(); ++j)
+                        if (childCount[j] == 0) { leaf = int(j); break; }
+                    mograph::Clip rot = base;
+                    const mograph::Quatf spin =
+                        mograph::Quatf::axisAngle(1, 0, 0, 1.0f);  // 1 rad
+                    if (leaf >= 0)
+                        for (auto& fr : rot.frames)
+                            fr.rot[leaf] = (fr.rot[leaf] * spin).normalized();
+                    const int k = 10;
+                    const float ms = 0.1f * sk.height;
+                    mograph::FrameCloud o0a, o0b, m1a, m1b;
+                    o0a.build(sk, base, 0.0f);
+                    o0b.build(sk, rot, 0.0f);
+                    m1a.build(sk, base, ms);
+                    m1b.build(sk, rot, ms);
+                    mograph::CostMatrix Do, Dm;
+                    mograph::computeCostMatrix(o0a, o0b, k, sk.height, Do);
+                    mograph::computeCostMatrix(m1a, m1b, k, sk.height, Dm);
+                    const float co = Do.empty() ? -1.0f : Do.at(0, 0);
+                    const float cm = Dm.empty() ? -1.0f : Dm.at(0, 0);
+                    float resid = -1.0f;
+                    if (!Dm.empty()) {
+                        auto r = mograph::optimalAlign(m1a, 0, m1b, k - 1, k,
+                                                       sk.height);
+                        const float lit = mograph::costDirect(m1a, 0, m1b, k - 1,
+                                                              k, sk.height, r.xf);
+                        resid = std::max(std::fabs(Dm.at(0, 0) - r.cost),
+                                         std::fabs(lit - r.cost));
+                    }
+                    const bool leafBlind = co >= 0.0f && co < 1e-4f;
+                    const bool markerSees = cm > 1e-3f;
+                    const bool identsHold = resid >= 0.0f && resid < 1e-3f;
+                    if (leaf >= 0 && leafBlind && markerSees && identsHold)
+                        pass("MG-7 / joint-axis markers capture orientation the "
+                             "origins miss");
+                    else
+                        fail("MG-7 / joint-axis markers capture orientation the "
+                             "origins miss",
+                             "leaf=" + std::to_string(leaf) + " co=" +
+                                 std::to_string(co) + " cm=" +
+                                 std::to_string(cm) + " resid=" +
+                                 std::to_string(resid));
+                }
+
+                // 8) DTW timewarp recovers a known 2x time stretch, and the
+                //    blend build bakes a continuous track through the API.
+                {
+                    mograph::Skeleton sk = mograph::Skeleton::extract(mWalk);
+                    mograph::Clip a, b;
+                    mograph::sampleClip(mWalk, sk, mWalk.frameTime, "A", a);
+                    // Half dt over the same duration → ~2x the frames of A.
+                    mograph::sampleClip(mWalk, sk, mWalk.frameTime * 0.5f, "B2x",
+                                        b);
+                    const int k = 10;
+                    const float ms = 0.1f * sk.height;
+                    mograph::FrameCloud fa, fb;
+                    fa.build(sk, a, ms);
+                    fb.build(sk, b, ms);
+                    mograph::CostMatrix D;
+                    mograph::computeCostMatrix(fa, fb, k, sk.height, D);
+                    mograph::WarpPath wp;
+                    const bool got = mograph::dtwPath(D, 2, wp);
+                    bool mono = got;
+                    for (size_t c = 1; c < wp.cells.size(); ++c)
+                        if (wp.cells[c].first < wp.cells[c - 1].first ||
+                            wp.cells[c].second < wp.cells[c - 1].second)
+                            mono = false;
+                    float slope = -1.0f;
+                    if (got && wp.cells.size() > 1) {
+                        const int da = wp.cells.back().first - wp.cells.front().first;
+                        const int db = wp.cells.back().second - wp.cells.front().second;
+                        if (da > 0) slope = float(db) / float(da);
+                    }
+                    const bool slopeOk = slope > 1.4f && slope < 2.6f;
+                    if (got && mono && slopeOk)
+                        pass("MG-8 / DTW recovers a 2x time-stretch warp");
+                    else
+                        fail("MG-8 / DTW recovers a 2x time-stretch warp",
+                             "got=" + std::to_string((int)got) + " mono=" +
+                                 std::to_string((int)mono) + " slope=" +
+                                 std::to_string(slope));
+
+                    const bool built = sim.buildKinematicBlend(
+                        0, "WalkLoopA.bvh", "walkToJog.bvh");
+                    auto* kinb = sim.kinematicOf(0);
+                    if (built && kinb && kinb->graphActive() &&
+                        kinb->motionMode == 3) {
+                        auto maxStep =
+                            [](const std::vector<mograph::LocalPose>& fr) {
+                                float mx = 0.0f;
+                                for (size_t f = 1; f < fr.size(); ++f) {
+                                    float d = 0.0f;
+                                    for (int c = 0; c < 3; ++c) {
+                                        const float e = fr[f].rootPos[c] -
+                                                        fr[f - 1].rootPos[c];
+                                        d += e * e;
+                                    }
+                                    mx = std::max(mx, std::sqrt(d));
+                                }
+                                return mx;
+                            };
+                        const auto& ses = kinb->graphSession;
+                        const float src =
+                            std::max(maxStep(ses.clips[0].frames),
+                                     maxStep(ses.clips[1].frames));
+                        const float comp = maxStep(ses.track);
+                        if (comp < 2.0f * src + 1e-4f)
+                            pass("MG-8b / DTW blend track is continuous");
+                        else
+                            fail("MG-8b / DTW blend track is continuous",
+                                 "step " + std::to_string(comp) + " vs src " +
+                                     std::to_string(src));
+                    } else {
+                        fail("MG-8b / DTW blend track is continuous",
+                             "build/mode failed: " +
+                                 (kinb ? kinb->graphStatus : "no kin"));
+                    }
+                    sim.setKinematicMode(0, 0);  // restore for later blocks
+                }
+            }
+        }
+    }
+
     // ---- Block RIG: rigid mesh stays glued to its Bullet body even when ----
     // the narrow-phase response shoves its verts (kinematic walker overlap).
     {
@@ -15821,6 +16813,19 @@ int main(int argc, char** argv) {
                 target.current_behavior_index = behaviorToIndex(selectedMesh->behaviorType);
                 target.grid_eligible = (dynamic_cast<MeshGridInitializer<Backend, Precision>*>(
                     selectedMesh->initializer) != nullptr);
+                // Plane checkerboard render option — grid meshes only (the
+                // plane primitive). Aliases the live flag for in-place
+                // preview; the callback mirrors onto the request so a
+                // Scene::pack rebuild preserves it (D-025-style mirror).
+                if (target.grid_eligible) {
+                    target.checkerboard = &selectedMesh->checkerboard;
+                    target.on_checkerboard = [&simulator](int id, bool on) {
+                        if (auto* m = Scene<Backend, Precision>::findById(id))
+                            m->checkerboard = on;
+                        if (auto* r = simulator.findRequest(id))
+                            r->checkerboard = on;
+                    };
+                }
                 target.on_behavior_change = [&simulator](int id, int newIndex) -> bool {
                     static const BehaviorType kIndexToType[] = {
                         BehaviorType::Float,
@@ -15875,13 +16880,49 @@ int main(int argc, char** argv) {
                     target.kin_speed = kin->playSpeed;
                     target.kin_loop = kin->loop;
                     target.kin_time = (float)kin->localTime;
-                    target.kin_duration = kin->motion.duration();
+                    target.kin_duration = (float)kin->activeDuration();
                     target.kin_file = std::filesystem::path(
                         kin->params.filePath).filename().string();
                     target.kin_file_list = listBVHFiles();
                     target.apply_gravity = nullptr;
                     target.apply_wind = nullptr;
                     target.current_behavior_index = -1;
+                    // Camera-follow toggle: reflect whether THIS body is the
+                    // current follow target; the callback sets/clears it.
+                    target.kin_camera_follow =
+                        (simulator.cameraFollowObjId == selectedMesh->id);
+                    target.on_kin_camera_follow =
+                        [&simulator](int id, bool follow) {
+                            simulator.cameraFollowObjId = follow ? id : -1;
+                        };
+                    // Motion-graph snapshots (mode-exclusive panel).
+                    target.kin_mode = kin->motionMode;
+                    target.kin_graph_ready = kin->graphActive();
+                    target.kin_threshold = kin->graphThreshold;
+                    target.kin_marker_frac = kin->graphMarkerFrac;
+                    target.kin_preview_a = kin->previewA;
+                    target.kin_preview_b = kin->previewB;
+                    target.kin_preview_col_a = kin->previewColA.data();
+                    target.kin_preview_col_b = kin->previewColB.data();
+                    target.kin_sim_paused = simulator.pause;
+                    target.kin_status = kin->graphStatus;
+                    if (kin->graphActive())
+                        target.kin_label =
+                            kin->graphSession.currentLabel(kin->localTime);
+                    target.kin_graph_selected.assign(
+                        target.kin_file_list.size(), 0);
+                    for (size_t fi = 0; fi < target.kin_file_list.size(); ++fi)
+                        for (const auto& s : kin->graphSelFiles)
+                            if (s == target.kin_file_list[fi]) {
+                                target.kin_graph_selected[fi] = 1;
+                                break;
+                            }
+                    target.kin_trans_a = kin->transFileA.empty()
+                                             ? target.kin_file
+                                             : kin->transFileA;
+                    target.kin_trans_b = kin->transFileB.empty()
+                                             ? target.kin_file
+                                             : kin->transFileB;
                     target.on_kin_play = [&simulator](int id, bool playing) {
                         if (auto* k = simulator.kinematicOf(id)) k->playing = playing;
                     };
@@ -15896,6 +16937,78 @@ int main(int argc, char** argv) {
                     };
                     target.on_kin_file = [&simulator](int id, const std::string& f) {
                         simulator.setKinematicFile(id, bvhAssetDir() + "/" + f);
+                    };
+                    target.on_kin_mode = [&simulator](int id, int mode) {
+                        simulator.setKinematicMode(id, mode);
+                    };
+                    target.on_kin_threshold = [&simulator](int id, float v) {
+                        if (auto* k = simulator.kinematicOf(id))
+                            k->graphThreshold = v;
+                    };
+                    target.on_kin_marker_frac = [&simulator](int id, float v) {
+                        if (auto* k = simulator.kinematicOf(id))
+                            k->graphMarkerFrac = v;
+                    };
+                    target.on_kin_graph_toggle =
+                        [&simulator](int id, const std::string& f, bool on) {
+                            auto* k = simulator.kinematicOf(id);
+                            if (!k) return;
+                            auto& v = k->graphSelFiles;
+                            auto it = std::find(v.begin(), v.end(), f);
+                            if (on && it == v.end()) v.push_back(f);
+                            else if (!on && it != v.end()) v.erase(it);
+                        };
+                    target.on_kin_graph_all = [&simulator](int id, bool all) {
+                        if (auto* k = simulator.kinematicOf(id)) {
+                            k->graphSelFiles =
+                                all ? listBVHFiles() : std::vector<std::string>{};
+                        }
+                    };
+                    target.on_kin_walk_build = [&simulator](int id) {
+                        simulator.buildKinematicWalk(id);
+                    };
+                    target.on_kin_walk_reseed = [&simulator](int id) {
+                        simulator.reseedKinematicWalk(id);
+                    };
+                    target.on_kin_trans_a =
+                        [&simulator](int id, const std::string& f) {
+                            if (auto* k = simulator.kinematicOf(id))
+                                k->transFileA = f;
+                        };
+                    target.on_kin_trans_b =
+                        [&simulator](int id, const std::string& f) {
+                            if (auto* k = simulator.kinematicOf(id))
+                                k->transFileB = f;
+                        };
+                    target.on_kin_trans_build = [&simulator](int id) {
+                        auto* k = simulator.kinematicOf(id);
+                        if (!k) return;
+                        const std::string cur = std::filesystem::path(
+                            k->params.filePath).filename().string();
+                        simulator.buildKinematicTransition(
+                            id, k->transFileA.empty() ? cur : k->transFileA,
+                            k->transFileB.empty() ? cur : k->transFileB);
+                    };
+                    target.on_kin_blend_build = [&simulator](int id) {
+                        auto* k = simulator.kinematicOf(id);
+                        if (!k) return;
+                        const std::string cur = std::filesystem::path(
+                            k->params.filePath).filename().string();
+                        simulator.buildKinematicBlend(
+                            id, k->transFileA.empty() ? cur : k->transFileA,
+                            k->transFileB.empty() ? cur : k->transFileB);
+                    };
+                    target.on_kin_preview_a = [&simulator](int id, bool on) {
+                        if (auto* k = simulator.kinematicOf(id)) k->previewA = on;
+                    };
+                    target.on_kin_preview_b = [&simulator](int id, bool on) {
+                        if (auto* k = simulator.kinematicOf(id)) k->previewB = on;
+                    };
+                    target.on_kin_preview_play_a = [&simulator](int id) {
+                        simulator.startPreviewPlayback(id, 1);
+                    };
+                    target.on_kin_preview_play_b = [&simulator](int id) {
+                        simulator.startPreviewPlayback(id, 2);
                     };
                 }
             }
@@ -16765,6 +17878,10 @@ int main(int argc, char** argv) {
             } else {
                 for (int s = 0; s < steps; ++s) simulator.update();
             }
+            // One-shot preview playback advances on render wall time, NOT the
+            // physics step — it animates while the sim is paused and dies at
+            // the clip end.
+            simulator.advancePreviewPlayback(wallDt);
         }
         simulator.uploadMeshes();
 
@@ -16810,6 +17927,21 @@ int main(int argc, char** argv) {
             shader.setUniform("LightVP", lightVP);
             shader.setUniform("shadowsOn", 1);
         };
+
+        // Camera-follow: lock the orbit pivot to a kinematic body's live
+        // animated root before any pass reads camera.lookAt(), so the whole
+        // frame (id / shadow / main) shares the followed view. Orbit + zoom
+        // still work (theta/phi/fovy untouched); only the pan pivot is
+        // overridden. Auto-clears if the followed mesh is gone.
+        if (simulator.cameraFollowObjId >= 0) {
+            tinym::vec3 followRoot;
+            if (simulator.kinematicRootWorldPos(simulator.cameraFollowObjId, followRoot)) {
+                camera.look = followRoot;
+                camera.rotatePosition();
+            } else {
+                simulator.cameraFollowObjId = -1;
+            }
+        }
 
         // ─── Pass 1: id buffer (offscreen) ────────────────────────────
         // Paints each mesh's id into idTex (R32I). Sampled later by

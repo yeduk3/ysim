@@ -334,39 +334,58 @@ void drawMeshInspectorWindow(MeshInspectorWindowState& st, const MeshInspectorTa
         }
     }
 
-    // ─── 모션 Kinematic playback ─────────────────────────────────────
+    // ─── 모션 Kinematic playback / motion graphs ─────────────────────
+    // Mode-exclusive sub-panels: the combo picks the pose source and only
+    // that mode's widgets render (단일 클립 = the original playback UI,
+    // untouched in behavior; the two graph modes add build controls and
+    // reveal their playback widgets once a build succeeds).
     if(t.kin_panel){
         if(AccordionHeader("모션","BVH Motion")){
             ImGui::Dummy({0,kP});ImGui::Indent(kP);
-            // File combo
-            ImGui::PushStyleColor(ImGuiCol_Text,kG60);ImGui::TextUnformatted("모션 파일");ImGui::PopStyleColor();ImGui::Dummy({0,4});
+
+            // Camera-follow toggle (applies in every playback mode): the
+            // viewport orbit pivot rides this body's animated root.
+            if(t.on_kin_camera_follow){
+                ImGui::PushStyleColor(ImGuiCol_Text,kG60);ImGui::TextUnformatted("카메라 추적");ImGui::PopStyleColor();
+                ImGui::SameLine(kP+CW()-42);
+                bool cf=t.kin_camera_follow;
+                if(PillToggle("##kcam",&cf))t.on_kin_camera_follow(t.mesh_id,cf);
+                ImGui::Dummy({0,16});
+            }
+
+            static const char* kKinModes[4]={
+                "단일 클립 재생","랜덤 워크 · 모션 그래프","모션 전환 · 모션 그래프",
+                "모션 블렌드 · DTW"};
+            const int mode=t.kin_mode<0?0:(t.kin_mode>3?3:t.kin_mode);
+            ImGui::PushStyleColor(ImGuiCol_Text,kG60);ImGui::TextUnformatted("재생 모드");ImGui::PopStyleColor();ImGui::Dummy({0,4});
             ImGui::SetNextItemWidth(CW());
-            if(ImGui::BeginCombo("##kinfile",t.kin_file.c_str())){
-                for(const auto& f:t.kin_file_list){
-                    bool sel=(f==t.kin_file);
-                    if(ImGui::Selectable(f.c_str(),sel)&&!sel&&t.on_kin_file)
-                        t.on_kin_file(t.mesh_id,f);
+            if(ImGui::BeginCombo("##kinmode",kKinModes[mode])){
+                for(int mi=0;mi<4;++mi){
+                    bool sel=(mi==mode);
+                    if(ImGui::Selectable(kKinModes[mi],sel)&&!sel&&t.on_kin_mode)
+                        t.on_kin_mode(t.mesh_id,mi);
                     if(sel)ImGui::SetItemDefaultFocus();
                 }
                 ImGui::EndCombo();
             }
             ImGui::Dummy({0,16});
-            // Play / pause + loop
-            {
+
+            // Shared widget rows; each mode composes the subset it needs.
+            auto playRow=[&](bool withLoop){
                 bool playing=t.kin_playing;
                 if(playing){ImGui::PushStyleColor(ImGuiCol_Button,kG90);ImGui::PushStyleColor(ImGuiCol_Text,kW);}
                 if(ImGui::Button(playing?"일시정지":"재생",{96,36})&&t.on_kin_play)
                     t.on_kin_play(t.mesh_id,!playing);
                 if(playing)ImGui::PopStyleColor(2);
-                ImGui::SameLine(0,16);
-                ImGui::PushStyleColor(ImGuiCol_Text,kG60);ImGui::TextUnformatted("반복");ImGui::PopStyleColor();
-                ImGui::SameLine();
-                bool lp=t.kin_loop;
-                if(PillToggle("##kloop",&lp)&&t.on_kin_loop)t.on_kin_loop(t.mesh_id,lp);
-            }
-            ImGui::Dummy({0,16});
-            // Time scrub
-            {
+                if(withLoop){
+                    ImGui::SameLine(0,16);
+                    ImGui::PushStyleColor(ImGuiCol_Text,kG60);ImGui::TextUnformatted("반복");ImGui::PopStyleColor();
+                    ImGui::SameLine();
+                    bool lp=t.kin_loop;
+                    if(PillToggle("##kloop",&lp)&&t.on_kin_loop)t.on_kin_loop(t.mesh_id,lp);
+                }
+            };
+            auto scrubRow=[&](){
                 float tm=t.kin_time;
                 ImGui::PushStyleColor(ImGuiCol_Text,kG60);
                 ImGui::Text("시간  %.2fs / %.2fs",tm,t.kin_duration);
@@ -374,13 +393,183 @@ void drawMeshInspectorWindow(MeshInspectorWindowState& st, const MeshInspectorTa
                 ImGui::SetNextItemWidth(CW());
                 if(ImGui::SliderFloat("##ktime",&tm,0.0f,t.kin_duration>0?t.kin_duration:1.0f,"")&&t.on_kin_scrub)
                     t.on_kin_scrub(t.mesh_id,tm);
-            }
-            ImGui::Dummy({0,12});
-            // Speed
-            {
+            };
+            auto speedRow=[&](){
                 float sp=t.kin_speed;
                 if(InlineSlider("재생 속도",&sp,0.0f,3.0f)&&t.on_kin_speed)
                     t.on_kin_speed(t.mesh_id,sp);
+            };
+            auto thresholdRow=[&](){
+                float th=t.kin_threshold;
+                if(InlineSlider("전환 임계값",&th,0.02f,0.50f)&&t.on_kin_threshold)
+                    t.on_kin_threshold(t.mesh_id,th);
+            };
+            auto markerFracRow=[&](){
+                float mf=t.kin_marker_frac;
+                if(InlineSlider("관절 방향 가중치",&mf,0.0f,0.30f)&&t.on_kin_marker_frac)
+                    t.on_kin_marker_frac(t.mesh_id,mf);
+            };
+            auto fileCombo=[&](const char* id,const std::string& cur,
+                               const std::function<void(const std::string&)>& onPick){
+                ImGui::SetNextItemWidth(CW());
+                if(ImGui::BeginCombo(id,cur.c_str())){
+                    for(const auto& f:t.kin_file_list){
+                        bool sel=(f==cur);
+                        if(ImGui::Selectable(f.c_str(),sel)&&!sel)onPick(f);
+                        if(sel)ImGui::SetItemDefaultFocus();
+                    }
+                    ImGui::EndCombo();
+                }
+            };
+            auto statusRow=[&](){
+                if(t.kin_status.empty())return;
+                ImGui::Dummy({0,8});
+                ImGui::PushStyleColor(ImGuiCol_Text,kG60);
+                ImGui::PushTextWrapPos(ImGui::GetCursorPosX()+CW());
+                ImGui::TextUnformatted(t.kin_status.c_str());
+                ImGui::PopTextWrapPos();ImGui::PopStyleColor();
+            };
+            auto labelRow=[&](){
+                if(t.kin_label.empty())return;
+                ImGui::PushStyleColor(ImGuiCol_Text,kG60);ImGui::TextUnformatted("현재");ImGui::PopStyleColor();
+                ImGui::SameLine(0,12);
+                ImGui::TextUnformatted(t.kin_label.c_str());
+                ImGui::Dummy({0,8});
+            };
+
+            if(mode==0){
+                // 단일 클립 — original playback widgets.
+                ImGui::PushStyleColor(ImGuiCol_Text,kG60);ImGui::TextUnformatted("모션 파일");ImGui::PopStyleColor();ImGui::Dummy({0,4});
+                fileCombo("##kinfile",t.kin_file,[&](const std::string& f){
+                    if(t.on_kin_file)t.on_kin_file(t.mesh_id,f);
+                });
+                ImGui::Dummy({0,16});
+                playRow(true);
+                ImGui::Dummy({0,16});
+                scrubRow();
+                ImGui::Dummy({0,12});
+                speedRow();
+            }else if(mode==1){
+                // 랜덤 워크 — clip set → build → walk controls.
+                ImGui::PushStyleColor(ImGuiCol_Text,kG60);ImGui::TextUnformatted("그래프 클립");ImGui::PopStyleColor();
+                ImGui::SameLine(0,12);
+                if(ImGui::SmallButton("전체")&&t.on_kin_graph_all)t.on_kin_graph_all(t.mesh_id,true);
+                ImGui::SameLine(0,6);
+                if(ImGui::SmallButton("해제")&&t.on_kin_graph_all)t.on_kin_graph_all(t.mesh_id,false);
+                ImGui::Dummy({0,4});
+                if(ImGui::BeginChild("##kinclips",{CW(),168},true)){
+                    for(size_t fi=0;fi<t.kin_file_list.size();++fi){
+                        bool on=fi<t.kin_graph_selected.size()&&t.kin_graph_selected[fi];
+                        if(ImGui::Checkbox(t.kin_file_list[fi].c_str(),&on)&&t.on_kin_graph_toggle)
+                            t.on_kin_graph_toggle(t.mesh_id,t.kin_file_list[fi],on);
+                    }
+                }
+                ImGui::EndChild();
+                ImGui::Dummy({0,12});
+                thresholdRow();
+                ImGui::Dummy({0,8});
+                markerFracRow();
+                ImGui::Dummy({0,12});
+                if(ImGui::Button("그래프 빌드",{CW(),36})&&t.on_kin_walk_build)
+                    t.on_kin_walk_build(t.mesh_id);
+                statusRow();
+                if(t.kin_graph_ready){
+                    ImGui::Dummy({0,16});
+                    labelRow();
+                    playRow(false);
+                    ImGui::SameLine(0,16);
+                    if(ImGui::Button("다른 경로",{96,36})&&t.on_kin_walk_reseed)
+                        t.on_kin_walk_reseed(t.mesh_id);
+                    ImGui::Dummy({0,12});
+                    ImGui::PushStyleColor(ImGuiCol_Text,kG60);
+                    ImGui::Text("시간  %.1fs",t.kin_time);
+                    ImGui::PopStyleColor();
+                    ImGui::Dummy({0,12});
+                    speedRow();
+                }
+            }else if(mode==2){
+                // 모션 전환 — A → B composite → playback with scrub.
+                ImGui::PushStyleColor(ImGuiCol_Text,kG60);ImGui::TextUnformatted("모션 1 (시작)");ImGui::PopStyleColor();ImGui::Dummy({0,4});
+                fileCombo("##kintra",t.kin_trans_a,[&](const std::string& f){
+                    if(t.on_kin_trans_a)t.on_kin_trans_a(t.mesh_id,f);
+                });
+                ImGui::Dummy({0,12});
+                ImGui::PushStyleColor(ImGuiCol_Text,kG60);ImGui::TextUnformatted("모션 2 (도착)");ImGui::PopStyleColor();ImGui::Dummy({0,4});
+                fileCombo("##kintrb",t.kin_trans_b,[&](const std::string& f){
+                    if(t.on_kin_trans_b)t.on_kin_trans_b(t.mesh_id,f);
+                });
+                ImGui::Dummy({0,12});
+                thresholdRow();
+                ImGui::Dummy({0,8});
+                markerFracRow();
+                ImGui::Dummy({0,12});
+                if(ImGui::Button("전환 생성",{CW(),36})&&t.on_kin_trans_build)
+                    t.on_kin_trans_build(t.mesh_id);
+                statusRow();
+                if(t.kin_graph_ready){
+                    ImGui::Dummy({0,16});
+                    labelRow();
+                    playRow(true);
+                    ImGui::Dummy({0,16});
+                    scrubRow();
+                    ImGui::Dummy({0,12});
+                    speedRow();
+                }
+            }else{
+                // 모션 블렌드 — DTW timewarp A→B → time-scaled crossfade track.
+                // A per-clip preview (strobe ghost + color) sits under each
+                // combo so each motion can be eyeballed as it is picked, before
+                // 블렌드 생성. Ghost root is placed at the object's transform.
+                ImGui::PushStyleColor(ImGuiCol_Text,kG60);ImGui::TextUnformatted("모션 1 (시작)");ImGui::PopStyleColor();ImGui::Dummy({0,4});
+                fileCombo("##kinbla",t.kin_trans_a,[&](const std::string& f){
+                    if(t.on_kin_trans_a)t.on_kin_trans_a(t.mesh_id,f);
+                });
+                ImGui::Dummy({0,6});
+                ImGui::PushStyleColor(ImGuiCol_Text,kG60);ImGui::TextUnformatted("프리뷰");ImGui::PopStyleColor();
+                ImGui::SameLine(0,8);
+                bool pa=t.kin_preview_a;
+                if(PillToggle("##kpva",&pa)&&t.on_kin_preview_a)t.on_kin_preview_a(t.mesh_id,pa);
+                if(t.kin_preview_col_a){
+                    ImGui::SameLine(0,10);
+                    ImGui::ColorEdit3("##kpca",t.kin_preview_col_a,ImGuiColorEditFlags_NoInputs|ImGuiColorEditFlags_NoLabel);
+                }
+                ImGui::SameLine(0,10);
+                ImGui::BeginDisabled(!(t.kin_preview_a&&t.kin_sim_paused));
+                if(ImGui::SmallButton("재생##pa")&&t.on_kin_preview_play_a)t.on_kin_preview_play_a(t.mesh_id);
+                ImGui::EndDisabled();
+                ImGui::Dummy({0,12});
+                ImGui::PushStyleColor(ImGuiCol_Text,kG60);ImGui::TextUnformatted("모션 2 (도착)");ImGui::PopStyleColor();ImGui::Dummy({0,4});
+                fileCombo("##kinblb",t.kin_trans_b,[&](const std::string& f){
+                    if(t.on_kin_trans_b)t.on_kin_trans_b(t.mesh_id,f);
+                });
+                ImGui::Dummy({0,6});
+                ImGui::PushStyleColor(ImGuiCol_Text,kG60);ImGui::TextUnformatted("프리뷰");ImGui::PopStyleColor();
+                ImGui::SameLine(0,8);
+                bool pb=t.kin_preview_b;
+                if(PillToggle("##kpvb",&pb)&&t.on_kin_preview_b)t.on_kin_preview_b(t.mesh_id,pb);
+                if(t.kin_preview_col_b){
+                    ImGui::SameLine(0,10);
+                    ImGui::ColorEdit3("##kpcb",t.kin_preview_col_b,ImGuiColorEditFlags_NoInputs|ImGuiColorEditFlags_NoLabel);
+                }
+                ImGui::SameLine(0,10);
+                ImGui::BeginDisabled(!(t.kin_preview_b&&t.kin_sim_paused));
+                if(ImGui::SmallButton("재생##pb")&&t.on_kin_preview_play_b)t.on_kin_preview_play_b(t.mesh_id);
+                ImGui::EndDisabled();
+                ImGui::Dummy({0,12});
+                markerFracRow();
+                ImGui::Dummy({0,12});
+                if(ImGui::Button("블렌드 생성",{CW(),36})&&t.on_kin_blend_build)
+                    t.on_kin_blend_build(t.mesh_id);
+                statusRow();
+                if(t.kin_graph_ready){
+                    ImGui::Dummy({0,16});
+                    labelRow();
+                    playRow(true);
+                    ImGui::Dummy({0,16});
+                    scrubRow();
+                    ImGui::Dummy({0,12});
+                    speedRow();
+                }
             }
             ImGui::Unindent(kP);ImGui::Dummy({0,kP});
         }
@@ -404,6 +593,17 @@ void drawMeshInspectorWindow(MeshInspectorWindowState& st, const MeshInspectorTa
             if(InputRGB("em",t.emission_color->v))fM();
         }
         ImGui::Unindent(kP);ImGui::Dummy({0,kP});
+    }
+
+    // ─── 렌더링 Render (plane checkerboard) ──────────────────────────
+    if(t.checkerboard&&t.on_checkerboard){
+        if(AccordionHeader("렌더링","Render")){
+            ImGui::Dummy({0,kP});ImGui::Indent(kP);
+            ImGui::PushStyleColor(ImGuiCol_Text,kG60);ImGui::TextUnformatted("체커보드");ImGui::PopStyleColor();
+            ImGui::SameLine(kP+CW()-42);
+            if(PillToggle("##chk",t.checkerboard))t.on_checkerboard(t.mesh_id,*t.checkerboard);
+            ImGui::Unindent(kP);ImGui::Dummy({0,kP});
+        }
     }
 
     // ─── 팽팽함 ──────────────────────────────────────────────────────

@@ -3,6 +3,7 @@
 in vec3 GNormal;
 in vec4 GPosition;
 in vec4 GShadowCoord;
+in vec3 GWorldPos;
 noperspective in vec3 GEdgeDistance;
 
 out vec4 FragColor;
@@ -16,10 +17,26 @@ uniform vec3 lightColor = vec3(160, 160, 160);
 // shader-bound-but-mesh-unbound draw renders the same as the prior
 // Phong default surface.
 uniform vec3  baseColor      = vec3(1.0);
+// Whole-fragment alpha multiplier. 1.0 for opaque meshes; the motion-preview
+// ghost pass lowers it and enables GL blending for translucent strobe poses.
+uniform float opacity        = 1.0;
 uniform float metallic       = 0.0;
 uniform float roughness      = 0.5;
 uniform float specularWeight = 1.0;
 uniform vec3  emissionColor  = vec3(0.0);
+
+// World-space checkerboard albedo override (per-mesh; plane render option).
+// checkerOn gates it. The pattern is computed in the mesh's LOCAL frame so
+// it does NOT slide when the object translates: d = worldPos - checkerOrigin
+// (origin = the plane's transformPosition), then projected onto checkerU /
+// checkerV — the plane's two in-plane axes rotated by the mesh's orientation
+// and kept UNIT-length, so the projected coordinate is in world units. The
+// scale shows up because the world vertices already carry it (more cells over
+// a bigger plane); each cell spans exactly 1 world unit via floor().
+uniform int   checkerOn      = 0;
+uniform vec3  checkerOrigin   = vec3(0.0);
+uniform vec3  checkerU        = vec3(1.0, 0.0, 0.0);
+uniform vec3  checkerV        = vec3(0.0, 0.0, 1.0);
 
 const float PI = 3.14159265359;
 
@@ -76,7 +93,7 @@ float geometrySmith(vec3 N, vec3 V_, vec3 L, float a) {
 // the shadowed side readable. No IBL / shadows / multi-light (out of
 // v1 scope). Verified manually via the GUI roughness slider — see
 // PROJECT_STATE.md's standing structural WARNING entry.
-vec4 pbrPreview() {
+vec4 pbrPreview(vec3 baseColor) {
     vec4 lp = V * vec4(lightPosition, 1.0);
     vec3 fragViewPos = GPosition.xyz / GPosition.w;
     vec3 L = normalize(lp.xyz / lp.w - fragViewPos);
@@ -137,7 +154,19 @@ uniform vec3 hoverOutlineColor = vec3(1.0, 1.0, 0.55);
 uniform vec3 selectOutlineColor = vec3(1.0, 0.8, 0.0);
 
 void main() {
-    FragColor = pbrPreview();
+    // Albedo is the material base color, unless the per-mesh checkerboard
+    // option is on (plane render option): then it's a world-space black/white
+    // checker derived in the plane's local frame (translation-invariant,
+    // scale-aware, 1 world unit per cell). See the checker* uniform comment.
+    vec3 albedo = baseColor;
+    if (checkerOn == 1) {
+        vec3 d = GWorldPos - checkerOrigin;
+        float cu = floor(dot(d, checkerU));
+        float cv = floor(dot(d, checkerV));
+        float parity = mod(cu + cv, 2.0);
+        albedo = (parity < 0.5) ? vec3(0.0) : vec3(1.0);
+    }
+    FragColor = pbrPreview(albedo);
 
     // Wireframe overlay (unchanged from the prior Phong path).
     float d = min( GEdgeDistance.x, GEdgeDistance.y );
@@ -196,4 +225,8 @@ void main() {
             FragColor = vec4(hoverOutlineColor, 1.0);
         }
     }
+
+    // Translucency multiplier (1.0 = opaque). Applied last so it scales the
+    // final composited color including wireframe/outline overlays.
+    FragColor.a *= opacity;
 }
