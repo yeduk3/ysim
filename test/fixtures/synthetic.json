@@ -1,0 +1,175 @@
+{
+  "environment": {
+    "background_color": [
+      0.8859999775886536,
+      0.906000018119812,
+      0.921999990940094
+    ],
+    "gravity": [
+      0.0,
+      -9.8100004196167,
+      0.0
+    ],
+    "wind": [
+      0.0,
+      0.0,
+      0.0
+    ]
+  },
+  "format_version": 1,
+  "objects": [
+    {
+      "apply_gravity": true,
+      "apply_wind": true,
+      "behavior": {
+        "params": {
+          "bend": 1000.0,
+          "shear": 1000.0,
+          "stretch": 1000.0,
+          "thickness": 0.009999999776482582
+        },
+        "type": "TriangularCloth"
+      },
+      "cloth_stiffness_scale": 1.0,
+      "id": 0,
+      "material": {
+        "base_color": [
+          1.0,
+          1.0,
+          1.0
+        ],
+        "emission_color": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.5,
+        "specular_weight": 1.0
+      },
+      "name": "object_0",
+      "source": {
+        "direction": "XZPlane",
+        "jiggle": true,
+        "mass": 0.10000000149011612,
+        "shape": "grid",
+        "size": 0.5,
+        "tessellation": 4,
+        "type": "primitive"
+      },
+      "transform": {
+        "position": [
+          0.0,
+          0.25,
+          0.0
+        ],
+        "rotation": [
+          1.0,
+          0.0,
+          0.0,
+          0.0
+        ]
+      }
+    },
+    {
+      "apply_gravity": true,
+      "apply_wind": true,
+      "behavior": {
+        "params": {},
+        "type": "Float"
+      },
+      "cloth_stiffness_scale": 1.0,
+      "id": 1,
+      "material": {
+        "base_color": [
+          1.0,
+          1.0,
+          1.0
+        ],
+        "emission_color": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.5,
+        "specular_weight": 1.0
+      },
+      "name": "object_1",
+      "source": {
+        "direction": "XZPlane",
+        "jiggle": false,
+        "mass": 0.10000000149011612,
+        "shape": "cube",
+        "size": 0.20000000298023224,
+        "tessellation": 2,
+        "type": "primitive"
+      },
+      "transform": {
+        "position": [
+          0.5,
+          -0.20000000298023224,
+          0.0
+        ],
+        "rotation": [
+          1.0,
+          0.0,
+          0.0,
+          0.0
+        ]
+      }
+    },
+    {
+      "apply_gravity": true,
+      "apply_wind": true,
+      "behavior": {
+        "params": {},
+        "type": "Float"
+      },
+      "cloth_stiffness_scale": 1.0,
+      "id": 2,
+      "material": {
+        "base_color": [
+          1.0,
+          1.0,
+          1.0
+        ],
+        "emission_color": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.5,
+        "specular_weight": 1.0
+      },
+      "name": "object_2",
+      "source": {
+        "direction": "XZPlane",
+        "jiggle": false,
+        "mass": 0.10000000149011612,
+        "shape": "grid",
+        "size": 2.0,
+        "tessellation": 2,
+        "type": "primitive"
+      },
+      "transform": {
+        "position": [
+          0.0,
+          -1.0,
+          0.0
+        ],
+        "rotation": [
+          1.0,
+          0.0,
+          0.0,
+          0.0
+        ]
+      }
+    }
+  ],
+  "simulation": {
+    "substeps": 8,
+    "time_per_frame": 0.01666666753590107
+  }
+}

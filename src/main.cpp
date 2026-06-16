@@ -11051,20 +11051,30 @@ static int runSelfTest() {
         Scene<Backend, Precision>::environment = SceneEnvironment{};
     };
 
+    // Phase-2 hybrid test migration: load a scene fixture (the scene SETUP as
+    // JSON) and apply it through the same applySnapshot path the GUI/CLI use.
+    // Assertions stay in C++; only the inline scene construction moves to
+    // JSON. Resolved under <project-root>/test/fixtures/. Records a failure
+    // (and returns false) if the fixture is missing/invalid.
+    auto loadFixture = [&](auto& sim, const std::string& name) -> bool {
+        const std::string path =
+            ysim_paths::projectRoot() + "/test/fixtures/" + name;
+        auto r = scene_format::readFromFile(path);
+        if (!r.ok) {
+            fail("fixture-load", path + ": " + r.error.message);
+            return false;
+        }
+        sim.applySnapshot(r.value, scene_format::sceneDir(path));
+        return true;
+    };
+
+    // The shared synthetic scene (4×4 TriangularCloth + cube + static ground)
+    // now lives in test/fixtures/synthetic.json. applySnapshot already clears
+    // the prior scene, so no separate resetScene() is needed. Regenerate the
+    // fixture with `YSIM_DUMP_FIXTURES=1 ./build/ysim --self-test` if the
+    // synthetic scene definition changes (see the Block-1 dump below).
     auto buildSyntheticScene = [&](auto& sim) {
-        resetScene();
-        // Tiny cloth so each pack/init is fast. 4×4 → 16 particles.
-        sim.addCloth(/*particleNum1D=*/4, /*size1D=*/0.5,
-                     tinym::vec3(0.0f, 0.25f, 0.0f),
-                     /*kstretch=*/1e3, /*kshear=*/1e3, /*kbend=*/1e3,
-                     /*thickness=*/0.01, /*mass=*/0.1);
-        // Cube primitive — exercises MeshCubeInitializer + the loader path
-        // when the harness later round-trips this scene.
-        sim.addCube(tinym::vec3(0.5f, -0.2f, 0.0f),
-                    /*tessellation=*/2, /*size=*/0.2f, /*mass=*/0.1f);
-        // Static ground — Float, must stay exact-zero under any gravity.
-        sim.addGround(PlaneDirection::XZPlane, tinym::vec3(0, -1, 0),
-                      /*size1D=*/2.0f);
+        loadFixture(sim, "synthetic.json");
     };
 
     // Bring up Metal eagerly. SKIP-not-FAIL when the device or metallib is
@@ -11307,7 +11317,7 @@ static int runSelfTest() {
     sim.pause = false;  // self-test wants update() to actually step.
 
     // ---- Block 1: CM-002 regression — re-running pack() is safe. ---------
-    buildSyntheticScene(sim);
+    buildSyntheticScene(sim);   // loads test/fixtures/synthetic.json
     sim.initialize();
     sim.initialize();  // second pack on the same scene must not segfault.
     pass("CM-002 / re-run pack stays sane");
