@@ -634,10 +634,14 @@ void drawMeshInspectorWindow(MeshInspectorWindowState& st, const MeshInspectorTa
     }
 
     // ─── 환경 Environment ────────────────────────────────────────────
-    if(t.apply_gravity||t.apply_wind){
+    if(t.apply_gravity||t.apply_wind||t.is_static){
         if(AccordionHeader("환경","Environment")){
             ImGui::Dummy({0,kP});ImGui::Indent(kP);
             auto fE=[&](){if(!t.on_env_toggle_change)return;bool g=t.apply_gravity?*t.apply_gravity:true;bool w=t.apply_wind?*t.apply_wind:true;t.on_env_toggle_change(t.mesh_id,g,w);};
+            if(t.is_static){
+                ImGui::PushStyleColor(ImGuiCol_Text,kG60);ImGui::TextUnformatted("고정");ImGui::PopStyleColor();
+                ImGui::SameLine(kP+CW()-42);if(PillToggle("##st",t.is_static)){if(t.on_static_change)t.on_static_change(t.mesh_id,*t.is_static);}ImGui::Dummy({0,12});
+            }
             if(t.apply_gravity){
                 ImGui::PushStyleColor(ImGuiCol_Text,kG60);ImGui::TextUnformatted("중력");ImGui::PopStyleColor();
                 ImGui::SameLine(kP+CW()-42);if(PillToggle("##gv",t.apply_gravity))fE();ImGui::Dummy({0,12});

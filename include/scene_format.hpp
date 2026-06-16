@@ -88,6 +88,9 @@ struct Object {
     // for backward compat — older snapshots default to "receive both".
     bool applyGravity = true;
     bool applyWind = true;
+    // Static(고정) declaration — when true the BVH skips per-substep refit
+    // for this object. Optional in JSON (older snapshots default false).
+    bool isStatic = false;
     // "팽팽함" — uniform multiplier on simulated cloth stiffness.
     // Optional in JSON (default 1.0 for older snapshots / non-cloth).
     double clothStiffnessScale = 1.0;
@@ -312,6 +315,7 @@ inline nlohmann::json toJson(const Object& o) {
     j["behavior"] = toJson(o.behavior);
     j["apply_gravity"] = o.applyGravity;
     j["apply_wind"] = o.applyWind;
+    j["is_static"] = o.isStatic;
     j["cloth_stiffness_scale"] = o.clothStiffnessScale;
     if (!o.fixedParticles.empty()) {
         nlohmann::json fp = nlohmann::json::array();
@@ -533,6 +537,9 @@ inline Result<Object> objectFromJson(const nlohmann::json& j, int idx,
     }
     if (auto it = j.find("apply_wind"); it != j.end() && it->is_boolean()) {
         o.applyWind = it->get<bool>();
+    }
+    if (auto it = j.find("is_static"); it != j.end() && it->is_boolean()) {
+        o.isStatic = it->get<bool>();
     }
     if (auto it = j.find("cloth_stiffness_scale");
         it != j.end() && it->is_number()) {

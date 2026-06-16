@@ -2664,6 +2664,15 @@ struct GeneralMesh {
     bool applyGravity = true;
     bool applyWind = true;
 
+    // 고정(Static) 선언 — UI 토글. true면 이 메시는 움직이지 않는다고
+    // 약속하는 것으로, BroadPhase가 매 substep BVH refit(리프 AABB 재계산)을
+    // 건너뛴다. 한 번 build()된 트리 AABB를 그대로 재사용 → floating/floor
+    // 류 정적 메시의 낭비되는 refit 제거. 충돌 '타깃'으로는 여전히 TLAS에
+    // 참여한다(천이 정적 바닥 위로 떨어지는 경우). static을 켜면 inspector
+    // 콜백이 applyGravity/applyWind를 자동으로 끈다(움직임 소스 제거).
+    // Persisted via scene_format::Object; mirrored on RequestGeneralMesh.
+    bool isStatic = false;
+
     // Plane checkerboard render option (UI-driven; plane/grid meshes only).
     // When true the renderer overrides the surface albedo with a world-space
     // black/white checker (1 world unit per cell) computed in the plane's
@@ -2703,6 +2712,7 @@ struct GeneralMesh {
           externalForces(std::move(other.externalForces)),
           applyGravity(other.applyGravity),
           applyWind(other.applyWind),
+          isStatic(other.isStatic),
           checkerboard(other.checkerboard)
     {
         other.initializer = nullptr;
@@ -2792,6 +2802,11 @@ struct Scene {
         // true (matches GeneralMesh defaults).
         bool applyGravity = true;
         bool applyWind = true;
+        // Mirror of GeneralMesh.isStatic kept on the request so the static
+        // declaration survives Scene::pack rebuilds (reset / load /
+        // changeBehavior). pack copies this onto the realized mesh; the
+        // inspector callback writes here in addition to the live field.
+        bool isStatic = false;
         // Mirror of GeneralMesh.checkerboard (plane render option) kept on
         // the request so the toggle survives Scene::pack rebuilds. pack
         // copies this onto the realized mesh; the inspector callback writes
@@ -3140,6 +3155,7 @@ struct Scene {
             // Apply Gravity / Apply Wind selections.
             meshes[i].applyGravity = req.applyGravity;
             meshes[i].applyWind    = req.applyWind;
+            meshes[i].isStatic     = req.isStatic;
             meshes[i].checkerboard = req.checkerboard;
             // Carry the user's orientation through pack. The R-3 preview
             // memcpy below restores the rotated *geometry*; this restores
@@ -4759,6 +4775,10 @@ struct BVH<BE, PR, BVHMODE::LINEAR, PRIMITIVE> {
     // and resets on resetScene). See CM-008 (graduated).
     int builtForLifetimeId = -1;
     VectorBase<METAL, int> objIds;
+    // Cached at build() from mesh->isStatic. When true the BroadPhase refit
+    // loops skip this object's per-leaf AABB recompute (the AABB can't move).
+    // Live-updated by the inspector static toggle, same pattern as objBehavior.
+    bool objStatic = false;
     BehaviorType objBehavior;
     VectorBase<METAL, BehaviorType> objBehaviors;
     ShapeType objShape;
@@ -5566,6 +5586,7 @@ struct BVH<BE, PR, BVHMODE::LINEAR, PRIMITIVE> {
         if(mesh) {
             velocities = mesh->state.v;
             objBehavior = mesh->behaviorType;
+            objStatic = mesh->isStatic;
             builtForLifetimeId = mesh->lifetimeId;  // D-026
             // Slice (c-2): cache the authored primitive type so the broad
             // phase can recognize spheres and route them to the analytic
@@ -6489,10 +6510,15 @@ struct BVH<BE, PR, BVHMODE::SCENE, BVHPRIMITIVE::OBJECT> {
             return;
         }
         for(Index i = 0; i < objTrees.size(); ++i) {
-            objTrees[i].useAgglomerative = useAgglomerative;
-            objTrees[i].useSubObjectBVH = useSubObjectBVH;
-            objTrees[i].subBvhSplitS = subBvhSplitS;
-            objTrees[i].refit();
+            // Static 메시는 리프 AABB가 불변 → 무거운 GPU refit을 건너뛰고
+            // build() 때 쓴 캐시 트리/positions를 그대로 재사용한다. TLAS
+            // (tree.build 아래)에는 계속 참여 → 충돌 타깃으로 유효.
+            if (!objTrees[i].objStatic) {
+                objTrees[i].useAgglomerative = useAgglomerative;
+                objTrees[i].useSubObjectBVH = useSubObjectBVH;
+                objTrees[i].subBvhSplitS = subBvhSplitS;
+                objTrees[i].refit();
+            }
             //std::cout << "[objTree root before scene build] id " << i
             //  << " min=" << objTrees[i].tree[0].min
             //  << " max=" << objTrees[i].tree[0].max << std::endl;
@@ -6518,10 +6544,13 @@ struct BVH<BE, PR, BVHMODE::SCENE, BVHPRIMITIVE::OBJECT> {
 
     void enlargeTrajectory(PR dt) {
         for(Index i = 0; i < objTrees.size(); ++i) {
-            objTrees[i].useAgglomerative = useAgglomerative;
-            objTrees[i].useSubObjectBVH = useSubObjectBVH;
-            objTrees[i].subBvhSplitS = subBvhSplitS;
-            objTrees[i].enlargeTrajectory(dt);
+            // Static 메시는 속도 0 → 궤적 확장이 no-op이므로 GPU dispatch 생략.
+            if (!objTrees[i].objStatic) {
+                objTrees[i].useAgglomerative = useAgglomerative;
+                objTrees[i].useSubObjectBVH = useSubObjectBVH;
+                objTrees[i].subBvhSplitS = subBvhSplitS;
+                objTrees[i].enlargeTrajectory(dt);
+            }
             Index pbase = i*6;
             AABB4 objBox = objTrees[i].objectRootAABB();
             positions[pbase  ] = objBox.min.x;
@@ -6552,14 +6581,17 @@ struct BVH<BE, PR, BVHMODE::SCENE, BVHPRIMITIVE::OBJECT> {
             return;
         }
         for(Index i = 0; i < objTrees.size(); ++i) {
-            objTrees[i].useAgglomerative = useAgglomerative;
-            objTrees[i].useSubObjectBVH = useSubObjectBVH;
-            objTrees[i].subBvhSplitS = subBvhSplitS;
-            if (objTrees[i].buildSweptLeafPSO) {
-                objTrees[i].refitSwept(dt);
-            } else {
-                objTrees[i].refit();
-                objTrees[i].enlargeTrajectory(dt);
+            // Static 메시: swept refit+enlarge 전체 생략 (AABB 불변, 속도 0).
+            if (!objTrees[i].objStatic) {
+                objTrees[i].useAgglomerative = useAgglomerative;
+                objTrees[i].useSubObjectBVH = useSubObjectBVH;
+                objTrees[i].subBvhSplitS = subBvhSplitS;
+                if (objTrees[i].buildSweptLeafPSO) {
+                    objTrees[i].refitSwept(dt);
+                } else {
+                    objTrees[i].refit();
+                    objTrees[i].enlargeTrajectory(dt);
+                }
             }
             Index pbase = i*6;
             AABB4 objBox = objTrees[i].objectRootAABB();
@@ -9906,13 +9938,14 @@ struct Simulator {
                               const tinym::vec3& scale,
                               const tinym::vec3* transformOverride,
                               const std::string& name,
-                              bool applyGravity, bool applyWind,
+                              bool applyGravity, bool applyWind, bool isStatic,
                               double clothStiffnessScale) {
             Object o;
             o.id = id;
             o.name = name;
             o.applyGravity = applyGravity;
             o.applyWind = applyWind;
+            o.isStatic = isStatic;
             o.clothStiffnessScale = clothStiffnessScale;
             o.material.baseColor = {mat.baseColor.x, mat.baseColor.y, mat.baseColor.z};
             o.material.metallic = mat.metallic;
@@ -10016,7 +10049,7 @@ struct Simulator {
                           m.scale,
                           &m.transformPosition,
                           "object_" + std::to_string(m.id),
-                          m.applyGravity, m.applyWind,
+                          m.applyGravity, m.applyWind, m.isStatic,
                           (double)m.clothStiffnessScale);
             }
         } else {
@@ -10027,7 +10060,7 @@ struct Simulator {
                           r.scale,
                           nullptr,
                           "object_" + std::to_string(r.id),
-                          r.applyGravity, r.applyWind,
+                          r.applyGravity, r.applyWind, r.isStatic,
                           (double)r.clothStiffnessScale);
             }
         }
@@ -10301,6 +10334,7 @@ struct Simulator {
                     // initialize, and they survive reset() identically.
                     Scene<BE,PR>::requestsGeneralMeshes[idx].applyGravity = o.applyGravity;
                     Scene<BE,PR>::requestsGeneralMeshes[idx].applyWind    = o.applyWind;
+                    Scene<BE,PR>::requestsGeneralMeshes[idx].isStatic     = o.isStatic;
                     Scene<BE,PR>::requestsGeneralMeshes[idx].clothStiffnessScale =
                         (PR)o.clothStiffnessScale;
                     // Pinned-vertex constraints. Scene::pack re-applies
@@ -18230,6 +18264,39 @@ int main(int argc, char** argv) {
                     auto& meshes = Scene<Backend, Precision>::meshes;
                     for (int idx = 0; idx < (int)meshes.size(); ++idx) {
                         if (meshes[idx].id != id) continue;
+                        if (meshes[idx].behaviorType == BehaviorType::Rigid) {
+                            simulator.recreateRigidBackendBody(idx);
+                        }
+                        break;
+                    }
+                };
+                // Static(고정) declaration toggle. Pill aliases isStatic; the
+                // callback mirrors to the request, live-updates the BVH
+                // objStatic cache (so the very next refit skips this object),
+                // and — when turning static ON — auto-clears gravity/wind so
+                // the mesh has no motion source (the apply_* pills follow,
+                // since they alias the same live fields). For Rigid meshes,
+                // gravity-off ⇒ mass=0 on the recreated Bullet body (static).
+                target.is_static = &selectedMesh->isStatic;
+                target.on_static_change = [&simulator](int id, bool s) {
+                    for (auto& r : Scene<Backend, Precision>::requestsGeneralMeshes) {
+                        if (r.id == id) {
+                            r.isStatic = s;
+                            if (s) { r.applyGravity = false; r.applyWind = false; }
+                            break;
+                        }
+                    }
+                    auto& meshes = Scene<Backend, Precision>::meshes;
+                    for (int idx = 0; idx < (int)meshes.size(); ++idx) {
+                        if (meshes[idx].id != id) continue;
+                        meshes[idx].isStatic = s;
+                        if (s) {
+                            meshes[idx].applyGravity = false;
+                            meshes[idx].applyWind    = false;
+                        }
+                        auto& trees =
+                            simulator.collisionPipeline.broadPhase.objTrees;
+                        if (idx < (int)trees.size()) trees[idx].objStatic = s;
                         if (meshes[idx].behaviorType == BehaviorType::Rigid) {
                             simulator.recreateRigidBackendBody(idx);
                         }

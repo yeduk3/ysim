@@ -252,6 +252,15 @@ struct MeshInspectorTarget {
     std::function<void(int /*meshId*/, bool /*applyGravity*/, bool /*applyWind*/)>
         on_env_toggle_change;
 
+    // Static(고정) declaration toggle. Pointer aliases GeneralMesh::isStatic;
+    // the widget mutates in place, then fires on_static_change so production
+    // can mirror to the request, update the BVH objStatic cache, and — when
+    // turning static ON — auto-clear applyGravity/applyWind (the apply_*
+    // pills reflect the change next frame since they alias the live fields).
+    // Optional; the Environment row renders the pill only when set.
+    bool* is_static = nullptr;
+    std::function<void(int /*meshId*/, bool /*isStatic*/)> on_static_change;
+
     // Checkerboard render option — non-null only for plane (grid) meshes.
     // The checkbox aliases GeneralMesh::checkerboard (renderer reads it each
     // frame); on_checkerboard mirrors the new value onto the request so
