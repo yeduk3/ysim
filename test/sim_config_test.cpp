@@ -28,6 +28,10 @@ TEST_CASE("RunConfig: defaults when engine/profile blocks absent (req 1)") {
     CHECK(r.value.profile.frames == 30);
     CHECK(r.value.profile.realtimeSync == false);
     CHECK(r.value.profile.outputPath.empty());
+    // `level` absent → InFrame (preserves the historical full-detail default).
+    // (cast to int: doctest can't stringify a scoped enum for CHECK.)
+    CHECK(static_cast<int>(r.value.profile.level) ==
+          static_cast<int>(ProfileLevel::InFrame));
 }
 
 TEST_CASE("RunConfig: a plain scene_format scene loads as a RunConfig (back-compat)") {
@@ -61,6 +65,44 @@ TEST_CASE("RunConfig: engine + profile round-trip through JSON") {
     CHECK(r.value.profile.frames == 45);
     CHECK(r.value.profile.realtimeSync == true);
     CHECK(r.value.profile.outputPath == "profiles/foo-45f.csv");
+}
+
+TEST_CASE("RunConfig: profile.level round-trips + parses each tier") {
+    for (auto lvl : {ProfileLevel::None, ProfileLevel::PerFrame,
+                     ProfileLevel::InFrame}) {
+        auto base = parseString(kMinimalScene);
+        REQUIRE(base.ok);
+        RunConfig c = base.value;
+        c.profile.level = lvl;
+        auto r = parseString(toString(c));
+        REQUIRE(r.ok);
+        CHECK(static_cast<int>(r.value.profile.level) == static_cast<int>(lvl));
+    }
+
+    // String forms parse to the right tier.
+    auto none = parseString(R"({
+      "format_version": 1, "objects": [],
+      "profile": { "level": "none" }
+    })");
+    REQUIRE(none.ok);
+    CHECK(static_cast<int>(none.value.profile.level) ==
+          static_cast<int>(ProfileLevel::None));
+
+    auto perFrame = parseString(R"({
+      "format_version": 1, "objects": [],
+      "profile": { "level": "per_frame" }
+    })");
+    REQUIRE(perFrame.ok);
+    CHECK(static_cast<int>(perFrame.value.profile.level) ==
+          static_cast<int>(ProfileLevel::PerFrame));
+}
+
+TEST_CASE("RunConfig: rejects unknown profile.level") {
+    auto bad = parseString(R"({
+      "format_version": 1, "objects": [],
+      "profile": { "level": "verbose" }
+    })");
+    CHECK_FALSE(bad.ok);
 }
 
 TEST_CASE("RunConfig: rejects unknown backend / system") {

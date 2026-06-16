@@ -69,7 +69,13 @@ void drawProfilerWindow(
     // Substep cadence knobs (Simulator::refitSubstepPeriod / cdSubstepPeriod,
     // both Index == uint32_t). 1 = every substep. Live-editable sliders.
     std::uint32_t* refit_substep_period = nullptr,
-    std::uint32_t* cd_substep_period = nullptr
+    std::uint32_t* cd_substep_period = nullptr,
+    // Profiling detail tier (0=None, 1=PerFrame, 2=InFrame), matching
+    // sim_config::ProfileLevel's enumerator order. When non-null a combo lets
+    // the user switch tiers live; main.cpp re-wires the profiler pointers from
+    // the edited value on the next frame. Kept as an int so this header stays
+    // free of a sim_config dependency.
+    int* profile_level = nullptr
 );
 
 } // namespace profiler

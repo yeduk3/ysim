@@ -9266,9 +9266,16 @@ struct Simulator {
         } else {
             MetalGlobalContext::commitAndWait();
         }
-        std::cout << Scene<BE, PR>::packedCollisionData.numBroadCollisions[0] << ", "
-            << Scene<BE, PR>::packedCollisionData.numNarrowCollisions[0] << '\n';
-        
+        // Per-frame collision-counter log is debug output: print only when the
+        // profiler is attached (InFrame). PerFrame/None keep the loop silent so
+        // stdout isn't a per-frame bottleneck. The commitAndWait above stays
+        // unconditionally — preview/render reads state.x on the CPU (req: keep
+        // CPU-sync commits, drop only debug-log-driven ones).
+        if (profiler) {
+            std::cout << Scene<BE, PR>::packedCollisionData.numBroadCollisions[0] << ", "
+                << Scene<BE, PR>::packedCollisionData.numNarrowCollisions[0] << '\n';
+        }
+
         system.acctime += system.h;
         frame++;
 
@@ -17163,8 +17170,11 @@ int main(int argc, char** argv) {
 
     std::cout << "[Main] callbacks are set" << std::endl;
 
-    simulator.profiler = &frameProfiler;
-    simulator.shBroadPhase.profiler = &frameProfiler;
+    // simulator.profiler / shBroadPhase.profiler are wired *after* the
+    // profiling level is derived below: only the InFrame tier attaches the
+    // profiler (the in-update ScopedTimer sections are gated on a non-null
+    // pointer). PerFrame/None run with profiler==nullptr — zero per-section
+    // Clock::now overhead and no per-frame debug logging.
 
     // --- Profiling activation (req 2) ---------------------------------------
     // Active when the --scene config's profile block is enabled, OR the
@@ -17195,12 +17205,58 @@ int main(int argc, char** argv) {
     // play click.
     if (profileActive) simulator.pause = false;
 
+    // --- Profiling detail level (3 tiers) -----------------------------------
+    // Source priority: YSIM_PROFILE_LEVEL env > --scene config > default. The
+    // default is InFrame so a build with no flags behaves exactly as before.
+    // Mutable: the ProfilerWindow combo edits it at runtime, and applyLevel()
+    // re-wires the profiler pointers each frame from this single source.
+    sim_config::ProfileLevel activeProfileLevel =
+        haveRunConfig ? runConfig.profile.level
+                      : sim_config::ProfileLevel::InFrame;
+    if (const char* el = std::getenv("YSIM_PROFILE_LEVEL")) {
+        sim_config::ProfileLevel parsed;
+        if (sim_config::parseProfileLevel(el, parsed))
+            activeProfileLevel = parsed;
+        else
+            std::cout << "[profile] ignoring unknown YSIM_PROFILE_LEVEL='" << el
+                      << "' (expected none|per_frame|in_frame)\n";
+    }
+    // Attach the profiler only at InFrame; PerFrame/None null it so update()'s
+    // `if (profiler)` sections take the fast path. Called once now and at the
+    // top of every render frame (so the GUI combo takes effect immediately).
+    auto applyProfilerLevel = [&]() {
+        profiler::FrameProfiler* p =
+            (activeProfileLevel == sim_config::ProfileLevel::InFrame)
+                ? &frameProfiler : nullptr;
+        simulator.profiler = p;
+        simulator.shBroadPhase.profiler = p;
+    };
+    applyProfilerLevel();
+    std::cout << "[profile] level = "
+              << sim_config::toString(activeProfileLevel) << "\n";
+    // GUI-editable mirror of activeProfileLevel (0/1/2). The ProfilerWindow
+    // combo writes this; render() syncs it back to the enum each frame.
+    int profileLevelUi = static_cast<int>(activeProfileLevel);
+
     auto init = []() {
         glfwSwapInterval(1);
     };
     auto render = [&]() {
         double currentTime = glfwGetTime();
-        bool collectProfileFrame = !simulator.pause;
+        // Re-wire the profiler pointers from the (possibly GUI-edited) level
+        // before any simulation step this frame. profileLevelUi is the combo's
+        // backing int; fold it back into the enum first.
+        activeProfileLevel = static_cast<sim_config::ProfileLevel>(profileLevelUi);
+        applyProfilerLevel();
+        const bool profilingOn =
+            activeProfileLevel != sim_config::ProfileLevel::None;
+        const bool inFrameLevel =
+            activeProfileLevel == sim_config::ProfileLevel::InFrame;
+        // Collect a frame snapshot at PerFrame *and* InFrame (None skips it).
+        // At PerFrame the snapshot carries frame_ms + the top-level
+        // physics_total/render_total scopes only; the in-update sections are
+        // off because simulator.profiler is null.
+        bool collectProfileFrame = profilingOn && !simulator.pause;
         // The guard pairs begin/endFrame on `collectProfileFrame`. Block 10
         // clause (c) constructs the same guard with `!sim.pause` so the
         // harness drives the production gate predicate (D-017).
@@ -18708,13 +18764,18 @@ int main(int argc, char** argv) {
             applyShadowUniforms();
 
             {
-                auto drawScope = frameProfiler.scoped("scene_draw");
+                // scene_draw / debug_draw are *in-frame* sub-sections: timed
+                // only at InFrame. At PerFrame they fold into render_total (the
+                // default-constructed ScopedTimer is an inert no-op).
+                profiler::FrameProfiler::ScopedTimer drawScope;
+                if (inFrameLevel) drawScope = frameProfiler.scoped("scene_draw");
                 simulator.draw(shader);
                 drawPointOverlay(V, P);
             }
 
             {
-                auto debugScope = frameProfiler.scoped("debug_draw");
+                profiler::FrameProfiler::ScopedTimer debugScope;
+                if (inFrameLevel) debugScope = frameProfiler.scoped("debug_draw");
                 if(debugEachBoxes) {
                     simulator.debugEachBoxes(V, P);
                 }
@@ -18784,7 +18845,7 @@ int main(int argc, char** argv) {
             sceneCounts.points    += (int)(m.state.x.size / 3);
             sceneCounts.triangles += (int)(m.adjacency.facets.size / 3);
         }
-        if (collectProfileFrame) {
+        if (inFrameLevel) {
             auto imguiScope = frameProfiler.scoped("imgui_draw");
             profiler::drawProfilerWindow(
                 profilerWindowState,
@@ -18801,7 +18862,8 @@ int main(int argc, char** argv) {
                 &simulator.useAnalyticPrimitive,
                 &simulator.useSpatialHashing,
                 &simulator.refitSubstepPeriod,
-                &simulator.cdSubstepPeriod
+                &simulator.cdSubstepPeriod,
+                &profileLevelUi
             );
             scene_log::drawSceneActionLogWindow(sceneLogWindowState);
             ImGui::Render();
@@ -18822,7 +18884,8 @@ int main(int argc, char** argv) {
                 &simulator.useAnalyticPrimitive,
                 &simulator.useSpatialHashing,
                 &simulator.refitSubstepPeriod,
-                &simulator.cdSubstepPeriod
+                &simulator.cdSubstepPeriod,
+                &profileLevelUi
             );
             scene_log::drawSceneActionLogWindow(sceneLogWindowState);
             ImGui::Render();
@@ -18846,6 +18909,7 @@ int main(int argc, char** argv) {
             outCfg.profile.frames       = profileFrames;
             outCfg.profile.realtimeSync = profileRealtimeSync;
             outCfg.profile.outputPath   = profileCsvPath;
+            outCfg.profile.level        = activeProfileLevel;  // record detail tier
             const std::string sidecar = sim_config::sidecarScenePath(profileCsvPath);
             std::string serr;
             bool sok = sim_config::writeToFile(outCfg, sidecar, &serr);
