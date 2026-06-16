@@ -506,6 +506,180 @@ kernel void bottomUpBoxes(
     }
 }
 
+// ============================================================================
+// Sub-object (multi-root) LBVH — square-cloth experiment (Phase 1).
+//
+// The primitive array is partitioned into k = 4^s groups by MATERIAL-space
+// tile (fixed for the cloth's lifetime). Each group owns an INDEPENDENT
+// Karras tree living in its own contiguous slot window of the shared `tree`
+// buffer. There are k roots; the broad phase (Phase 2) treats each group
+// root as a separate object via the existing scene TLAS.
+//
+// Layout for group g with M = groupSize[g] prims:
+//   sorted positions : [primBase[g], primBase[g]+M)        (set by host
+//                       stable group-partition after the global Morton sort)
+//   node window      : [nodeBase[g], nodeBase[g]+(2M-1))
+//   internal local l : 0..M-2   -> global slot nodeBase[g] + l
+//   leaf     local l : 0..M-1   -> global slot nodeBase[g] + (M-1) + l
+//   group root       : nodeBase[g]
+// Total nodes across all groups = 2N - k (<= the 2N-1 single-root alloc).
+//
+// These mirror buildTree_Tri / buildLeaf_Tri / bottomUpBoxes with N->M_g,
+// the mortons pointer shifted by primBase[g], and slots offset by
+// nodeBase[g]. determineRange/findSplit operate on the group's LOCAL range,
+// so the Karras delta rule never crosses a group boundary.
+// ============================================================================
+
+// Grouped hierarchy + leaf build. One thread per global sorted position.
+kernel void buildTree_Tri_Grouped(
+    device const packed_float3* x [[buffer(0)]],
+    device const packed_uint3* facets [[buffer(1)]],
+    constant int& numPrimitives [[buffer(2)]],
+    device const MortonNode* mortons [[buffer(3)]],
+    device BVHNode* tree [[buffer(4)]],
+    device int* treeParent [[buffer(5)]],
+    device const uint* sortedPosToGroup [[buffer(6)]],
+    device const uint* groupSize [[buffer(7)]],
+    device const uint* groupPrimBase [[buffer(8)]],
+    device const uint* groupNodeBase [[buffer(9)]],
+    uint id [[thread_position_in_grid]]
+) {
+    int gid = (int)id;
+    if (gid >= numPrimitives) return;
+
+    uint g     = sortedPosToGroup[gid];
+    int  M     = (int)groupSize[g];
+    int  pbase = (int)groupPrimBase[g];
+    int  nbase = (int)groupNodeBase[g];
+    int  l     = gid - pbase;          // local sorted index within group
+
+    // leaf node
+    int fid = mortons[gid].index;
+    uint3 facet = facets[fid];
+    float3 v0 = x[facet.x];
+    float3 v1 = x[facet.y];
+    float3 v2 = x[facet.z];
+    int leafid = nbase + (M - 1) + l;
+    tree[leafid].min = min3(v0, v1, v2);
+    tree[leafid].childA = -1;
+    tree[leafid].max = max3(v0, v1, v2);
+    tree[leafid].childB = fid;
+
+    // last sorted position in the group is a leaf only (M-1 internals)
+    if (l == M - 1) return;
+
+    // LOCAL Karras range/split (mortons shifted to group start)
+    int2 range = determineRange(mortons + pbase, M, l);
+    uint split = findSplit(mortons + pbase, range.x, range.y);
+
+    int childA, childB;
+    if ((int)split == range.x)     childA = nbase + (M - 1) + (int)split;
+    else                           childA = nbase + (int)split;
+    if ((int)split + 1 == range.y) childB = nbase + (M - 1) + (int)split + 1;
+    else                           childB = nbase + (int)split + 1;
+
+    int self = nbase + l;
+    tree[self].childA = childA;
+    tree[self].childB = childB;
+    treeParent[childA] = self;
+    treeParent[childB] = self;
+}
+
+// Grouped leaf-only refit. Topology (treeParent + childA/B) carried from the
+// prior grouped build; only leaf AABBs are recomputed from current positions.
+kernel void buildLeaf_Tri_Grouped(
+    device const packed_float3* x [[buffer(0)]],
+    device const packed_uint3* facets [[buffer(1)]],
+    constant int& numPrimitives [[buffer(2)]],
+    device const MortonNode* mortons [[buffer(3)]],
+    device BVHNode* tree [[buffer(4)]],
+    device const uint* sortedPosToGroup [[buffer(6)]],
+    device const uint* groupSize [[buffer(7)]],
+    device const uint* groupPrimBase [[buffer(8)]],
+    device const uint* groupNodeBase [[buffer(9)]],
+    uint id [[thread_position_in_grid]]
+) {
+    int gid = (int)id;
+    if (gid >= numPrimitives) return;
+
+    uint g     = sortedPosToGroup[gid];
+    int  M     = (int)groupSize[g];
+    int  pbase = (int)groupPrimBase[g];
+    int  nbase = (int)groupNodeBase[g];
+    int  l     = gid - pbase;
+
+    int fid = mortons[gid].index;
+    uint3 facet = facets[fid];
+    float3 v0 = x[facet.x];
+    float3 v1 = x[facet.y];
+    float3 v2 = x[facet.z];
+    int leafid = nbase + (M - 1) + l;
+    tree[leafid].min = min3(v0, v1, v2);
+    tree[leafid].childA = -1;
+    tree[leafid].max = max3(v0, v1, v2);
+    tree[leafid].childB = fid;
+}
+
+// Multi-root bottom-up AABB combine. Identical lock-free walk to
+// `bottomUpBoxes`, except each leaf stops at its GROUP root (nodeBase[g])
+// instead of slot 0. Group node windows are disjoint, so treeVisitCounts
+// atomics never collide across groups; one dispatch over all N leaves.
+//
+// Divergence note: walk depth is ~log(M_g) (not ~log N), and consecutive
+// sorted leaves share a group, so per-warp walk depths are uniform — the
+// motivation for this layout.
+kernel void bottomUpBoxesMultiRoot(
+    constant AABB4& sceneBox [[buffer(2)]],
+    device BVHNode* tree [[buffer(4)]],
+    device const int* treeParent [[buffer(5)]],
+    device atomic_uint* treeVisitCounts [[buffer(6)]],
+    device const uint* sortedPosToGroup [[buffer(7)]],
+    device const uint* groupSize [[buffer(8)]],
+    device const uint* groupPrimBase [[buffer(9)]],
+    device const uint* groupNodeBase [[buffer(10)]],
+    uint id [[thread_position_in_grid]]
+) {
+    uint numPrimitives = (uint)sceneBox._pad0;
+    if (id >= numPrimitives) return;
+
+    uint g     = sortedPosToGroup[id];
+    int  M     = (int)groupSize[g];
+    int  pbase = (int)groupPrimBase[g];
+    int  root  = (int)groupNodeBase[g];
+    int  l     = (int)id - pbase;
+
+    int child = root + (M - 1) + l;     // this thread's leaf slot
+    if (child == root) return;          // singleton group (M == 1): leaf IS root
+
+    uint maxSteps = 2u * (uint)M;       // group-local wedge guard
+    for (uint step = 0; step < maxSteps; ++step) {
+        int parent = treeParent[child];
+
+        uint old = atomic_fetch_add_explicit(
+            &treeVisitCounts[parent], 1u, memory_order_relaxed);
+
+        if (old == 0u) return;          // first arrival — second will combine
+
+        atomic_thread_fence(mem_flags::mem_device,
+                            memory_order_seq_cst, thread_scope_device);
+
+        int childA = tree[parent].childA;
+        int childB = tree[parent].childB;
+        float3 minA = float3(tree[childA].min);
+        float3 maxA = float3(tree[childA].max);
+        float3 minB = float3(tree[childB].min);
+        float3 maxB = float3(tree[childB].max);
+        tree[parent].min = packed_float3(min(minA, minB));
+        tree[parent].max = packed_float3(max(maxA, maxB));
+
+        atomic_thread_fence(mem_flags::mem_device,
+                            memory_order_seq_cst, thread_scope_device);
+
+        child = parent;
+        if (child == root) return;      // wrote group root, done
+    }
+}
+
 // Apetrei (2014) "Fast and Simple Agglomerative LBVH Construction".
 // Single-kernel replacement for buildTree_* + bottomUpBoxes. Each thread
 // starts from a leaf and walks toward the root, deciding the parent at
