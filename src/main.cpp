@@ -18099,6 +18099,13 @@ int main(int argc, char** argv) {
     for (int i = 1; i + 1 < argc; ++i) {
         if (std::string(argv[i]) == "--scene") { scenePath = argv[i + 1]; break; }
     }
+    // --demo-uniform: launch the GUI on the multi-level-spatial-hash demo scene
+    // (cloth on a tessellated floor — uniform face size, the hgrid sweet spot)
+    // with ML already the active broad phase and a held-pair cadence that is both
+    // stable and fast. Mirrors runMlDriveDiag("uniform").
+    bool demoUniform = false;
+    for (int i = 1; i < argc; ++i)
+        if (std::string(argv[i]) == "--demo-uniform") { demoUniform = true; break; }
 
     std::cout << "Run simulator" << std::endl;
 
@@ -18168,6 +18175,14 @@ int main(int argc, char** argv) {
         haveRunConfig = true;
         std::cout << "[--scene] loaded " << scenePath << " ("
                   << runConfig.scene.objects.size() << " objects)\n";
+    } else if (demoUniform) {
+        // Tessellated floor (3 wide, 24x24 -> face ~0.12) as a static Float + a
+        // cloth (1 wide, 20x20 -> face ~0.05). All faces within ~2x -> every grid
+        // cell stays sparse, no oversized primitive. ML-friendly geometry.
+        simulator.addPlane(PlaneDirection::XZPlane, tinym::vec3(0, 0, 0), 24, 3.0,
+                           0.1, BehaviorType::Float);
+        simulator.addCloth(20, 1, tinym::vec3(0, 0.6, 0), kstretch, kshear, kbend, thickness, mass);
+        simulator.mlBroadPhase.floorExcludeDiag = 1e9f;   // exclude NOTHING
     } else {
         simulator.addCloth(50, 1, tinym::vec3(0, 1.25, 0), kstretch, kshear, kbend, thickness, mass);
         //simulator.addClothFile("src/assets", "teapot.obj", {0,0,0} 15, 1e4, 0, 2e4, thickness mass);
@@ -18182,6 +18197,18 @@ int main(int argc, char** argv) {
 
     simulator.initialize();
     std::cout << "[Main] simulator is initialized" << std::endl;
+
+    if (demoUniform) {
+        // Multi-level spatial hash as the active broad phase, held over cdP=8
+        // substeps (stable + ~20-26fps on this scene; BVH tunnels at this
+        // cadence). Toggle off live with the Profiler "Multi-level Spatial Hash"
+        // checkbox / CD-period slider to A/B against BVH.
+        simulator.useMultiLevelSH   = true;
+        simulator.useSpatialHashing = false;
+        simulator.cdSubstepPeriod    = 8;
+        simulator.refitSubstepPeriod = 8;
+        std::cout << "[Main] --demo-uniform: ML broad phase active, cdP=8\n";
+    }
 
     // if(Scene<Backend, Precision>::numMeshes > 0) {
     //     std::cout << "Try to pin general meshes\n";
