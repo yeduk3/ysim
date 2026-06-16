@@ -2,6 +2,7 @@
 # a Metal device or a GL context (docs/ARCHITECTURE.md §4.1, D-002).
 add_executable(ysim_tests
     scene_io_test.cpp
+    sim_config_test.cpp
 )
 
 target_link_libraries(ysim_tests PRIVATE ysim_core)

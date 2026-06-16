@@ -108,7 +108,7 @@ The fix-turn stays on the same slice branch (commit prefix `fix:` rather than `a
 
 ## Stable harness gotchas (read before writing a new Block)
 
-- **CWD for `--self-test` is `build/`.** The binary needs `default.metallib` adjacent. Running `./build/src/ysim --self-test` from project root SKIP-exits with "Metal-library not loadable from cwd"; running from `build/` works.
+- **`--self-test` runs from any cwd.** The binary is `build/ysim`; `default.metallib` + shaders resolve via the executable dir and assets via the project root (`ysim_paths.hpp`), so `./build/ysim --self-test` works from the repo root (no `cd build`).
 - **`sim.update()` once after `sim.initialize()`** if your block reads BVH state (e.g., `BroadPhase::queryClickRay`). Production refits every frame before the click callback fires; harness mirrors that explicitly.
 - **`sim.collisionPipeline.broadPhase.objTrees.clear();`** before `sim.initialize()` if your block creates a fresh scene with the same `numMeshes` count as the previous block (CM-008). The Float-mesh skip in `BroadPhase::build` reuses stale trees otherwise.
 - **`Scene<...>::packedCollisionData.cumulativeNarrowCollisions = 0;`** before each `sim.update()` if your block asserts on the counter. `resetScene()` doesn't clear it (it's a static).

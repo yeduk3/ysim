@@ -15,6 +15,14 @@ add_executable(ysim
     ${CMAKE_SOURCE_DIR}/third_party/imgui/backends/imgui_impl_opengl3.cpp
 )
 
+# Emit the binary as build/ysim (not build/src/ysim) so it sits next to its
+# runtime artifacts (default.metallib + shaders, copied into build/ below).
+# Combined with executable-dir path resolution (ysim_paths.hpp), this lets
+# ysim run from any working directory.
+set_target_properties(ysim PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}
+)
+
 # 2. OpenGL 찾기
 find_package(OpenGL REQUIRED)
 find_path(GLFW_NATIVE_INCLUDE_DIR GLFW/glfw3native.h
@@ -131,16 +139,10 @@ configure_file(
     ${CMAKE_BINARY_DIR}/shadow.frag
     COPYONLY
 )
-# Asset sync. A standalone custom *target* (no OUTPUT) is always considered
-# out-of-date, so the copy runs on every `cmake --build` — even when only
-# files under assets/ changed and ysim itself was not relinked. (A
-# POST_BUILD custom command on the ysim target would only fire when ysim
-# is actually re-linked, silently skipping newly added asset files.)
-add_custom_target(copy_assets ALL
-    COMMAND ${CMAKE_COMMAND} -E copy_directory
-            ${CMAKE_SOURCE_DIR}/assets
-            ${CMAKE_BINARY_DIR}/assets
-    COMMENT "Syncing assets -> ${CMAKE_BINARY_DIR}/assets"
-)
-add_dependencies(ysim copy_assets)
+# Assets are NO LONGER copied into the build tree. External assets (models,
+# icons, BVH cache) are referenced directly from the project source tree via
+# ysim_paths::assetRoot() (compiled-in YSIM_PROJECT_ROOT, env-overridable).
+# Only build artifacts that must sit next to the binary — default.metallib
+# (root CMakeLists) and the GLSL shaders (configure_file above) — live in
+# build/. This keeps the build output minimal and the run cwd-independent.
 

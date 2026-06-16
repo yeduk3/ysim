@@ -11,6 +11,7 @@ cmake -B build
 cmake --build build -j
 ./build/test/ysim_tests
 ./build/test/ysim_primitive_tests
-# Headless self-test (D-012). cwd must be build/ so the existing
-# `default.metallib` lookup (relative path in MetalKernelContext) resolves.
-(cd build && ./src/ysim --self-test)
+# Headless self-test (D-012). Binary is build/ysim; paths (default.metallib,
+# shaders, assets) resolve via the executable dir + project root, so it runs
+# from any cwd — no `cd build` needed (ysim_paths.hpp).
+./build/ysim --self-test

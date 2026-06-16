@@ -14,6 +14,8 @@ using namespace tinym;
 #include <fstream>
 #include <iostream>
 
+#include "ysim_paths.hpp"
+
 struct Program
 {
     GLuint programID = 0;
@@ -163,8 +165,12 @@ struct Program
     
     GLuint loadShaderOf(const char *shaderFile, const GLenum shaderType) {
         std::string shaderName = std::string(shaderFile);
-        
-        std::string shaderText = loadText(shaderFile);
+
+        // Shaders are build artifacts copied next to the binary; resolve
+        // relative names against the executable dir, not the cwd, so ysim
+        // runs from any working directory.
+        std::string shaderPath = ysim_paths::runtimeFile(shaderFile);
+        std::string shaderText = loadText(shaderPath.c_str());
         
         GLuint shaderID = glCreateShader(shaderType);
         

@@ -13,6 +13,8 @@
 #include "assimpreader.hpp"
 #include <nfd.hpp>
 #include "scene_format.hpp"
+#include "sim_config.hpp"
+#include "ysim_paths.hpp"
 #include "MeshGL.hpp"
 #include "MeshRenderState.hpp"
 #include "HiddenGLContext.hpp"
@@ -31,6 +33,7 @@ extern "C" {
 }
 
 #include <cstddef>
+#include <cstdlib>
 #include <iostream>
 #include <iterator>
 #include <ratio>
@@ -200,7 +203,10 @@ struct MetalKernelContext {
         if (!library) {
             NS::Error* error = nullptr;
 
-            auto path = NS::String::string("default.metallib", NS::UTF8StringEncoding);
+            // metallib is a build artifact next to the binary — resolve via
+            // the executable dir, not the cwd (ysim runs from any directory).
+            std::string libPath = ysim_paths::runtimeFile("default.metallib");
+            auto path = NS::String::string(libPath.c_str(), NS::UTF8StringEncoding);
 
             library = MetalGlobalContext::getDevice()->newLibrary(path, &error);
 
@@ -1818,17 +1824,11 @@ const char* behaviorTypeName(BehaviorType behaviorType) {
     }
 }
 
-// BVH motion asset directory. The run cwd varies (repo root vs build/ —
-// copy_assets syncs assets/ into the build tree), so prefer the relative
-// path and fall back to the CMake-defined source root.
+// BVH motion asset directory — external asset, referenced from the project
+// source tree (no longer copied into the build). ysim_paths::assetFile
+// honors the YSIM_ASSET_ROOT / project-root resolution.
 inline std::string bvhAssetDir() {
-    namespace fs = std::filesystem;
-    if (fs::exists("assets/BVH")) return "assets/BVH";
-#ifdef YSIM_PROJECT_ROOT
-    return std::string(YSIM_PROJECT_ROOT) + "/assets/BVH";
-#else
-    return "assets/BVH";
-#endif
+    return ysim_paths::assetFile("BVH");
 }
 
 // Sorted *.bvh file names (no directory) in bvhAssetDir().
@@ -8861,11 +8861,18 @@ struct Simulator {
                         // Without this, a flat cloth (~zero-thickness Y AABB)
                         // crossing a flat ground in one substep is missed —
                         // CM-005's root cause.
+                        // YSIM_NO_ENLARGE env: skip the swept-AABB enlarge
+                        // pass (profiling experiment). Section column stays in
+                        // the CSV at ~0 ms; broad pairs may drop / thin
+                        // collisions may be missed (CM-005 trade-off).
+                        const bool skipEnlarge = std::getenv("YSIM_NO_ENLARGE") != nullptr;
                         if (profiler) {
                             auto scope = profiler->scoped("broad_enlarge_trajectory");
-                            collisionPipeline.broadPhase.enlargeTrajectory(system.subh);
+                            if (!skipEnlarge)
+                                collisionPipeline.broadPhase.enlargeTrajectory(system.subh);
                         } else {
-                            collisionPipeline.broadPhase.enlargeTrajectory(system.subh);
+                            if (!skipEnlarge)
+                                collisionPipeline.broadPhase.enlargeTrajectory(system.subh);
                         }
                     }
                     if (doBroad) {
@@ -9483,7 +9490,18 @@ struct Simulator {
                 false);
             return r;
         }
+        applySnapshot(r.value, scene_format::sceneDir(path));
+        scene_log::logSceneIO("씬 불러오기: " + path + " (오브젝트 " +
+            std::to_string(r.value.objects.size()) + "개)");
+        return r;
+    }
 
+    // Apply a parsed scene snapshot to the live simulator — the single
+    // scene-build path shared by GUI File>Load (via loadScene), the CLI
+    // --scene flag, and the headless RunConfig builder. `sceneDir` resolves
+    // relative import paths (empty when the snapshot has no source file).
+    void applySnapshot(const scene_format::SceneSnapshot& snap,
+                       const std::string& sceneDir) {
         // BDD-016: only mutate the scene after parse + structural validation succeed.
         // Match the pack()-side ownership convention: meshes are non-owning
         // views over requestsGeneralMeshes' initializer pointers. Clear the
@@ -9527,17 +9545,17 @@ struct Simulator {
         pointRefPickActive = false;
 
         Scene<BE,PR>::environment.gravity = tinym::vec3(
-            (float)r.value.environment.gravity[0],
-            (float)r.value.environment.gravity[1],
-            (float)r.value.environment.gravity[2]);
+            (float)snap.environment.gravity[0],
+            (float)snap.environment.gravity[1],
+            (float)snap.environment.gravity[2]);
         Scene<BE,PR>::environment.wind = tinym::vec3(
-            (float)r.value.environment.wind[0],
-            (float)r.value.environment.wind[1],
-            (float)r.value.environment.wind[2]);
+            (float)snap.environment.wind[0],
+            (float)snap.environment.wind[1],
+            (float)snap.environment.wind[2]);
         Scene<BE,PR>::environment.backgroundColor = tinym::vec3(
-            (float)r.value.environment.backgroundColor[0],
-            (float)r.value.environment.backgroundColor[1],
-            (float)r.value.environment.backgroundColor[2]);
+            (float)snap.environment.backgroundColor[0],
+            (float)snap.environment.backgroundColor[1],
+            (float)snap.environment.backgroundColor[2]);
 
         // Restore solver timing into the live system. r.value.simulation
         // already carries the engine defaults (1/60 s, 60 substeps) when
@@ -9546,13 +9564,12 @@ struct Simulator {
         // loader's default-init, not a branch here. subh must be
         // recomputed (it is the per-substep integrator dt; see the
         // 시뮬레이션 환경 panel for the same resync rationale).
-        system.h        = (PR)r.value.simulation.timePerFrame;
-        system.subSteps = (size_t)(r.value.simulation.subSteps > 0
-                                   ? r.value.simulation.subSteps : 1);
+        system.h        = (PR)snap.simulation.timePerFrame;
+        system.subSteps = (size_t)(snap.simulation.subSteps > 0
+                                   ? snap.simulation.subSteps : 1);
         system.subh     = system.h / (PR)system.subSteps;
 
-        const std::string sceneDir = scene_format::sceneDir(path);
-        for (auto& o : r.value.objects) {
+        for (auto& o : snap.objects) {
             BehaviorType btype = BehaviorType::Float;
             BehaviorParams<PR> bparams = FloatBehaviorParams<PR>{};
             if (o.behavior.type == "TriangularCloth") {
@@ -9713,7 +9730,7 @@ struct Simulator {
         // Restore scene-level reference-point constraints. Stored as
         // object id + physics vid (same space the integrator consumes),
         // so this is a flat copy back into the Scene-static list.
-        for (const auto& rc : r.value.referenceConstraints) {
+        for (const auto& rc : snap.referenceConstraints) {
             ReferencePointConstraint c;
             c.objPair.query     = (Index)rc.queryObject;
             c.vertexPair.query  = (Index)rc.queryVertex;
@@ -9725,9 +9742,6 @@ struct Simulator {
         // first post-load pack (see initialize()). Only when something
         // was actually restored.
         pendingRefSnap = !Scene<BE,PR>::referenceConstraints.empty();
-        scene_log::logSceneIO("씬 불러오기: " + path + " (오브젝트 " +
-            std::to_string(r.value.objects.size()) + "개)");
-        return r;
     }
 
     // S3-2/S3-3: retired. Material is request-owned (pack copies
@@ -10132,8 +10146,8 @@ struct ExplicitSystem<METAL, PR> {
 //   - BDD-015: saveScene → loadScene round-trips numMeshes + env, then init
 //     and a sim step are stable.
 //
-// Pass/fail via stderr lines + exit code (0 == all-pass). The Estimator's
-// scripts/verify.sh runs this from cwd=build/ so default.metallib is found.
+// Pass/fail via stderr lines + exit code (0 == all-pass). Runs from any cwd:
+// default.metallib + assets resolve via ysim_paths (exe dir + project root).
 // D-031: BVH refit benchmarking harness. Times `broad_refit` across four
 // refit methods x four cloth resolutions x ten frames on a cloth-only
 // FastGridCloth scene, writes per-frame CSV rows. Method labels map to
@@ -11528,7 +11542,7 @@ static int runSelfTest() {
         const int beforeImport = Scene<Backend, Precision>::numMeshes;
 
         std::string err;
-        bool ok = sim.importMesh("assets", "Human.obj",
+        bool ok = sim.importMesh(ysim_paths::assetRoot(), "Human.obj",
                                  /*scale=*/(Precision)0.04,
                                  /*mass=*/(Precision)0.1, &err);
         if (!ok) {
@@ -11615,7 +11629,7 @@ static int runSelfTest() {
         // Error path — missing file must NOT mutate the scene.
         const int beforeMissing = Scene<Backend, Precision>::numMeshes;
         std::string missErr;
-        bool missingOk = sim.importMesh("assets",
+        bool missingOk = sim.importMesh(ysim_paths::assetRoot(),
                                         "ysim_selftest_does_not_exist.obj",
                                         (Precision)1.0, (Precision)0.1, &missErr);
         const int afterMissing = Scene<Backend, Precision>::numMeshes;
@@ -15850,6 +15864,72 @@ static int runSelfTest() {
     return 1;
 }
 
+// Compile-time backend name for the req-6 engine check. The build wires
+// exactly one backend (METAL today); a config asking for a different one is
+// rejected by the builder rather than silently ignored.
+template <typename BE> inline const char* backendName();
+template <> inline const char* backendName<METAL>() { return "METAL"; }
+template <> inline const char* backendName<CPU>()   { return "CPU"; }
+template <> inline const char* backendName<CUDA>()  { return "CUDA"; }
+
+// SimulatorBuilder — turns a RunConfig (scene + engine + profile) into a
+// configured simulator. The simulator and its System are caller-owned
+// (System must outlive the Simulator that references it, and Scene state is
+// process-static), so the builder *configures* a provided sim+system rather
+// than allocating them: build a scene from config.scene via the shared
+// applySnapshot path, after validating the config's requested backend/system
+// match this build (req 6). Used by the `--scene` CLI and headless tests.
+template <typename BE, typename PR, typename Sys>
+struct SimulatorBuilder {
+    sim_config::RunConfig config;
+    std::string sceneDir;  // resolves relative import paths in config.scene
+
+    static sim_config::Result<SimulatorBuilder> fromFile(const std::string& rawPath) {
+        using R = sim_config::Result<SimulatorBuilder>;
+        // Accept a cwd-relative / absolute path, falling back to project-root
+        // relative so `scenes/x.json` works from the repo root or build/.
+        const std::string path = ysim_paths::resolveInput(rawPath);
+        auto r = sim_config::readFromFile(path);
+        if (!r.ok) return R::fail(r.error.message);
+        SimulatorBuilder b;
+        b.config = std::move(r.value);
+        b.sceneDir = scene_format::sceneDir(path);  // imports resolve here
+        return R::success(std::move(b));
+    }
+
+    SimulatorBuilder& withConfig(sim_config::RunConfig c) {
+        config = std::move(c);
+        return *this;
+    }
+    SimulatorBuilder& withProfile(sim_config::ProfileConfig p) {
+        config.profile = std::move(p);
+        return *this;
+    }
+
+    // Configure `sim`+`system` from this config. Returns false (and fills
+    // `error`) on backend/system mismatch with the compiled build.
+    bool buildInto(Simulator<BE, PR, Sys>& sim, Sys& /*system*/,
+                   std::string* error = nullptr) const {
+        const std::string have = backendName<BE>();
+        if (config.engine.backend != have) {
+            if (error)
+                *error = "config requests backend '" + config.engine.backend +
+                         "' but this build is '" + have + "'";
+            return false;
+        }
+        if (config.engine.system != "Explicit") {
+            if (error)
+                *error = "config requests system '" + config.engine.system +
+                         "' but this build only wires 'Explicit'";
+            return false;
+        }
+        // applySnapshot sets system timing (h/subSteps), environment, and
+        // rebuilds the object set — the exact GUI-load path (req 3).
+        sim.applySnapshot(config.scene, sceneDir);
+        return true;
+    }
+};
+
 int main(int argc, char** argv) {
     if (argc > 1 && std::string(argv[1]) == "--self-test") {
         return runSelfTest();
@@ -15921,6 +16001,9 @@ int main(int argc, char** argv) {
 #else
         cfg.outCsvPath = "profiles/experiment/analytic-collision-2026-06-04/analytic_bench.csv";
 #endif
+        // YSIM_BENCH_CSV env: redirect output (e.g. multi-run sweep) so the
+        // archived baseline CSV is not clobbered.
+        if (const char* o = std::getenv("YSIM_BENCH_CSV")) cfg.outCsvPath = o;
         return runAnalyticBench(cfg);
     }
     if (argc > 1 && std::string(argv[1]) == "--bench-cadence") {
@@ -15944,6 +16027,15 @@ int main(int argc, char** argv) {
         return runCadenceBench(cfg);
     }
 
+    // --scene <file.json>: drive the interactive app from a RunConfig instead
+    // of the hardcoded default scene. Functionally identical to GUI File>Load
+    // (req 3); the config's profile block (req 2) can run a headless N-frame
+    // capture + sidecar (req 4).
+    std::string scenePath;
+    for (int i = 1; i + 1 < argc; ++i) {
+        if (std::string(argv[i]) == "--scene") { scenePath = argv[i + 1]; break; }
+    }
+
     std::cout << "Run simulator" << std::endl;
 
     //window = new YGLWindow(640, 480, "ysim");
@@ -15952,7 +16044,7 @@ int main(int argc, char** argv) {
     // Set macOS Dock icon — done via setDockIcon() in dock_icon.mm
     #ifdef __APPLE__
     extern void setDockIcon(const char* path);
-    setDockIcon("assets/icons/app_icon.png");
+    setDockIcon(ysim_paths::assetFile("icons/app_icon.png").c_str());
     #endif
 
 
@@ -15991,13 +16083,36 @@ int main(int argc, char** argv) {
     //simulator.addClothGridFast(100, 1, kstretch, kshear, kbend, thickness, mass);
     //for(int i = 0; i < 1; i++) 
     //    simulator.addCloth(particleNum1D, size1D, tinym::vec3(0, 0.15+(float)i*0.05f, 0), kstretch, kshear, kbend, thickness, mass);
-    simulator.addCloth(50, 1, tinym::vec3(0, 1.25, 0), kstretch, kshear, kbend, thickness, mass);
-    //simulator.addClothFile("src/assets", "teapot.obj", {0,0,0} 15, 1e4, 0, 2e4, thickness mass);
-    //simulator.addClothFile("src/assets", "horse-gallop-01.obj", {0,0,0}, 80, 1e4, 0, 2e4, thickness mass);
-    //simulator.addFloatMesh("src/assets", "horse-gallop-01.obj", {0, -1, 0}, 1.2);
-    //simulator.addFloatMesh("src/assets", "camel-gallop-reference.obj", {0, -1, 0}, 1.2);
-    simulator.addFloatMesh("assets", "Human.obj", {0, 0.35, 0}, 0.04);
-    simulator.addGround(PlaneDirection::XZPlane, tinym::vec3(0, 0, 0), 50);
+    // RunConfig (scene + engine + profile) active for this run — set from
+    // --scene, else left at defaults (the profile sidecar synthesizes a scene
+    // from the live default sim on export).
+    sim_config::RunConfig runConfig;
+    bool haveRunConfig = false;
+    if (!scenePath.empty()) {
+        auto bres = SimulatorBuilder<Backend, Precision,
+            ExplicitSystem<Backend, Precision>>::fromFile(scenePath);
+        if (!bres.ok) {
+            std::cerr << "[--scene] load failed: " << bres.error.message << "\n";
+            return 1;
+        }
+        std::string berr;
+        if (!bres.value.buildInto(simulator, system, &berr)) {
+            std::cerr << "[--scene] " << berr << "\n";
+            return 1;
+        }
+        runConfig = bres.value.config;
+        haveRunConfig = true;
+        std::cout << "[--scene] loaded " << scenePath << " ("
+                  << runConfig.scene.objects.size() << " objects)\n";
+    } else {
+        simulator.addCloth(50, 1, tinym::vec3(0, 1.25, 0), kstretch, kshear, kbend, thickness, mass);
+        //simulator.addClothFile("src/assets", "teapot.obj", {0,0,0} 15, 1e4, 0, 2e4, thickness mass);
+        //simulator.addClothFile("src/assets", "horse-gallop-01.obj", {0,0,0}, 80, 1e4, 0, 2e4, thickness mass);
+        //simulator.addFloatMesh("src/assets", "horse-gallop-01.obj", {0, -1, 0}, 1.2);
+        //simulator.addFloatMesh("src/assets", "camel-gallop-reference.obj", {0, -1, 0}, 1.2);
+        simulator.addFloatMesh(ysim_paths::assetRoot(), "Human.obj", {0, 0.35, 0}, 0.04);
+        simulator.addGround(PlaneDirection::XZPlane, tinym::vec3(0, 0, 0), 50);
+    }
 
     std::cout << "[Main] mesh added to scene" << std::endl;
 
@@ -16575,6 +16690,35 @@ int main(int argc, char** argv) {
     simulator.profiler = &frameProfiler;
     simulator.shBroadPhase.profiler = &frameProfiler;
 
+    // --- Profiling activation (req 2) ---------------------------------------
+    // Active when the --scene config's profile block is enabled, OR the
+    // YSIM_PROFILE_RUN env override is set (legacy/ad-hoc). When active the
+    // app auto-runs unpaused, captures `profileFrames`, then writes the CSV +
+    // a scene sidecar (req 4) and quits.
+    const bool envProfile = std::getenv("YSIM_PROFILE_RUN") != nullptr;
+    const bool cfgProfile = haveRunConfig && runConfig.profile.enabled;
+    const bool profileActive = cfgProfile || envProfile;
+    const int  profileFrames = cfgProfile ? runConfig.profile.frames : 30;
+    const bool profileRealtimeSync = cfgProfile ? runConfig.profile.realtimeSync : false;
+    std::string profileCsvPath;
+    if (cfgProfile && !runConfig.profile.outputPath.empty()) {
+        profileCsvPath = runConfig.profile.outputPath;
+    } else if (const char* e = std::getenv("YSIM_PROFILE_CSV")) {
+        profileCsvPath = e;
+    } else {
+#ifdef YSIM_PROJECT_ROOT
+        const std::string root = YSIM_PROJECT_ROOT;
+#else
+        const std::string root = "";
+#endif
+        const std::string stem = scenePath.empty() ? std::string("default-scene")
+                                                    : sim_config::pathStem(scenePath);
+        profileCsvPath = sim_config::defaultProfilePath(root, stem, profileFrames);
+    }
+    // Auto-start unpaused so the render loop collects frames without a manual
+    // play click.
+    if (profileActive) simulator.pause = false;
+
     auto init = []() {
         glfwSwapInterval(1);
     };
@@ -17046,7 +17190,10 @@ int main(int argc, char** argv) {
         // Wall-clock ↔ sim-time sync toggle (좌측 시뮬레이션 환경 패널).
         // On: fixed-h steps are paced by the accumulated wall dt; off:
         // legacy 1 step/frame.
-        static bool realtimeSimSync = true;
+        // Profiling runs step once per render frame (pure compute, not
+        // wall-clock-throttled) unless the config explicitly asks for
+        // real-time sync. Non-profiling launches default to real-time ON.
+        static bool realtimeSimSync = profileActive ? profileRealtimeSync : true;
         // Shadow pass toggle (좌측 조명 패널). Gates both the depth pass
         // and the shadowsOn frag uniform; shadowOk (FBO health) still
         // wins when false.
@@ -18209,6 +18356,29 @@ int main(int argc, char** argv) {
         // Close before the window-title read below — title reads
         // history().latestFrame() and needs endFrame() to have run.
         frameGate.close();
+
+        // Once profileFrames are collected, dump the per-section CSV + a
+        // scene sidecar (req 4: the exact RunConfig that produced it) and ask
+        // the window to close so the run exits.
+        static bool ysimProfileDone = false;
+        if (!ysimProfileDone && profileActive
+            && simulator.frame >= profileFrames) {
+            frameProfiler.history().exportCsv(profileCsvPath);  // creates dirs
+            sim_config::RunConfig outCfg = runConfig;
+            if (!haveRunConfig) outCfg.scene = simulator.toSnapshot();
+            outCfg.profile.enabled      = true;
+            outCfg.profile.frames       = profileFrames;
+            outCfg.profile.realtimeSync = profileRealtimeSync;
+            outCfg.profile.outputPath   = profileCsvPath;
+            const std::string sidecar = sim_config::sidecarScenePath(profileCsvPath);
+            std::string serr;
+            bool sok = sim_config::writeToFile(outCfg, sidecar, &serr);
+            std::cout << "[profile] wrote " << profileCsvPath << " ("
+                      << frameProfiler.history().frames().size() << " frames) + "
+                      << (sok ? sidecar : ("sidecar FAILED: " + serr)) << "\n";
+            ysimProfileDone = true;
+            glfwSetWindowShouldClose(yglwindow->getGLFWWindow(), GLFW_TRUE);
+        }
 
         if (const auto* latest = frameProfiler.history().latestFrame()) {
             char title[256];

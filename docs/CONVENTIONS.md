@@ -6,7 +6,7 @@
 ## Language / stack
 
 - **Language:** C++17.
-- **Build system:** CMake 3.10+. Build with `cmake -B build && cmake --build build`. Run with `./build/src/ysim`.
+- **Build system:** CMake 3.10+. Build with `cmake -B build && cmake --build build`. Run with `./build/ysim` (runnable from any cwd).
 - **Platform:** macOS only (v1). The simulation backend is Metal; the build pipeline shells out to `xcrun metal` and `xcrun metallib`.
 - **GPU:** Metal compute for simulation, OpenGL for rendering. ImGui uses the OpenGL backend.
 - **Dependencies:** Eigen 5.0+, GLFW 3.4, GLEW, OpenGL, Metal, Bullet, Jolt (when rigid lands), nlohmann/json (when persistence lands — see `docs/DECISIONS.md`).
