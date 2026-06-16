@@ -39,7 +39,8 @@ void drawProfilerWindow(
     bool* use_spatial_hashing,
     std::uint32_t* refit_substep_period,
     std::uint32_t* cd_substep_period,
-    int* profile_level
+    int* profile_level,
+    bool* fused_refit_enlarge
 ) {
     if (!state.open) return;
 
@@ -111,6 +112,11 @@ void drawProfilerWindow(
         ImGui::Checkbox("BVH Refit", enable_refit);
         ImGui::SameLine();
         ImGui::TextDisabled(*enable_refit ? "[incremental]" : "[full rebuild]");
+    }
+    if (fused_refit_enlarge) {
+        ImGui::Checkbox("Fused Refit+Enlarge", fused_refit_enlarge);
+        ImGui::SameLine();
+        ImGui::TextDisabled(*fused_refit_enlarge ? "[1 swept pass]" : "[2-pass legacy]");
     }
     if (use_analytic_primitive) {
         ImGui::Checkbox("Analytic Primitive (A)", use_analytic_primitive);

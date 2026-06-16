@@ -75,7 +75,11 @@ void drawProfilerWindow(
     // the user switch tiers live; main.cpp re-wires the profiler pointers from
     // the edited value on the next frame. Kept as an int so this header stays
     // free of a sim_config dependency.
-    int* profile_level = nullptr
+    int* profile_level = nullptr,
+    // Fused refit+enlarge toggle (single-pass broad-phase maintenance). When
+    // non-null, a checkbox lets the user A/B it live against the legacy
+    // two-pass path.
+    bool* fused_refit_enlarge = nullptr
 );
 
 } // namespace profiler

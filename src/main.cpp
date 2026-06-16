@@ -4762,6 +4762,10 @@ struct BVH<BE, PR, BVHMODE::LINEAR, PRIMITIVE> {
     MTL::ComputePipelineState* buildTreeGroupedPSO = nullptr;     // sub-object
     MTL::ComputePipelineState* buildLeafGroupedPSO = nullptr;     // sub-object
     MTL::ComputePipelineState* bottomUpBoxesMultiRootPSO = nullptr; // sub-object
+    MTL::ComputePipelineState* enlargeLeafPSO = nullptr;          // GPU enlargeTrajectory
+    MTL::ComputePipelineState* enlargeLeafGroupedPSO = nullptr;   // GPU enlarge (multi-root)
+    MTL::ComputePipelineState* buildSweptLeafPSO = nullptr;        // fused refit+enlarge
+    MTL::ComputePipelineState* buildSweptLeafGroupedPSO = nullptr; // fused (multi-root)
     MTL::ComputePipelineState* queryPointsPSO;
     // Segmented (per-threadgroup) detect+reduce variant — three PSOs
     // matching bvh.metal's queryPointsSegmented → scanReserveSegmented
@@ -4800,6 +4804,12 @@ struct BVH<BE, PR, BVHMODE::LINEAR, PRIMITIVE> {
             buildTreeGroupedPSO = MetalKernelContext::getPSO("buildTree_Tri_Grouped");
             buildLeafGroupedPSO = MetalKernelContext::getPSO("buildLeaf_Tri_Grouped");
             bottomUpBoxesMultiRootPSO = MetalKernelContext::getPSO("bottomUpBoxesMultiRoot");
+            // GPU enlargeTrajectory (triangle-only; edge BVH keeps the CPU loop).
+            enlargeLeafPSO = MetalKernelContext::getPSO("enlargeLeaf_Tri");
+            enlargeLeafGroupedPSO = MetalKernelContext::getPSO("enlargeLeaf_Tri_Grouped");
+            // Fused refit+enlarge (triangle-only).
+            buildSweptLeafPSO = MetalKernelContext::getPSO("buildSweptLeaf_Tri");
+            buildSweptLeafGroupedPSO = MetalKernelContext::getPSO("buildSweptLeaf_Tri_Grouped");
         } else if constexpr (PRIMITIVE == BVHPRIMITIVE::EDGE) {
             fillMortonsPSO = MetalKernelContext::getPSO("fillMortons_Edge");
             buildTreePSO = MetalKernelContext::getPSO("buildTree_Edge");
@@ -5313,6 +5323,93 @@ struct BVH<BE, PR, BVHMODE::LINEAR, PRIMITIVE> {
         MetalGlobalContext::setBuffer(groupNodeBase, 9);
         MetalGlobalContext::dispatchThreads(buildLeafGroupedPSO, numPrimitives);
     }
+    // GPU enlargeTrajectory leaf pass (single-root). Expands each leaf box by
+    // the swept volume; positions+velocities buffers + dt go in, tree updated
+    // in place. Caller follows with bottomUpBoxesGPU + commitAndWait.
+    void enlargeLeafGPU(PR dt) {
+        int numPrimitives = primitives.size / PRIMITIVE;
+        if (numPrimitives == 0) return;
+        float dtf = (float)dt;
+        MetalGlobalContext::setBuffer(positions, 0);
+        MetalGlobalContext::setBuffer(velocities, 1);
+        MetalGlobalContext::setBuffer(primitives, 2);
+        MetalGlobalContext::setBytes(numPrimitives, 3);
+        MetalGlobalContext::setBytes(dtf, 4);
+        MetalGlobalContext::setBuffer(mortons, 5);
+        MetalGlobalContext::setBuffer(tree, 6);
+        MetalGlobalContext::dispatchThreads(enlargeLeafPSO, numPrimitives);
+    }
+    // GPU enlargeTrajectory leaf pass (multi-root). Grouped index buffers at
+    // 7..10 mirror buildLeafGroupedGPU; caller follows with
+    // bottomUpBoxesMultiRootGPU + commitAndWait.
+    void enlargeLeafGroupedGPU(PR dt) {
+        int numPrimitives = primitives.size / PRIMITIVE;
+        if (numPrimitives == 0) return;
+        float dtf = (float)dt;
+        MetalGlobalContext::setBuffer(positions, 0);
+        MetalGlobalContext::setBuffer(velocities, 1);
+        MetalGlobalContext::setBuffer(primitives, 2);
+        MetalGlobalContext::setBytes(numPrimitives, 3);
+        MetalGlobalContext::setBytes(dtf, 4);
+        MetalGlobalContext::setBuffer(mortons, 5);
+        MetalGlobalContext::setBuffer(tree, 6);
+        MetalGlobalContext::setBuffer(sortedPosToGroup, 7);
+        MetalGlobalContext::setBuffer(groupSize, 8);
+        MetalGlobalContext::setBuffer(groupPrimBase, 9);
+        MetalGlobalContext::setBuffer(groupNodeBase, 10);
+        MetalGlobalContext::dispatchThreads(enlargeLeafGroupedPSO, numPrimitives);
+    }
+    // Fused refit+enlarge leaf pass (single-root): SETS each leaf to the swept
+    // hull in one dispatch (no prior refit needed). Same bindings as
+    // enlargeLeafGPU; the kernel writes the full leaf instead of expanding.
+    void buildSweptLeafGPU(PR dt) {
+        int numPrimitives = primitives.size / PRIMITIVE;
+        if (numPrimitives == 0) return;
+        float dtf = (float)dt;
+        MetalGlobalContext::setBuffer(positions, 0);
+        MetalGlobalContext::setBuffer(velocities, 1);
+        MetalGlobalContext::setBuffer(primitives, 2);
+        MetalGlobalContext::setBytes(numPrimitives, 3);
+        MetalGlobalContext::setBytes(dtf, 4);
+        MetalGlobalContext::setBuffer(mortons, 5);
+        MetalGlobalContext::setBuffer(tree, 6);
+        MetalGlobalContext::dispatchThreads(buildSweptLeafPSO, numPrimitives);
+    }
+    void buildSweptLeafGroupedGPU(PR dt) {
+        int numPrimitives = primitives.size / PRIMITIVE;
+        if (numPrimitives == 0) return;
+        float dtf = (float)dt;
+        MetalGlobalContext::setBuffer(positions, 0);
+        MetalGlobalContext::setBuffer(velocities, 1);
+        MetalGlobalContext::setBuffer(primitives, 2);
+        MetalGlobalContext::setBytes(numPrimitives, 3);
+        MetalGlobalContext::setBytes(dtf, 4);
+        MetalGlobalContext::setBuffer(mortons, 5);
+        MetalGlobalContext::setBuffer(tree, 6);
+        MetalGlobalContext::setBuffer(sortedPosToGroup, 7);
+        MetalGlobalContext::setBuffer(groupSize, 8);
+        MetalGlobalContext::setBuffer(groupPrimBase, 9);
+        MetalGlobalContext::setBuffer(groupNodeBase, 10);
+        MetalGlobalContext::dispatchThreads(buildSweptLeafGroupedPSO, numPrimitives);
+    }
+    // Per-tree fused refit+enlarge: ONE swept-leaf pass + ONE bottom-up + ONE
+    // sync, replacing the refit()+enlargeTrajectory() pair (which each did a
+    // leaf pass + a propagate). Topology (treeParent/childA/childB + group
+    // partition) carries from build(), same as refit(). Triangle-only; the
+    // caller (multi-tree refitSwept) only routes here when the swept PSO loaded.
+    void refitSwept(PR dt) {
+        Index numPrimitives = primitives.size / PRIMITIVE;
+        if (numPrimitives == 0) return;
+        AABB4 sceneBox; sceneBox.i0 = numPrimitives;
+        if (subObjectActive() && groupOfPrim.size == numPrimitives) {
+            buildSweptLeafGroupedGPU(dt);
+            bottomUpBoxesMultiRootGPU(sceneBox);
+        } else {
+            buildSweptLeafGPU(dt);
+            bottomUpBoxesGPU(sceneBox);
+        }
+        MetalGlobalContext::commitAndWait();
+    }
     // Multi-root combine. Mirrors bottomUpBoxesGPU (zero visit-counts +
     // dispatch) but the kernel stops each leaf walk at its group root.
     void bottomUpBoxesMultiRootGPU(const AABB4& sceneBox) {
@@ -5790,6 +5887,34 @@ struct BVH<BE, PR, BVHMODE::LINEAR, PRIMITIVE> {
 
     void enlargeTrajectory(PR dt) {
         Index numPrimitives = primitives.size/PRIMITIVE;
+        if (numPrimitives == 0) return;
+
+        // GPU path (triangle BVH only): the leaf swept-expand runs as a kernel
+        // and the propagate reuses the GPU bottom-up (same as refit), turning
+        // the old O(N) CPU leaf loop + CPU bottomUpCombine into one dispatch +
+        // one GPU walk + one sync. enlargeLeafPSO is non-null only for TRIANGLE
+        // (edge BVHs fall through to the CPU loop).
+        //
+        // OPT-IN (default OFF = legacy CPU path, the known-good behavior). The
+        // GPU path is marginal on its own (the bottom-up dominates, not the
+        // leaf loop — use the fused refitSwept toggle for the real win) and was
+        // implicated in a GPU-wedge report, so it stays behind YSIM_GPU_ENLARGE
+        // until root-caused. Read once via static init.
+        static const bool gpuEnlarge =
+            (std::getenv("YSIM_GPU_ENLARGE") != nullptr);
+        if (gpuEnlarge && enlargeLeafPSO) {
+            AABB4 sceneBox; sceneBox.i0 = numPrimitives;
+            if (subObjectActive() && groupOfPrim.size == numPrimitives) {
+                enlargeLeafGroupedGPU(dt);
+                bottomUpBoxesMultiRootGPU(sceneBox);
+            } else {
+                enlargeLeafGPU(dt);
+                bottomUpBoxesGPU(sceneBox);
+            }
+            MetalGlobalContext::commitAndWait();
+            return;
+        }
+
         // Multi-root: leaves live in per-group windows (NOT [N-1, 2N-2]), so
         // enlarge the grouped leaf slots and propagate via the multi-root
         // combine. Reading tree[N+i-1] here would hit internal/unused slots
@@ -5913,6 +6038,7 @@ struct BVH<BE, PR, BVHMODE::LINEAR, PRIMITIVE> {
         uint32_t tBehavior;
         uint32_t qShape;
         uint32_t tShape;
+        uint32_t numNodes;   // queried tree's node count → traversal index bound
     };
 
     void queryBegin() {
@@ -5939,7 +6065,8 @@ struct BVH<BE, PR, BVHMODE::LINEAR, PRIMITIVE> {
         typename Scene<METAL, PR>::PackedCollisionData& packedCol = Scene<METAL, PR>::packedCollisionData;
         QueryPointsParams qParams = {
             queryMargin, qnumPoints, qIndex, (Index)objIndex, /*constraints.maxNumCollisions*/ packedCol.maxNumCollisions,
-            (Index)qmesh.behaviorType, (Index)objBehavior, (Index)qmesh.shapeType, (Index)objShape
+            (Index)qmesh.behaviorType, (Index)objBehavior, (Index)qmesh.shapeType, (Index)objShape,
+            (uint32_t)tree.size
         };
         //auto& broadCols = constraints.broadCollisions;
         //auto& numBroadCols = constraints.numBroadCollisions;
@@ -5985,6 +6112,7 @@ struct BVH<BE, PR, BVHMODE::LINEAR, PRIMITIVE> {
         uint32_t tBehavior;
         uint32_t qShape;
         uint32_t tShape;
+        uint32_t numNodes;   // queried tree's node count → traversal index bound
     };
     struct SegScanParams {
         uint32_t numTGs;
@@ -6023,7 +6151,8 @@ struct BVH<BE, PR, BVHMODE::LINEAR, PRIMITIVE> {
             (uint32_t)qIndex, (uint32_t)objIndex,
             perTGCap,
             (uint32_t)qmesh.behaviorType, (uint32_t)objBehavior,
-            (uint32_t)qmesh.shapeType,    (uint32_t)objShape
+            (uint32_t)qmesh.shapeType,    (uint32_t)objShape,
+            (uint32_t)tree.size
         };
         MetalGlobalContext::setBuffer(qpos, 0);
         MetalGlobalContext::setBuffer(primitives, 1);
@@ -6189,6 +6318,13 @@ struct BVH<BE, PR, BVHMODE::SCENE, BVHPRIMITIVE::OBJECT> {
     // 다시 만든다 — 큰 변형 후 트리 품질 회복용 비교 모드.
     bool enableRefit = true;
 
+    // Fused refit+enlarge A/B toggle (default OFF = legacy two-pass:
+    // refit() then enlargeTrajectory()). When ON the substep loop calls
+    // refitSwept() once — a single swept-leaf pass + one bottom-up + one TLAS
+    // build, dropping the separate enlarge pass. Triangle-only (per-tree
+    // refitSwept routes to GPU swept kernels); other primitives keep two-pass.
+    bool fusedRefitEnlarge = false;
+
     // Sub-object (multi-root) LBVH A/B toggle — Phase 1 divergence
     // experiment. Pushed to every per-mesh TRI_LBVH; only triangle BVHs over
     // a detectable square cloth actually switch (subObjectActive()), so
@@ -6315,6 +6451,44 @@ struct BVH<BE, PR, BVHMODE::SCENE, BVHPRIMITIVE::OBJECT> {
             indices[ibase+1] = ibase+1;
         }
 
+        tree.useAgglomerative = useAgglomerative;
+        tree.build(-1, positions, indices);
+    }
+
+    // Fused refit+enlarge (NEW, parallel to refit()+enlargeTrajectory()). One
+    // per-tree swept pass that both refits AND inflates by velocity, then one
+    // TLAS build — replacing the two-pass sequence's two objTree passes + two
+    // TLAS builds. enableRefit==false falls back to a full rebuild like
+    // refit(). A per-tree without the swept PSO (edge BVH) self-falls-back to
+    // refit()+enlargeTrajectory() so correctness is preserved for all shapes.
+    void refitSwept(PR dt) {
+        if (!enableRefit) {
+            Scene<METAL, PR> sceneRef;
+            build(sceneRef);
+            return;
+        }
+        for(Index i = 0; i < objTrees.size(); ++i) {
+            objTrees[i].useAgglomerative = useAgglomerative;
+            objTrees[i].useSubObjectBVH = useSubObjectBVH;
+            objTrees[i].subBvhSplitS = subBvhSplitS;
+            if (objTrees[i].buildSweptLeafPSO) {
+                objTrees[i].refitSwept(dt);
+            } else {
+                objTrees[i].refit();
+                objTrees[i].enlargeTrajectory(dt);
+            }
+            Index pbase = i*6;
+            AABB4 objBox = objTrees[i].objectRootAABB();
+            positions[pbase  ] = objBox.min.x;
+            positions[pbase+1] = objBox.min.y;
+            positions[pbase+2] = objBox.min.z;
+            positions[pbase+3] = objBox.max.x;
+            positions[pbase+4] = objBox.max.y;
+            positions[pbase+5] = objBox.max.z;
+            Index ibase = i*2;
+            indices[ibase  ] = ibase;
+            indices[ibase+1] = ibase+1;
+        }
         tree.useAgglomerative = useAgglomerative;
         tree.build(-1, positions, indices);
     }
@@ -9161,6 +9335,17 @@ struct Simulator {
                     }
                 } else {
                     if (doRefit) {
+                      if (collisionPipeline.broadPhase.fusedRefitEnlarge) {
+                        // Fused path (NEW): one swept refit+enlarge call,
+                        // replacing the refit()+enlargeTrajectory() pair in the
+                        // legacy branch below. One objTree pass + one TLAS build.
+                        if (profiler) {
+                            auto scope = profiler->scoped("broad_refit_swept");
+                            collisionPipeline.broadPhase.refitSwept(system.subh);
+                        } else {
+                            collisionPipeline.broadPhase.refitSwept(system.subh);
+                        }
+                      } else {
                         if (profiler) {
                             auto scope = profiler->scoped("broad_refit");
                             collisionPipeline.broadPhase.refit();
@@ -9186,6 +9371,7 @@ struct Simulator {
                             if (!skipEnlarge)
                                 collisionPipeline.broadPhase.enlargeTrajectory(system.subh);
                         }
+                      } // end legacy two-pass (refit + enlarge) branch
                     }
                     if (doBroad) {
                         if (profiler) {
@@ -17238,6 +17424,12 @@ int main(int argc, char** argv) {
     // combo writes this; render() syncs it back to the enum each frame.
     int profileLevelUi = static_cast<int>(activeProfileLevel);
 
+    // Fused refit+enlarge experiment (NEW single-pass path; default OFF =
+    // legacy refit()+enlargeTrajectory()). Opt in via env or the Profiler
+    // window's "Fused Refit+Enlarge" checkbox.
+    if (std::getenv("YSIM_FUSED_REFIT") != nullptr)
+        simulator.collisionPipeline.broadPhase.fusedRefitEnlarge = true;
+
     auto init = []() {
         glfwSwapInterval(1);
     };
@@ -18863,7 +19055,8 @@ int main(int argc, char** argv) {
                 &simulator.useSpatialHashing,
                 &simulator.refitSubstepPeriod,
                 &simulator.cdSubstepPeriod,
-                &profileLevelUi
+                &profileLevelUi,
+                &simulator.collisionPipeline.broadPhase.fusedRefitEnlarge
             );
             scene_log::drawSceneActionLogWindow(sceneLogWindowState);
             ImGui::Render();
@@ -18885,7 +19078,8 @@ int main(int argc, char** argv) {
                 &simulator.useSpatialHashing,
                 &simulator.refitSubstepPeriod,
                 &simulator.cdSubstepPeriod,
-                &profileLevelUi
+                &profileLevelUi,
+                &simulator.collisionPipeline.broadPhase.fusedRefitEnlarge
             );
             scene_log::drawSceneActionLogWindow(sceneLogWindowState);
             ImGui::Render();
