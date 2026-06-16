@@ -40,7 +40,9 @@ void drawProfilerWindow(
     std::uint32_t* refit_substep_period,
     std::uint32_t* cd_substep_period,
     int* profile_level,
-    bool* fused_refit_enlarge
+    bool* fused_refit_enlarge,
+    bool* use_subobject_bvh,
+    int*  subbvh_split_s
 ) {
     if (!state.open) return;
 
@@ -117,6 +119,18 @@ void drawProfilerWindow(
         ImGui::Checkbox("Fused Refit+Enlarge", fused_refit_enlarge);
         ImGui::SameLine();
         ImGui::TextDisabled(*fused_refit_enlarge ? "[1 swept pass]" : "[2-pass legacy]");
+    }
+    if (use_subobject_bvh) {
+        ImGui::Checkbox("Sub-object BVH (B)", use_subobject_bvh);
+        ImGui::SameLine();
+        ImGui::TextDisabled(*use_subobject_bvh ? "[multi-root + mini-TLAS]"
+                                               : "[single-root]");
+        if (subbvh_split_s) {
+            // SliderInt clamps to [1,16]; k = tiles² saturates at full split.
+            ImGui::SliderInt("Split s (N)", subbvh_split_s, 1, 16, "s=%d");
+            ImGui::SameLine();
+            ImGui::TextDisabled("[applies on next BVH rebuild]");
+        }
     }
     if (use_analytic_primitive) {
         ImGui::Checkbox("Analytic Primitive (A)", use_analytic_primitive);

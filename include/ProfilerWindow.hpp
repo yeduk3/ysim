@@ -79,7 +79,13 @@ void drawProfilerWindow(
     // Fused refit+enlarge toggle (single-pass broad-phase maintenance). When
     // non-null, a checkbox lets the user A/B it live against the legacy
     // two-pass path.
-    bool* fused_refit_enlarge = nullptr
+    bool* fused_refit_enlarge = nullptr,
+    // Sub-object (multi-root) LBVH: checkbox toggles single↔multi-root, slider
+    // sets split s (k = tiles², saturates at full split). Both apply on the
+    // next BVH rebuild (frame%10). Phase 2b mini-TLAS makes the multi-root
+    // query O(log N), so any s is query-cheap.
+    bool* use_subobject_bvh = nullptr,
+    int*  subbvh_split_s = nullptr
 );
 
 } // namespace profiler

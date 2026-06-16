@@ -1300,6 +1300,7 @@ struct QueryPointsParams {
     uint qShape;
     uint tShape;
     uint numNodes;   // node count of the queried tree → traversal index bound
+    uint entryRoot;  // Phase 2b: traversal entry slot (super-root; 0 single-root)
 };
 
 
@@ -1325,7 +1326,11 @@ void queryAABB(
 
     int stack[stackDepth];
     int sp = 0;
-    stack[sp++] = 0;
+    // Phase 2b: enter at the mini-TLAS super-root (grouped) or slot 0 (single).
+    // ONE O(log N) traversal — the super-root box unions all k group roots, so
+    // descending it reaches every group whose AABB overlaps the query (Phase 2a
+    // looped all k roots = O(k)/point; this is the log-k replacement).
+    stack[sp++] = (int)qParams.entryRoot;
 
     // WEDGE GUARD: a healthy traversal visits at most the node count of
     // the tree (~2M for a 1M-facet mesh). A corrupted topology (child
@@ -1435,6 +1440,7 @@ struct QuerySegParams {
     uint qShape;
     uint tShape;
     uint numNodes;       // queried tree's node count → traversal index bound
+    uint entryRoot;      // Phase 2b: traversal entry slot (super-root; 0 single-root)
 };
 
 void queryAABBSegmented(
@@ -1452,7 +1458,8 @@ void queryAABBSegmented(
     const int stackDepth = 64;
     int stack[stackDepth];
     int sp = 0;
-    stack[sp++] = 0;
+    // Phase 2b: enter at the mini-TLAS super-root (grouped) or slot 0 (single).
+    stack[sp++] = (int)qParams.entryRoot;
 
     // WEDGE GUARD: same visit cap as queryAABB — see comment there.
     uint visited = 0u;
