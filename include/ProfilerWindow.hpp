@@ -85,7 +85,10 @@ void drawProfilerWindow(
     // next BVH rebuild (frame%10). Phase 2b mini-TLAS makes the multi-root
     // query O(log N), so any s is query-cheap.
     bool* use_subobject_bvh = nullptr,
-    int*  subbvh_split_s = nullptr
+    int*  subbvh_split_s = nullptr,
+    // Multi-level (hgrid) spatial-hash broadphase toggle. When non-null a
+    // checkbox flips Simulator::useMultiLevelSH (oversized floor auto-excluded).
+    bool* use_multilevel_sh = nullptr
 );
 
 } // namespace profiler

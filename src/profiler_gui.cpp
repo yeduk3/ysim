@@ -42,7 +42,8 @@ void drawProfilerWindow(
     int* profile_level,
     bool* fused_refit_enlarge,
     bool* use_subobject_bvh,
-    int*  subbvh_split_s
+    int*  subbvh_split_s,
+    bool* use_multilevel_sh
 ) {
     if (!state.open) return;
 
@@ -99,6 +100,11 @@ void drawProfilerWindow(
         ImGui::Checkbox("Spatial Hashing", use_spatial_hashing);
         ImGui::SameLine();
         ImGui::TextDisabled(*use_spatial_hashing ? "[uniform grid]" : "[BVH broadphase]");
+    }
+    if (use_multilevel_sh) {
+        ImGui::Checkbox("Multi-level Spatial Hash", use_multilevel_sh);
+        ImGui::SameLine();
+        ImGui::TextDisabled(*use_multilevel_sh ? "[hgrid, floor excluded]" : "[off]");
     }
     if (use_segmented_bvh_query) {
         ImGui::Checkbox("BVH Segmented Query (G)", use_segmented_bvh_query);
