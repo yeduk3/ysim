@@ -38,7 +38,8 @@ void drawProfilerWindow(
     bool* use_analytic_primitive,
     bool* use_spatial_hashing,
     std::uint32_t* refit_substep_period,
-    std::uint32_t* cd_substep_period
+    std::uint32_t* cd_substep_period,
+    int* profile_level
 ) {
     if (!state.open) return;
 
@@ -61,6 +62,20 @@ void drawProfilerWindow(
         ImGui::Text("Sequence %llu", static_cast<unsigned long long>(latest->sequence));
     } else {
         ImGui::TextDisabled("No frame samples yet");
+    }
+
+    if (profile_level) {
+        // None → no profiling (max sim loop). PerFrame → frame_ms +
+        // physics/render split only. InFrame → full per-section breakdown.
+        static const char* kLevels[] = {"None", "Per-Frame", "In-Frame"};
+        if (*profile_level < 0) *profile_level = 0;
+        if (*profile_level > 2) *profile_level = 2;
+        ImGui::Combo("Profile Level", profile_level, kLevels, 3);
+        ImGui::SameLine();
+        ImGui::TextDisabled(
+            *profile_level == 0 ? "[no overhead]"
+          : *profile_level == 1 ? "[frame + phys/render]"
+                                : "[all sections]");
     }
 
     ImGui::Separator();
