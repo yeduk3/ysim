@@ -17822,7 +17822,113 @@ static int runBroadphaseBench(int frames, int mlLevels, float floorDiag, int cdP
     return 0;
 }
 
+// Headless ML-DRIVEN drive: reproduces the GUI's useMultiLevelSH path (ML is the
+// active broad phase, not a probe) to observe stability + real frame time.
+//   scene "default" = cloth + 48918-tri Human + oversized floor (ML's worst case:
+//                     dense Human -> tri-tri pair explosion).
+//   scene "uniform" = N uniform cloth patches piling on a TESSELLATED floor — all
+//                     similar triangle size, so every grid cell stays sparse. The
+//                     hierarchical-hash sweet spot (the floor is not an oversized
+//                     primitive here, so nothing is excluded).
+static int runMlDriveDiag(int frames, int cdPeriod, const std::string& method,
+                          const std::string& scene) {
+    using Backend = METAL;
+    using SystemT = ExplicitSystem<Backend, Precision>;
+    if (!MetalGlobalContext::getDevice() || !MetalKernelContext::getLibrary()) {
+        std::cerr << "[ml-drive SKIP] metal unavailable\n"; return 0;
+    }
+    for (auto& m : Scene<Backend, Precision>::meshes) m.initializer = nullptr;
+    Scene<Backend, Precision>::meshes.clear();
+    for (auto& r : Scene<Backend, Precision>::requestsGeneralMeshes) delete r.initializer;
+    Scene<Backend, Precision>::requestsGeneralMeshes.clear();
+    Scene<Backend, Precision>::numMeshes = 0;
+    Scene<Backend, Precision>::nextMeshId = 0;
+    Scene<Backend, Precision>::dirty = true;
+    Scene<Backend, Precision>::environment = SceneEnvironment{};
+
+    Precision h = Precision(1) / Precision(60);
+    Index subSteps = 60;
+    SystemT system(h, subSteps);
+    Simulator<Backend, Precision, SystemT> sim(system);
+    sim.pause = false;
+    bool uniform = (scene == "uniform");
+    if (uniform) {
+        // Tessellated floor (4 wide, 40x40 -> face ~0.1) as a static Float, plus
+        // 4 cloth patches (1 wide, 20x20 -> face ~0.05) dropped at staggered
+        // heights so they fall, drape and pile. ~2x face-size ratio: comfortably
+        // inside the multi-level budget, no oversized primitive.
+        // Tessellated floor (3 wide, 24x24 -> face ~0.12) as a static Float, plus
+        // a cloth patch (1 wide, 20x20 -> face ~0.05) dropped onto it. All faces
+        // are within ~2x in size -> every grid cell stays sparse: the multi-level
+        // sweet spot, with no oversized primitive to exclude (cf. the 48918-tri
+        // Human in the default scene, which makes the tri-sphere pairs explode).
+        sim.addPlane(PlaneDirection::XZPlane, tinym::vec3(0, 0, 0), 24, 3.0,
+                     0.1, BehaviorType::Float);
+        sim.addCloth(20, 1, tinym::vec3(0, 0.6, 0), 1e5, 1e5, 2e5, 0.01, 0.1);
+        sim.mlBroadPhase.floorExcludeDiag = 1e9f;   // exclude NOTHING (no oversized prim)
+    } else {
+        sim.addCloth(50, 1, tinym::vec3(0, 1.25, 0), 1e5, 1e5, 2e5, 0.01, 0.1);
+        sim.addFloatMesh(ysim_paths::assetRoot(), "Human.obj", {0, 0.35, 0}, 0.04);
+        sim.addGround(PlaneDirection::XZPlane, tinym::vec3(0, 0, 0), 50);
+    }
+    sim.initialize();
+    sim.useMultiLevelSH   = (method == "ml");
+    sim.useSpatialHashing = (method == "sh");   // else BVH
+    sim.cdSubstepPeriod    = (cdPeriod < 1) ? 1 : cdPeriod;
+    sim.refitSubstepPeriod = (cdPeriod < 1) ? 1 : cdPeriod;
+
+    std::printf("=== %s-DRIVEN drive (%s scene, cdP=%d) ===\n",
+                method.c_str(), scene.c_str(), cdPeriod);
+    using Clock = std::chrono::steady_clock;
+    auto& packed = Scene<Backend, Precision>::packedMeshData;
+    // Scan all vertices: minY < 0 flags fall-through/penetration, maxAbs blow-up.
+    Index clothEnd = packed.statesOffsets[Scene<Backend, Precision>::numMeshes];
+    double sumMsTail = 0; int tailCount = 0; double worstPen = 0; bool diverged = false;
+    int tailStart = frames / 2;   // average over the settled second half
+    for (int f = 0; f < frames; ++f) {
+        auto t0 = Clock::now();
+        sim.update();
+        MetalGlobalContext::commitAndWait();
+        auto t1 = Clock::now();
+        double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        double minY = 1e30, maxAbs = 0; bool nan = false;
+        // Cloth-only Y (skip mesh 0 = floor in uniform; in default cloth IS mesh 0).
+        Index cloBeg = uniform ? packed.statesOffsets[1] : 0;
+        Index cloEnd = uniform ? clothEnd : packed.statesOffsets[1];
+        double clothMinY = 1e30, clothMaxY = -1e30;
+        for (Index v = 0; v < clothEnd; ++v) {
+            float x = (float)packed.x.ptr[v*3+0];
+            float y = (float)packed.x.ptr[v*3+1];
+            float z = (float)packed.x.ptr[v*3+2];
+            if (!std::isfinite(x)||!std::isfinite(y)||!std::isfinite(z)) { nan = true; break; }
+            minY = std::min(minY, (double)y);
+            maxAbs = std::max({maxAbs, (double)std::fabs(x), (double)std::fabs(y), (double)std::fabs(z)});
+            if (v >= cloBeg && v < cloEnd) { clothMinY = std::min(clothMinY,(double)y); clothMaxY = std::max(clothMaxY,(double)y); }
+        }
+        (void)minY;
+        uint64_t nb = Scene<Backend, Precision>::packedCollisionData.numBroadCollisions[0];
+        std::printf("  frame %3d: %7.1f ms (%5.1f fps)  clothY=[%.3g,%.3g] maxAbs=%-9.3g broadOut=%llu%s\n",
+                    f, ms, ms > 0 ? 1000.0 / ms : 0, nan ? -1e30 : clothMinY, nan ? 1e30 : clothMaxY,
+                    nan ? 1e30 : maxAbs, (unsigned long long)nb, nan ? "  <-- NaN" : "");
+        if (f >= tailStart && !nan) { sumMsTail += ms; ++tailCount; worstPen = std::min(worstPen, clothMinY); }
+        if (nan || maxAbs > 1e4) { std::printf("  [stop] diverged at frame %d\n", f); diverged = true; break; }
+    }
+    double avgMs = tailCount ? sumMsTail / tailCount : 0;
+    std::printf("  --- %s/%s cdP=%d: avg %.1f ms (%.1f fps) over settled half | "
+                "worst cloth penetration %.3g | %s ---\n",
+                method.c_str(), scene.c_str(), cdPeriod, avgMs, avgMs > 0 ? 1000.0 / avgMs : 0,
+                worstPen, diverged ? "DIVERGED" : (worstPen < -0.05 ? "fell through" : "STABLE"));
+    return 0;
+}
+
 int main(int argc, char** argv) {
+    if (argc > 1 && std::string(argv[1]) == "--drive-ml") {
+        int frames   = (argc > 2) ? std::atoi(argv[2]) : 30;
+        int cdPeriod = (argc > 3) ? std::atoi(argv[3]) : 1;
+        std::string method = (argc > 4) ? argv[4] : "ml";       // ml | sh | bvh
+        std::string scene  = (argc > 5) ? argv[5] : "default";  // default | uniform
+        return runMlDriveDiag(frames, cdPeriod, method, scene);
+    }
     if (argc > 1 && std::string(argv[1]) == "--self-test") {
         return runSelfTest();
     }
