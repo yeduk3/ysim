@@ -4678,6 +4678,28 @@ struct BVH<BE, PR, BVHMODE::LINEAR, PRIMITIVE> {
     VectorBase<METAL, int> nodeRangeRight;            // numInternals
     VectorBase<METAL, int> rootIndexBuf;              // 1
 
+    // ---- Sub-object (multi-root) LBVH — square-cloth experiment (Phase 1) ----
+    // Partition the primitives into k = 4^s groups by MATERIAL-space tile
+    // (fixed for the cloth's lifetime). Each group gets an independent Karras
+    // tree in its own slot window of `tree`; there are k roots. Build/refit
+    // combine into k roots in ONE dispatch (bottomUpBoxesMultiRoot), which is
+    // the divergence experiment. Query integration (scene TLAS over the k
+    // roots) is Phase 2 — with this toggle ON but Phase 2 absent, the broad
+    // phase still traverses from slot 0 only, so collision is INCOMPLETE.
+    // Default OFF ⇒ every existing path is bit-identical. Triangle prim only.
+    bool useSubObjectBVH = false;
+    int  subBvhSplitS = 1;        // s: k = 4^s groups
+    int  subBvhP = 0;             // particleNum1D of the source grid cloth
+    int  numGroups = 0;           // k = 4^s (logical; some may be empty/ragged)
+    int  subBvhBuiltS = -1;       // s the current group tables were built for
+
+    VectorBase<METAL, uint32_t> groupOfPrim;       // [N] original prim -> group
+    VectorBase<METAL, uint32_t> sortedPosToGroup;  // [N] sorted pos -> group (static)
+    VectorBase<METAL, uint32_t> groupSize;         // [k] M_g
+    VectorBase<METAL, uint32_t> groupPrimBase;     // [k] Σ M_h  (h<g)
+    VectorBase<METAL, uint32_t> groupNodeBase;     // [k] Σ (2 M_h - 1)  (h<g)
+    uint32_t subBvhNumNodes = 0;                   // 2N - (#nonempty groups)
+
     // Runtime toggle between the two BVH construction paths. Default is
     // the existing Karras pipeline (`buildTree_*` + `bottomUpBoxes`); set
     // to true to use the Apetrei agglomerative single-kernel build
@@ -4737,6 +4759,9 @@ struct BVH<BE, PR, BVHMODE::LINEAR, PRIMITIVE> {
     MTL::ComputePipelineState* zeroVisitCountsPSO;    // D-029
     MTL::ComputePipelineState* agglomerativeBuildPSO;     // Apetrei 2014
     MTL::ComputePipelineState* agglomerativeSwapRootPSO;  // Apetrei 2014
+    MTL::ComputePipelineState* buildTreeGroupedPSO = nullptr;     // sub-object
+    MTL::ComputePipelineState* buildLeafGroupedPSO = nullptr;     // sub-object
+    MTL::ComputePipelineState* bottomUpBoxesMultiRootPSO = nullptr; // sub-object
     MTL::ComputePipelineState* queryPointsPSO;
     // Segmented (per-threadgroup) detect+reduce variant — three PSOs
     // matching bvh.metal's queryPointsSegmented → scanReserveSegmented
@@ -4771,6 +4796,10 @@ struct BVH<BE, PR, BVHMODE::LINEAR, PRIMITIVE> {
             buildTreePSO = MetalKernelContext::getPSO("buildTree_Tri");
             buildLeafPSO = MetalKernelContext::getPSO("buildLeaf_Tri");
             agglomerativeBuildPSO = MetalKernelContext::getPSO("agglomerativeBuild_Tri");
+            // Sub-object (multi-root) LBVH — triangle-only Phase 1 kernels.
+            buildTreeGroupedPSO = MetalKernelContext::getPSO("buildTree_Tri_Grouped");
+            buildLeafGroupedPSO = MetalKernelContext::getPSO("buildLeaf_Tri_Grouped");
+            bottomUpBoxesMultiRootPSO = MetalKernelContext::getPSO("bottomUpBoxesMultiRoot");
         } else if constexpr (PRIMITIVE == BVHPRIMITIVE::EDGE) {
             fillMortonsPSO = MetalKernelContext::getPSO("fillMortons_Edge");
             buildTreePSO = MetalKernelContext::getPSO("buildTree_Edge");
@@ -5156,6 +5185,212 @@ struct BVH<BE, PR, BVHMODE::LINEAR, PRIMITIVE> {
         MetalGlobalContext::dispatchThreads(fillMortonsPSO, numPrimitives);
         //MetalGlobalContext::commitAndWait();
     }
+
+    // ---- Sub-object (multi-root) LBVH helpers (Phase 1) ----
+
+    // Square-cloth detection: a grid cloth of P×P verts emits N = 2(P-1)²
+    // triangles. Recover P from N so the toggle can be pushed to every
+    // objTree and non-square / non-triangle meshes self-fall-back to the
+    // single-root path. Returns 0 when N is not a square-cloth count.
+    int deriveSquareClothP() const {
+        if (PRIMITIVE != BVHPRIMITIVE::TRIANGLE) return 0;
+        Index N = primitives.size / PRIMITIVE;
+        if (N < 2 || (N & 1)) return 0;          // 2 tris per quad
+        Index half = N / 2;                      // (P-1)²
+        int q = (int)std::lround(std::sqrt((double)half));
+        if (q < 1 || (Index)q * q != half) return 0;
+        return q + 1;                            // P
+    }
+    // Phase-1 gate: sub-object path is active only for triangle BVHs over a
+    // detectable square cloth with the toggle on and a built grouped PSO.
+    bool subObjectActive() const {
+        return useSubObjectBVH && buildTreeGroupedPSO
+               && (primitives.size / PRIMITIVE) > 1 && deriveSquareClothP() >= 2;
+    }
+
+    // Assign each triangle prim to a material-space tile group and build the
+    // static offset tables. Grid topology (MeshGridInitializer): facets are
+    // emitted 2 per quad, quads row-major, so prim t -> quad q=t/2 ->
+    // (quadRow, quadCol) = (q/Q, q%Q), Q = P-1. Tile = (quadRow/span,
+    // quadCol/span), span = ceil(Q / 2^s); ragged last tile absorbs the
+    // remainder. Group windows are packed; empty groups contribute 0 nodes.
+    void computeSubObjectGroups() {
+        Index N = primitives.size / PRIMITIVE;
+        int P = deriveSquareClothP();
+        subBvhP = P;
+        int Q = P - 1;                       // quads per side
+        int T = 1 << subBvhSplitS;           // requested tiles/side (s up to ~16 ok)
+        int span = (Q + T - 1) / T;          // ceil(Q/T) = quads per tile
+        if (span < 1) span = 1;
+        // COMPACT tile grid: the requested 4^s tiles are mostly empty once
+        // T > Q (each quad becomes its own tile and the partition saturates at
+        // Q²). Index by the EFFECTIVE TR×TR grid instead — TR = ceil(Q/span) ≤
+        // Q — so the group tables stay ≤ Q² regardless of s. Without this, s≥14
+        // would need multi-GB tables and s=16 overflows 4^s past int32.
+        int TR = (Q + span - 1) / span;      // effective tiles per side
+        if (TR < 1) TR = 1;
+        int k = TR * TR;                     // compact group count, no empties
+        numGroups = k;
+
+        groupOfPrim      = VectorBase<METAL, uint32_t>(N);
+        sortedPosToGroup = VectorBase<METAL, uint32_t>(N);
+        groupSize        = VectorBase<METAL, uint32_t>(k);
+        groupPrimBase    = VectorBase<METAL, uint32_t>(k);
+        groupNodeBase    = VectorBase<METAL, uint32_t>(k);
+
+        for (int g = 0; g < k; ++g) groupSize[g] = 0u;
+        for (Index t = 0; t < N; ++t) {
+            Index q = t / 2;
+            int tr = (int)(q / Q) / span;    // tr < TR (qr ≤ Q-1)
+            int tc = (int)(q % Q) / span;
+            int g = tr * TR + tc;
+            groupOfPrim[t] = (uint32_t)g;
+            groupSize[g]++;
+        }
+        uint32_t pacc = 0, nacc = 0;
+        for (int g = 0; g < k; ++g) {
+            groupPrimBase[g] = pacc;
+            groupNodeBase[g] = nacc;
+            uint32_t M = groupSize[g];       // every compact tile is non-empty
+            pacc += M;
+            nacc += (M > 0) ? (2u * M - 1u) : 0u;
+        }
+        subBvhNumNodes = nacc;               // = 2N - k
+        subBvhBuiltS = subBvhSplitS;
+        for (int g = 0; g < k; ++g) {
+            uint32_t base = groupPrimBase[g], M = groupSize[g];
+            for (uint32_t i = 0; i < M; ++i) sortedPosToGroup[base + i] = (uint32_t)g;
+        }
+        std::cout << "[SubObjectBVH] s=" << subBvhSplitS << " tiles/side=" << TR
+                  << " groups=" << k << " nodes=" << subBvhNumNodes
+                  << " (vs single-root " << (2 * N - 1) << ")" << std::endl;
+    }
+
+    // Stable partition of the Morton-sorted `mortons` so each group's prims
+    // are contiguous in [primBase[g], primBase[g]+M_g) while KEEPING their
+    // Morton order (LSD radix: sort minor key = Morton, then stable-sort
+    // major key = group). CPU because build is rare and unified memory makes
+    // the scatter trivial. Pre: `mortons` is Morton-sorted and CPU-visible
+    // (caller commitAndWait'd after radixSortGPU).
+    void cpuStableGroupPartition() {
+        Index N = primitives.size / PRIMITIVE;
+        std::vector<uint32_t> off(numGroups);
+        for (int g = 0; g < numGroups; ++g) off[g] = groupPrimBase[g];
+        for (Index i = 0; i < N; ++i) {
+            uint32_t prim = mortons[i].index;
+            uint32_t g = groupOfPrim[prim];
+            mortonsTemp[off[g]++] = mortons[i];
+        }
+        std::copy(mortonsTemp.ptr, mortonsTemp.ptr + N, mortons.ptr);
+    }
+
+    void buildTreeGroupedGPU() {
+        int numPrimitives = primitives.size / PRIMITIVE;
+        if (numPrimitives == 0) return;
+        MetalGlobalContext::setBuffer(positions, 0);
+        MetalGlobalContext::setBuffer(primitives, 1);
+        MetalGlobalContext::setBytes(numPrimitives, 2);
+        MetalGlobalContext::setBuffer(mortons, 3);
+        MetalGlobalContext::setBuffer(tree, 4);
+        MetalGlobalContext::setBuffer(treeParent, 5);
+        MetalGlobalContext::setBuffer(sortedPosToGroup, 6);
+        MetalGlobalContext::setBuffer(groupSize, 7);
+        MetalGlobalContext::setBuffer(groupPrimBase, 8);
+        MetalGlobalContext::setBuffer(groupNodeBase, 9);
+        MetalGlobalContext::dispatchThreads(buildTreeGroupedPSO, numPrimitives);
+    }
+    void buildLeafGroupedGPU() {
+        int numPrimitives = primitives.size / PRIMITIVE;
+        if (numPrimitives == 0) return;
+        MetalGlobalContext::setBuffer(positions, 0);
+        MetalGlobalContext::setBuffer(primitives, 1);
+        MetalGlobalContext::setBytes(numPrimitives, 2);
+        MetalGlobalContext::setBuffer(mortons, 3);
+        MetalGlobalContext::setBuffer(tree, 4);
+        MetalGlobalContext::setBuffer(sortedPosToGroup, 6);
+        MetalGlobalContext::setBuffer(groupSize, 7);
+        MetalGlobalContext::setBuffer(groupPrimBase, 8);
+        MetalGlobalContext::setBuffer(groupNodeBase, 9);
+        MetalGlobalContext::dispatchThreads(buildLeafGroupedPSO, numPrimitives);
+    }
+    // Multi-root combine. Mirrors bottomUpBoxesGPU (zero visit-counts +
+    // dispatch) but the kernel stops each leaf walk at its group root.
+    void bottomUpBoxesMultiRootGPU(const AABB4& sceneBox) {
+        Index numPrimitives = primitives.size / PRIMITIVE;
+        if (numPrimitives <= 1) return;
+        Index numNodes = 2 * numPrimitives - 1;   // zero whole alloc (harmless)
+
+        uint32_t numNodesU = (uint32_t)numNodes;
+        MetalGlobalContext::setBuffer(treeVisitCounts, 0);
+        MetalGlobalContext::setBytes(numNodesU, 1);
+        MetalGlobalContext::dispatchThreads(zeroVisitCountsPSO, numNodes);
+
+        MetalGlobalContext::setBytes(sceneBox, 2);
+        MetalGlobalContext::setBuffer(tree, 4);
+        MetalGlobalContext::setBuffer(treeParent, 5);
+        MetalGlobalContext::setBuffer(treeVisitCounts, 6);
+        MetalGlobalContext::setBuffer(sortedPosToGroup, 7);
+        MetalGlobalContext::setBuffer(groupSize, 8);
+        MetalGlobalContext::setBuffer(groupPrimBase, 9);
+        MetalGlobalContext::setBuffer(groupNodeBase, 10);
+        MetalGlobalContext::dispatchThreads(bottomUpBoxesMultiRootPSO, numPrimitives);
+    }
+
+    // CPU correctness check (no query needed): every prim's AABB must sit
+    // inside its group's root AABB, and the union of all group roots must
+    // equal the scene box. Call after a sub-object build/refit + commitAndWait.
+    // Returns true on pass; logs the first failure.
+    bool validateSubObjectBVH() {
+        Index N = primitives.size / PRIMITIVE;
+        if (!useSubObjectBVH || groupOfPrim.size != N) return false;
+        AABB4 unionBox; bool unionInit = false;
+        for (int g = 0; g < numGroups; ++g) {
+            uint32_t M = groupSize[g];
+            if (M == 0) continue;
+            BVHNode& root = tree[groupNodeBase[g]];
+            // enclosure: each prim of this group inside root
+            for (uint32_t i = 0; i < M; ++i) {
+                uint32_t sp = groupPrimBase[g] + i;
+                uint32_t fid = mortons[sp].index;
+                Index base = (Index)fid * PRIMITIVE;
+                for (int p = 0; p < PRIMITIVE; ++p) {
+                    Index vid = primitives[base + p];
+                    tinym::vec3_view v(positions.ptr + vid * 3);
+                    for (int c = 0; c < 3; ++c) {
+                        if (v[c] < root.min[c] - 1e-4f || v[c] > root.max[c] + 1e-4f) {
+                            std::cout << "[SubObjectBVH] VALIDATE FAIL g=" << g
+                                      << " prim=" << fid << " axis=" << c
+                                      << " v=" << v[c] << " root=[" << root.min[c]
+                                      << "," << root.max[c] << "]" << std::endl;
+                            return false;
+                        }
+                    }
+                }
+            }
+            if (!unionInit) { unionBox = root.aabb; unionInit = true; }
+            else unionBox.combine(root.aabb);
+        }
+        std::cout << "[SubObjectBVH] VALIDATE OK — " << numGroups
+                  << " groups, union=[" << unionBox.min << " .. "
+                  << unionBox.max << "]" << std::endl;
+        return true;
+    }
+
+    // Object-level AABB for the scene TLAS. Single-root: slot 0. Multi-root:
+    // union of the k group roots (slot 0 is only group 0's root, so reading
+    // tree[0] alone would under-cull this object in the broad phase).
+    AABB4 objectRootAABB() {
+        if (!subObjectActive() || groupOfPrim.size != primitives.size / PRIMITIVE)
+            return tree[0].aabb;
+        AABB4 box; bool init = false;
+        for (int g = 0; g < numGroups; ++g) {
+            if (groupSize[g] == 0) continue;
+            AABB4& r = tree[groupNodeBase[g]].aabb;
+            if (!init) { box = r; init = true; } else box.combine(r);
+        }
+        return init ? box : tree[0].aabb;
+    }
+
     void build(int oid, VectorBase<METAL, PR>& pos, VectorBase<METAL, Index>& prim) {
         //std::cout << "[BVH Build] Memory allocated, BVH build start" << std::endl;
         objid = oid;
@@ -5219,7 +5454,19 @@ struct BVH<BE, PR, BVHMODE::LINEAR, PRIMITIVE> {
         // the Apetrei agglomerative path collapses both into a single
         // kernel launch plus a 1-thread root-swap. Either side can be
         // deprecated independently by removing its branch.
-        if (useAgglomerative) {
+        if (subObjectActive()) {
+            // Sub-object multi-root build. Stable group-partition of the
+            // Morton-sorted prims (CPU; build is rare) then grouped Karras
+            // hierarchy + multi-root combine. Tables are (re)built lazily
+            // when the prim count changes.
+            if (groupOfPrim.size != numPrimitives || subBvhBuiltS != subBvhSplitS)
+                computeSubObjectGroups();
+            MetalGlobalContext::commitAndWait();   // Morton sort visible to CPU
+            cpuStableGroupPartition();
+            buildTreeGroupedGPU();
+            bottomUpBoxesMultiRootGPU(sceneBox);
+            MetalGlobalContext::commitAndWait();
+        } else if (useAgglomerative) {
             agglomerativeBuildGPU();
             agglomerativeSwapRootGPU();
             // **프로파일링 공정성**을 위한 강제 sync — 원래 agglomerative
@@ -5526,6 +5773,15 @@ struct BVH<BE, PR, BVHMODE::LINEAR, PRIMITIVE> {
         AABB4 sceneBox;  // only sceneBox._pad0 (= numPrimitives) is read by the kernel
         sceneBox.i0 = numPrimitives;
 
+        // Sub-object refit: topology + group partition carried from build();
+        // recompute leaf AABBs into the grouped slots, combine into k roots.
+        if (subObjectActive() && groupOfPrim.size == numPrimitives) {
+            buildLeafGroupedGPU();
+            bottomUpBoxesMultiRootGPU(sceneBox);
+            MetalGlobalContext::commitAndWait();
+            return;
+        }
+
         buildLeafGPU();
         // Pure-GPU walk-to-root. build() 의 같은 swap 참고.
         bottomUpBoxesGPU(sceneBox);
@@ -5534,6 +5790,30 @@ struct BVH<BE, PR, BVHMODE::LINEAR, PRIMITIVE> {
 
     void enlargeTrajectory(PR dt) {
         Index numPrimitives = primitives.size/PRIMITIVE;
+        // Multi-root: leaves live in per-group windows (NOT [N-1, 2N-2]), so
+        // enlarge the grouped leaf slots and propagate via the multi-root
+        // combine. Reading tree[N+i-1] here would hit internal/unused slots
+        // and dereference a garbage childB.
+        if (subObjectActive() && groupOfPrim.size == numPrimitives) {
+            for (Index sp = 0; sp < numPrimitives; ++sp) {
+                uint32_t g = sortedPosToGroup[sp];
+                uint32_t M = groupSize[g];
+                uint32_t leafSlot = groupNodeBase[g] + (M - 1) + (sp - groupPrimBase[g]);
+                BVHNode& t = tree[leafSlot];
+                Index pbase = (Index)t.childB * PRIMITIVE;
+                for (Index p = 0; p < PRIMITIVE; ++p) {
+                    Index posid = primitives[pbase+p];
+                    tinym::vec3_view pos (positions.ptr + posid*3);
+                    tinym::vec3_view v (velocities.ptr + posid*3);
+                    t.min = tinym::min(t.min, pos+v*dt);
+                    t.max = tinym::max(t.max, pos+v*dt);
+                }
+            }
+            AABB4 sceneBox; sceneBox.i0 = numPrimitives;
+            bottomUpBoxesMultiRootGPU(sceneBox);
+            MetalGlobalContext::commitAndWait();
+            return;
+        }
         for(Index i = 0; i < numPrimitives; ++i) {
             BVHNode& t = tree[numPrimitives+i-1];
             Index pid = t.childB;
@@ -5909,6 +6189,15 @@ struct BVH<BE, PR, BVHMODE::SCENE, BVHPRIMITIVE::OBJECT> {
     // 다시 만든다 — 큰 변형 후 트리 품질 회복용 비교 모드.
     bool enableRefit = true;
 
+    // Sub-object (multi-root) LBVH A/B toggle — Phase 1 divergence
+    // experiment. Pushed to every per-mesh TRI_LBVH; only triangle BVHs over
+    // a detectable square cloth actually switch (subObjectActive()), so
+    // spheres/cubes/edge-TLAS self-fall-back. Object-level AABB for the scene
+    // TLAS comes from objectRootAABB() (union of group roots). Default false.
+    bool useSubObjectBVH = false;
+    int  subBvhSplitS = 1;       // s: k = 4^s groups
+    bool validateSubObject = false;  // one-shot CPU correctness check on build
+
     //BVH(SceneObject<METAL, PR>& scene) 
     //    : objTrees(scene.numMeshes), positions(scene.numMeshes*3), indices(scene.numMeshes*2) {}
 
@@ -5936,15 +6225,20 @@ struct BVH<BE, PR, BVHMODE::SCENE, BVHPRIMITIVE::OBJECT> {
                 continue;
             }
             objTrees[i].useAgglomerative = useAgglomerative;
+            objTrees[i].useSubObjectBVH = useSubObjectBVH;
+            objTrees[i].subBvhSplitS = subBvhSplitS;
             objTrees[i].build(scene.meshes[i]);
             objTrees[i].objIndex = (int)i;  // D-041 turn-3
+            if (validateSubObject && objTrees[i].subObjectActive())
+                objTrees[i].validateSubObjectBVH();
             Index pbase = i*6;
-            positions[pbase  ] = objTrees[i].tree[0].min.x;
-            positions[pbase+1] = objTrees[i].tree[0].min.y;
-            positions[pbase+2] = objTrees[i].tree[0].min.z;
-            positions[pbase+3] = objTrees[i].tree[0].max.x;
-            positions[pbase+4] = objTrees[i].tree[0].max.y;
-            positions[pbase+5] = objTrees[i].tree[0].max.z;
+            AABB4 objBox = objTrees[i].objectRootAABB();
+            positions[pbase  ] = objBox.min.x;
+            positions[pbase+1] = objBox.min.y;
+            positions[pbase+2] = objBox.min.z;
+            positions[pbase+3] = objBox.max.x;
+            positions[pbase+4] = objBox.max.y;
+            positions[pbase+5] = objBox.max.z;
             Index ibase = i*2;
             indices[ibase  ] = ibase;
             indices[ibase+1] = ibase+1;
@@ -5976,17 +6270,20 @@ struct BVH<BE, PR, BVHMODE::SCENE, BVHPRIMITIVE::OBJECT> {
         }
         for(Index i = 0; i < objTrees.size(); ++i) {
             objTrees[i].useAgglomerative = useAgglomerative;
+            objTrees[i].useSubObjectBVH = useSubObjectBVH;
+            objTrees[i].subBvhSplitS = subBvhSplitS;
             objTrees[i].refit();
             //std::cout << "[objTree root before scene build] id " << i
             //  << " min=" << objTrees[i].tree[0].min
             //  << " max=" << objTrees[i].tree[0].max << std::endl;
             Index pbase = i*6;
-            positions[pbase  ] = objTrees[i].tree[0].min.x;
-            positions[pbase+1] = objTrees[i].tree[0].min.y;
-            positions[pbase+2] = objTrees[i].tree[0].min.z;
-            positions[pbase+3] = objTrees[i].tree[0].max.x;
-            positions[pbase+4] = objTrees[i].tree[0].max.y;
-            positions[pbase+5] = objTrees[i].tree[0].max.z;
+            AABB4 objBox = objTrees[i].objectRootAABB();
+            positions[pbase  ] = objBox.min.x;
+            positions[pbase+1] = objBox.min.y;
+            positions[pbase+2] = objBox.min.z;
+            positions[pbase+3] = objBox.max.x;
+            positions[pbase+4] = objBox.max.y;
+            positions[pbase+5] = objBox.max.z;
             Index ibase = i*2;
             indices[ibase  ] = ibase;
             indices[ibase+1] = ibase+1;
@@ -6002,14 +6299,17 @@ struct BVH<BE, PR, BVHMODE::SCENE, BVHPRIMITIVE::OBJECT> {
     void enlargeTrajectory(PR dt) {
         for(Index i = 0; i < objTrees.size(); ++i) {
             objTrees[i].useAgglomerative = useAgglomerative;
+            objTrees[i].useSubObjectBVH = useSubObjectBVH;
+            objTrees[i].subBvhSplitS = subBvhSplitS;
             objTrees[i].enlargeTrajectory(dt);
             Index pbase = i*6;
-            positions[pbase  ] = objTrees[i].tree[0].min.x;
-            positions[pbase+1] = objTrees[i].tree[0].min.y;
-            positions[pbase+2] = objTrees[i].tree[0].min.z;
-            positions[pbase+3] = objTrees[i].tree[0].max.x;
-            positions[pbase+4] = objTrees[i].tree[0].max.y;
-            positions[pbase+5] = objTrees[i].tree[0].max.z;
+            AABB4 objBox = objTrees[i].objectRootAABB();
+            positions[pbase  ] = objBox.min.x;
+            positions[pbase+1] = objBox.min.y;
+            positions[pbase+2] = objBox.min.z;
+            positions[pbase+3] = objBox.max.x;
+            positions[pbase+4] = objBox.max.y;
+            positions[pbase+5] = objBox.max.z;
             Index ibase = i*2;
             indices[ibase  ] = ibase;
             indices[ibase+1] = ibase+1;
@@ -8447,6 +8747,18 @@ struct Simulator {
         collisionPipeline.broadPhaseTest = decltype(collisionPipeline.broadPhaseTest){};
         shBroadPhase                     = decltype(shBroadPhase){};
 
+        // Sub-object (multi-root) LBVH headless hook: YSIM_SUBOBJECT=<s>
+        // enables the Phase-1 multi-root path on square cloths with split s
+        // and turns on the one-shot CPU validator. Mirrors YSIM_NO_ENLARGE.
+        if (const char* so = std::getenv("YSIM_SUBOBJECT")) {
+            int s = std::atoi(so);
+            if (s >= 1) {
+                collisionPipeline.broadPhase.useSubObjectBVH = true;
+                collisionPipeline.broadPhase.subBvhSplitS = s;
+                collisionPipeline.broadPhase.validateSubObject = true;
+            }
+        }
+
         collisionPipeline.broadPhase.build(scene);
         shBroadPhase.build(scene);
 
@@ -10477,6 +10789,127 @@ static int runBuildBench(const BuildBenchConfig& cfg) {
     csv.flush();
     csv.close();
     std::cerr << "[build-bench DONE] wrote " << cfg.outCsvPath << "\n";
+    return 0;
+}
+
+// Sub-object (multi-root) LBVH combine bench. Isolates the bottom-up COMBINE
+// kernel (the divergence experiment) from the per-frame commitAndWait sync
+// floor — which dominates `broad_refit` wall-time and would mask the kernel
+// (see project_bvh_refit_diagnosis). Method: encode `reps` combine dispatches
+// (zeroVisitCounts + combine) into ONE command buffer, single commitAndWait,
+// divide by reps → amortized per-combine GPU+encode time. Compares single-root
+// (`bottomUpBoxesGPU`) vs multi-root (`bottomUpBoxesMultiRootGPU`) for s=1..S
+// on the SAME square cloth, plus end-to-end refit() wall for realism.
+// CSV: variant,particle1d,num_prims,split_s,num_groups,sub_nodes,
+//      combine_us_per_rep,refit_ms_e2e
+struct SubObjectBenchConfig {
+    std::vector<int> particleNum1Ds;
+    int maxSplitS = 6;
+    int reps = 200;       // combine dispatches amortized per measurement
+    int refitReps = 30;   // end-to-end refit() calls averaged
+    std::string outCsvPath;
+};
+
+static int runSubObjectBench(const SubObjectBenchConfig& cfg) {
+    using Backend = METAL;
+    using SystemT = ExplicitSystem<Backend, Precision>;
+    using Clock = std::chrono::steady_clock;
+
+    if (!MetalGlobalContext::getDevice() || !MetalKernelContext::getLibrary()) {
+        std::cerr << "[subobject-bench SKIP] metal unavailable\n";
+        return 0;
+    }
+
+    namespace fs = std::filesystem;
+    fs::path csvPath(cfg.outCsvPath);
+    if (csvPath.has_parent_path()) {
+        std::error_code ec;
+        fs::create_directories(csvPath.parent_path(), ec);
+    }
+    std::ofstream csv(csvPath);
+    if (!csv) { std::cerr << "[subobject-bench FAIL] open " << cfg.outCsvPath << "\n"; return 1; }
+    csv << "variant,particle1d,num_prims,split_s,num_groups,sub_nodes,"
+           "combine_us_per_rep,refit_ms_e2e\n";
+
+    auto resetScene = []() {
+        for (auto& m : Scene<Backend, Precision>::meshes) m.initializer = nullptr;
+        Scene<Backend, Precision>::meshes.clear();
+        for (auto& r : Scene<Backend, Precision>::requestsGeneralMeshes) delete r.initializer;
+        Scene<Backend, Precision>::requestsGeneralMeshes.clear();
+        Scene<Backend, Precision>::numMeshes = 0;
+        Scene<Backend, Precision>::nextMeshId = 0;
+        Scene<Backend, Precision>::dirty = true;
+        Scene<Backend, Precision>::environment = SceneEnvironment{};
+    };
+
+    auto msSince = [](Clock::time_point a, Clock::time_point b) {
+        return std::chrono::duration<double, std::milli>(b - a).count();
+    };
+
+    for (int P : cfg.particleNum1Ds) {
+        resetScene();
+        Precision h = Precision(1) / Precision(60);
+        SystemT system(h, 60);
+        Simulator<Backend, Precision, SystemT> sim(system);
+        sim.pause = false;
+        sim.addClothGridFast(P, Precision(1.0));
+        sim.initialize();
+
+        auto& bp = sim.collisionPipeline.broadPhase;
+        if (bp.objTrees.empty()) { std::cerr << "[subobject-bench] no objTree P=" << P << "\n"; continue; }
+        auto& t = bp.objTrees[0];
+        auto& mesh = Scene<Backend, Precision>::meshes[0];
+        int64_t numPrims = (int64_t)(t.primitives.size / 3);
+
+        AABB4 sceneBox; sceneBox.i0 = (int)numPrims;
+
+        // Amortized combine micro-bench: warm once, then reps in one buffer.
+        auto microCombine = [&](auto&& dispatchOnce) -> double {
+            dispatchOnce(); MetalGlobalContext::commitAndWait();   // warm
+            auto a = Clock::now();
+            for (int r = 0; r < cfg.reps; ++r) dispatchOnce();
+            MetalGlobalContext::commitAndWait();
+            auto b = Clock::now();
+            return msSince(a, b) / cfg.reps * 1000.0;             // µs/rep
+        };
+        auto e2eRefit = [&]() -> double {
+            t.refit();                                            // warm
+            auto a = Clock::now();
+            for (int r = 0; r < cfg.refitReps; ++r) t.refit();    // each commits
+            auto b = Clock::now();
+            return msSince(a, b) / cfg.refitReps;
+        };
+
+        // --- single-root baseline ---
+        t.useSubObjectBVH = false;
+        t.build(mesh);
+        double sCombine = microCombine([&]{ t.bottomUpBoxesGPU(sceneBox); });
+        double sRefit   = e2eRefit();
+        csv << "single," << P << ',' << numPrims << ",0,1," << (2*numPrims-1)
+            << ',' << sCombine << ',' << sRefit << '\n';
+        std::cerr << "[subobject-bench] P=" << P << " prims=" << numPrims
+                  << " single combine=" << sCombine << "us refit=" << sRefit << "ms\n";
+
+        // --- multi-root, s = 1..maxSplitS ---
+        for (int s = 1; s <= cfg.maxSplitS; ++s) {
+            t.useSubObjectBVH = true;
+            t.subBvhSplitS = s;
+            t.build(mesh);
+            if (!t.subObjectActive()) continue;
+            double mCombine = microCombine([&]{ t.bottomUpBoxesMultiRootGPU(sceneBox); });
+            double mRefit   = e2eRefit();
+            csv << "multi," << P << ',' << numPrims << ',' << s << ','
+                << t.numGroups << ',' << t.subBvhNumNodes << ','
+                << mCombine << ',' << mRefit << '\n';
+            std::cerr << "[subobject-bench] P=" << P << " s=" << s
+                      << " k=" << t.numGroups << " combine=" << mCombine
+                      << "us refit=" << mRefit << "ms\n";
+        }
+        csv.flush();
+    }
+
+    csv.close();
+    std::cerr << "[subobject-bench DONE] wrote " << cfg.outCsvPath << "\n";
     return 0;
 }
 
@@ -15965,6 +16398,21 @@ int main(int argc, char** argv) {
 #endif
         return runRefitBench(cfg);
     }
+    if (argc > 1 && std::string(argv[1]) == "--bench-bvh-subobject") {
+        SubObjectBenchConfig cfg;
+        // Vertex counts ~ {1k, 10k, 100k, 500k} (NxN grid). prims = 2(P-1)^2.
+        cfg.particleNum1Ds = {32, 100, 316, 707};
+        cfg.maxSplitS = 16;
+        cfg.reps = 200;
+        cfg.refitReps = 100;
+#ifdef YSIM_PROJECT_ROOT
+        cfg.outCsvPath = std::string(YSIM_PROJECT_ROOT)
+                       + "/profiles/experiment/subobject-bvh-2026-06-16/combine_bench.csv";
+#else
+        cfg.outCsvPath = "profiles/experiment/subobject-bvh-2026-06-16/combine_bench.csv";
+#endif
+        return runSubObjectBench(cfg);
+    }
     if (argc > 1 && std::string(argv[1]) == "--bench-bvh-build") {
         BuildBenchConfig cfg;
         cfg.cases = {BVHBuildCase::RefitWithRebuild,
@@ -16684,6 +17132,24 @@ int main(int argc, char** argv) {
                           ? "on (segmented per-TG)"
                           : "off (baseline atomicAdd)")
                       << "\n";
+        } else if(key == GLFW_KEY_B && action == GLFW_PRESS) {
+            // Sub-object (multi-root) LBVH A/B toggle — Phase 1 divergence
+            // experiment. Square-cloth triangle BVHs only; others fall back.
+            // WARNING: query traversal is single-root (Phase 2 pending), so
+            // intra-cloth self-collision is INCOMPLETE while this is on —
+            // measurement mode for build/refit combine timing.
+            auto& bp = simulator->collisionPipeline.broadPhase;
+            bp.useSubObjectBVH = !bp.useSubObjectBVH;
+            bp.validateSubObject = bp.useSubObjectBVH;
+            std::cout << "[main] useSubObjectBVH = "
+                      << (bp.useSubObjectBVH ? "on (multi-root)" : "off (single-root)")
+                      << " s=" << bp.subBvhSplitS
+                      << " (groups compact <= Q^2; see [SubObjectBVH] log)\n";
+        } else if(key == GLFW_KEY_N && action == GLFW_PRESS) {
+            // Cycle the sub-object split parameter s in [1,16].
+            auto& bp = simulator->collisionPipeline.broadPhase;
+            bp.subBvhSplitS = (bp.subBvhSplitS % 16) + 1;
+            std::cout << "[main] subBvhSplitS = " << bp.subBvhSplitS << "\n";
         }
         // NOTE: ESC-deselect is handled in the early block above
         // (before the WantCaptureKeyboard guard), not here — see the
