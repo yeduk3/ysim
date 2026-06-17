@@ -5268,6 +5268,14 @@ struct BVH<BE, PR, BVHMODE::LINEAR, PRIMITIVE> {
     // loops skip this object's per-leaf AABB recompute (the AABB can't move).
     // Live-updated by the inspector static toggle, same pattern as objBehavior.
     bool objStatic = false;
+    // One-time correctness guard for the static fast-path. build()/refit() use
+    // the GPU bottom-up combine, which can leave a LARGE tree incompletely
+    // combined (root AABB minY=0 vs true geometry); the per-substep CPU enlarge
+    // normally masks this. A static mesh skips that enlarge, so the BroadPhase
+    // loops run ONE CPU re-combine (combineStaticOnce) the first time they see
+    // an uncombined static tree, then freeze. Reset on rebuild / when the mesh
+    // goes dynamic again so a re-declared static mesh re-corrects.
+    bool staticCombined = false;
     BehaviorType objBehavior;
     VectorBase<METAL, BehaviorType> objBehaviors;
     ShapeType objShape;
@@ -6076,6 +6084,7 @@ struct BVH<BE, PR, BVHMODE::LINEAR, PRIMITIVE> {
             velocities = mesh->state.v;
             objBehavior = mesh->behaviorType;
             objStatic = mesh->isStatic;
+            staticCombined = false;   // fresh GPU-combined tree → needs one CPU correction if static
             builtForLifetimeId = mesh->lifetimeId;  // D-026
             // Slice (c-2): cache the authored primitive type so the broad
             // phase can recognize spheres and route them to the analytic
@@ -6455,15 +6464,26 @@ struct BVH<BE, PR, BVHMODE::LINEAR, PRIMITIVE> {
         if (subObjectActive() && groupOfPrim.size == numPrimitives) {
             buildLeafGroupedGPU();
             bottomUpBoxesMultiRootGPU(sceneBox);
-            MetalGlobalContext::commitAndWait();
-            topCombineCPU();   // Phase 2b: refresh mini-TLAS AABBs
+            // No commitAndWait / topCombineCPU — only the GPU multi-root combine
+            // is dispatched. The caller batches ONE commitAndWait then calls
+            // topCombineCPU for grouped trees (see BroadPhase::refit), matching the
+            // non-grouped path and enlargeTrajectory's grouped externalization.
+            // Batching this sync cut refit ~13% / frame ~19% (vs the old inline)
+            // on the sub-object scene.
             return;
         }
 
         buildLeafGPU();
         // Pure-GPU walk-to-root. build() 의 같은 swap 참고.
         bottomUpBoxesGPU(sceneBox);
-        MetalGlobalContext::commitAndWait();
+        // NOTE: no commitAndWait here. The leaf+combine are GPU-only and the
+        // result is read later (the TLAS reads each root AABB on the CPU). The
+        // sync is the CALLER's responsibility — it batches ONE commitAndWait
+        // after dispatching every object's refit, so N objects share a single
+        // GPU round-trip instead of paying N per-substep syncs. Any caller that
+        // reads this tree on the CPU (objectRootAABB, the CPU enlarge leaf loop,
+        // a timing bench) must commitAndWait first. The grouped path above keeps
+        // its own commit because topCombineCPU reads the GPU group-roots inline.
     }
 
     void enlargeTrajectory(PR dt) {
@@ -6493,8 +6513,9 @@ struct BVH<BE, PR, BVHMODE::LINEAR, PRIMITIVE> {
                 enlargeLeafGPU(dt);
                 bottomUpBoxesGPU(sceneBox);
             }
-            MetalGlobalContext::commitAndWait();
-            if (grouped) topCombineCPU();   // Phase 2b
+            // No commitAndWait / topCombineCPU here — the GPU combine is only
+            // dispatched. The caller batches ONE commitAndWait, then calls
+            // topCombineCPU for grouped trees (see BroadPhase::enlargeTrajectory).
             return;
         }
 
@@ -6519,8 +6540,11 @@ struct BVH<BE, PR, BVHMODE::LINEAR, PRIMITIVE> {
             }
             AABB4 sceneBox; sceneBox.i0 = numPrimitives;
             bottomUpBoxesMultiRootGPU(sceneBox);
-            MetalGlobalContext::commitAndWait();
-            topCombineCPU();   // Phase 2b: refresh mini-TLAS AABBs
+            // No commitAndWait / topCombineCPU here — only the GPU multi-root
+            // combine is dispatched. The caller batches ONE commitAndWait then
+            // calls topCombineCPU (see BroadPhase::enlargeTrajectory). This is
+            // the per-substep sync that made sub-object enlarge +67%; batching it
+            // cut frame time ~11% (vs the old inline sync) on the sub-object scene.
             return;
         }
         for(Index i = 0; i < numPrimitives; ++i) {
@@ -6537,7 +6561,23 @@ struct BVH<BE, PR, BVHMODE::LINEAR, PRIMITIVE> {
         }
         bottomUpCombine();
     }
-    
+
+    // One-time CPU re-combine for a static tree (see `staticCombined`). build()
+    // and refit() combine the tree on the GPU (`bottomUpBoxesGPU`), which can
+    // leave a large tree incompletely combined — root AABB minY pinned at the
+    // init 0 instead of the true geometry, so the broad-phase traversal prunes
+    // wrong and under-detects contacts (cloth tunnels through a static collider).
+    // The per-substep CPU enlarge masks this for dynamic meshes; a static mesh
+    // skips it, so correct the tree ONCE here on the CPU, then it stays frozen.
+    // Reuses enlargeTrajectory's CPU bottom-up combine (dt=0 ⇒ pure re-combine,
+    // velocity term vanishes — a static mesh has zero velocity anyway). A leading
+    // sync makes the GPU-written leaf AABBs visible to the CPU combine.
+    void combineStaticOnce() {
+        if (primitives.size/PRIMITIVE == 0) return;
+        MetalGlobalContext::commitAndWait();
+        enlargeTrajectory(0);
+    }
+
     void queryAABB(const AABB4& queryBox, const BVHNode& node) {
         if(! node.aabb.intersect(queryBox)) return;
 
@@ -6998,6 +7038,11 @@ struct BVH<BE, PR, BVHMODE::SCENE, BVHPRIMITIVE::OBJECT> {
             build(sceneRef);
             return;
         }
+        // Pass 1 — dispatch each dynamic object's refit (GPU leaf+combine, no
+        // per-object sync now that refit() doesn't commit) so all objects'
+        // GPU work is in flight, then a SINGLE commitAndWait below batches the
+        // N round-trips into one. Static objects reuse the cached tree (one CPU
+        // correction via combineStaticOnce, which syncs itself).
         for(Index i = 0; i < objTrees.size(); ++i) {
             // Static 메시는 리프 AABB가 불변 → 무거운 GPU refit을 건너뛰고
             // build() 때 쓴 캐시 트리/positions를 그대로 재사용한다. TLAS
@@ -7007,10 +7052,27 @@ struct BVH<BE, PR, BVHMODE::SCENE, BVHPRIMITIVE::OBJECT> {
                 objTrees[i].useSubObjectBVH = useSubObjectBVH;
                 objTrees[i].subBvhSplitS = subBvhSplitS;
                 objTrees[i].refit();
+                objTrees[i].staticCombined = false;  // dynamic frame re-breaks the GPU combine
+            } else if (!objTrees[i].staticCombined) {
+                // Static skip is unsafe until the GPU-built tree is corrected
+                // once on the CPU (else the broad phase under-detects and the
+                // cloth tunnels through this collider). Correct once, then skip.
+                objTrees[i].combineStaticOnce();
+                objTrees[i].staticCombined = true;
             }
-            //std::cout << "[objTree root before scene build] id " << i
-            //  << " min=" << objTrees[i].tree[0].min
-            //  << " max=" << objTrees[i].tree[0].max << std::endl;
+        }
+        // External sync (moved out of refit()): make every dispatched leaf+combine
+        // visible before the CPU reads each object root AABB below. ONE round-trip
+        // for all dynamic objects — measured ~34% faster than the old per-object
+        // commit (refit 58.9→38.9 ms, frame 190→169 ms on the static-Human scene),
+        // even with a single dynamic mesh. (Grouped/static objects sync inline.)
+        MetalGlobalContext::commitAndWait();
+        // Pass 2 — grouped trees finalize their mini-TLAS on the CPU (the GPU
+        // group roots are visible after the batched sync), then read each object's
+        // now-synced root AABB into the TLAS input.
+        for(Index i = 0; i < objTrees.size(); ++i) {
+            if (!objTrees[i].objStatic && objTrees[i].subObjectActive())
+                objTrees[i].topCombineCPU();
             Index pbase = i*6;
             AABB4 objBox = objTrees[i].objectRootAABB();
             positions[pbase  ] = objBox.min.x;
@@ -7032,6 +7094,12 @@ struct BVH<BE, PR, BVHMODE::SCENE, BVHPRIMITIVE::OBJECT> {
     }
 
     void enlargeTrajectory(PR dt) {
+        // Pass 1 — dispatch each dynamic object's enlarge. Grouped (sub-object)
+        // and the opt-in GPU path only DISPATCH a GPU combine now (no inline
+        // commit/topCombine — that per-substep sync is what made sub-object
+        // enlarge +67%); the regular path is pure CPU and needs no sync at all.
+        static const bool gpuEnlarge = std::getenv("YSIM_GPU_ENLARGE") != nullptr;
+        bool needSync = gpuEnlarge;   // GPU path syncs even when non-grouped
         for(Index i = 0; i < objTrees.size(); ++i) {
             // Static 메시는 속도 0 → 궤적 확장이 no-op이므로 GPU dispatch 생략.
             if (!objTrees[i].objStatic) {
@@ -7039,7 +7107,22 @@ struct BVH<BE, PR, BVHMODE::SCENE, BVHPRIMITIVE::OBJECT> {
                 objTrees[i].useSubObjectBVH = useSubObjectBVH;
                 objTrees[i].subBvhSplitS = subBvhSplitS;
                 objTrees[i].enlargeTrajectory(dt);
+                needSync |= objTrees[i].subObjectActive();   // grouped → GPU combine pending
+                objTrees[i].staticCombined = false;
+            } else if (!objTrees[i].staticCombined) {
+                objTrees[i].combineStaticOnce();   // one-time CPU correction (see refit())
+                objTrees[i].staticCombined = true;
             }
+        }
+        // External sync (moved out of enlargeTrajectory): one round-trip for all
+        // dispatched grouped/GPU combines. Skipped entirely when every dynamic
+        // object took the pure-CPU path → the regular scene pays NO new sync.
+        if (needSync) MetalGlobalContext::commitAndWait();
+        // Pass 2 — grouped trees finalize their mini-TLAS on the CPU (now that the
+        // GPU group roots are visible), then read each root AABB into the TLAS.
+        for(Index i = 0; i < objTrees.size(); ++i) {
+            if (!objTrees[i].objStatic && objTrees[i].subObjectActive())
+                objTrees[i].topCombineCPU();
             Index pbase = i*6;
             AABB4 objBox = objTrees[i].objectRootAABB();
             positions[pbase  ] = objBox.min.x;
@@ -7079,8 +7162,15 @@ struct BVH<BE, PR, BVHMODE::SCENE, BVHPRIMITIVE::OBJECT> {
                     objTrees[i].refitSwept(dt);
                 } else {
                     objTrees[i].refit();
+                    // refit() no longer commits; enlargeTrajectory's CPU leaf
+                    // loop reads the GPU-written leaf AABBs, so sync between.
+                    MetalGlobalContext::commitAndWait();
                     objTrees[i].enlargeTrajectory(dt);
                 }
+                objTrees[i].staticCombined = false;
+            } else if (!objTrees[i].staticCombined) {
+                objTrees[i].combineStaticOnce();   // one-time CPU correction (see refit())
+                objTrees[i].staticCombined = true;
             }
             Index pbase = i*6;
             AABB4 objBox = objTrees[i].objectRootAABB();
@@ -11735,9 +11825,14 @@ static int runSubObjectBench(const SubObjectBenchConfig& cfg) {
             return msSince(a, b) / cfg.reps * 1000.0;             // µs/rep
         };
         auto e2eRefit = [&]() -> double {
-            t.refit();                                            // warm
+            // refit() no longer commits; this bench measures e2e refit INCLUDING
+            // the per-call sync floor, so commit after each call here.
+            t.refit(); MetalGlobalContext::commitAndWait();       // warm
             auto a = Clock::now();
-            for (int r = 0; r < cfg.refitReps; ++r) t.refit();    // each commits
+            for (int r = 0; r < cfg.refitReps; ++r) {
+                t.refit();
+                MetalGlobalContext::commitAndWait();              // e2e incl sync
+            }
             auto b = Clock::now();
             return msSince(a, b) / cfg.refitReps;
         };
