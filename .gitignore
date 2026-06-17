@@ -5,6 +5,7 @@ buildxc/
 compile_commands.json
 
 .DS_Store
+imgui.ini
 
 codex/
 profiles/
