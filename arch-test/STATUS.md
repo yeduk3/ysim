@@ -43,7 +43,11 @@ cmake --build build
 | Scene (정적 기술 + realize) | core/Scene.hpp | **REAL 구조** / grid·ground 지오메트리 CPU 시드 REAL / **topology(facets/adjacency) pack DEFERRED**, FileMesh(OBJ) 로드 DEFERRED |
 | IBVH 인터페이스 + BVHFactory(per-part cpu/gpu) | collision/IBVH.hpp, BVHFactory.hpp | **REAL 인터페이스 + config 골격**; Karras12만 생성, 나머지 throw |
 | Karras12BVH concrete | collision/Karras12BVH.hpp, AABB4.hpp, RadixSorter.hpp | **REAL** build/refit GPU (fillMortons→radix→buildTree→bottomUpBoxes); tree 검증(root AABB encloses, 2N-1 nodes). detectCollisions/queryPoints는 narrow 단계 |
-| Scene topology (facets/edges/CSR/restLen) | core/Topology.hpp | **REAL** (grid 삼각화 + adjacency, facets=4802 검증) |
+| Scene topology (facets/edges/CSR/restLen) | core/Topology.hpp | **REAL** (grid 삼각화 + adjacency; buildFacetsOnly for colliders) |
+| OBJ 로더 (Human.obj) | mesh/ObjLoader.hpp | **REAL** (24461 verts/48918 tris, scale+origin) |
+| SceneBVH TLAS (cross-mesh broad) | collision/SceneBVH.hpp, BroadBuffers.hpp | **REAL** per-mesh BLAS + obj cull + queryPoints → BroadCollision pairs |
+| Narrow phase (BruteForce<METAL>) | collision/DefaultCDPipeline.hpp | **REAL** narrow_pt_tri + CPU counting sort → vertColFacets |
+| **충돌 drape (전체 default scene)** | (통합) | **REAL**: cloth가 Human.obj에 drape (clothY 1.25→0.48, broad 66k/narrow 549, coherent) |
 | ICDPipeline + DefaultCDPipeline | collision/ICDPipeline.hpp, DefaultCDPipeline.hpp | **REAL seam**; narrow PLACEHOLDER, ccd no-op(D-A1) |
 | ISystem 인터페이스 | system/ISystem.hpp | **REAL** |
 | ExplicitSystem<METAL> | system/ExplicitSystem.hpp, KernelParams.hpp | **REAL** GPU 2-pass: compute_tri_spring_forces + integrate_cloth(접촉 융합); anomaly guard. CPU 템플릿은 free-fall 참조 |
@@ -59,20 +63,20 @@ PLACEHOLDER = 컴파일/실행되지만 실제 GPU 물리/충돌 미구현(seam�
 
 ## 다음 포팅 (재 리팩토링 우선순위)
 DONE: backend, core, spine, **N-Simulator(allocator)**, **LUT**, **Scene topology pack**,
-**karras12 LBVH build/refit(GPU)**, **ExplicitSystem GPU 2-pass(springs+integrate)**.
-이제 cloth는 진짜 스프링으로 결속되어 GPU에서 적분됨(접촉 슬롯은 빈 버퍼=무해).
+**karras12 LBVH(GPU)**, **ExplicitSystem GPU 2-pass(springs)**, **OBJ 로더**,
+**SceneBVH TLAS(cross-mesh broad)**, **narrow phase**, **A-full 충돌 drape**.
+→ 전체 default scene이 새 엔진에서 end-to-end 동작: cloth가 karras12 broad+narrow+springs+
+  recovery로 Human.obj에 drape (headless, N-Simulator, build green). **최소 목표 + A-full 달성.**
 
-남은 — A: 진짜 충돌 (= cloth가 ground/human에 drape). 이게 가장 큰 청크:
-1. **충돌 대상 삼각형 필요** — 현재 topology는 GridCloth만. ground(quad→2 facets) topology 추가,
-   human은 OBJ 로드(아래 4) 또는 임시 skip. 대상 삼각형 없으면 cloth는 자기충돌만 가능.
-2. **per-mesh BVH + cross-mesh query (TLAS)** — Karras12BVH는 현재 cloth 1개 트리만.
-   cloth verts ↔ ground/human 트리 질의 필요(BVH<SCENE,OBJECT> TLAS, main.cpp 6935-7361) 또는
-   직접 cloth-vs-target 질의. queryPoints + enlargeTrajectory(swept) (main.cpp 6678-6934 + bvh.metal).
-3. **BruteForce<METAL> narrow** — narrow_pt_tri + per-vertex counting sort → SimState.vertColFacets
-   (main.cpp 7393-7681). DefaultCDPipeline.dcd에 연결. integrate가 이미 이 버퍼 읽음(B에서 배선됨).
-4. **FileMesh(OBJ) 로드** — Human.obj (Float collider). assimp 불필요, OBJ 로더로.
-5. 그 다음 concretes: Apetrei / SubObject / SpatialHashing / MultiLevelSH (BVHFactory에 추가).
-6. 결정됐으나 미구현: DCD/CCD 분리(O5), detect=3스텝(O7), OpenGL+LUT renderer(O3), GUI 에디터(O8).
+남은 (polish / 확장):
+1. **swept CCD 분리(O5)** — narrow_pt_tri는 xPrev swept(needsXPrev). 별도 ccd 패스로 분리(셰이더).
+2. **detect = 3 독립 스텝(O7)** — 현재 detectCollisions 안에 broad 묶임. broad/candidate/narrow 노출.
+3. **OpenGL renderer + LUT 피드(O3)** — GUI 단계. SimState.x 핸들 LUT로.
+4. **GUI 에디터(O8)** — add*/translate/rotate/scale CPU 큐.
+5. **다른 BVH concretes** — Apetrei / SubObject / SpatialHashing / MultiLevelSH (BVHFactory에).
+6. **per-part cpu/gpu 실구현(C6)** — 현재 BVHPartConfig는 골격(GPU만). CPU build/sort/combine 실연결.
+7. **정리**: "[Pool] Tried to allocate more than tha capacity" 로그는 양성(pool auto-grow 신호)이나
+   오해 소지 — 메시지 정리. clangd unused-include 경고(양성).
 
 결정됐으나 미구현 (REFACTOR_REVIEW.md 2차):
 - **DCD/CCD 분리**(O5) — swept 테스트를 별도 ccd 패스로(셰이더 작업). 4번 narrow와 함께.
