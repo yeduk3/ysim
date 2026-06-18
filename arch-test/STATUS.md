@@ -46,31 +46,45 @@ cmake --build build
 | ICDPipeline + DefaultCDPipeline | collision/ICDPipeline.hpp, DefaultCDPipeline.hpp | **REAL seam**; narrow PLACEHOLDER, ccd no-op(D-A1) |
 | ISystem 인터페이스 | system/ISystem.hpp | **REAL** |
 | ExplicitSystem | system/ExplicitSystem.hpp | **PLACEHOLDER integrate** (CPU semi-implicit Euler free-fall, 스프링/접촉 없음) |
-| Simulator (hub) | sim/Simulator.hpp | **REAL** (generic, virtual cd/sys 보유, substep 루프, frame당 1 commit) |
+| Simulator (hub) | sim/Simulator.hpp | **REAL** (generic, virtual cd/sys 보유, substep 루프, frame당 1 commit, owns pool+LUT) |
 | setupBasicScene | scenes/basic_scene.hpp | **REAL** (id 0/1/2 레시피 정확) |
-| Runner | runner/Runner.hpp | **REAL** (headless 구동 + 검증) |
+| Runner | runner/Runner.hpp | **REAL** (headless run() + runMulti() N-sim demo) |
+| **N-Simulator (per-sim allocator)** | backend/MemoryPool.hpp, sim/Simulator.hpp | **REAL** (O2): GlobalAutoAllocator active-pool swap; 2 sims coexist 검증 (sim0 buffers valid after sim1) |
+| **LUT 런타임 데이터버스** | core/LUT.hpp | **REAL** (O1): typed name→handle dict + type_index + UpdatePolicy; Simulator.publish() 바인딩 |
 
 PLACEHOLDER = 컴파일/실행되지만 실제 GPU 물리/충돌 미구현(seam만 입증).
 각 PLACEHOLDER 파일에 포팅 출처(main.cpp 라인)를 1줄 `ponytail:` 주석으로 남김.
 
 ## 다음 포팅 (재 리팩토링 우선순위)
-의존성 순서 = backend(완) → core(완) → **아래부터**:
+DONE: backend, core, spine, **N-Simulator 토대(allocator instancing)**, **LUT**.
+이제 실제 GPU 컴퓨트 포팅 — 의존성 순서:
 1. **Scene topology pack** — MeshGridInitializer 삼각화 + MeshAdjacency(edges/CSR/restLengths)
-   를 GPU 버퍼로 pack (main.cpp 1180-1391, 856-1171, 2771-3462). karras12·스프링의 선결.
-2. **Karras12BVH GPU body** — fillMortons→radixSort→buildTree→bottomUpBoxes→queryPoints
+   를 GPU 버퍼로 pack (main.cpp 1180-1391, 856-1171, 2771-3462). karras12·스프링의 선결. ← **다음**
+2. **ExplicitSystem GPU 2-pass** — compute_tri_spring_forces + integrate_cloth(접촉 융합)
+   (main.cpp 11172-11389 + physics.metal). behavior setBuffer 테이블. → 진짜 cloth 거동.
+3. **Karras12BVH GPU body** — fillMortons→radixSort→buildTree→bottomUpBoxes→queryPoints
    (main.cpp 5101-6934 + bvh.metal). RadixSorter, AABB4 동반. BVH_VERSIONS.md §4.
-3. **BruteForce<METAL> narrow** — narrow_pt_tri + per-vertex counting sort → vertColFacets
+4. **BruteForce<METAL> narrow** — narrow_pt_tri + per-vertex counting sort → vertColFacets
    (main.cpp 7393-7681). DefaultCDPipeline.dcd에 연결.
-4. **ExplicitSystem GPU 2-pass** — compute_tri_spring_forces + integrate_cloth(접촉 융합)
-   (main.cpp 11172-11389 + physics.metal). behavior setBuffer 테이블.
 5. **FileMesh(OBJ) 로드** — Human.obj (Float collider). assimp 불필요, OBJ 로더로.
 6. 그 다음 concretes: Apetrei / SubObject / SpatialHashing / MultiLevelSH (BVHFactory에 추가).
 
-## 보류된 모호 결정
-DECISIONS.md (2)절 A1–A12 그대로 — LUT 버스, render-split(IRenderer), loadFromConfig,
-ConstraintSet 통합, Profiler 레벨, CUDA, hot-loop virtual-vs-template, Simulator GL carve
-범위, DCD/CCD 분리, GlobalAutoAllocator 인스턴스화, detectCollisions surface 통일,
-Kinematic 분리. 미구현, 문서화만.
+결정됐으나 미구현 (REFACTOR_REVIEW.md 2차):
+- **DCD/CCD 분리**(O5) — swept 테스트를 별도 ccd 패스로(셰이더 작업). 4번 narrow와 함께.
+- **detect = 3 독립 스텝**(O7) — broad/candidate/narrow를 ICDPipeline에 분리 노출. 3·4와 함께.
+- **OpenGL renderer + LUT 피드**(O3) — GUI 붙일 때. headless 동안 보류.
+- **GUI 에디터 CPU 큐**(O8) — add*/translate/rotate/scale CPU 부분 유지. GUI 단계에서.
+
+## 보류/해소된 모호 결정
+- **해소(REFACTOR_REVIEW.md 2차)**: LUT(O1,구현), N-Simulator(O2,구현), renderer=OpenGL+LUT(O3),
+  pin/coincidence/contact 셋 다 유지(O4), DCD/CCD 분리(O5), loadFromConfig 폐기→setup(O6),
+  detect=3스텝(O7), GUI 에디터 유지(O8).
+- **여전히 보류**: Profiler 레벨, CUDA backend, hot-loop virtual-vs-template(실측 후), Kinematic 분리.
+
+## 알려진 함정 (verify 지적)
+- LUT "pos"/"vel"/"nrm"는 버퍼 ptr **값**을 bind → SimState realloc/rebuild 시 stale.
+  현재는 publish()가 initialize() 끝에 재호출돼 안전(rebuild 경로 없음). **rebuild 추가 시 publish() 재호출 필수**.
+- runMulti() distinct 판정이 float `==` — 데모용. 두 config가 근접하면 취약.
 
 ## 참고
 - `arch-test/src/*.hpp` 루트의 빈 스케치 파일(BVHFactory/Scene/Simulator/SceneBuilder 등)은
