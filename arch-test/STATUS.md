@@ -46,7 +46,8 @@ cmake --build build
 | Scene topology (facets/edges/CSR/restLen) | core/Topology.hpp | **REAL** (grid 삼각화 + adjacency, facets=4802 검증) |
 | ICDPipeline + DefaultCDPipeline | collision/ICDPipeline.hpp, DefaultCDPipeline.hpp | **REAL seam**; narrow PLACEHOLDER, ccd no-op(D-A1) |
 | ISystem 인터페이스 | system/ISystem.hpp | **REAL** |
-| ExplicitSystem | system/ExplicitSystem.hpp | **PLACEHOLDER integrate** (CPU semi-implicit Euler free-fall, 스프링/접촉 없음) |
+| ExplicitSystem<METAL> | system/ExplicitSystem.hpp, KernelParams.hpp | **REAL** GPU 2-pass: compute_tri_spring_forces + integrate_cloth(접촉 융합); anomaly guard. CPU 템플릿은 free-fall 참조 |
+| 통합 prereqs | core/SimState.hpp | **REAL** fixedParticles(pin)/빈 contact 버퍼/statesOffsetsGPU; Scene jiggle |
 | Simulator (hub) | sim/Simulator.hpp | **REAL** (generic, virtual cd/sys 보유, substep 루프, frame당 1 commit, owns pool+LUT) |
 | setupBasicScene | scenes/basic_scene.hpp | **REAL** (id 0/1/2 레시피 정확) |
 | Runner | runner/Runner.hpp | **REAL** (headless run() + runMulti() N-sim demo) |
@@ -57,19 +58,21 @@ PLACEHOLDER = 컴파일/실행되지만 실제 GPU 물리/충돌 미구현(seam�
 각 PLACEHOLDER 파일에 포팅 출처(main.cpp 라인)를 1줄 `ponytail:` 주석으로 남김.
 
 ## 다음 포팅 (재 리팩토링 우선순위)
-DONE: backend, core, spine, **N-Simulator 토대(allocator instancing)**, **LUT**,
-**Scene topology pack**, **karras12 LBVH build/refit(GPU)**.
-남은 GPU 컴퓨트 포팅 — 의존성 순서:
-1. **BVH detectCollisions/queryPoints** — broad pair 생성(queryPoints + enlargeTrajectory/swept).
-   (main.cpp 6678-6934 + bvh.metal queryPoints). enlargeLeaf_Tri PSO는 이미 로드됨(state.v 배선 필요).
-2. **BruteForce<METAL> narrow** — narrow_pt_tri + per-vertex counting sort → vertColFacets
-   (main.cpp 7393-7681). DefaultCDPipeline.dcd에 연결. 1과 함께 = 진짜 충돌검출.
-3. **ExplicitSystem GPU 2-pass** — compute_tri_spring_forces + integrate_cloth(접촉 융합)
-   (main.cpp 11172-11389 + physics.metal). behavior setBuffer 테이블. → 진짜 cloth 거동 + drape.
-   (fixedParticles pin 버퍼 + 빈 vertColFacets 슬롯 필요.)
+DONE: backend, core, spine, **N-Simulator(allocator)**, **LUT**, **Scene topology pack**,
+**karras12 LBVH build/refit(GPU)**, **ExplicitSystem GPU 2-pass(springs+integrate)**.
+이제 cloth는 진짜 스프링으로 결속되어 GPU에서 적분됨(접촉 슬롯은 빈 버퍼=무해).
+
+남은 — A: 진짜 충돌 (= cloth가 ground/human에 drape). 이게 가장 큰 청크:
+1. **충돌 대상 삼각형 필요** — 현재 topology는 GridCloth만. ground(quad→2 facets) topology 추가,
+   human은 OBJ 로드(아래 4) 또는 임시 skip. 대상 삼각형 없으면 cloth는 자기충돌만 가능.
+2. **per-mesh BVH + cross-mesh query (TLAS)** — Karras12BVH는 현재 cloth 1개 트리만.
+   cloth verts ↔ ground/human 트리 질의 필요(BVH<SCENE,OBJECT> TLAS, main.cpp 6935-7361) 또는
+   직접 cloth-vs-target 질의. queryPoints + enlargeTrajectory(swept) (main.cpp 6678-6934 + bvh.metal).
+3. **BruteForce<METAL> narrow** — narrow_pt_tri + per-vertex counting sort → SimState.vertColFacets
+   (main.cpp 7393-7681). DefaultCDPipeline.dcd에 연결. integrate가 이미 이 버퍼 읽음(B에서 배선됨).
 4. **FileMesh(OBJ) 로드** — Human.obj (Float collider). assimp 불필요, OBJ 로더로.
 5. 그 다음 concretes: Apetrei / SubObject / SpatialHashing / MultiLevelSH (BVHFactory에 추가).
-6. 결정됐으나 미구현: DCD/CCD 분리(O5, 1·2와), detect=3스텝(O7), OpenGL+LUT renderer(O3), GUI 에디터(O8).
+6. 결정됐으나 미구현: DCD/CCD 분리(O5), detect=3스텝(O7), OpenGL+LUT renderer(O3), GUI 에디터(O8).
 
 결정됐으나 미구현 (REFACTOR_REVIEW.md 2차):
 - **DCD/CCD 분리**(O5) — swept 테스트를 별도 ccd 패스로(셰이더 작업). 4번 narrow와 함께.
