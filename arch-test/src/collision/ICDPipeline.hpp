@@ -17,4 +17,8 @@ struct ICDPipeline {
     // x under deferred kernels anyway; xPrev is unused with no CCD). When CCD
     // lands this becomes a GPU copy kernel, NOT a CPU loop. (design §6)
     virtual bool needsXPrev() const { return false; }
+    // Broad pairs from the most recent dcd (verification). 0 if no broad phase.
+    virtual uint32_t lastBroadPairCount() const { return 0u; }
+    // Narrow contacts from the most recent dcd (verification). 0 if no narrow.
+    virtual uint32_t lastNarrowContactCount() const { return 0u; }
 };

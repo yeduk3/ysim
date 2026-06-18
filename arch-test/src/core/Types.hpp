@@ -42,10 +42,22 @@ struct alignas(16) AnalyticShape {
     uint32_t shapeType, objId, behaviorType, flags;
 };
 
+// Host mirror of common_types.metalh NarrowParams (setBytes slot 9 of
+// narrow_pt_tri). 5 x 4B = 20B; field order/type byte-exact. skipSphere=0 in
+// arch (no analytic path) so sphere pairs flow through the triangle-soup test.
+struct NarrowParams {
+    uint32_t numBroadCollisions;   // thread domain = min(numBroad, maxCollisions)
+    uint32_t maxNumCollisions;     // overflow cap on the atomic append
+    float    radius;               // Simulator::radius (0.012)
+    float    thickness;            // cloth thickness — slow-touch band = radius+thickness
+    uint32_t skipSphere;           // 0 (no analytic path in arch)
+};
+
 static_assert(sizeof(IndexPair) == 8);
 static_assert(sizeof(BroadCollision) == 32);
 static_assert(sizeof(NarrowCollision) == 48);
 static_assert(sizeof(AnalyticShape) == 80);
+static_assert(sizeof(NarrowParams) == 20);
 
 struct FixedVertex { uint32_t vid; tinym::vec3 pos; };
 struct ReferencePointConstraint { IndexPair objPair, vertexPair; };

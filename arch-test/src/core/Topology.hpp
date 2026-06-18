@@ -41,6 +41,20 @@ struct MeshTopology {
     Index numEdges = 0;
     bool built = false;
 
+    // Float-collider topology: triangle facets ONLY (no spring adjacency).
+    // Used for FileMesh + Ground colliders — BVH leaf build and narrow_pt_tri
+    // read `facets` (mesh-local indices); edges/CSR/rest stay empty (no spring
+    // kernel runs over a Float mesh). Counterpart to build() — added, not
+    // widening build(), per the memory rule (creation verb = parallel symbol).
+    void buildFacetsOnly(const std::vector<Index>& localFacets) {
+        numFacets = (Index)(localFacets.size() / 3);
+        facets = VecI(numFacets * 3);
+        for (Index i = 0; i < numFacets * 3; ++i) facets[i] = localFacets[i];
+        numEdges = 0;
+        built = true;
+        assert(facets.size == numFacets * 3);
+    }
+
     // Triangulate an NxN alternating-diagonal grid + build spring adjacency.
     // Positions are already seeded into s.x by Scene::realize; rest lengths
     // are measured from them. `base` is the mesh's vertex offset.

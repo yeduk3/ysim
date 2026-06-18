@@ -4,11 +4,14 @@
 #include "core/BehaviorParams.hpp"
 #include "core/SimState.hpp"
 #include "core/Topology.hpp"
+#include "mesh/ObjLoader.hpp"   // GL-free OBJ load for FileMesh Float colliders
 
 #include "tinym.hpp"
 #include <string>
 #include <vector>
 #include <random>   // deterministic cloth jiggle (D-018)
+#include <unordered_map>
+#include <algorithm>   // std::max (packed-facet slab sizing)
 
 // Cloth params are sent to the spring/integrate kernels verbatim via setBytes;
 // lock the byte layout against physics.metal ClothParams (4 floats, DECISIONS C22).
@@ -47,6 +50,15 @@ struct Scene {
     std::vector<MeshTopology<BE, PR>> topology;  // index-aligned with objects
     SceneEnvironment environment;
 
+    // Scene-wide PACKED facet table (Stage 3 narrow prereq, Gap 1). narrow_pt_tri
+    // resolves a target triangle as packedFacets[tri + packedFacetsOffsets[tObjId]]
+    // with target-LOCAL vertex ids (resolved against statesOffsets[tObjId] at read
+    // time). packedFacets concatenates every object's mesh-local topology[i].facets
+    // (3 Index / tri); packedFacetsOffsets is in FACET units (cumulative numFacets,
+    // size objects+1). Built once in realize() after topology; whole-buffer binds.
+    VectorBase<BE, Index> packedFacets;          // sum(numFacets)*3, mesh-local ids
+    VectorBase<BE, Index> packedFacetsOffsets;   // objects+1, facet-unit prefix sum
+
     Index add(ObjectDesc d) {
         d.id = (Index)objects.size();
         objects.push_back(d);
@@ -58,13 +70,25 @@ struct Scene {
     // kinematic convention) so the integrator leaves them in place.
     void realize(SimState<BE, PR>& s) {
         statesOffsets.assign(objects.size() + 1, 0);
+        std::unordered_map<size_t, ObjMesh> objCache;   // FileMesh loads, by index
+
         Index total = 0;
         for (size_t i = 0; i < objects.size(); ++i) {
             auto& o = objects[i];
             switch (o.kind) {
-                case ObjectDesc::Kind::GridCloth: o.vertexCount = Index(o.gridN) * Index(o.gridN); break;
-                case ObjectDesc::Kind::Ground:    o.vertexCount = 4; break;
-                case ObjectDesc::Kind::FileMesh:  o.vertexCount = 0; break; // OBJ load deferred
+                case ObjectDesc::Kind::GridCloth:
+                    o.vertexCount = Index(o.gridN) * Index(o.gridN);
+                    break;
+                case ObjectDesc::Kind::Ground:
+                    o.vertexCount = 4;
+                    break;
+                case ObjectDesc::Kind::FileMesh: {
+                    // Load NOW so vertexCount is known before allocate (TASK).
+                    ObjMesh mesh = loadObjMesh(o.filePath, o.scale, o.origin);
+                    o.vertexCount = mesh.vertexCount;     // 0 on failure -> empty slot
+                    objCache.emplace(i, std::move(mesh));
+                    break;
+                }
             }
             statesOffsets[i] = total;
             total += o.vertexCount;
@@ -75,29 +99,70 @@ struct Scene {
         if (total == 0) return;
         s.realizeAux(statesOffsets);   // GPU mirror of statesOffsets (integrate slot 18)
 
-        bool isCloth = false;
         for (size_t i = 0; i < objects.size(); ++i) {
             auto& o = objects[i];
-            isCloth = (o.behavior == BehaviorType::TriangularCloth ||
-                       o.behavior == BehaviorType::FastGridCloth);
+            bool isCloth = (o.behavior == BehaviorType::TriangularCloth ||
+                            o.behavior == BehaviorType::FastGridCloth);
             Index base = statesOffsets[i];
-            seedGeometry(o, s, base, isCloth);
+            const ObjMesh* cached = nullptr;
+            if (auto it = objCache.find(i); it != objCache.end()) cached = &it->second;
+            seedGeometry(o, s, base, isCloth, cached);
         }
 
-        // Build triangle topology + spring adjacency for GridCloth meshes.
-        // Positions are seeded above; rest lengths are measured from them.
-        // Ground / FileMesh get an empty (built=false) slot — no consumer
-        // yet, and free-fall is unchanged (nothing reads topology this pass).
+        // Topology: GridCloth -> full spring build; Float colliders (Ground +
+        // FileMesh) -> facets-only build (BVH/narrow targets, no springs).
+        // Cloth's spring/BVH path is unchanged; the Float topologies sit ready
+        // for the later TLAS/narrow port (free-fall stays the same this pass —
+        // Karras12BVH still builds over topology[0] only).
         topology.assign(objects.size(), MeshTopology<BE, PR>{});
         for (size_t i = 0; i < objects.size(); ++i) {
             const auto& o = objects[i];
-            if (o.kind == ObjectDesc::Kind::GridCloth && o.gridN > 1)
+            if (o.kind == ObjectDesc::Kind::GridCloth && o.gridN > 1) {
                 topology[i].build(o.gridN, statesOffsets[i], s);
+            } else if (o.kind == ObjectDesc::Kind::Ground) {
+                topology[i].buildFacetsOnly(groundFacets());      // 2 triangles
+            } else if (o.kind == ObjectDesc::Kind::FileMesh) {
+                if (auto it = objCache.find(i);
+                    it != objCache.end() && it->second.ok)
+                    topology[i].buildFacetsOnly(it->second.facets);
+            }
+        }
+
+        buildPackedFacets();   // Gap 1: scene-wide packed facet table (narrow slot 5/6)
+    }
+
+    // Concatenate every object's mesh-local facets into the scene-wide packed
+    // table the narrow kernel binds at slots 5/6 (Gap 1). Offsets are in FACET
+    // units (the kernel does packedFacets[tri + packedFacetsOffsets[tObjId]]).
+    // Empty objects contribute 0 facets but still advance the prefix sum so the
+    // offset array stays index-aligned with objects[].
+    void buildPackedFacets() {
+        std::vector<Index> offsets(objects.size() + 1, 0);
+        Index totalFacets = 0;
+        for (size_t i = 0; i < objects.size(); ++i) {
+            offsets[i] = totalFacets;
+            totalFacets += topology[i].numFacets;
+        }
+        offsets[objects.size()] = totalFacets;
+
+        packedFacetsOffsets = VectorBase<BE, Index>(objects.size() + 1, Index(0));
+        for (size_t i = 0; i < offsets.size(); ++i) packedFacetsOffsets[i] = offsets[i];
+
+        // Always size >= 1 so the buffer is a valid pool allocation even with no
+        // collider facets (degenerate scene). Pack 3 mesh-local ids per triangle.
+        Index slabIdx = std::max<Index>(totalFacets * 3, 1);
+        packedFacets = VectorBase<BE, Index>(slabIdx, Index(0));
+        for (size_t i = 0; i < objects.size(); ++i) {
+            const auto& topo = topology[i];
+            Index base3 = offsets[i] * 3;
+            for (Index k = 0; k < topo.numFacets * 3; ++k)
+                packedFacets[base3 + k] = topo.facets.ptr[k];   // facets is const here
         }
     }
 
 private:
-    static void seedGeometry(const ObjectDesc& o, SimState<BE, PR>& s, Index base, bool isCloth) {
+    static void seedGeometry(const ObjectDesc& o, SimState<BE, PR>& s, Index base,
+                             bool isCloth, const ObjMesh* cached) {
         auto put = [&](Index v, PR px, PR py, PR pz) {
             s.x[(base + v) * 3 + 0] = px;
             s.x[(base + v) * 3 + 1] = py;
@@ -105,8 +170,8 @@ private:
             s.xPrev[(base + v) * 3 + 0] = px;
             s.xPrev[(base + v) * 3 + 1] = py;
             s.xPrev[(base + v) * 3 + 2] = pz;
-            // mass: deformable cloth participates; everything else fixed.
-            s.m[base + v] = isCloth ? PR(o.cloth.thickness > 0 ? 1 : 1) : PR(0);
+            // mass: deformable cloth participates; everything else fixed (m=0).
+            s.m[base + v] = isCloth ? PR(1) : PR(0);
         };
         if (o.kind == ObjectDesc::Kind::GridCloth) {
             int N = o.gridN;
@@ -139,6 +204,20 @@ private:
             put(1, PR(o.origin.x) + h, PR(o.origin.y), PR(o.origin.z) - h);
             put(2, PR(o.origin.x) - h, PR(o.origin.y), PR(o.origin.z) + h);
             put(3, PR(o.origin.x) + h, PR(o.origin.y), PR(o.origin.z) + h);
+        } else if (o.kind == ObjectDesc::Kind::FileMesh) {
+            if (!cached || !cached->ok) return;          // load failed -> nothing
+            for (Index v = 0; v < cached->vertexCount; ++v)
+                put(v, PR(cached->positions[v].x),
+                       PR(cached->positions[v].y),
+                       PR(cached->positions[v].z));
         }
+    }
+
+    // 4-vert XZ quad -> 2 triangles. v0=(-,-) v1=(+,-) v2=(-,+) v3=(+,+).
+    // Winding is irrelevant: narrow_pt_tri auto-orients the contact normal
+    // toward the query point (one-way Float collider). Matches the grid
+    // even-cell rule addFacet(p00,p01,p11)/addFacet(p00,p11,p10).
+    static std::vector<Index> groundFacets() {
+        return { 0, 2, 3,   0, 3, 1 };
     }
 };
