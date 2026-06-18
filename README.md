@@ -4,14 +4,11 @@ A macOS physics simulation engine for **cloth dynamics** and **rigid bodies** wi
 
 ## Demo
 
-<!-- DEMO-VIDEO-SLOT: replace the line below with the recorded gif once available -->
 <p align="center">
   <img src="media/demo.gif" alt="ysim cloth simulation demo" width="720">
   <br>
-  <em>Cloth draping over an imported mesh — real-time GPU simulation.</em>
+  <em>Scene #1 — cloth draping in real time, driven by the GPU sim.</em>
 </p>
-
-> _Demo clip pending — drop `media/demo.gif` here._
 
 ## Highlights
 
