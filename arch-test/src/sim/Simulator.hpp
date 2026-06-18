@@ -83,9 +83,15 @@ struct Simulator {
     void step() {
         GlobalAutoAllocator<BE>::setActive(&pool);  // BVH dcd may allocate scratch (real port)
         PR dt = h / PR(subSteps);
+        const bool snapXPrev = cdPipeline->needsXPrev();  // design §6: skip w/o CCD
         for (int sub = 0; sub < subSteps; ++sub) {
             cdPipeline->dcd(scene, state, margin);
-            for (Index i = 0; i < state.numPoints * 3; ++i) state.xPrev[i] = state.x[i];
+            // xPrev snapshot only when CCD consumes it. Under GPU kernels the
+            // CPU x read would be a frame stale (writes deferred to the per-frame
+            // commit); xPrev is unused with no CCD. When CCD lands this becomes a
+            // GPU copy_xprev dispatch inside the encoder, not a CPU loop.
+            if (snapXPrev)
+                for (Index i = 0; i < state.numPoints * 3; ++i) state.xPrev[i] = state.x[i];
             system->accumulate(scene, state);
             system->integration(state, dt);
             system->recoveryPenetration(state);

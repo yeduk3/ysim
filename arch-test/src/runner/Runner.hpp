@@ -75,8 +75,40 @@ struct Runner {
                   << " clothY " << y0 << " -> " << y1
                   << " finite=" << (finite ? "yes" : "no") << "\n";
 
+        // Edge-coherence: |len-rest|/rest over all unique cloth(id0) edges.
+        // Proves the sheet fell as a COHERENT sheet (springs working), not as
+        // independent free-falling points (which would also drop y). A working
+        // stiff solver keeps edges tight; an exploding one yields huge/NaN.
+        PR maxStretch = 0, meanStretch = 0;
+        uint32_t anomaly = sim.system ? sim.system->anomaly() : 0u;
+        bool stretchFinite = true;
+        if (!sim.scene.topology.empty() && sim.scene.topology[0].built && pos) {
+            const auto& t = sim.scene.topology[0];
+            Index base = sim.scene.statesOffsets.empty() ? 0 : sim.scene.statesOffsets[0];
+            PR sum = 0;
+            for (Index e = 0; e < t.numEdges; ++e) {
+                Index a = t.edges.ptr[e * 2], b = t.edges.ptr[e * 2 + 1];
+                const Precision* pa = pos + (base + a) * 3;
+                const Precision* pb = pos + (base + b) * 3;
+                PR dx = pb[0] - pa[0], dy = pb[1] - pa[1], dz = pb[2] - pa[2];
+                PR len = std::sqrt(dx * dx + dy * dy + dz * dz);
+                PR rest = t.restEdgeLengths.ptr[e];
+                if (!std::isfinite((double)len)) { stretchFinite = false; break; }
+                PR st = (rest > PR(0)) ? std::abs(len - rest) / rest : PR(0);
+                if (st > maxStretch) maxStretch = st;
+                sum += st;
+            }
+            if (t.numEdges) meanStretch = sum / PR(t.numEdges);
+        }
+        bool coherent = stretchFinite && (anomaly == 0u) &&
+                        (meanStretch < PR(0.05)) && (maxStretch < PR(0.5));
+        std::cout << "[Verify] meanStretch=" << meanStretch
+                  << " maxStretch=" << maxStretch
+                  << " anomaly=" << anomaly
+                  << " -> " << (coherent ? "COHERENT" : "INCOHERENT") << "\n";
+
         bool clothFell = (!np || *np == 0) || (y1 < y0);
-        bool ok = finite && clothFell;
+        bool ok = finite && clothFell && coherent;
         std::cout << "[Runner] " << (ok ? "PASS" : "FAIL") << "\n";
         return ok;
     }

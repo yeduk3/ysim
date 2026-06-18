@@ -14,4 +14,7 @@ struct ISystem {
     virtual void accumulate(Scene<BE, PR>& scene, SimState<BE, PR>& state) = 0;
     virtual void integration(SimState<BE, PR>& state, PR dt) = 0;
     virtual void recoveryPenetration(SimState<BE, PR>& state) = 0;
+    // World-bounds guard readback (GPU integrate sets 1 on NaN/Inf/escape).
+    // 0 for CPU/placeholder paths that have no anomaly flag.
+    virtual uint32_t anomaly() const { return 0; }
 };

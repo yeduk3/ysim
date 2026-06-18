@@ -8,6 +8,12 @@
 #include "tinym.hpp"
 #include <string>
 #include <vector>
+#include <random>   // deterministic cloth jiggle (D-018)
+
+// Cloth params are sent to the spring/integrate kernels verbatim via setBytes;
+// lock the byte layout against physics.metal ClothParams (4 floats, DECISIONS C22).
+static_assert(sizeof(ClothBehaviorParams<float>) == 16,
+              "ClothBehaviorParams<float> must be byte-identical to metal ClothParams");
 
 // STATIC scene description (DECISIONS C9). Holds per-object blueprints +
 // derived topology offsets; NO live pos/vel (those live in SimState).
@@ -67,6 +73,7 @@ struct Scene {
 
         s.allocate(total);
         if (total == 0) return;
+        s.realizeAux(statesOffsets);   // GPU mirror of statesOffsets (integrate slot 18)
 
         bool isCloth = false;
         for (size_t i = 0; i < objects.size(); ++i) {
@@ -112,6 +119,20 @@ private:
                            PR(o.origin.y),
                            PR(o.origin.z) - half + step * r);
                 }
+            // JIGGLE (port of MeshGridInitializer main.cpp:1180-1391): break the
+            // coplanar degeneracy so springs are live. XZ grid -> Y is the plane
+            // normal. Deterministic seed (=o.id, D-018). MUST run before topology
+            // build so rest lengths measure the jiggled config (rest stays
+            // consistent with the simulated state). Magnitude <=1e-4 << rest edge.
+            if (isCloth && N > 1) {
+                std::mt19937 rng((uint32_t)o.id);
+                std::uniform_real_distribution<PR> jig(PR(0), PR(1.0 / 10000.0));
+                for (Index v = 0; v < Index(N) * Index(N); ++v) {
+                    PR dy = jig(rng);
+                    s.x[(base + v) * 3 + 1] += dy;
+                    s.xPrev[(base + v) * 3 + 1] += dy;  // keep xPrev == x at t0
+                }
+            }
         } else if (o.kind == ObjectDesc::Kind::Ground) {
             PR h = PR(o.sizeWorld) * PR(0.5);
             put(0, PR(o.origin.x) - h, PR(o.origin.y), PR(o.origin.z) - h);
