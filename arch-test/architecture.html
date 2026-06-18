@@ -1,0 +1,339 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ysim — Refactor Blueprint</title>
+<style>
+  :root{
+    --bg:#0e1116; --panel:#161b22; --line:#2d333b; --txt:#c9d1d9; --muted:#7d8590;
+    --accent:#58a6ff; --owns:#8b949e; --impl:#bc8cff; --build:#3fb950; --use:#d29922; --feed:#58a6ff;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%;background:var(--bg);color:var(--txt);
+    font:13px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+  #wrap{display:flex;height:100vh}
+  #stage{flex:1;position:relative;overflow:auto}
+  svg{position:absolute;top:0;left:0}
+  .node{position:absolute;background:var(--panel);border:1px solid var(--line);
+    border-radius:8px;padding:7px 9px;width:165px;cursor:grab;user-select:none;
+    box-shadow:0 1px 3px rgba(0,0,0,.4);transition:opacity .15s,border-color .15s,box-shadow .15s}
+  .node:active{cursor:grabbing}
+  .node h4{margin:0 0 1px;font-size:12.5px;color:#fff}
+  .node .tag{font-size:9px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px}
+  .node.iface{border-style:dashed}
+  .node.opt{border-style:dotted;opacity:.92}
+  .node .badge{position:absolute;top:-8px;right:-8px;font-size:9px;font-weight:700;padding:1px 5px;border-radius:6px}
+  .node.newish .badge{background:var(--build);color:#04140a}
+  .node.opt .badge{background:var(--use);color:#1a1200}
+  .node.dim{opacity:.14}
+  .node.hot{border-color:var(--accent);box-shadow:0 0 0 2px var(--accent)}
+  .pchips{position:absolute;bottom:3px;right:5px;display:flex;gap:2px}
+  .pchip{width:13px;height:13px;border-radius:50%;font-size:8.5px;font-weight:700;
+    display:flex;align-items:center;justify-content:center;background:#30363d;color:#6b7280}
+  .pchip.on{background:var(--accent);color:#04140a}
+  #side{width:390px;min-width:390px;background:var(--panel);border-left:1px solid var(--line);
+    overflow:auto;padding:18px}
+  #side h1{font-size:16px;margin:0 0 4px}
+  #side h2{font-size:13px;color:var(--accent);margin:16px 0 6px;border-bottom:1px solid var(--line);padding-bottom:4px}
+  #side .sub{color:var(--muted);font-size:11px;margin-bottom:14px}
+  .ctrls{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:10px}
+  .btn{background:#21262d;border:1px solid var(--line);color:var(--txt);border-radius:6px;
+    padding:4px 9px;font-size:11px;cursor:pointer}
+  .btn.active{background:var(--accent);color:#04140a;border-color:var(--accent);font-weight:600}
+  .legend{display:flex;flex-wrap:wrap;gap:9px;font-size:10.5px;color:var(--muted);margin-bottom:8px}
+  .legend span{display:flex;align-items:center;gap:4px}
+  .legend i{width:16px;height:0;border-top:2px solid}
+  .det .role{color:var(--muted);font-size:11px;margin-bottom:8px}
+  .det .now{background:#21262d;border-left:3px solid var(--use);padding:6px 8px;border-radius:0 4px 4px 0;margin:6px 0;font-size:12px}
+  .det .to{background:#10261a;border-left:3px solid var(--build);padding:6px 8px;border-radius:0 4px 4px 0;margin:6px 0;font-size:12px}
+  .det ul{margin:6px 0;padding-left:18px}
+  .det li{margin:3px 0}
+  .inv{background:#2a1d0a;border-left:3px solid var(--use);padding:8px 10px;border-radius:0 4px 4px 0;margin:6px 0;font-size:12px}
+  .inv b{color:#f0c674}
+  code{background:#21262d;padding:1px 4px;border-radius:4px;font-size:11px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+  .pill{display:inline-block;font-size:10px;padding:1px 6px;border-radius:10px;background:#21262d;color:var(--muted);margin:2px 2px 2px 0}
+  .pill.p{background:#0d2942;color:var(--accent)}
+  .hint{color:var(--muted);font-size:11px;margin-top:8px}
+</style>
+</head>
+<body>
+<div id="wrap">
+  <div id="stage"><svg id="edges"></svg></div>
+  <div id="side">
+    <h1>ysim Refactor Blueprint</h1>
+    <div class="sub">From one 20k-line <code>main.cpp</code> to swappable, render-agnostic, headless-capable sim. Drag nodes · click for detail · filter by goal.</div>
+
+    <div class="ctrls" id="pfilter">
+      <button class="btn active" data-p="0">All</button>
+      <button class="btn" data-p="1">1 · Algo swap</button>
+      <button class="btn" data-p="2">2 · Unified Sim</button>
+      <button class="btn" data-p="3">3 · Render split</button>
+      <button class="btn" data-p="4">4 · Profiler</button>
+      <button class="btn" data-p="5">5 · Data bus</button>
+    </div>
+    <div class="legend">
+      <span><i style="border-color:var(--owns)"></i>owns</span>
+      <span><i style="border-color:var(--impl);border-top-style:dashed"></i>implements</span>
+      <span><i style="border-color:var(--build)"></i>builds</span>
+      <span><i style="border-color:var(--use)"></i>uses</span>
+      <span><i style="border-color:var(--feed)"></i>exports/feeds</span>
+    </div>
+
+    <div id="detail" class="det">
+      <div class="role">Click any box for its role, current state, and target state.</div>
+
+      <h2>4 invariants (enforce in code)</h2>
+      <div class="inv"><b>a · cache the KEY, never the pointer.</b> Renderer/GUI hold the LUT name and re-lookup each frame. Rebuild re-points the entry → no dangling.</div>
+      <div class="inv"><b>b · structural swap = paused-only.</b> <code>assert(paused)</code> before destroy+recreate of CDPipeline/System. This is what makes (a) race-free.</div>
+      <div class="inv"><b>c · no Simulator subclass.</b> One generic <code>Simulator</code>. Scene specificity lives in <code>setup*()</code> free functions, not subtypes.</div>
+      <div class="inv"><b>d · live state ∉ Scene.</b> <code>Scene</code> = static description (topology, groups, isStatic). Live GPU pos/vel = <code>SimState</code>, passed per-substep.</div>
+
+      <h2>The 5 goals</h2>
+      <ol style="padding-left:18px">
+        <li><b>Algo swap</b> — <code>CDPipeline</code> is the swap unit. Researcher's choice: compose Broad+Narrow (+optional CandidateSet) OR a monolithic fused pipeline. No forced broad→narrow handoff.</li>
+        <li><b>Unified Simulator</b> — no Builder. <code>setup*(Simulator&amp;)</code> free fn (code, fast iteration) or <code>loadFromConfig</code> (JSON, repro/sweep). Both write one generic Simulator.</li>
+        <li><b>Render split</b> — Simulator holds zero GL. Exposes render-out handles via LUT; renderer re-looks-up by name. Offscreen = null renderer = headless.</li>
+        <li><b>Profiler</b> — runtime level (Off/Coarse/Fine) set on Sim; <code>export()→CSV/JSON</code>. Runtime branch, not compiled-out.</li>
+        <li><b>Data bus</b> — one <code>LUT: name→handle</code> for render-out AND params. <code>bind&lt;T&gt;</code> typed. GUI read/write through it; dirty-policy = live | rebuild(paused) | restart-frame-0.</li>
+      </ol>
+      <div class="hint">Attack order: build <b>SimState + LUT</b> seam first (render split keystone) → carve GL/GUI out of Simulator → hoist CDPipeline → System. Phasing notes on the <b>Simulator</b> node.</div>
+    </div>
+  </div>
+</div>
+
+<script>
+const COLS=["Setup (free fns)","Orchestrate","Describe (static)","Live state","Collide","Physics","Render","Bus + UI","Backend"];
+const N=[
+ // 0 Setup
+ {id:"setupFns",t:"setup*(Simulator&)",col:0,kind:"impl",p:[2],role:"Hand-written scene setup (code path).",
+  now:"Setup is inline in main(); no reusable per-scene entry.",
+  to:"Free function per experiment: builds Scene + configures Simulator. Full C++, fast iteration. NOT a subclass (invariant c).",
+  pts:["Common case for research","Calls Scene + descs directly"]},
+ {id:"loadConfig",t:"loadFromConfig()",col:0,kind:"new",p:[2],role:"JSON spec → Simulator (repro/sweep path).",
+  now:"RunConfig JSON exists (sim_config.hpp, uncommitted).",
+  to:"One generic loader reusing RunConfig. For stable scenes + param sweeps via Runner.",
+  pts:["YAGNI: wire only when sweep is actually needed","Separate from code path — don't force JSON for experiments"]},
+ // 1 Orchestrate
+ {id:"runner",t:"Runner",col:1,kind:"new",p:[1,3,4],role:"Owns N Simulators; headless / sweep driver.",
+  now:"Does not exist. One sim, one window, one loop in main().",
+  to:"vector&lt;Simulator&gt;, steps each, collects results via LUT. No renderer required.",
+  pts:["HONEST: N sims share one device/queue → serial loop, not free parallelism. N× memory.","Real speedup needs batched command buffer; else it's just headless serial."]},
+ {id:"sim",t:"Simulator",col:1,kind:"core",p:[1,2,3,4,5],role:"The hub. Owns Scene, SimState, CDPipeline, System, ConstraintSet, Profiler, LUT.",
+  now:"main.cpp:7727 — ~3300 lines. GL buffers, ImGui, bench configs, GUI all fused with the sim.",
+  to:"Thin: step()=dcd→accumulate→integrate→ccd→recover. No GL, no ImGui, no Builder. Generic — never subclassed.",
+  pts:["PHASING: 1) SimState+LUT seam. 2) carve GL/GUI → renderer+windows. 3) hoist CDPipeline behind base. 4) hoist System. 5) bench configs → /bench.","Enforces 4 invariants (a key-cache, b paused-swap, c no-subclass, d live∉Scene).","Biggest risk: 3300 fused lines — slice by slice, compile every step."]},
+ // 2 Describe (static)
+ {id:"scene",t:"Scene",col:2,kind:"data",p:[2,3],role:"STATIC object description, immutable after build.",
+  now:"main.cpp:2772 (~700 lines) — mixes data with GPU upload + behavior dispatch + (implicitly) live state.",
+  to:"Passive fat struct: topology, collision groups, isStatic, primitive layout, materials. NO live pos/vel (invariant d). Algos read whatever fields they need — no getter ceremony.",
+  pts:["Deformable / Rigid / Fluid buckets","const Scene& passed to CDPipeline"]},
+ {id:"clothDesc",t:"ClothDesc / *Desc",col:2,kind:"data",p:[1,2],role:"Declarative recipe for one object.",
+  now:"Many *Initializer + *BehaviorParams structs.",
+  to:"Small value descs: size, material, behavior tag. Serializable → RunConfig.",pts:["Behavior chosen by tag (goal 1)"]},
+ {id:"sceneDesc",t:"SceneDescription",col:2,kind:"new",p:[3],role:"Static render info, sent to renderer once.",
+  now:"Renderer reaches into sim internals for topology/materials.",
+  to:"Index buffers, materials, static transforms → renderer.init(). Per-frame updates come only via LUT render-out.",
+  pts:["Decouples renderer from sim memory (goal 3)"]},
+ // 3 Live state
+ {id:"simState",t:"SimState",col:3,kind:"data",p:[1,3],role:"LIVE GPU state: positions / velocities.",
+  now:"Lives implicitly inside Scene/MeshState + Simulator, tangled with description.",
+  to:"Explicit live buffers, passed per-substep to CDPipeline & System. The render-out handles point here. KEYSTONE of render split.",
+  pts:["Separating this from Scene unlocks goals 1 & 3","Renderer/Runner read it via LUT handles"]},
+ {id:"constraintSet",t:"ConstraintSet",col:3,kind:"new",p:[1],role:"Contacts / constraints buffer (param-passed).",
+  now:"Collision results fused into Simulator step.",
+  to:"Simulator-owned SCRATCH, reused across substeps (no alloc churn). ccd() fills it, recoveryPenetration() reads it. Explicit param-passing — NO observer pattern.",
+  pts:["Static known data flow → param passing beats observer","Owner = Simulator; ccd writes, System reads"]},
+ // 4 Collide
+ {id:"cdPipe",t:"CDPipeline (base)",col:4,kind:"iface",p:[1],role:"The collision swap unit. Virtual dcd/ccd.",
+  now:"CollisionPipeline shell (main.cpp:7717); real work fused into Simulator + env-var/branch selection.",
+  to:"<code>dcd(const Scene&, SimState&, ConstraintSet&)</code> / <code>ccd(...)</code>. Virtual @ PHASE granularity (~6k calls/s vs ms GPU work → cost negligible). Inner loop stays in Metal kernels.",
+  pts:["Swap the WHOLE pipeline, not broad/narrow separately","Selection = code-level or paused-swap (no factory needed)"]},
+ {id:"concretePipe",t:"Concrete pipeline",col:4,kind:"impl",p:[1],role:"A researcher's collision strategy.",
+  now:"—",
+  to:"Implements CDPipeline base. TWO build styles, researcher's free choice: (A) compose Broad+Narrow parts, or (B) monolithic fused.",
+  pts:["e.g. BVHPipeline, HGridPipeline, FusedSHPipeline","Mix/match parts internally — private layout, no public seam"]},
+ {id:"broad",t:"BroadPhase",col:4,kind:"opt",p:[1],role:"Reusable broad-phase part (OPTIONAL).",
+  now:"3 impls (BVH/SH/MLSH) selected by env var + branching.",
+  to:"Concrete reusable helper/member — NOT a forced virtual interface. A composable pipeline uses it; a monolithic one skips it.",
+  pts:["Reuse across pipelines without copy-paste","No IBroadPhase virtual unless you need runtime broad-only swap"]},
+ {id:"narrow",t:"NarrowPhase",col:4,kind:"opt",p:[1],role:"Reusable narrow-phase part (OPTIONAL).",
+  now:"BruteForce<CPU/METAL> (main.cpp:7372+).",
+  to:"Concrete part co-designed with its broad phase. Optional — fused pipelines test inline.",pts:[]},
+ {id:"candidateSet",t:"CandidateSet",col:4,kind:"opt",p:[1],role:"Intermediate pair carrier (OPTIONAL).",
+  now:"—",
+  to:"Used ONLY by composable pipelines (broad→carrier→narrow). Monolithic/fused pipelines skip it entirely → saves writing pair list to global memory (GPU bandwidth win).",
+  pts:["Not part of the public contract","Skipping it can be FASTER, not just lazy (your insight)"]},
+ {id:"algos",t:"BVH / SH / hgrid / BruteForce",col:4,kind:"impl",p:[1],role:"Existing algorithms become parts or whole pipelines.",
+  now:"main.cpp:3540(SH)/4500(hgrid)/4966(BVH)/7372(BruteForce).",
+  to:"Refactored into BroadPhase parts and/or concrete pipelines. Keep query-coherence / BVTT-front (per-algo wins) — no flattening seam.",pts:[]},
+ // 5 Physics
+ {id:"system",t:"System (base)",col:5,kind:"iface",p:[1],role:"Integrator interface.",
+  now:"ExplicitSystem<CPU/METAL> concrete (main.cpp:11022+); no shared seam.",
+  to:"<code>accumulate() · integration() · recoveryPenetration(state, contacts)</code>. Swap Explicit↔Implicit↔XPBD. Selection code-level / paused-swap.",
+  pts:["Keep template on hot CPU loop if needed; CD stays virtual"]},
+ {id:"explicit",t:"ExplicitSystem",col:5,kind:"impl",p:[1],role:"Concrete integrator (current).",
+  now:"main.cpp:11022 (CPU) / 11172 (METAL).",to:"One impl of System; Implicit / XPBD drop in beside it.",pts:[]},
+ {id:"behavior",t:"Behaviors",col:5,kind:"impl",p:[1],role:"Per-material force models.",
+  now:"TriangularClothBehavior, FastGridClothBehavior (main.cpp:2010+).",
+  to:"Pluggable force kernels chosen by ClothDesc tag.",pts:["Add behavior = add kernel + tag"]},
+ // 6 Render
+ {id:"renderer",t:"IRenderer",col:6,kind:"iface",p:[3],role:"Consumes SceneDescription + LUT render-out.",
+  now:"OpenGL render code inlined in Simulator + main.",
+  to:"<code>init(SceneDescription) · draw()</code> reads LUT handles by name (re-lookup, invariant a). Sim never names a GL type.",pts:[]},
+ {id:"ygl",t:"YGL / GL / Offscreen",col:6,kind:"impl",p:[3],role:"Concrete renderers.",
+  now:"Single hard-wired GL path.",
+  to:"YGL (yours), current GL, null/offscreen for headless.",pts:["Headless = the null renderer","Same machine: share GPU buffer handle, don't copy"]},
+ // 7 Bus + UI
+ {id:"lut",t:"LUT (name→handle)",col:7,kind:"new",p:[3,5],role:"Unified bus: render-out AND params.",
+  now:"GUI mutates sim fields directly; renderer reads live buffers directly. No indirection.",
+  to:"One dict <code>name → handle</code>. <code>bind&lt;T&gt;(\"wind\",&w,Live)</code>. Two views: render-out (float buffers) + params. Consumers cache the KEY, re-lookup each frame (invariant a). Rebuild re-points entries → no dangling.",
+  pts:["Merges FrameSnapshot + DataRegistry (your unification)","dirty-policy: live | rebuild(paused) | restart-frame-0","Optional int-handle cache if string hash ever shows up (it won't, vs GPU work)"]},
+ {id:"guiWin",t:"GuiWindow",col:7,kind:"impl",p:[5],role:"Reads/writes sim via LUT.",
+  now:"mesh_inspector_gui.cpp + ImGui fused in Simulator.",
+  to:"Decoupled window; only touches LUT handles. Structural writes trigger paused-swap.",pts:[]},
+ {id:"profWin",t:"ProfilerWindow",col:7,kind:"impl",p:[4,5],role:"Reads Profiler; renderer-only.",
+  now:"profiler_gui.cpp (235 lines).",to:"Pulls from Profiler; absent in headless.",pts:[]},
+ {id:"profiler",t:"Profiler (+History)",col:7,kind:"core",p:[4],role:"Leveled scoped timing; exportable.",
+  now:"FrameProfiler + FrameProfilerHistory; called ad-hoc; CSV to profiles/.",
+  to:"Runtime level (Off/Coarse/Fine) set on Sim; <code>YSIM_PROFILE(name)</code> scope; <code>export()→CSV/JSON</code>. Runtime branch (tiny bool check), NOT compiled-out.",
+  pts:["Single level switch from config (goal 4)"]},
+ // 8 Backend
+ {id:"metalCtx",t:"MetalContext",col:8,kind:"core",p:[],role:"device / queue / PSO cache.",
+  now:"MetalGlobalContext + MetalKernelContext singletons (main.cpp:126,200).",to:"Keep; inject where practical.",pts:[]},
+ {id:"mem",t:"MemoryPool / Allocators",col:8,kind:"core",p:[],role:"Backend-templated buffers.",
+  now:"ByteMemoryPool / Dynamic… / GlobalAutoAllocator (main.cpp:79+).",to:"Keep — backend seam already works. Don't refactor what isn't in the way.",pts:[]},
+ {id:"backend",t:"CPU / METAL / CUDA",col:8,kind:"data",p:[],role:"Backend tag types.",
+  now:"main.cpp:54.",to:"Unchanged. Template param everywhere.",pts:[]},
+];
+const E=[
+ // build
+ ["setupFns","sim","build"],["setupFns","scene","build"],["loadConfig","sim","build"],
+ // own
+ ["runner","sim","owns"],
+ ["sim","scene","owns"],["sim","simState","owns"],["sim","constraintSet","owns"],
+ ["sim","cdPipe","owns"],["sim","system","owns"],["sim","profiler","owns"],["sim","lut","owns"],
+ // setup uses descs
+ ["setupFns","clothDesc","uses"],
+ // describe → render
+ ["scene","sceneDesc","feed"],["sceneDesc","renderer","feed"],
+ // collide internals
+ ["concretePipe","cdPipe","impl"],["concretePipe","broad","uses"],["concretePipe","narrow","uses"],
+ ["broad","candidateSet","feed"],["candidateSet","narrow","feed"],
+ ["algos","concretePipe","impl"],["algos","broad","impl"],
+ // collide data contract
+ ["cdPipe","scene","uses"],["cdPipe","simState","uses"],["cdPipe","constraintSet","feed"],
+ // physics
+ ["explicit","system","impl"],["system","behavior","uses"],
+ ["system","simState","uses"],["system","constraintSet","uses"],
+ // render
+ ["ygl","renderer","impl"],["lut","renderer","feed"],["simState","lut","feed"],
+ // ui / bus
+ ["guiWin","lut","uses"],["profiler","profWin","feed"],
+ // runner collect
+ ["runner","lut","feed"],
+ // backend
+ ["cdPipe","metalCtx","uses"],["system","metalCtx","uses"],["broad","mem","uses"],["system","mem","uses"],
+];
+
+// ---- layout ------------------------------------------------------------
+const NW=165, COLW=200, X0=40, Y0=66, ROWH=98;
+const colCount={};
+N.forEach(n=>{n._row=(colCount[n.col]=(colCount[n.col]||0)); colCount[n.col]++;});
+N.forEach(n=>{n.x=X0+n.col*COLW; n.y=Y0+n._row*ROWH;});
+const W=X0+COLS.length*COLW+40, H=Y0+Math.max(...Object.values(colCount))*ROWH+50;
+
+const stage=document.getElementById("stage"), svg=document.getElementById("edges");
+svg.setAttribute("width",W); svg.setAttribute("height",H);
+stage.style.minWidth=W+"px"; stage.style.minHeight=H+"px";
+const EC={owns:"#8b949e",impl:"#bc8cff",build:"#3fb950",uses:"#d29922",feed:"#58a6ff"};
+const MK={owns:"owns",impl:"impl",build:"build",uses:"use",feed:"feed"};
+svg.innerHTML=`<defs>${Object.entries(EC).map(([k,c])=>
+  `<marker id="a-${MK[k]}" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="${c}"/></marker>`).join("")}</defs>`;
+COLS.forEach((c,i)=>{const t=document.createElementNS("http://www.w3.org/2000/svg","text");
+  t.setAttribute("x",X0+i*COLW); t.setAttribute("y",34); t.setAttribute("fill","#7d8590");
+  t.setAttribute("font-size","11"); t.setAttribute("font-weight","700"); t.setAttribute("letter-spacing","1");
+  t.textContent=c.toUpperCase(); svg.appendChild(t);});
+
+const byId=Object.fromEntries(N.map(n=>[n.id,n]));
+function makeNode(n){
+  const d=document.createElement("div");
+  d.className="node "+(n.kind==="iface"?"iface ":"")+(n.kind==="new"?"newish ":"")+(n.kind==="opt"?"opt ":"");
+  d.style.left=n.x+"px"; d.style.top=n.y+"px"; d.id="n-"+n.id; d.dataset.id=n.id;
+  const badge=n.kind==="new"?'<span class="badge">NEW</span>':n.kind==="opt"?'<span class="badge">OPT</span>':'';
+  d.innerHTML=`${badge}<div class="tag">${COLS[n.col]}</div><h4>${n.t}</h4>
+    <div class="pchips">${[1,2,3,4,5].map(p=>`<span class="pchip ${n.p.includes(p)?"on":""}">${p}</span>`).join("")}</div>`;
+  stage.appendChild(d); drag(d,n);
+  d.addEventListener("click",()=>{if(!d._moved)showDetail(n);});
+}
+N.forEach(makeNode);
+
+function center(n){return {x:n.x+NW/2,y:n.y+28};}
+function drawEdges(){
+  [...svg.querySelectorAll("path.edge")].forEach(p=>p.remove());
+  E.forEach(([a,b,ty])=>{
+    const na=byId[a],nb=byId[b]; if(!na||!nb)return;
+    const A=center(na),B=center(nb), same=na.col===nb.col;
+    const p=document.createElementNS("http://www.w3.org/2000/svg","path");
+    let x1,x2,d;
+    if(same){ // route on right side
+      x1=A.x+NW/2; x2=B.x+NW/2; const bow=40;
+      d=`M${x1},${A.y} C${x1+bow},${A.y} ${x2+bow},${B.y} ${x2},${B.y}`;
+    }else{
+      const r=B.x>A.x; x1=A.x+(r?NW/2:-NW/2); x2=B.x+(r?-NW/2:NW/2);
+      const dx=Math.max(40,Math.abs(B.x-A.x)*0.4)*(r?1:-1);
+      d=`M${x1},${A.y} C${x1+dx},${A.y} ${x2-dx},${B.y} ${x2},${B.y}`;
+    }
+    p.setAttribute("d",d); p.setAttribute("fill","none"); p.setAttribute("stroke",EC[ty]);
+    p.setAttribute("stroke-width","1.6");
+    if(ty==="impl")p.setAttribute("stroke-dasharray","5 4");
+    p.setAttribute("marker-end",`url(#a-${MK[ty]})`); p.setAttribute("opacity",".75");
+    p.classList.add("edge"); p.dataset.a=a; p.dataset.b=b;
+    svg.appendChild(p);
+  });
+}
+drawEdges();
+
+function drag(el,n){
+  let sx,sy,ox,oy;
+  el.addEventListener("mousedown",e=>{
+    el._moved=false; sx=e.clientX; sy=e.clientY; ox=n.x; oy=n.y;
+    const mv=ev=>{const ddx=ev.clientX-sx,ddy=ev.clientY-sy;
+      if(Math.abs(ddx)+Math.abs(ddy)>3)el._moved=true;
+      n.x=ox+ddx; n.y=oy+ddy; el.style.left=n.x+"px"; el.style.top=n.y+"px"; drawEdges();};
+    const up=()=>{document.removeEventListener("mousemove",mv);document.removeEventListener("mouseup",up);};
+    document.addEventListener("mousemove",mv); document.addEventListener("mouseup",up); e.preventDefault();
+  });
+}
+
+function showDetail(n){
+  document.querySelectorAll(".node").forEach(e=>e.classList.remove("hot"));
+  document.getElementById("n-"+n.id).classList.add("hot");
+  const k={core:"hub",iface:"abstract base",impl:"concrete",data:"data",new:"new",opt:"optional part"}[n.kind]||n.kind;
+  document.getElementById("detail").innerHTML=`
+    <div class="role">${COLS[n.col]} · ${k}</div>
+    <h2>${n.t}</h2>
+    <div style="margin-bottom:8px">${n.role}</div>
+    <div class="now"><b>Today:</b> ${n.now}</div>
+    <div class="to"><b>Target:</b> ${n.to}</div>
+    ${n.pts.length?`<ul>${n.pts.map(x=>`<li>${x}</li>`).join("")}</ul>`:""}
+    <div style="margin-top:10px">${n.p.length?n.p.map(p=>`<span class="pill p">goal ${p}</span>`).join(""):'<span class="pill">infrastructure — keep as-is</span>'}</div>`;
+}
+
+let active=0;
+document.querySelectorAll("#pfilter .btn").forEach(b=>{
+  b.addEventListener("click",()=>{
+    document.querySelectorAll("#pfilter .btn").forEach(x=>x.classList.remove("active"));
+    b.classList.add("active"); active=+b.dataset.p; applyFilter();
+  });
+});
+function applyFilter(){
+  N.forEach(n=>document.getElementById("n-"+n.id).classList.toggle("dim",!(active===0||n.p.includes(active))));
+  svg.querySelectorAll("path.edge").forEach(p=>{
+    const on=active===0||(byId[p.dataset.a].p.includes(active)&&byId[p.dataset.b].p.includes(active));
+    p.style.opacity=on?".75":".05";
+  });
+}
+</script>
+</body>
+</html>

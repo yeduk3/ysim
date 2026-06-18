@@ -1,0 +1,89 @@
+{
+  "format_version": 1,
+  "engine": {
+    "backend": "METAL",
+    "system": "Explicit"
+  },
+  "environment": {
+    "background_color": [
+      0.8859999775886536,
+      0.906000018119812,
+      0.921999990940094
+    ],
+    "gravity": [
+      0.0,
+      -9.8100004196167,
+      0.0
+    ],
+    "wind": [
+      0.0,
+      0.0,
+      0.0
+    ]
+  },
+  "simulation": {
+    "substeps": 60,
+    "time_per_frame": 0.0166666675
+  },
+  "profile": {
+    "enabled": true,
+    "frames": 30,
+    "realtime_sync": false,
+    "output_path": "profiles/experiment/subobject-bvh-2026-06-16/scene_profile.csv"
+  },
+  "objects": [
+    {
+      "apply_gravity": true,
+      "apply_wind": true,
+      "behavior": {
+        "params": {
+          "bend": 200000.0,
+          "shear": 100000.0,
+          "stretch": 100000.0,
+          "thickness": 0.009999999776482582
+        },
+        "type": "TriangularCloth"
+      },
+      "cloth_stiffness_scale": 1.0,
+      "id": 0,
+      "material": {
+        "base_color": [
+          1.0,
+          1.0,
+          1.0
+        ],
+        "emission_color": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.5,
+        "specular_weight": 1.0
+      },
+      "name": "subobject_cloth",
+      "source": {
+        "direction": "XZPlane",
+        "jiggle": true,
+        "mass": 0.10000000149011612,
+        "shape": "grid",
+        "size": 1.0,
+        "tessellation": 128,
+        "type": "primitive"
+      },
+      "transform": {
+        "position": [
+          0.0,
+          0.5,
+          0.0
+        ],
+        "rotation": [
+          1.0,
+          0.0,
+          0.0,
+          0.0
+        ]
+      }
+    }
+  ]
+}

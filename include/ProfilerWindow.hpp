@@ -69,7 +69,26 @@ void drawProfilerWindow(
     // Substep cadence knobs (Simulator::refitSubstepPeriod / cdSubstepPeriod,
     // both Index == uint32_t). 1 = every substep. Live-editable sliders.
     std::uint32_t* refit_substep_period = nullptr,
-    std::uint32_t* cd_substep_period = nullptr
+    std::uint32_t* cd_substep_period = nullptr,
+    // Profiling detail tier (0=None, 1=PerFrame, 2=InFrame), matching
+    // sim_config::ProfileLevel's enumerator order. When non-null a combo lets
+    // the user switch tiers live; main.cpp re-wires the profiler pointers from
+    // the edited value on the next frame. Kept as an int so this header stays
+    // free of a sim_config dependency.
+    int* profile_level = nullptr,
+    // Fused refit+enlarge toggle (single-pass broad-phase maintenance). When
+    // non-null, a checkbox lets the user A/B it live against the legacy
+    // two-pass path.
+    bool* fused_refit_enlarge = nullptr,
+    // Sub-object (multi-root) LBVH: checkbox toggles single↔multi-root, slider
+    // sets split s (k = tiles², saturates at full split). Both apply on the
+    // next BVH rebuild (frame%10). Phase 2b mini-TLAS makes the multi-root
+    // query O(log N), so any s is query-cheap.
+    bool* use_subobject_bvh = nullptr,
+    int*  subbvh_split_s = nullptr,
+    // Multi-level (hgrid) spatial-hash broadphase toggle. When non-null a
+    // checkbox flips Simulator::useMultiLevelSH (oversized floor auto-excluded).
+    bool* use_multilevel_sh = nullptr
 );
 
 } // namespace profiler

@@ -5,6 +5,7 @@ buildxc/
 compile_commands.json
 
 .DS_Store
+imgui.ini
 
 codex/
 profiles/
@@ -20,3 +21,4 @@ uml/
 docs/references/**/*.pdf
 docs/references/**/*.html
 assets/BVH/
+

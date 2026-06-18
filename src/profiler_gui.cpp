@@ -38,7 +38,12 @@ void drawProfilerWindow(
     bool* use_analytic_primitive,
     bool* use_spatial_hashing,
     std::uint32_t* refit_substep_period,
-    std::uint32_t* cd_substep_period
+    std::uint32_t* cd_substep_period,
+    int* profile_level,
+    bool* fused_refit_enlarge,
+    bool* use_subobject_bvh,
+    int*  subbvh_split_s,
+    bool* use_multilevel_sh
 ) {
     if (!state.open) return;
 
@@ -63,6 +68,20 @@ void drawProfilerWindow(
         ImGui::TextDisabled("No frame samples yet");
     }
 
+    if (profile_level) {
+        // None → no profiling (max sim loop). PerFrame → frame_ms +
+        // physics/render split only. InFrame → full per-section breakdown.
+        static const char* kLevels[] = {"None", "Per-Frame", "In-Frame"};
+        if (*profile_level < 0) *profile_level = 0;
+        if (*profile_level > 2) *profile_level = 2;
+        ImGui::Combo("Profile Level", profile_level, kLevels, 3);
+        ImGui::SameLine();
+        ImGui::TextDisabled(
+            *profile_level == 0 ? "[no overhead]"
+          : *profile_level == 1 ? "[frame + phys/render]"
+                                : "[all sections]");
+    }
+
     ImGui::Separator();
     ImGui::Text("Scene: %d meshes / %d points / %d triangles",
                 scene_counts.meshes,
@@ -82,6 +101,11 @@ void drawProfilerWindow(
         ImGui::SameLine();
         ImGui::TextDisabled(*use_spatial_hashing ? "[uniform grid]" : "[BVH broadphase]");
     }
+    if (use_multilevel_sh) {
+        ImGui::Checkbox("Multi-level Spatial Hash", use_multilevel_sh);
+        ImGui::SameLine();
+        ImGui::TextDisabled(*use_multilevel_sh ? "[hgrid, floor excluded]" : "[off]");
+    }
     if (use_segmented_bvh_query) {
         ImGui::Checkbox("BVH Segmented Query (G)", use_segmented_bvh_query);
         ImGui::SameLine();
@@ -96,6 +120,23 @@ void drawProfilerWindow(
         ImGui::Checkbox("BVH Refit", enable_refit);
         ImGui::SameLine();
         ImGui::TextDisabled(*enable_refit ? "[incremental]" : "[full rebuild]");
+    }
+    if (fused_refit_enlarge) {
+        ImGui::Checkbox("Fused Refit+Enlarge", fused_refit_enlarge);
+        ImGui::SameLine();
+        ImGui::TextDisabled(*fused_refit_enlarge ? "[1 swept pass]" : "[2-pass legacy]");
+    }
+    if (use_subobject_bvh) {
+        ImGui::Checkbox("Sub-object BVH (B)", use_subobject_bvh);
+        ImGui::SameLine();
+        ImGui::TextDisabled(*use_subobject_bvh ? "[multi-root + mini-TLAS]"
+                                               : "[single-root]");
+        if (subbvh_split_s) {
+            // SliderInt clamps to [1,16]; k = tiles² saturates at full split.
+            ImGui::SliderInt("Split s (N)", subbvh_split_s, 1, 16, "s=%d");
+            ImGui::SameLine();
+            ImGui::TextDisabled("[applies on next BVH rebuild]");
+        }
     }
     if (use_analytic_primitive) {
         ImGui::Checkbox("Analytic Primitive (A)", use_analytic_primitive);

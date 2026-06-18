@@ -45,16 +45,49 @@ struct EngineConfig {
     std::string system  = "Explicit"; // Explicit (only system wired today)
 };
 
-// Profiling output (req 2). When enabled, a `--scene` run collects `frames`
+// Profiling detail level (3 tiers, additive over the legacy on/off model):
+//   None     — no profiling at all. The simulator runs with profiler==nullptr
+//              (no ScopedTimer / Clock::now overhead) and per-frame debug logs
+//              are silenced. commitAndWait is kept only where a CPU read truly
+//              needs it. Maximizes the pure simulation loop.
+//   PerFrame — frame-granularity only: total frame_ms plus the two top-level
+//              physics_total / render_total splits. No inside-frame section
+//              breakdown (no extra commitAndWait inserted).
+//   InFrame  — the full per-section breakdown (broad/narrow/integrate/render
+//              sub-sections). This is the historical default.
+enum class ProfileLevel { None, PerFrame, InFrame };
+
+inline const char* toString(ProfileLevel l) {
+    switch (l) {
+        case ProfileLevel::None:     return "none";
+        case ProfileLevel::PerFrame: return "per_frame";
+        case ProfileLevel::InFrame:  return "in_frame";
+    }
+    return "in_frame";
+}
+
+// Parse a level string. Returns false (and leaves `out` untouched) on an
+// unrecognized name so callers can fail loud.
+inline bool parseProfileLevel(const std::string& s, ProfileLevel& out) {
+    if (s == "none")      { out = ProfileLevel::None;     return true; }
+    if (s == "per_frame") { out = ProfileLevel::PerFrame; return true; }
+    if (s == "in_frame")  { out = ProfileLevel::InFrame;  return true; }
+    return false;
+}
+
+// Profiling output (req 2). When `enabled`, a `--scene` run collects `frames`
 // profiled frames then writes the CSV to `outputPath` (or, when empty, a
 // default path derived from the scene file stem — see defaultProfilePath).
-// realtimeSync mirrors the GUI "실시간 동기화" toggle: false → one fixed step
-// per render frame (pure compute, the profiling default).
+// `enabled` is the *headless automation* switch (auto-play → CSV → quit);
+// `level` is the orthogonal *detail* switch and applies in interactive mode
+// too. realtimeSync mirrors the GUI "실시간 동기화" toggle: false → one fixed
+// step per render frame (pure compute, the profiling default).
 struct ProfileConfig {
     bool enabled = false;
     int  frames = 30;
     bool realtimeSync = false;
     std::string outputPath;  // empty → defaultProfilePath(stem, frames)
+    ProfileLevel level = ProfileLevel::InFrame;  // detail tier (default = full)
 };
 
 struct RunConfig {
@@ -86,6 +119,7 @@ inline nlohmann::json toJson(const ProfileConfig& p) {
     j["frames"] = p.frames;
     j["realtime_sync"] = p.realtimeSync;
     j["output_path"] = p.outputPath;
+    j["level"] = toString(p.level);
     return j;
 }
 
@@ -144,6 +178,15 @@ inline Result<ProfileConfig> profileFromJson(const nlohmann::json& j) {
     if (auto it = j.find("output_path"); it != j.end()) {
         if (!it->is_string()) return R::fail("profile.output_path must be a string");
         p.outputPath = it->get<std::string>();
+    }
+    // `level` is additive and optional: a config without it keeps the default
+    // (InFrame), so every pre-existing scene/profile JSON round-trips with the
+    // historical full-detail behavior.
+    if (auto it = j.find("level"); it != j.end()) {
+        if (!it->is_string()) return R::fail("profile.level must be a string");
+        if (!parseProfileLevel(it->get<std::string>(), p.level))
+            return R::fail("unknown profile.level '" + it->get<std::string>() +
+                           "' (expected none | per_frame | in_frame)");
     }
     return R::success(p);
 }

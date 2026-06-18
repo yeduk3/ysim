@@ -281,6 +281,74 @@ kernel void buildLeaf_Tri(
     tree[leafid].max = max3(v0, v1, v2);
     tree[leafid].childB = fid;
 }
+// GPU port of BVH::enlargeTrajectory's single-root leaf pass. Expands each
+// leaf AABB to cover the swept volume {x, x + vel*dt} of its triangle's 3
+// verts. Mirrors buildLeaf_Tri's leaf-slot math (numPrimitives+idx-1). The
+// existing box (set by the preceding refit) is unioned, so the result equals
+// the CPU loop's `min(box, x+vel*dt)` (refit already put x in the box).
+kernel void enlargeLeaf_Tri(
+    device const packed_float3* x [[buffer(0)]],
+    device const packed_float3* vel [[buffer(1)]],
+    device const packed_uint3* facets [[buffer(2)]],
+    constant int& numPrimitives [[buffer(3)]],
+    constant float& dt [[buffer(4)]],
+    device const MortonNode* mortons [[buffer(5)]],
+    device BVHNode* tree [[buffer(6)]],
+    uint id [[thread_position_in_grid]]
+) {
+    int idx = (int)id;
+    if (idx >= numPrimitives) return;
+
+    int fid = mortons[id].index;
+    uint3 facet = facets[fid];
+    int leafid = numPrimitives+idx-1;
+
+    float3 lo = tree[leafid].min;
+    float3 hi = tree[leafid].max;
+    uint vid[3] = { facet.x, facet.y, facet.z };
+    for (int k = 0; k < 3; ++k) {
+        float3 p = x[vid[k]];
+        float3 s = p + vel[vid[k]] * dt;
+        lo = min(lo, min(p, s));
+        hi = max(hi, max(p, s));
+    }
+    tree[leafid].min = lo;
+    tree[leafid].max = hi;
+}
+// Fused refit+enlarge leaf pass (single-root). SETS the full leaf node
+// (box + childA/childB) from the swept hull {x, x+vel*dt} in ONE kernel —
+// equal to buildLeaf_Tri immediately followed by enlargeLeaf_Tri, but
+// self-contained (no prior refit). Lets the fused path do one leaf pass +
+// one bottom-up + one sync instead of refit's pass and enlarge's pass.
+kernel void buildSweptLeaf_Tri(
+    device const packed_float3* x [[buffer(0)]],
+    device const packed_float3* vel [[buffer(1)]],
+    device const packed_uint3* facets [[buffer(2)]],
+    constant int& numPrimitives [[buffer(3)]],
+    constant float& dt [[buffer(4)]],
+    device const MortonNode* mortons [[buffer(5)]],
+    device BVHNode* tree [[buffer(6)]],
+    uint id [[thread_position_in_grid]]
+) {
+    int idx = (int)id;
+    if (idx >= numPrimitives) return;
+
+    int fid = mortons[id].index;
+    uint3 facet = facets[fid];
+
+    float3 p0 = x[facet.x]; float3 s0 = p0 + vel[facet.x] * dt;
+    float3 lo = min(p0, s0), hi = max(p0, s0);
+    float3 p1 = x[facet.y]; float3 s1 = p1 + vel[facet.y] * dt;
+    lo = min(lo, min(p1, s1)); hi = max(hi, max(p1, s1));
+    float3 p2 = x[facet.z]; float3 s2 = p2 + vel[facet.z] * dt;
+    lo = min(lo, min(p2, s2)); hi = max(hi, max(p2, s2));
+
+    int leafid = numPrimitives+idx-1;
+    tree[leafid].min = lo;
+    tree[leafid].childA = -1;
+    tree[leafid].max = hi;
+    tree[leafid].childB = fid;
+}
 kernel void buildTree_Tri(
     device const packed_float3* x [[buffer(0)]],
     device const packed_uint3* facets [[buffer(1)]],
@@ -459,9 +527,17 @@ kernel void bottomUpBoxes(
     // the worst case is a stale/wrong parent AABB, which the broad phase
     // tolerates (over/under-report), unlike a frozen GPU.
     uint maxSteps = 2u * numPrimitives;
+    int numNodes = int(2u * numPrimitives) - 1;   // valid index range [0, numNodes)
 
     for (uint step = 0; step < maxSteps; ++step) {
         int parent = treeParent[child];
+
+        // INDEX GUARD: the step cap above catches a parent *cycle* (valid
+        // indices looping), but a garbage `parent` (out-of-range) would make
+        // the atomic below an OUT-OF-BOUNDS device write → GPU memory fault
+        // that wedges the device (survives host kill). Bail on a bad index
+        // instead — same "stale/wrong box tolerated" trade-off as the step cap.
+        if (parent < 0 || parent >= numNodes) return;
 
         // Atomics are relaxed-only in MSL; fences carry the
         // memory ordering — see kernel doc-block above.
@@ -484,6 +560,9 @@ kernel void bottomUpBoxes(
 
         int childA = tree[parent].childA;
         int childB = tree[parent].childB;
+        // INDEX GUARD: corrupt internal node → OOB read fault. Bail.
+        if (childA < 0 || childA >= numNodes ||
+            childB < 0 || childB >= numNodes) return;
 
         float3 minA = float3(tree[childA].min);
         float3 maxA = float3(tree[childA].max);
@@ -503,6 +582,270 @@ kernel void bottomUpBoxes(
 
         child = parent;
         if (child == 0) return; // wrote root, done
+    }
+}
+
+// ============================================================================
+// Sub-object (multi-root) LBVH — square-cloth experiment (Phase 1).
+//
+// The primitive array is partitioned into k = 4^s groups by MATERIAL-space
+// tile (fixed for the cloth's lifetime). Each group owns an INDEPENDENT
+// Karras tree living in its own contiguous slot window of the shared `tree`
+// buffer. There are k roots; the broad phase (Phase 2) treats each group
+// root as a separate object via the existing scene TLAS.
+//
+// Layout for group g with M = groupSize[g] prims:
+//   sorted positions : [primBase[g], primBase[g]+M)        (set by host
+//                       stable group-partition after the global Morton sort)
+//   node window      : [nodeBase[g], nodeBase[g]+(2M-1))
+//   internal local l : 0..M-2   -> global slot nodeBase[g] + l
+//   leaf     local l : 0..M-1   -> global slot nodeBase[g] + (M-1) + l
+//   group root       : nodeBase[g]
+// Total nodes across all groups = 2N - k (<= the 2N-1 single-root alloc).
+//
+// These mirror buildTree_Tri / buildLeaf_Tri / bottomUpBoxes with N->M_g,
+// the mortons pointer shifted by primBase[g], and slots offset by
+// nodeBase[g]. determineRange/findSplit operate on the group's LOCAL range,
+// so the Karras delta rule never crosses a group boundary.
+// ============================================================================
+
+// Grouped hierarchy + leaf build. One thread per global sorted position.
+kernel void buildTree_Tri_Grouped(
+    device const packed_float3* x [[buffer(0)]],
+    device const packed_uint3* facets [[buffer(1)]],
+    constant int& numPrimitives [[buffer(2)]],
+    device const MortonNode* mortons [[buffer(3)]],
+    device BVHNode* tree [[buffer(4)]],
+    device int* treeParent [[buffer(5)]],
+    device const uint* sortedPosToGroup [[buffer(6)]],
+    device const uint* groupSize [[buffer(7)]],
+    device const uint* groupPrimBase [[buffer(8)]],
+    device const uint* groupNodeBase [[buffer(9)]],
+    uint id [[thread_position_in_grid]]
+) {
+    int gid = (int)id;
+    if (gid >= numPrimitives) return;
+
+    uint g     = sortedPosToGroup[gid];
+    int  M     = (int)groupSize[g];
+    int  pbase = (int)groupPrimBase[g];
+    int  nbase = (int)groupNodeBase[g];
+    int  l     = gid - pbase;          // local sorted index within group
+
+    // leaf node
+    int fid = mortons[gid].index;
+    uint3 facet = facets[fid];
+    float3 v0 = x[facet.x];
+    float3 v1 = x[facet.y];
+    float3 v2 = x[facet.z];
+    int leafid = nbase + (M - 1) + l;
+    tree[leafid].min = min3(v0, v1, v2);
+    tree[leafid].childA = -1;
+    tree[leafid].max = max3(v0, v1, v2);
+    tree[leafid].childB = fid;
+
+    // last sorted position in the group is a leaf only (M-1 internals)
+    if (l == M - 1) return;
+
+    // LOCAL Karras range/split (mortons shifted to group start)
+    int2 range = determineRange(mortons + pbase, M, l);
+    uint split = findSplit(mortons + pbase, range.x, range.y);
+
+    int childA, childB;
+    if ((int)split == range.x)     childA = nbase + (M - 1) + (int)split;
+    else                           childA = nbase + (int)split;
+    if ((int)split + 1 == range.y) childB = nbase + (M - 1) + (int)split + 1;
+    else                           childB = nbase + (int)split + 1;
+
+    int self = nbase + l;
+    tree[self].childA = childA;
+    tree[self].childB = childB;
+    treeParent[childA] = self;
+    treeParent[childB] = self;
+}
+
+// Grouped leaf-only refit. Topology (treeParent + childA/B) carried from the
+// prior grouped build; only leaf AABBs are recomputed from current positions.
+kernel void buildLeaf_Tri_Grouped(
+    device const packed_float3* x [[buffer(0)]],
+    device const packed_uint3* facets [[buffer(1)]],
+    constant int& numPrimitives [[buffer(2)]],
+    device const MortonNode* mortons [[buffer(3)]],
+    device BVHNode* tree [[buffer(4)]],
+    device const uint* sortedPosToGroup [[buffer(6)]],
+    device const uint* groupSize [[buffer(7)]],
+    device const uint* groupPrimBase [[buffer(8)]],
+    device const uint* groupNodeBase [[buffer(9)]],
+    uint id [[thread_position_in_grid]]
+) {
+    int gid = (int)id;
+    if (gid >= numPrimitives) return;
+
+    uint g     = sortedPosToGroup[gid];
+    int  M     = (int)groupSize[g];
+    int  pbase = (int)groupPrimBase[g];
+    int  nbase = (int)groupNodeBase[g];
+    int  l     = gid - pbase;
+
+    int fid = mortons[gid].index;
+    uint3 facet = facets[fid];
+    float3 v0 = x[facet.x];
+    float3 v1 = x[facet.y];
+    float3 v2 = x[facet.z];
+    int leafid = nbase + (M - 1) + l;
+    tree[leafid].min = min3(v0, v1, v2);
+    tree[leafid].childA = -1;
+    tree[leafid].max = max3(v0, v1, v2);
+    tree[leafid].childB = fid;
+}
+// Multi-root counterpart of enlargeLeaf_Tri. Same swept-union expansion, but
+// the leaf lives in its group window (nbase + (M-1) + l) like
+// buildLeaf_Tri_Grouped. Buffer slots shift by one vs the single-root kernel
+// (vel at 1) so the grouped index buffers move to 7..10.
+kernel void enlargeLeaf_Tri_Grouped(
+    device const packed_float3* x [[buffer(0)]],
+    device const packed_float3* vel [[buffer(1)]],
+    device const packed_uint3* facets [[buffer(2)]],
+    constant int& numPrimitives [[buffer(3)]],
+    constant float& dt [[buffer(4)]],
+    device const MortonNode* mortons [[buffer(5)]],
+    device BVHNode* tree [[buffer(6)]],
+    device const uint* sortedPosToGroup [[buffer(7)]],
+    device const uint* groupSize [[buffer(8)]],
+    device const uint* groupPrimBase [[buffer(9)]],
+    device const uint* groupNodeBase [[buffer(10)]],
+    uint id [[thread_position_in_grid]]
+) {
+    int gid = (int)id;
+    if (gid >= numPrimitives) return;
+
+    uint g     = sortedPosToGroup[gid];
+    int  M     = (int)groupSize[g];
+    int  pbase = (int)groupPrimBase[g];
+    int  nbase = (int)groupNodeBase[g];
+    int  l     = gid - pbase;
+
+    int fid = mortons[gid].index;
+    uint3 facet = facets[fid];
+    int leafid = nbase + (M - 1) + l;
+
+    float3 lo = tree[leafid].min;
+    float3 hi = tree[leafid].max;
+    uint vid[3] = { facet.x, facet.y, facet.z };
+    for (int k = 0; k < 3; ++k) {
+        float3 p = x[vid[k]];
+        float3 s = p + vel[vid[k]] * dt;
+        lo = min(lo, min(p, s));
+        hi = max(hi, max(p, s));
+    }
+    tree[leafid].min = lo;
+    tree[leafid].max = hi;
+}
+// Fused refit+enlarge leaf pass (multi-root). SETS the full grouped leaf node
+// from the swept hull, like buildLeaf_Tri_Grouped + enlarge in one kernel.
+kernel void buildSweptLeaf_Tri_Grouped(
+    device const packed_float3* x [[buffer(0)]],
+    device const packed_float3* vel [[buffer(1)]],
+    device const packed_uint3* facets [[buffer(2)]],
+    constant int& numPrimitives [[buffer(3)]],
+    constant float& dt [[buffer(4)]],
+    device const MortonNode* mortons [[buffer(5)]],
+    device BVHNode* tree [[buffer(6)]],
+    device const uint* sortedPosToGroup [[buffer(7)]],
+    device const uint* groupSize [[buffer(8)]],
+    device const uint* groupPrimBase [[buffer(9)]],
+    device const uint* groupNodeBase [[buffer(10)]],
+    uint id [[thread_position_in_grid]]
+) {
+    int gid = (int)id;
+    if (gid >= numPrimitives) return;
+
+    uint g     = sortedPosToGroup[gid];
+    int  M     = (int)groupSize[g];
+    int  pbase = (int)groupPrimBase[g];
+    int  nbase = (int)groupNodeBase[g];
+    int  l     = gid - pbase;
+
+    int fid = mortons[gid].index;
+    uint3 facet = facets[fid];
+
+    float3 p0 = x[facet.x]; float3 s0 = p0 + vel[facet.x] * dt;
+    float3 lo = min(p0, s0), hi = max(p0, s0);
+    float3 p1 = x[facet.y]; float3 s1 = p1 + vel[facet.y] * dt;
+    lo = min(lo, min(p1, s1)); hi = max(hi, max(p1, s1));
+    float3 p2 = x[facet.z]; float3 s2 = p2 + vel[facet.z] * dt;
+    lo = min(lo, min(p2, s2)); hi = max(hi, max(p2, s2));
+
+    int leafid = nbase + (M - 1) + l;
+    tree[leafid].min = lo;
+    tree[leafid].childA = -1;
+    tree[leafid].max = hi;
+    tree[leafid].childB = fid;
+}
+
+// Multi-root bottom-up AABB combine. Identical lock-free walk to
+// `bottomUpBoxes`, except each leaf stops at its GROUP root (nodeBase[g])
+// instead of slot 0. Group node windows are disjoint, so treeVisitCounts
+// atomics never collide across groups; one dispatch over all N leaves.
+//
+// Divergence note: walk depth is ~log(M_g) (not ~log N), and consecutive
+// sorted leaves share a group, so per-warp walk depths are uniform — the
+// motivation for this layout.
+kernel void bottomUpBoxesMultiRoot(
+    constant AABB4& sceneBox [[buffer(2)]],
+    device BVHNode* tree [[buffer(4)]],
+    device const int* treeParent [[buffer(5)]],
+    device atomic_uint* treeVisitCounts [[buffer(6)]],
+    device const uint* sortedPosToGroup [[buffer(7)]],
+    device const uint* groupSize [[buffer(8)]],
+    device const uint* groupPrimBase [[buffer(9)]],
+    device const uint* groupNodeBase [[buffer(10)]],
+    uint id [[thread_position_in_grid]]
+) {
+    uint numPrimitives = (uint)sceneBox._pad0;
+    if (id >= numPrimitives) return;
+
+    uint g     = sortedPosToGroup[id];
+    int  M     = (int)groupSize[g];
+    int  pbase = (int)groupPrimBase[g];
+    int  root  = (int)groupNodeBase[g];
+    int  l     = (int)id - pbase;
+
+    int child = root + (M - 1) + l;     // this thread's leaf slot
+    if (child == root) return;          // singleton group (M == 1): leaf IS root
+
+    int numNodes = int(2u * numPrimitives) - 1;  // shared tree buffer bound
+
+    uint maxSteps = 2u * (uint)M;       // group-local wedge guard
+    for (uint step = 0; step < maxSteps; ++step) {
+        int parent = treeParent[child];
+        // INDEX GUARD: garbage parent → OOB atomic = GPU fault/wedge. Bail.
+        if (parent < 0 || parent >= numNodes) return;
+
+        uint old = atomic_fetch_add_explicit(
+            &treeVisitCounts[parent], 1u, memory_order_relaxed);
+
+        if (old == 0u) return;          // first arrival — second will combine
+
+        atomic_thread_fence(mem_flags::mem_device,
+                            memory_order_seq_cst, thread_scope_device);
+
+        int childA = tree[parent].childA;
+        int childB = tree[parent].childB;
+        if (childA < 0 || childA >= numNodes ||
+            childB < 0 || childB >= numNodes) return;   // corrupt node → bail
+        float3 minA = float3(tree[childA].min);
+        float3 maxA = float3(tree[childA].max);
+        float3 minB = float3(tree[childB].min);
+        float3 maxB = float3(tree[childB].max);
+        tree[parent].min = packed_float3(min(minA, minB));
+        tree[parent].max = packed_float3(max(maxA, maxB));
+
+        atomic_thread_fence(mem_flags::mem_device,
+                            memory_order_seq_cst, thread_scope_device);
+
+        child = parent;
+        if (child == root) return;      // wrote group root, done
     }
 }
 
@@ -886,6 +1229,7 @@ kernel void bottomUpBoxesPartial(
 
     int child = int(id + numPrimitives - 1); // leaf node index
     uint depth = 0u;
+    int numNodes = int(2u * numPrimitives) - 1;   // valid index range [0, numNodes)
 
     while (true) {
         int parent = treeParent[child];
@@ -894,6 +1238,8 @@ kernel void bottomUpBoxesPartial(
         // here don't touch treeVisitCounts at this level (preserves
         // the frontier invariant above).
         if (depth >= maxDepth) return;
+        // INDEX GUARD: garbage parent → OOB atomic = GPU fault/wedge. Bail.
+        if (parent < 0 || parent >= numNodes) return;
 
         uint old = atomic_fetch_add_explicit(
             &treeVisitCounts[parent],
@@ -909,6 +1255,8 @@ kernel void bottomUpBoxesPartial(
 
         int childA = tree[parent].childA;
         int childB = tree[parent].childB;
+        if (childA < 0 || childA >= numNodes ||
+            childB < 0 || childB >= numNodes) return;   // corrupt node → bail
 
         float3 minA = float3(tree[childA].min);
         float3 maxA = float3(tree[childA].max);
@@ -951,6 +1299,8 @@ struct QueryPointsParams {
     uint tBehavior;
     uint qShape;
     uint tShape;
+    uint numNodes;   // node count of the queried tree → traversal index bound
+    uint entryRoot;  // Phase 2b: traversal entry slot (super-root; 0 single-root)
 };
 
 
@@ -976,7 +1326,11 @@ void queryAABB(
 
     int stack[stackDepth];
     int sp = 0;
-    stack[sp++] = 0;
+    // Phase 2b: enter at the mini-TLAS super-root (grouped) or slot 0 (single).
+    // ONE O(log N) traversal — the super-root box unions all k group roots, so
+    // descending it reaches every group whose AABB overlaps the query (Phase 2a
+    // looped all k roots = O(k)/point; this is the log-k replacement).
+    stack[sp++] = (int)qParams.entryRoot;
 
     // WEDGE GUARD: a healthy traversal visits at most the node count of
     // the tree (~2M for a 1M-facet mesh). A corrupted topology (child
@@ -991,6 +1345,10 @@ void queryAABB(
             return;
         }
         int nodeid = stack[--sp];
+        // INDEX GUARD: a corrupt childA/childB pushed below could be an
+        // out-of-range slot → tree[nodeid] OOB read = GPU fault/wedge. Skip
+        // invalid indices (the visited cap already bounds healthy traversals).
+        if (nodeid < 0 || nodeid >= (int)qParams.numNodes) continue;
         BVHNode node = tree[nodeid];
 
         if (!intersectAABB(qmin, qmax, node))
@@ -1081,6 +1439,8 @@ struct QuerySegParams {
     uint tBehavior;
     uint qShape;
     uint tShape;
+    uint numNodes;       // queried tree's node count → traversal index bound
+    uint entryRoot;      // Phase 2b: traversal entry slot (super-root; 0 single-root)
 };
 
 void queryAABBSegmented(
@@ -1098,7 +1458,8 @@ void queryAABBSegmented(
     const int stackDepth = 64;
     int stack[stackDepth];
     int sp = 0;
-    stack[sp++] = 0;
+    // Phase 2b: enter at the mini-TLAS super-root (grouped) or slot 0 (single).
+    stack[sp++] = (int)qParams.entryRoot;
 
     // WEDGE GUARD: same visit cap as queryAABB — see comment there.
     uint visited = 0u;
@@ -1109,6 +1470,9 @@ void queryAABBSegmented(
             return;
         }
         int nodeid = stack[--sp];
+        // INDEX GUARD: skip out-of-range slots (corrupt child pointer) →
+        // avoids an OOB tree read that would wedge the GPU. See queryAABB.
+        if (nodeid < 0 || nodeid >= (int)qParams.numNodes) continue;
         BVHNode node = tree[nodeid];
 
         if (!intersectAABB(qmin, qmax, node)) continue;

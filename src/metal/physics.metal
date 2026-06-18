@@ -255,6 +255,21 @@ kernel void integrate_cloth_grid(
     uint end   = vertColFacetsOffsets[obase+id+1];
 
     for (uint i = begin; i < end; ++i) {
+        // Dedup coincident contacts: the triangle-sphere broad phases (spatial-
+        // hash / multi-level) list the same (vertex, target-triangle) contact
+        // once per query-side triangle incident to the vertex. Summing those
+        // identical position pushes over-corrects and blows the cloth up, so
+        // skip a contact whose (targetObj, targetTri) already appeared for this
+        // vertex. DISTINCT facets — e.g. the floor below and a cloth resting on
+        // top — still each contribute, so stacking is preserved. The BVH set is
+        // already unique per (vertex, triangle), so this is a no-op there.
+        bool dup = false;
+        for (uint j = begin; j < i; ++j) {
+            if (vertColFacets[j].objPair.y   == vertColFacets[i].objPair.y &&
+                vertColFacets[j].indexPair.y == vertColFacets[i].indexPair.y) { dup = true; break; }
+        }
+        if (dup) continue;
+
         float3 n = vertColFacets[i].collisionNormalAndDistance.xyz;
 
         float nlen2 = dot(n, n);
@@ -394,6 +409,21 @@ kernel void integrate_cloth(
     uint end   = vertColFacetsOffsets[obase+id+1];
 
     for (uint i = begin; i < end; ++i) {
+        // Dedup coincident contacts: the triangle-sphere broad phases (spatial-
+        // hash / multi-level) list the same (vertex, target-triangle) contact
+        // once per query-side triangle incident to the vertex. Summing those
+        // identical position pushes over-corrects and blows the cloth up, so
+        // skip a contact whose (targetObj, targetTri) already appeared for this
+        // vertex. DISTINCT facets — e.g. the floor below and a cloth resting on
+        // top — still each contribute, so stacking is preserved. The BVH set is
+        // already unique per (vertex, triangle), so this is a no-op there.
+        bool dup = false;
+        for (uint j = begin; j < i; ++j) {
+            if (vertColFacets[j].objPair.y   == vertColFacets[i].objPair.y &&
+                vertColFacets[j].indexPair.y == vertColFacets[i].indexPair.y) { dup = true; break; }
+        }
+        if (dup) continue;
+
         float3 n = vertColFacets[i].collisionNormalAndDistance.xyz;
 
         float nlen2 = dot(n, n);
