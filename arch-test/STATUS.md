@@ -42,7 +42,8 @@ cmake --build build
 | SimState (x/xPrev/v/f/n/extF/m) | core/SimState.hpp | **REAL** (contiguous alloc) |
 | Scene (정적 기술 + realize) | core/Scene.hpp | **REAL 구조** / grid·ground 지오메트리 CPU 시드 REAL / **topology(facets/adjacency) pack DEFERRED**, FileMesh(OBJ) 로드 DEFERRED |
 | IBVH 인터페이스 + BVHFactory(per-part cpu/gpu) | collision/IBVH.hpp, BVHFactory.hpp | **REAL 인터페이스 + config 골격**; Karras12만 생성, 나머지 throw |
-| Karras12BVH concrete | collision/Karras12BVH.hpp | **PLACEHOLDER** (no-op); GPU build pipeline 포팅 대상 |
+| Karras12BVH concrete | collision/Karras12BVH.hpp, AABB4.hpp, RadixSorter.hpp | **REAL** build/refit GPU (fillMortons→radix→buildTree→bottomUpBoxes); tree 검증(root AABB encloses, 2N-1 nodes). detectCollisions/queryPoints는 narrow 단계 |
+| Scene topology (facets/edges/CSR/restLen) | core/Topology.hpp | **REAL** (grid 삼각화 + adjacency, facets=4802 검증) |
 | ICDPipeline + DefaultCDPipeline | collision/ICDPipeline.hpp, DefaultCDPipeline.hpp | **REAL seam**; narrow PLACEHOLDER, ccd no-op(D-A1) |
 | ISystem 인터페이스 | system/ISystem.hpp | **REAL** |
 | ExplicitSystem | system/ExplicitSystem.hpp | **PLACEHOLDER integrate** (CPU semi-implicit Euler free-fall, 스프링/접촉 없음) |
@@ -56,18 +57,19 @@ PLACEHOLDER = 컴파일/실행되지만 실제 GPU 물리/충돌 미구현(seam�
 각 PLACEHOLDER 파일에 포팅 출처(main.cpp 라인)를 1줄 `ponytail:` 주석으로 남김.
 
 ## 다음 포팅 (재 리팩토링 우선순위)
-DONE: backend, core, spine, **N-Simulator 토대(allocator instancing)**, **LUT**.
-이제 실제 GPU 컴퓨트 포팅 — 의존성 순서:
-1. **Scene topology pack** — MeshGridInitializer 삼각화 + MeshAdjacency(edges/CSR/restLengths)
-   를 GPU 버퍼로 pack (main.cpp 1180-1391, 856-1171, 2771-3462). karras12·스프링의 선결. ← **다음**
-2. **ExplicitSystem GPU 2-pass** — compute_tri_spring_forces + integrate_cloth(접촉 융합)
-   (main.cpp 11172-11389 + physics.metal). behavior setBuffer 테이블. → 진짜 cloth 거동.
-3. **Karras12BVH GPU body** — fillMortons→radixSort→buildTree→bottomUpBoxes→queryPoints
-   (main.cpp 5101-6934 + bvh.metal). RadixSorter, AABB4 동반. BVH_VERSIONS.md §4.
-4. **BruteForce<METAL> narrow** — narrow_pt_tri + per-vertex counting sort → vertColFacets
-   (main.cpp 7393-7681). DefaultCDPipeline.dcd에 연결.
-5. **FileMesh(OBJ) 로드** — Human.obj (Float collider). assimp 불필요, OBJ 로더로.
-6. 그 다음 concretes: Apetrei / SubObject / SpatialHashing / MultiLevelSH (BVHFactory에 추가).
+DONE: backend, core, spine, **N-Simulator 토대(allocator instancing)**, **LUT**,
+**Scene topology pack**, **karras12 LBVH build/refit(GPU)**.
+남은 GPU 컴퓨트 포팅 — 의존성 순서:
+1. **BVH detectCollisions/queryPoints** — broad pair 생성(queryPoints + enlargeTrajectory/swept).
+   (main.cpp 6678-6934 + bvh.metal queryPoints). enlargeLeaf_Tri PSO는 이미 로드됨(state.v 배선 필요).
+2. **BruteForce<METAL> narrow** — narrow_pt_tri + per-vertex counting sort → vertColFacets
+   (main.cpp 7393-7681). DefaultCDPipeline.dcd에 연결. 1과 함께 = 진짜 충돌검출.
+3. **ExplicitSystem GPU 2-pass** — compute_tri_spring_forces + integrate_cloth(접촉 융합)
+   (main.cpp 11172-11389 + physics.metal). behavior setBuffer 테이블. → 진짜 cloth 거동 + drape.
+   (fixedParticles pin 버퍼 + 빈 vertColFacets 슬롯 필요.)
+4. **FileMesh(OBJ) 로드** — Human.obj (Float collider). assimp 불필요, OBJ 로더로.
+5. 그 다음 concretes: Apetrei / SubObject / SpatialHashing / MultiLevelSH (BVHFactory에 추가).
+6. 결정됐으나 미구현: DCD/CCD 분리(O5, 1·2와), detect=3스텝(O7), OpenGL+LUT renderer(O3), GUI 에디터(O8).
 
 결정됐으나 미구현 (REFACTOR_REVIEW.md 2차):
 - **DCD/CCD 분리**(O5) — swept 테스트를 별도 ccd 패스로(셰이더 작업). 4번 narrow와 함께.
