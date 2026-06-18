@@ -259,16 +259,26 @@ template <typename BE>
 struct GlobalAutoAllocator {
     inline static DynamicMemoryAllocator<BE> globalPool;
     inline static bool globalInitialized = false;
+
+    // Swappable routing target (O2): each Simulator setActive(&ownPool) so its
+    // allocations land in its own pool; defaults to globalPool for back-compat.
+    inline static DynamicMemoryAllocator<BE>* active = &globalPool;
+
     static void globalInitialize(size_t N) {
         if (globalInitialized) return;
         globalPool = DynamicMemoryAllocator<BE>(N);
         globalInitialized = true;
+        active = &globalPool;
     }
-    static void reset() { globalPool.pool.resetMarkers(); }
+
+    static void setActive(DynamicMemoryAllocator<BE>* a) { active = a ? a : &globalPool; }
+    static DynamicMemoryAllocator<BE>* getActive() { return active; }
+
+    static void reset() { active->pool.resetMarkers(); }   // D-041 replay rewind of ACTIVE pool
     template <typename PR>
-    static MemoryBlock<BE, PR> alloc(size_t count) { return globalPool.template alloc<PR>(count); }
+    static MemoryBlock<BE, PR> alloc(size_t count) { return active->template alloc<PR>(count); }
     template <typename PR>
-    static MemoryBlock<BE, PR> zeros(size_t count) { return globalPool.template zeros<PR>(count); }
+    static MemoryBlock<BE, PR> zeros(size_t count) { return active->template zeros<PR>(count); }
     template <typename PR>
-    static MemoryBlock<BE, PR> allocFill(size_t count, PR fill) { return globalPool.template allocFill<PR>(count, fill); }
+    static MemoryBlock<BE, PR> allocFill(size_t count, PR fill) { return active->template allocFill<PR>(count, fill); }
 };

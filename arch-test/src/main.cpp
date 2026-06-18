@@ -12,5 +12,7 @@ int main(int argc, char** argv) {
     GlobalAutoAllocator<METAL>::globalInitialize(size_t(1) << 28);
 
     Runner<METAL, Precision> runner(frames);
-    return runner.run() ? 0 : 1;
+    bool single = runner.run();          // single-sim PASS path (back-compat)
+    bool multi  = runner.runMulti();     // N coexisting Simulators (O2)
+    return (single && multi) ? 0 : 1;
 }
