@@ -3,6 +3,7 @@
 #include "core/Types.hpp"
 #include "core/BehaviorParams.hpp"
 #include "core/SimState.hpp"
+#include "core/Topology.hpp"
 
 #include "tinym.hpp"
 #include <string>
@@ -37,6 +38,7 @@ template <typename BE, typename PR>
 struct Scene {
     std::vector<ObjectDesc> objects;
     std::vector<Index> statesOffsets;   // size objects+1, vertex start per mesh
+    std::vector<MeshTopology<BE, PR>> topology;  // index-aligned with objects
     SceneEnvironment environment;
 
     Index add(ObjectDesc d) {
@@ -73,6 +75,17 @@ struct Scene {
                        o.behavior == BehaviorType::FastGridCloth);
             Index base = statesOffsets[i];
             seedGeometry(o, s, base, isCloth);
+        }
+
+        // Build triangle topology + spring adjacency for GridCloth meshes.
+        // Positions are seeded above; rest lengths are measured from them.
+        // Ground / FileMesh get an empty (built=false) slot — no consumer
+        // yet, and free-fall is unchanged (nothing reads topology this pass).
+        topology.assign(objects.size(), MeshTopology<BE, PR>{});
+        for (size_t i = 0; i < objects.size(); ++i) {
+            const auto& o = objects[i];
+            if (o.kind == ObjectDesc::Kind::GridCloth && o.gridN > 1)
+                topology[i].build(o.gridN, statesOffsets[i], s);
         }
     }
 

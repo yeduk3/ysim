@@ -43,6 +43,18 @@ struct Runner {
                   << " cd=" << (sim.cdPipeline ? sim.cdPipeline->name() : "none")
                   << " sys=" << sim.system->name() << "\n";
 
+        // topology sanity (id 0 grid cloth): facets=2*(N-1)^2, edges>0, restLen>0
+        if (!sim.scene.topology.empty() && sim.scene.topology[0].built) {
+            const auto& t = sim.scene.topology[0];
+            const PR* rest = t.restEdgeLengths.ptr;
+            PR minRest = (t.numEdges ? rest[0] : PR(0));
+            for (Index e = 1; e < t.numEdges; ++e)
+                if (rest[e] < minRest) minRest = rest[e];
+            std::cout << "[Topology] cloth(id0) facets=" << t.numFacets
+                      << " uniqueEdges=" << t.numEdges
+                      << " minRestEdgeLen=" << minRest << "\n";
+        }
+
         // cloth (id 0) starting height — read via LUT
         PR y0 = clothY(sim);
 
