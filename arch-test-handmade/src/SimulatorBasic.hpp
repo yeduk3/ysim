@@ -4,18 +4,18 @@
 
 #include "Solver.hpp"
 
-template <class SimConfigT, class SolverT, class CDPT, class SceneT>
-requires Solver<SolverT, CDPT, SceneT>
-class BasicSimulator {
+template <class SimConfigT, class SolverT, class CDT, class SceneT>
+requires Solver<SolverT, CDT, SceneT>
+struct SimulatorBasic {
     SimConfigT simConfig;
     SolverT solver;
-    CDPT cd;
+    CDT cd;
     SceneT scene;
 
-    BasicSimulator(
+    SimulatorBasic(
         SimConfigT simConfig,
         SolverT solver,
-        CDPT cd,
+        CDT cd,
         SceneT scene
     ) : simConfig(simConfig),
         solver(solver),
@@ -23,12 +23,13 @@ class BasicSimulator {
         scene(scene)
     {}
 
-    void step(SolverT& solver, CDPT& cd, SceneT& scene, const SimConfigT& simConfig) {
+    void step() {
         Real subDt = simConfig.dt / simConfig.substeps;
         for(int substep = 0; substep < simConfig.substeps; substep++) {
             cd.dcd();
-            solver.accumulate();
+            solver.accumulate(cd, scene);
             solver.integrate(scene, subDt);
+            cd.ccd();
         }
     }
 };

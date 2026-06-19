@@ -11,9 +11,9 @@
 // - scene
 // - simconfig
 
-template <class SimulatorT, class SolverT, class CDPT, class SceneT>
-concept Simulator = requires(SimulatorT& simulator, SolverT& solver, CDPT& cd, SceneT& scene, Real dt) {
-    { simulator.step(solver, scene, cd, dt) } -> std::same_as<void>;
+template <class SimulatorT>
+concept Simulator = requires(SimulatorT& simulator) {
+    { simulator.step() } -> std::same_as<void>;
 };
 
 

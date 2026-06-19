@@ -1,3 +1,8 @@
 #include "src/Runner.hpp"
 
-int main() { return 0; }
+int main() { 
+    Runner runner;
+    runner.init();
+
+    runner.run();
+}
