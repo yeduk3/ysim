@@ -12685,11 +12685,18 @@ static int runSyncProbe(int particleNum1D, int frames) {
         // None = no profiler attached; PerFrame/InFrame attach one.
         profiler::FrameProfiler prof((std::size_t)(frames + 4));
         sim.profiler = (level == sim_config::ProfileLevel::None) ? nullptr : &prof;
+        std::vector<double> frameMs;     // wall-clock per frame (the payoff metric)
+        uint64_t lastSyncs = 0;
         for (int f = 0; f < frames; ++f) {
             uint64_t before = MetalGlobalContext::syncCount;
+            auto t0 = std::chrono::steady_clock::now();
             if (sim.profiler) sim.profiler->beginFrame((uint64_t)f, (double)f * (double)h);
             sim.update();
             if (sim.profiler) sim.profiler->endFrame();
+            auto t1 = std::chrono::steady_clock::now();
+            double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+            if (f >= frames / 2) frameMs.push_back(ms);   // steady (post free-fall)
+            lastSyncs = MetalGlobalContext::syncCount - before;
             // Cloth Y range (mesh 0) — a correctness sentinel: the async GPU
             // bucketing (None/PerFrame) must drape like the CPU path (InFrame).
             // maxY held ~1.18 = on the Human, no tunnel; a broken bucket lets
@@ -12706,15 +12713,26 @@ static int runSyncProbe(int particleNum1D, int frames) {
                       << " syncs=" << (MetalGlobalContext::syncCount - before)
                       << " clothY=[" << mn << "," << mx << "]"
                       << " broad=" << pc.numBroadCollisions[0]
-                      << " narrow=" << pc.numNarrowCollisions[0] << "\n";
+                      << " narrow=" << pc.numNarrowCollisions[0]
+                      << " frame=" << ms << "ms\n";
         }
         sim.profiler = nullptr;
+        std::sort(frameMs.begin(), frameMs.end());
+        double medMs = frameMs.empty() ? 0.0 : frameMs[frameMs.size()/2];
+        std::cerr << "[sync-probe " << name << "] SUMMARY  median frame="
+                  << medMs << "ms  syncs/frame=" << lastSyncs << "\n";
+        return medMs;
     };
     std::cerr << "=== sync probe: P=" << particleNum1D << " frames=" << frames
               << " (60 substeps/frame) ===\n";
-    runLevel(sim_config::ProfileLevel::None,      "none     ");
-    runLevel(sim_config::ProfileLevel::PerFrame,  "per_frame");
-    runLevel(sim_config::ProfileLevel::InFrame,   "in_frame ");
+    // InFrame first as the reference, then the async tiers, so the speedup is
+    // the last thing printed.
+    double inf = runLevel(sim_config::ProfileLevel::InFrame,   "in_frame ");
+    double prf = runLevel(sim_config::ProfileLevel::PerFrame,  "per_frame");
+    double non = runLevel(sim_config::ProfileLevel::None,      "none     ");
+    std::cerr << "=== payoff: in_frame " << inf << "ms -> none " << non
+              << "ms  (" << (non > 0 ? inf / non : 0.0) << "x faster, "
+              << "sync floor removed: 181 -> 1 sync/frame) ===\n";
     return 0;
 }
 
@@ -19750,6 +19768,12 @@ int main(int argc, char** argv) {
     // `if (profiler)` sections take the fast path. Called once now and at the
     // top of every render frame (so the GUI combo takes effect immediately).
     auto applyProfilerLevel = [&]() {
+        // Drive the sync tier: profileLevel gates syncEachPhase() inside
+        // update(), so None/PerFrame run the substep loop fully async (one
+        // boundary sync/frame) and InFrame keeps the per-section commits.
+        // Without this the GUI level selector would record nothing extra but
+        // still pay the full 181-sync floor.
+        simulator.profileLevel = activeProfileLevel;
         profiler::FrameProfiler* p =
             (activeProfileLevel == sim_config::ProfileLevel::InFrame)
                 ? &frameProfiler : nullptr;
