@@ -1,0 +1,186 @@
+{
+  "engine": {
+    "backend": "METAL",
+    "system": "Explicit"
+  },
+  "environment": {
+    "background_color": [
+      0.8859999775886536,
+      0.906000018119812,
+      0.921999990940094
+    ],
+    "gravity": [
+      0.0,
+      -9.8100004196167,
+      0.0
+    ],
+    "wind": [
+      0.0,
+      0.0,
+      0.0
+    ]
+  },
+  "format_version": 1,
+  "objects": [
+    {
+      "apply_gravity": true,
+      "apply_wind": true,
+      "behavior": {
+        "params": {
+          "bend": 200000.0,
+          "shear": 100000.0,
+          "stretch": 100000.0,
+          "thickness": 0.009999999776482582
+        },
+        "type": "TriangularCloth"
+      },
+      "cloth_stiffness_scale": 1.0,
+      "id": 0,
+      "is_static": false,
+      "material": {
+        "base_color": [
+          1.0,
+          1.0,
+          1.0
+        ],
+        "emission_color": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.5,
+        "specular_weight": 1.0
+      },
+      "name": "object_0",
+      "source": {
+        "direction": "XZPlane",
+        "jiggle": true,
+        "mass": 0.10000000149011612,
+        "shape": "grid",
+        "size": 1.0,
+        "tessellation": 50,
+        "type": "primitive"
+      },
+      "transform": {
+        "position": [
+          0.0,
+          1.25,
+          0.0
+        ],
+        "rotation": [
+          1.0,
+          0.0,
+          0.0,
+          0.0
+        ]
+      }
+    },
+    {
+      "apply_gravity": true,
+      "apply_wind": true,
+      "behavior": {
+        "params": {},
+        "type": "Float"
+      },
+      "cloth_stiffness_scale": 1.0,
+      "id": 1,
+      "is_static": true,
+      "material": {
+        "base_color": [
+          1.0,
+          1.0,
+          1.0
+        ],
+        "emission_color": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.5,
+        "specular_weight": 1.0
+      },
+      "name": "object_1",
+      "source": {
+        "mass": 0.10000000149011612,
+        "path": "/Users/gyu/codes/ysim/assets/Human.obj",
+        "scale": 0.03999999910593033,
+        "type": "import"
+      },
+      "transform": {
+        "position": [
+          0.0,
+          0.3499999940395355,
+          0.0
+        ],
+        "rotation": [
+          1.0,
+          0.0,
+          0.0,
+          0.0
+        ]
+      }
+    },
+    {
+      "apply_gravity": true,
+      "apply_wind": true,
+      "behavior": {
+        "params": {},
+        "type": "Float"
+      },
+      "cloth_stiffness_scale": 1.0,
+      "id": 2,
+      "is_static": true,
+      "material": {
+        "base_color": [
+          1.0,
+          1.0,
+          1.0
+        ],
+        "emission_color": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "metallic": 0.0,
+        "roughness": 0.5,
+        "specular_weight": 1.0
+      },
+      "name": "object_2",
+      "source": {
+        "direction": "XZPlane",
+        "jiggle": false,
+        "mass": 0.10000000149011612,
+        "shape": "grid",
+        "size": 50.0,
+        "tessellation": 2,
+        "type": "primitive"
+      },
+      "transform": {
+        "position": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "rotation": [
+          1.0,
+          0.0,
+          0.0,
+          0.0
+        ]
+      }
+    }
+  ],
+  "profile": {
+    "enabled": true,
+    "frames": 30,
+    "level": "in_frame",
+    "output_path": "profiles/experiment/sap-topphase-2026-06-23/gpu_s3_r5.csv",
+    "realtime_sync": false
+  },
+  "simulation": {
+    "substeps": 60,
+    "time_per_frame": 0.01666666753590107
+  }
+}

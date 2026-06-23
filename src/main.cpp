@@ -5209,18 +5209,27 @@ struct BVH<BE, PR, BVHMODE::LINEAR, PRIMITIVE> {
     VectorBase<METAL, uint32_t> groupNodeBase;     // [k] Σ (2 M_h - 1)  (h<g)
     uint32_t subBvhNumNodes = 0;                   // 2N - (#nonempty groups)
 
-    // ---- Phase 2b: mini-TLAS over the k group roots ----
-    // The k group subtrees occupy slots [0, 2N-k); the TAIL slots
-    // [2N-k, 2N-1) (exactly k-1) host a binary top tree whose k leaves ARE
-    // the group roots. Stitching the k roots under one super-root turns the
-    // multi-root query back into a SINGLE-root traversal (enter at superRoot),
-    // O(log N) — replacing Phase 2a's O(k) per-point root scan. Top-tree
-    // topology is FIXED (material-space tile grid) so it is built once; only
-    // its internal AABBs are recombined per refit (topCombineCPU, cheap: k-1
-    // CPU unions after the GPU multi-root combine). The GPU combine stops at
-    // group roots and never touches the tail, so it is unaffected.
-    int subBvhSuperRoot = 0;                       // entry slot for grouped query
-    std::vector<int> subBvhTopCombineOrder;        // top internals, child-before-parent
+    // ---- Sub-object top phase: which group subtree(s) does a query point
+    // descend? The k group subtrees occupy node slots [0, 2N-k); the top level
+    // (point → candidate groups) is a flat cull over the k group root boxes —
+    // NOT a tree. (The old binary mini-TLAS was removed: experiments showed it
+    // gives no win over a flat cull, and a tree over k boxes has no
+    // justification — profiles/experiment/sap-topphase-2026-06-23/FINDINGS.md.)
+    //   0 = CPU SAP (default, queryPointsSAP): CPU sweep-and-prune over the k
+    //       group root boxes emits candidate (point, groupRoot) pairs, GPU
+    //       descends one subtree per pair. Point boxes have constant width
+    //       2·margin, so "overlaps group g on X" is a contiguous slice of
+    //       x-sorted points → two binary searches/group.
+    //   1 = GPU brute (queryPointsGPUTop): each point thread brute-tests the k
+    //       group roots on the GPU and descends overlapping subtrees inline —
+    //       no CPU sort, no pair buffer. Parity with SAP in the experiment.
+    // Mode is live (read at query time).
+    int subTopMode = 0;
+    struct SAPPair { uint32_t pointId; uint32_t entryRoot; };
+    VectorBase<METAL, SAPPair> sapPairs;           // [cap] candidate pairs (GPU)
+    uint32_t sapPairsCap = 0;                       // capacity in pairs
+    std::vector<uint32_t> sapOrder;                 // point ids sorted by x.min (reused)
+    std::vector<SAPPair>  sapBuild_;                 // CPU pair build scratch (reused)
 
     // Runtime toggle between the two BVH construction paths. Default is
     // the existing Karras pipeline (`buildTree_*` + `bottomUpBoxes`); set
@@ -5301,6 +5310,8 @@ struct BVH<BE, PR, BVHMODE::LINEAR, PRIMITIVE> {
     MTL::ComputePipelineState* buildSweptLeafPSO = nullptr;        // fused refit+enlarge
     MTL::ComputePipelineState* buildSweptLeafGroupedPSO = nullptr; // fused (multi-root)
     MTL::ComputePipelineState* queryPointsPSO;
+    MTL::ComputePipelineState* queryPointsPairsPSO = nullptr;  // SAP top-phase descent
+    MTL::ComputePipelineState* queryPointsGroupedPSO = nullptr; // GPU brute top-phase
     // Segmented (per-threadgroup) detect+reduce variant — three PSOs
     // matching bvh.metal's queryPointsSegmented → scanReserveSegmented
     // → compactSegmented pipeline. Loaded unconditionally so a runtime
@@ -5355,6 +5366,8 @@ struct BVH<BE, PR, BVHMODE::LINEAR, PRIMITIVE> {
         zeroVisitCountsPSO = MetalKernelContext::getPSO("zeroVisitCounts"); // D-029
         agglomerativeSwapRootPSO = MetalKernelContext::getPSO("agglomerativeSwapRoot");
         queryPointsPSO = MetalKernelContext::getPSO("queryPoints");
+        queryPointsPairsPSO = MetalKernelContext::getPSO("queryPointsPairs");  // SAP top phase
+        queryPointsGroupedPSO = MetalKernelContext::getPSO("queryPointsGrouped");  // GPU top phase
         queryPointsSegmentedPSO = MetalKernelContext::getPSO("queryPointsSegmented");
         scanReserveSegmentedPSO = MetalKernelContext::getPSO("scanReserveSegmented");
         compactSegmentedPSO     = MetalKernelContext::getPSO("compactSegmented");
@@ -5828,62 +5841,6 @@ struct BVH<BE, PR, BVHMODE::LINEAR, PRIMITIVE> {
         std::copy(mortonsTemp.ptr, mortonsTemp.ptr + N, mortons.ptr);
     }
 
-    // Phase 2b: recursive median-split over the group set `gs[0..n)` on the
-    // TR×TR tile grid (group g at tile (g/TR, g%TR)). Returns the node slot for
-    // this subtree: a group root (leaf, slot groupNodeBase[g]) for n==1, else a
-    // freshly-allocated tail internal. Sets childA/childB and records the
-    // internal in `subBvhTopCombineOrder` AFTER its children (post-order) so a
-    // single forward pass combines bottom-up. treeParent is left untouched so
-    // the GPU multi-root combine (which walks only WITHIN group windows) is
-    // unaffected. `internalNext` consumes exactly k-1 tail slots.
-    int buildTopRec(int* gs, int n, int TR, int& internalNext) {
-        if (n <= 1) return (int)groupNodeBase[gs[0]];
-        int minR = INT_MAX, maxR = INT_MIN, minC = INT_MAX, maxC = INT_MIN;
-        for (int i = 0; i < n; ++i) {
-            int r = gs[i] / TR, c = gs[i] % TR;
-            minR = std::min(minR, r); maxR = std::max(maxR, r);
-            minC = std::min(minC, c); maxC = std::max(maxC, c);
-        }
-        bool splitRow = (maxR - minR) >= (maxC - minC);
-        std::sort(gs, gs + n, [TR, splitRow](int x, int y) {
-            return splitRow ? (x / TR < y / TR) : (x % TR < y % TR);
-        });
-        int mid = n / 2;
-        int a = buildTopRec(gs, mid, TR, internalNext);
-        int b = buildTopRec(gs + mid, n - mid, TR, internalNext);
-        int slot = internalNext++;
-        tree[slot].childA = a;
-        tree[slot].childB = b;
-        subBvhTopCombineOrder.push_back(slot);
-        return slot;
-    }
-
-    // Build the mini-TLAS over the k group roots into the tail slots. Topology
-    // only (depends on the fixed tile grid) — call once when the group tables
-    // are (re)built. AABBs are filled per refit by topCombineCPU().
-    void buildSubObjectTopTree() {
-        subBvhTopCombineOrder.clear();
-        int k = numGroups;
-        if (k <= 1) { subBvhSuperRoot = (k == 1) ? (int)groupNodeBase[0] : 0; return; }
-        int TR = (int)std::lround(std::sqrt((double)k));   // k == TR²
-        int internalNext = (int)subBvhNumNodes;            // first free tail slot (2N-k)
-        std::vector<int> all(k);
-        for (int g = 0; g < k; ++g) all[g] = g;
-        subBvhSuperRoot = buildTopRec(all.data(), k, TR, internalNext);
-    }
-
-    // Combine the top-tree internal AABBs from the group roots up to the
-    // super-root. min/max ONLY (childA/childB preserved — they alias the same
-    // 32B node). Run AFTER bottomUpBoxesMultiRootGPU has committed (group roots
-    // CPU-visible). Child-before-parent order → one forward pass.
-    void topCombineCPU() {
-        for (int slot : subBvhTopCombineOrder) {
-            int a = tree[slot].childA, b = tree[slot].childB;
-            tree[slot].min = tinym::min(tree[a].min, tree[b].min);
-            tree[slot].max = tinym::max(tree[a].max, tree[b].max);
-        }
-    }
-
     void buildTreeGroupedGPU() {
         int numPrimitives = primitives.size / PRIMITIVE;
         if (numPrimitives == 0) return;
@@ -6000,7 +5957,6 @@ struct BVH<BE, PR, BVHMODE::LINEAR, PRIMITIVE> {
             bottomUpBoxesGPU(sceneBox);
         }
         MetalGlobalContext::commitAndWait();
-        if (grouped) topCombineCPU();   // Phase 2b: refresh mini-TLAS AABBs
     }
     // Multi-root combine. Mirrors bottomUpBoxesGPU (zero visit-counts +
     // dispatch) but the kernel stops each leaf walk at its group root.
@@ -6067,13 +6023,17 @@ struct BVH<BE, PR, BVHMODE::LINEAR, PRIMITIVE> {
 
     // Object-level AABB for the scene TLAS. Single-root: slot 0. Multi-root:
     // union of the k group roots (slot 0 is only group 0's root, so reading
-    // tree[0] alone would under-cull this object in the broad phase).
+    // tree[0] alone would under-cull this object in the broad phase). Group
+    // roots (slot groupNodeBase[g]) are CPU-visible after the GPU multi-root
+    // combine + commitAndWait, so this k-loop runs in the BroadPhase refit's
+    // post-sync pass. k is tiny vs the per-substep work.
     AABB4 objectRootAABB() {
         if (!subObjectActive() || groupOfPrim.size != primitives.size / PRIMITIVE)
             return tree[0].aabb;
-        // Phase 2b: the mini-TLAS super-root box IS the union of all k group
-        // roots (filled by topCombineCPU) → O(1), no per-call k-loop.
-        return tree[subBvhSuperRoot].aabb;
+        AABB4 box = tree[groupNodeBase[0]].aabb;
+        for (int g = 1; g < numGroups; ++g)
+            if (groupSize[g] > 0) box.combine(tree[groupNodeBase[g]].aabb);
+        return box;
     }
 
     void build(int oid, VectorBase<METAL, PR>& pos, VectorBase<METAL, Index>& prim) {
@@ -6148,14 +6108,12 @@ struct BVH<BE, PR, BVHMODE::LINEAR, PRIMITIVE> {
             // when the prim count changes.
             if (groupOfPrim.size != numPrimitives || subBvhBuiltS != subBvhSplitS) {
                 computeSubObjectGroups();
-                buildSubObjectTopTree();           // Phase 2b: mini-TLAS topology (once)
             }
             MetalGlobalContext::commitAndWait();   // Morton sort visible to CPU
             cpuStableGroupPartition();
             buildTreeGroupedGPU();
             bottomUpBoxesMultiRootGPU(sceneBox);
             MetalGlobalContext::commitAndWait();
-            topCombineCPU();                        // Phase 2b: fill mini-TLAS AABBs
         } else if (useAgglomerative) {
             agglomerativeBuildGPU();
             agglomerativeSwapRootGPU();
@@ -6468,12 +6426,11 @@ struct BVH<BE, PR, BVHMODE::LINEAR, PRIMITIVE> {
         if (subObjectActive() && groupOfPrim.size == numPrimitives) {
             buildLeafGroupedGPU();
             bottomUpBoxesMultiRootGPU(sceneBox);
-            // No commitAndWait / topCombineCPU — only the GPU multi-root combine
-            // is dispatched. The caller batches ONE commitAndWait then calls
-            // topCombineCPU for grouped trees (see BroadPhase::refit), matching the
-            // non-grouped path and enlargeTrajectory's grouped externalization.
-            // Batching this sync cut refit ~13% / frame ~19% (vs the old inline)
-            // on the sub-object scene.
+            // No commitAndWait — only the GPU multi-root combine is dispatched.
+            // The caller batches ONE commitAndWait, after which the group roots
+            // are CPU-visible for objectRootAABB() and the SAP top phase (see
+            // BroadPhase::refit). Batching this sync cut refit ~13% / frame ~19%
+            // (vs the old inline) on the sub-object scene.
             return;
         }
 
@@ -6486,8 +6443,7 @@ struct BVH<BE, PR, BVHMODE::LINEAR, PRIMITIVE> {
         // after dispatching every object's refit, so N objects share a single
         // GPU round-trip instead of paying N per-substep syncs. Any caller that
         // reads this tree on the CPU (objectRootAABB, the CPU enlarge leaf loop,
-        // a timing bench) must commitAndWait first. The grouped path above keeps
-        // its own commit because topCombineCPU reads the GPU group-roots inline.
+        // a timing bench) must commitAndWait first.
     }
 
     void enlargeTrajectory(PR dt) {
@@ -6517,9 +6473,9 @@ struct BVH<BE, PR, BVHMODE::LINEAR, PRIMITIVE> {
                 enlargeLeafGPU(dt);
                 bottomUpBoxesGPU(sceneBox);
             }
-            // No commitAndWait / topCombineCPU here — the GPU combine is only
-            // dispatched. The caller batches ONE commitAndWait, then calls
-            // topCombineCPU for grouped trees (see BroadPhase::enlargeTrajectory).
+            // No commitAndWait here — the GPU combine is only dispatched. The
+            // caller batches ONE commitAndWait (group roots then CPU-visible for
+            // objectRootAABB / SAP; see BroadPhase::enlargeTrajectory).
             return;
         }
 
@@ -6544,11 +6500,11 @@ struct BVH<BE, PR, BVHMODE::LINEAR, PRIMITIVE> {
             }
             AABB4 sceneBox; sceneBox.i0 = numPrimitives;
             bottomUpBoxesMultiRootGPU(sceneBox);
-            // No commitAndWait / topCombineCPU here — only the GPU multi-root
-            // combine is dispatched. The caller batches ONE commitAndWait then
-            // calls topCombineCPU (see BroadPhase::enlargeTrajectory). This is
-            // the per-substep sync that made sub-object enlarge +67%; batching it
-            // cut frame time ~11% (vs the old inline sync) on the sub-object scene.
+            // No commitAndWait here — only the GPU multi-root combine is
+            // dispatched. The caller batches ONE commitAndWait (group roots then
+            // CPU-visible for objectRootAABB / SAP; see BroadPhase). This is the
+            // per-substep sync that made sub-object enlarge +67%; batching it cut
+            // frame time ~11% (vs the old inline sync) on the sub-object scene.
             return;
         }
         for(Index i = 0; i < numPrimitives; ++i) {
@@ -6667,7 +6623,7 @@ struct BVH<BE, PR, BVHMODE::LINEAR, PRIMITIVE> {
         uint32_t qShape;
         uint32_t tShape;
         uint32_t numNodes;   // queried tree's node count → traversal index bound
-        uint32_t entryRoot;  // Phase 2b: traversal entry slot (super-root; 0 single)
+        uint32_t entryRoot;  // single-root entry slot (0); repurposed by SAP/GPU kernels
     };
 
     void queryBegin() {
@@ -6692,15 +6648,22 @@ struct BVH<BE, PR, BVHMODE::LINEAR, PRIMITIVE> {
         Index qnumPoints = qpos.size/3;
         //auto& constraints = qmesh->constraints;
         typename Scene<METAL, PR>::PackedCollisionData& packedCol = Scene<METAL, PR>::packedCollisionData;
-        // Phase 2b: grouped query enters at the mini-TLAS super-root (one
-        // O(log N) traversal); single-root enters at slot 0.
+        // Sub-object top phase (no mini-TLAS): a grouped query culls point→group
+        // via a flat top phase, then descends only the overlapping subtrees.
+        // subTopMode 0 = CPU SAP (default), 1 = GPU brute. Single-root meshes
+        // (non-grouped) fall through to the slot-0 descent below.
         const bool grouped = subObjectActive()
                           && groupOfPrim.size == primitives.size / PRIMITIVE;
+        if (grouped) {
+            if (subTopMode == 1 && queryPointsGroupedPSO) queryPointsGPUTop(qIndex, queryMargin);
+            else                                          queryPointsSAP(qIndex, queryMargin);
+            return;
+        }
         QueryPointsParams qParams = {
             queryMargin, qnumPoints, qIndex, (Index)objIndex, packedCol.maxNumCollisions,
             (Index)qmesh.behaviorType, (Index)objBehavior, (Index)qmesh.shapeType, (Index)objShape,
             (uint32_t)tree.size,
-            grouped ? (uint32_t)subBvhSuperRoot : 0u
+            0u   // single-root: enter at slot 0
         };
 
         MetalGlobalContext::setBuffer(qpos, 0);
@@ -6719,6 +6682,118 @@ struct BVH<BE, PR, BVHMODE::LINEAR, PRIMITIVE> {
 
         // D-041 turn-3: self-pair uses this tree's INDEX (not mesh.id).
         queryPoints(objIndex, queryMargin);
+    }
+
+    // SAP top phase (experiment). CPU sweep-and-prune over the k group root
+    // boxes vs the qnumPoints query boxes emits candidate (point, groupRoot)
+    // pairs; the GPU then descends one group subtree per pair. Replaces the
+    // mini-TLAS GPU descent (Phase 2b). Pre: refit committed (group root boxes
+    // CPU-visible) and the querying mesh's positions are current on the CPU.
+    void queryPointsSAP(Index qIndex, PR queryMargin) {
+        if (qIndex < 0 || qIndex >= (Index)Scene<METAL, PR>::meshes.size()) return;
+        auto& qmesh = Scene<METAL, PR>::meshes[qIndex];
+        auto& qpos  = qmesh.state.x;
+        Index qnumPoints = qpos.size / 3;
+        if (qnumPoints == 0 || numGroups <= 0) return;
+        typename Scene<METAL, PR>::PackedCollisionData& packedCol =
+            Scene<METAL, PR>::packedCollisionData;
+
+        const float m = (float)queryMargin;
+        const float* xp = qpos.ptr;   // unified memory: CPU-visible positions
+
+        // Sort point ids by x.min (= x - m, monotone in x ⇒ sort by x).
+        sapOrder.resize((size_t)qnumPoints);
+        for (Index i = 0; i < qnumPoints; ++i) sapOrder[i] = (uint32_t)i;
+        std::sort(sapOrder.begin(), sapOrder.end(),
+                  [xp](uint32_t a, uint32_t b) { return xp[3*a] < xp[3*b]; });
+
+        // Per group: X-slice of points whose box overlaps the group box on X.
+        // Point box = [x-m, x+m] (constant width 2m) ⇒ overlap on X iff
+        //   x - m <= gxmax  &&  x + m >= gxmin  ⇔  gxmin-2m <= (x-m) <= gxmax
+        // i.e. a contiguous run in sapOrder (sorted by x). Within it, confirm
+        // Y/Z overlap, then emit (pointId, groupRoot).
+        auto xkey = [xp](uint32_t id) { return xp[3*id]; };  // sort key (x)
+        std::vector<SAPPair>& out = sapBuild_;
+        out.clear();
+        for (int g = 0; g < numGroups; ++g) {
+            if (groupSize[g] == 0) continue;
+            const BVHNode& gb = tree[groupNodeBase[g]];
+            const float gxmin = gb.min.x, gxmax = gb.max.x;
+            const float gymin = gb.min.y, gymax = gb.max.y;
+            const float gzmin = gb.min.z, gzmax = gb.max.z;
+            // run = [lo, hi) over sapOrder where x in [gxmin - m, gxmax + m]
+            // (x-m <= gxmax ⇒ x <= gxmax+m ; x+m >= gxmin ⇒ x >= gxmin-m).
+            auto lo = std::lower_bound(sapOrder.begin(), sapOrder.end(), gxmin - m,
+                          [&](uint32_t id, float v) { return xkey(id) < v; });
+            auto hi = std::upper_bound(sapOrder.begin(), sapOrder.end(), gxmax + m,
+                          [&](float v, uint32_t id) { return v < xkey(id); });
+            const uint32_t root = groupNodeBase[g];
+            for (auto it = lo; it != hi; ++it) {
+                uint32_t id = *it;
+                float y = xp[3*id+1], z = xp[3*id+2];
+                if (y + m < gymin || y - m > gymax) continue;
+                if (z + m < gzmin || z - m > gzmax) continue;
+                out.push_back({ id, root });
+            }
+        }
+
+        const uint32_t numPairs = (uint32_t)out.size();
+        if (numPairs == 0) return;
+
+        // Grow the GPU pair buffer geometrically; refill each call.
+        if (numPairs > sapPairsCap) {
+            sapPairsCap = numPairs + numPairs / 2 + 64;
+            sapPairs = VectorBase<METAL, SAPPair>(sapPairsCap);
+        }
+        std::copy(out.begin(), out.end(), sapPairs.ptr);
+
+        QueryPointsParams qParams = {
+            queryMargin, numPairs, (Index)qIndex, (Index)objIndex,
+            packedCol.maxNumCollisions,
+            (Index)qmesh.behaviorType, (Index)objBehavior,
+            (Index)qmesh.shapeType, (Index)objShape,
+            (uint32_t)tree.size, 0u  // entryRoot unused (per-pair)
+        };
+        MetalGlobalContext::setBuffer(qpos, 0);
+        MetalGlobalContext::setBuffer(primitives, 1);
+        MetalGlobalContext::setBuffer(tree, 2);
+        MetalGlobalContext::setBytes(qParams, 3);
+        MetalGlobalContext::setBuffer(packedCol.broadCollisions, 4);
+        MetalGlobalContext::setBuffer(packedCol.numBroadCollisions, 5);
+        MetalGlobalContext::setBuffer(qFlag, 6);
+        MetalGlobalContext::setBuffer(sapPairs, 7);
+        MetalGlobalContext::dispatchThreads(queryPointsPairsPSO, numPairs);
+    }
+
+    // GPU top phase (mode 2). One thread per query point brute-tests the k
+    // group root boxes on the GPU and descends overlapping subtrees inline —
+    // no CPU sort, no pair buffer (vs queryPointsSAP). qParams.entryRoot is
+    // repurposed as the group count; groupNodeBase[] holds the k root slots.
+    void queryPointsGPUTop(Index qIndex, PR queryMargin) {
+        if (qIndex < 0 || qIndex >= (Index)Scene<METAL, PR>::meshes.size()) return;
+        auto& qmesh = Scene<METAL, PR>::meshes[qIndex];
+        auto& qpos  = qmesh.state.x;
+        Index qnumPoints = qpos.size / 3;
+        if (qnumPoints == 0 || numGroups <= 0) return;
+        typename Scene<METAL, PR>::PackedCollisionData& packedCol =
+            Scene<METAL, PR>::packedCollisionData;
+
+        QueryPointsParams qParams = {
+            queryMargin, (uint32_t)qnumPoints, (Index)qIndex, (Index)objIndex,
+            packedCol.maxNumCollisions,
+            (Index)qmesh.behaviorType, (Index)objBehavior,
+            (Index)qmesh.shapeType, (Index)objShape,
+            (uint32_t)tree.size, (uint32_t)numGroups  // entryRoot repurposed = group count
+        };
+        MetalGlobalContext::setBuffer(qpos, 0);
+        MetalGlobalContext::setBuffer(primitives, 1);
+        MetalGlobalContext::setBuffer(tree, 2);
+        MetalGlobalContext::setBytes(qParams, 3);
+        MetalGlobalContext::setBuffer(packedCol.broadCollisions, 4);
+        MetalGlobalContext::setBuffer(packedCol.numBroadCollisions, 5);
+        MetalGlobalContext::setBuffer(qFlag, 6);
+        MetalGlobalContext::setBuffer(groupNodeBase, 7);
+        MetalGlobalContext::dispatchThreads(queryPointsGroupedPSO, qnumPoints);
     }
 
     // ===== Segmented (per-threadgroup) detect+reduce variant =====
@@ -6745,7 +6820,7 @@ struct BVH<BE, PR, BVHMODE::LINEAR, PRIMITIVE> {
         uint32_t qShape;
         uint32_t tShape;
         uint32_t numNodes;   // queried tree's node count → traversal index bound
-        uint32_t entryRoot;  // Phase 2b: traversal entry slot (super-root; 0 single)
+        uint32_t entryRoot;  // single-root entry slot (0); repurposed by SAP/GPU kernels
     };
     struct SegScanParams {
         uint32_t numTGs;
@@ -6778,11 +6853,19 @@ struct BVH<BE, PR, BVHMODE::LINEAR, PRIMITIVE> {
             return;
         }
 
-        // (1) detection: per-TG private writes via threadgroup atomics.
-        // Phase 2b: grouped query enters at the mini-TLAS super-root (one
-        // O(log N) traversal); single-root enters at slot 0.
+        // Sub-object has no mini-TLAS to descend, so a grouped query can't use
+        // the segmented single-tree pipeline. Delegate to the flat top phase
+        // (SAP/GPU), which writes straight to the global broadCollisions (the
+        // same counter the segmented compact biases from) and skips the
+        // per-TG reduce/compact below.
         const bool grouped = subObjectActive()
                           && groupOfPrim.size == primitives.size / PRIMITIVE;
+        if (grouped) {
+            if (subTopMode == 1 && queryPointsGroupedPSO) queryPointsGPUTop(qIndex, queryMargin);
+            else                                          queryPointsSAP(qIndex, queryMargin);
+            return;
+        }
+        // (1) detection: per-TG private writes via threadgroup atomics.
         QuerySegParams qParams = {
             (float)queryMargin, (uint32_t)qnumPoints,
             (uint32_t)qIndex, (uint32_t)objIndex,
@@ -6790,7 +6873,7 @@ struct BVH<BE, PR, BVHMODE::LINEAR, PRIMITIVE> {
             (uint32_t)qmesh.behaviorType, (uint32_t)objBehavior,
             (uint32_t)qmesh.shapeType,    (uint32_t)objShape,
             (uint32_t)tree.size,
-            grouped ? (uint32_t)subBvhSuperRoot : 0u
+            0u   // single-root: enter at slot 0
         };
         MetalGlobalContext::setBuffer(qpos, 0);
         MetalGlobalContext::setBuffer(primitives, 1);
@@ -6971,6 +7054,18 @@ struct BVH<BE, PR, BVHMODE::SCENE, BVHPRIMITIVE::OBJECT> {
     bool useSubObjectBVH = false;
     int  subBvhSplitS = 1;       // s: k = 4^s groups
     bool validateSubObject = false;  // one-shot CPU correctness check on build
+    // Sub-object top-phase mode (with useSubObjectBVH): 0 CPU SAP (default),
+    // 1 GPU brute. Pushed to every per-mesh tree. See BVH::subTopMode.
+    int subTopMode = 0;
+
+    // Two-mesh experiment (human + cloth only). When ON: (1) the scene-level
+    // TLAS (`tree`, the EDGE_LBVH over object AABBs) is NOT built/refit — the
+    // broad phase is a direct pairwise objectRootAABB overlap test, which is
+    // all detectCollisions ever uses anyway; and (2) detectCollisionsTwoMesh
+    // queries BIDIRECTIONALLY (a Float mesh — the static Human — is not
+    // skipped as a query source). Set by --bench-twomesh. Default false ⇒
+    // every existing path is bit-identical.
+    bool twoMeshExperiment = false;
 
     //BVH(SceneObject<METAL, PR>& scene) 
     //    : objTrees(scene.numMeshes), positions(scene.numMeshes*3), indices(scene.numMeshes*2) {}
@@ -7000,6 +7095,7 @@ struct BVH<BE, PR, BVHMODE::SCENE, BVHPRIMITIVE::OBJECT> {
             }
             objTrees[i].useAgglomerative = useAgglomerative;
             objTrees[i].useSubObjectBVH = useSubObjectBVH;
+            objTrees[i].subTopMode = subTopMode;
             objTrees[i].subBvhSplitS = subBvhSplitS;
             objTrees[i].build(scene.meshes[i]);
             objTrees[i].objIndex = (int)i;  // D-041 turn-3
@@ -7018,8 +7114,10 @@ struct BVH<BE, PR, BVHMODE::SCENE, BVHPRIMITIVE::OBJECT> {
             indices[ibase+1] = ibase+1;
         }
 
-        tree.useAgglomerative = useAgglomerative;
-        tree.build(-1, positions, indices);
+        if (!twoMeshExperiment) {
+            tree.useAgglomerative = useAgglomerative;
+            tree.build(-1, positions, indices);
+        }
         //print(tree.tree[0]);
     }
 
@@ -7054,6 +7152,7 @@ struct BVH<BE, PR, BVHMODE::SCENE, BVHPRIMITIVE::OBJECT> {
             if (!objTrees[i].objStatic) {
                 objTrees[i].useAgglomerative = useAgglomerative;
                 objTrees[i].useSubObjectBVH = useSubObjectBVH;
+                objTrees[i].subTopMode = subTopMode;
                 objTrees[i].subBvhSplitS = subBvhSplitS;
                 objTrees[i].refit();
                 objTrees[i].staticCombined = false;  // dynamic frame re-breaks the GPU combine
@@ -7071,12 +7170,12 @@ struct BVH<BE, PR, BVHMODE::SCENE, BVHPRIMITIVE::OBJECT> {
         // commit (refit 58.9→38.9 ms, frame 190→169 ms on the static-Human scene),
         // even with a single dynamic mesh. (Grouped/static objects sync inline.)
         MetalGlobalContext::commitAndWait();
-        // Pass 2 — grouped trees finalize their mini-TLAS on the CPU (the GPU
-        // group roots are visible after the batched sync), then read each object's
-        // now-synced root AABB into the TLAS input.
+        // Pass 2 — read each object's now-synced root AABB into the TLAS input.
+        // Grouped trees: objectRootAABB() unions the k group roots on the CPU
+        // (visible after the batched sync above). Skipped in the two-mesh
+        // experiment — no scene-level TLAS, broad phase reads roots directly.
+        if (!twoMeshExperiment) {
         for(Index i = 0; i < objTrees.size(); ++i) {
-            if (!objTrees[i].objStatic && objTrees[i].subObjectActive())
-                objTrees[i].topCombineCPU();
             Index pbase = i*6;
             AABB4 objBox = objTrees[i].objectRootAABB();
             positions[pbase  ] = objBox.min.x;
@@ -7092,6 +7191,7 @@ struct BVH<BE, PR, BVHMODE::SCENE, BVHPRIMITIVE::OBJECT> {
 
         tree.useAgglomerative = useAgglomerative;
         tree.build(-1, positions, indices);
+        }
         //    std::cout << "[tree root before scene build] scene tree "
         //      << " min=" << tree.tree[0].min
         //      << " max=" << tree.tree[0].max << std::endl;
@@ -7109,6 +7209,7 @@ struct BVH<BE, PR, BVHMODE::SCENE, BVHPRIMITIVE::OBJECT> {
             if (!objTrees[i].objStatic) {
                 objTrees[i].useAgglomerative = useAgglomerative;
                 objTrees[i].useSubObjectBVH = useSubObjectBVH;
+                objTrees[i].subTopMode = subTopMode;
                 objTrees[i].subBvhSplitS = subBvhSplitS;
                 objTrees[i].enlargeTrajectory(dt);
                 needSync |= objTrees[i].subObjectActive();   // grouped → GPU combine pending
@@ -7122,11 +7223,11 @@ struct BVH<BE, PR, BVHMODE::SCENE, BVHPRIMITIVE::OBJECT> {
         // dispatched grouped/GPU combines. Skipped entirely when every dynamic
         // object took the pure-CPU path → the regular scene pays NO new sync.
         if (needSync) MetalGlobalContext::commitAndWait();
-        // Pass 2 — grouped trees finalize their mini-TLAS on the CPU (now that the
-        // GPU group roots are visible), then read each root AABB into the TLAS.
+        // Pass 2 — read each root AABB into the TLAS (grouped: objectRootAABB()
+        // unions the k group roots on the CPU, visible after the sync above).
+        // Skipped in the two-mesh experiment (no scene-level TLAS).
+        if (!twoMeshExperiment) {
         for(Index i = 0; i < objTrees.size(); ++i) {
-            if (!objTrees[i].objStatic && objTrees[i].subObjectActive())
-                objTrees[i].topCombineCPU();
             Index pbase = i*6;
             AABB4 objBox = objTrees[i].objectRootAABB();
             positions[pbase  ] = objBox.min.x;
@@ -7142,6 +7243,7 @@ struct BVH<BE, PR, BVHMODE::SCENE, BVHPRIMITIVE::OBJECT> {
 
         tree.useAgglomerative = useAgglomerative;
         tree.build(-1, positions, indices);
+        }
     }
 
     // Fused refit+enlarge (NEW, parallel to refit()+enlargeTrajectory()). One
@@ -7161,6 +7263,7 @@ struct BVH<BE, PR, BVHMODE::SCENE, BVHPRIMITIVE::OBJECT> {
             if (!objTrees[i].objStatic) {
                 objTrees[i].useAgglomerative = useAgglomerative;
                 objTrees[i].useSubObjectBVH = useSubObjectBVH;
+                objTrees[i].subTopMode = subTopMode;
                 objTrees[i].subBvhSplitS = subBvhSplitS;
                 if (objTrees[i].buildSweptLeafPSO) {
                     objTrees[i].refitSwept(dt);
@@ -7176,6 +7279,7 @@ struct BVH<BE, PR, BVHMODE::SCENE, BVHPRIMITIVE::OBJECT> {
                 objTrees[i].combineStaticOnce();   // one-time CPU correction (see refit())
                 objTrees[i].staticCombined = true;
             }
+            if (!twoMeshExperiment) {   // no scene-level TLAS in the experiment
             Index pbase = i*6;
             AABB4 objBox = objTrees[i].objectRootAABB();
             positions[pbase  ] = objBox.min.x;
@@ -7187,9 +7291,12 @@ struct BVH<BE, PR, BVHMODE::SCENE, BVHPRIMITIVE::OBJECT> {
             Index ibase = i*2;
             indices[ibase  ] = ibase;
             indices[ibase+1] = ibase+1;
+            }
         }
-        tree.useAgglomerative = useAgglomerative;
-        tree.build(-1, positions, indices);
+        if (!twoMeshExperiment) {
+            tree.useAgglomerative = useAgglomerative;
+            tree.build(-1, positions, indices);
+        }
     }
 
     void checkSelfCollisions(PR margin) {
@@ -7334,6 +7441,34 @@ struct BVH<BE, PR, BVHMODE::SCENE, BVHPRIMITIVE::OBJECT> {
                     }
                     checked.insert({a, b});
                 }
+            }
+        }
+        queryEnd();
+    }
+
+    // Two-mesh experiment broad phase (human + cloth). No scene-level TLAS —
+    // a direct pairwise objectRootAABB overlap test (exactly what
+    // detectCollisions already culls with). BIDIRECTIONAL: unlike
+    // detectCollisions, a Float/Kinematic mesh is NOT skipped as a query
+    // source, so when the two meshes' root AABBs overlap we run BOTH ordered
+    // directions — (q,t) visits objTrees[t].queryPoints(q), so cloth→human
+    // (cloth points vs Human tris) AND human→cloth (Human points vs cloth
+    // tris) are both emitted. The static Human contributes contact DATA in its
+    // direction without responding (Float meshes don't integrate). Grouped
+    // (sub-object) cloth trees route through queryPoints' grouped top phase.
+    void detectCollisionsTwoMesh(PR margin, bool enableSelfCollisions=false) {
+        queryBegin();
+        Scene<METAL, PR>::packedCollisionData.analyticPairs.clear();
+        for(Index q = 0; q < objTrees.size(); ++q) {
+            auto& queryTree = objTrees[q];
+            for(Index t = 0; t < objTrees.size(); ++t) {
+                if(q == t) {
+                    if(enableSelfCollisions) queryTree.checkSelfCollisions(margin);
+                    continue;
+                }
+                AABB4 qa = queryTree.objectRootAABB();
+                AABB4 ta = objTrees[t].objectRootAABB();
+                if(ta.intersect(qa)) objTrees[t].queryPoints(q, margin);
             }
         }
         queryEnd();
@@ -9665,6 +9800,12 @@ struct Simulator {
                 collisionPipeline.broadPhase.validateSubObject = true;
             }
         }
+        // Sub-object top-phase mode headless hook (needs YSIM_SUBOBJECT for the
+        // grouped path). Default 0 = CPU SAP; YSIM_SUBTOP=gpu (or 1) = GPU brute.
+        if (const char* st = std::getenv("YSIM_SUBTOP")) {
+            std::string v(st);
+            collisionPipeline.broadPhase.subTopMode = (v == "gpu" || v == "1") ? 1 : 0;
+        }
 
         collisionPipeline.broadPhase.build(scene);
         shBroadPhase.build(scene);
@@ -10145,17 +10286,20 @@ struct Simulator {
                       } // end legacy two-pass (refit + enlarge) branch
                     }
                     if (doBroad) {
+                        auto& bp = collisionPipeline.broadPhase;
+                        auto runDetect = [&]() {
+                            if (bp.twoMeshExperiment)
+                                bp.detectCollisionsTwoMesh(margin, enableSelfCollisions);
+                            else if (useSegmentedBVHQuery)
+                                bp.detectCollisionsSegmented(margin, enableSelfCollisions, useAnalyticPrimitive);
+                            else
+                                bp.detectCollisions(margin, enableSelfCollisions, useAnalyticPrimitive);
+                        };
                         if (profiler) {
                             auto scope = profiler->scoped("broad_detect");
-                            if (useSegmentedBVHQuery)
-                                collisionPipeline.broadPhase.detectCollisionsSegmented(margin, enableSelfCollisions, useAnalyticPrimitive);
-                            else
-                                collisionPipeline.broadPhase.detectCollisions(margin, enableSelfCollisions, useAnalyticPrimitive);
+                            runDetect();
                         } else {
-                            if (useSegmentedBVHQuery)
-                                collisionPipeline.broadPhase.detectCollisionsSegmented(margin, enableSelfCollisions, useAnalyticPrimitive);
-                            else
-                                collisionPipeline.broadPhase.detectCollisions(margin, enableSelfCollisions, useAnalyticPrimitive);
+                            runDetect();
                         }
                     }
                 }
@@ -12063,9 +12207,9 @@ static int runSubObjectSceneBench(const SubObjectSceneBenchConfig& cfg) {
     return 0;
 }
 
-// Phase 2a QUERY COST: multi-root query enters at all k group roots (O(k)
-// entry-scan per query point). This bench quantifies that vs single-root so
-// the Phase 2b mini-TLAS payoff (log k instead of k) is sized. Same draped
+// SUB-OBJECT QUERY COST: the grouped top phase (SAP / GPU brute) culls each
+// query point to its overlapping group roots, then descends those subtrees.
+// This bench quantifies the grouped detect vs single-root. Same draped
 // cloth-on-sphere state as the refit bench; measures broad `detectCollisions`
 // e2e (one synced broad detect — the per-cdP-substep cost in the real frame).
 // Correctness gate: broad_collisions MUST match single across all s (else the
@@ -12269,6 +12413,295 @@ static int runSubObjectValidate(int particleNum1D, int splitS, int frames) {
               << " frames=" << frames << " (sphere top y=+0.5) ===\n";
     runVariant(false, 0);
     for (int s = 1; s <= splitS; ++s) runVariant(true, s);
+    return 0;
+}
+
+// Two-mesh experiment: human (static, BVH built ONCE) + cloth (sub-object BVH,
+// refit every frame), NO ground and NO scene-level TLAS. Broad phase is the
+// direct pairwise-overlap BIDIRECTIONAL test (detectCollisionsTwoMesh). Scene
+// matches the default interactive demo: dt = 1/60, 60 substeps, cloth
+// stiffness k_stretch/shear/bend = 1e5/1e5/2e5, thickness 0.01, mass 0.1.
+//
+// SWEEPS the sub-object split s = 0 (single-root baseline) .. maxSplitS, with
+// `repeats` round-robin INTERLEAVED repeats (single,s1..sN, single,s1..sN, ...)
+// so thermal drift hits every variant equally (per the subobject methodology:
+// interleave conditions, use MEDIAN not mean, and watch narrow_phase — which s
+// cannot affect — as the noise floor). Per variant it attaches a FrameProfiler,
+// runs `frames` frames, and records the MEDIAN steady-frame section time for
+// broad_refit_swept (cloth multi-root combine) + broad_detect (the grouped
+// human→cloth query top phase) + narrow_phase + whole frame. The s-sensitive
+// cost lives in refit+detect; collision counts are s-INVARIANT (correctness).
+static int runTwoMeshExperiment(int particleNum1D, int maxSplitS, int frames,
+                                int repeats) {
+    using Backend = METAL;
+    using SystemT = ExplicitSystem<Backend, Precision>;
+    using Clock = std::chrono::steady_clock;
+    if (!MetalGlobalContext::getDevice() || !MetalKernelContext::getLibrary()) {
+        std::cerr << "[twomesh SKIP] metal unavailable\n";
+        return 0;
+    }
+    namespace fs = std::filesystem;
+    std::string outPath;
+#ifdef YSIM_PROJECT_ROOT
+    outPath = std::string(YSIM_PROJECT_ROOT)
+            + "/profiles/experiment/twomesh-2026-06-23/twomesh_sweep.csv";
+#else
+    outPath = "profiles/experiment/twomesh-2026-06-23/twomesh_sweep.csv";
+#endif
+    if (const char* o = std::getenv("YSIM_BENCH_CSV")) outPath = o;
+    fs::path csvPath(outPath);
+    if (csvPath.has_parent_path()) {
+        std::error_code ec; fs::create_directories(csvPath.parent_path(), ec);
+    }
+    std::ofstream csv(csvPath);
+    if (!csv) { std::cerr << "[twomesh FAIL] open " << outPath << "\n"; return 1; }
+    csv << "variant,split_s,top_mode,num_groups,repeat,refit_ms,detect_ms,"
+           "narrow_ms,frame_ms,broad_collisions,narrow_collisions,"
+           "cloth_minY,cloth_maxY\n";
+
+    auto resetScene = []() {
+        for (auto& m : Scene<Backend, Precision>::meshes) m.initializer = nullptr;
+        Scene<Backend, Precision>::meshes.clear();
+        for (auto& r : Scene<Backend, Precision>::requestsGeneralMeshes) delete r.initializer;
+        Scene<Backend, Precision>::requestsGeneralMeshes.clear();
+        Scene<Backend, Precision>::numMeshes = 0;
+        Scene<Backend, Precision>::nextMeshId = 0;
+        Scene<Backend, Precision>::dirty = true;
+        Scene<Backend, Precision>::environment = SceneEnvironment{};
+    };
+    auto median = [](std::vector<double> v) -> double {
+        if (v.empty()) return 0.0;
+        std::sort(v.begin(), v.end());
+        std::size_t n = v.size();
+        return (n & 1) ? v[n/2] : 0.5 * (v[n/2 - 1] + v[n/2]);
+    };
+
+    struct VarResult { double refit, detect, narrow, frame;
+                       uint32_t broad, nrw; double minY, maxY; int k; };
+    auto runVariant = [&](int splitS, int topMode) -> VarResult {
+        resetScene();
+        Precision h = Precision(1) / Precision(60);
+        SystemT system(h, 60);                       // dt=1/60, 60 substeps
+        Simulator<Backend, Precision, SystemT> sim(system);
+        sim.pause = false;
+        // Cloth (index 0) — default-scene stiffness kept (k_bend 2e5).
+        sim.addCloth(particleNum1D, Precision(1.0), tinym::vec3(0, Precision(1.25), 0),
+                     Precision(1e5), Precision(1e5), Precision(2e5),
+                     Precision(0.01), Precision(0.1));
+        // Human (index 1) — STATIC: BVH built once, never refit. No ground.
+        sim.addFloatMesh(ysim_paths::assetRoot(), "Human.obj",
+                         tinym::vec3(0, Precision(0.35), 0), Precision(0.04));
+        {
+            auto& humanReq = Scene<Backend, Precision>::requestsGeneralMeshes.back();
+            humanReq.isStatic     = true;
+            humanReq.applyGravity = false;
+            humanReq.applyWind    = false;
+        }
+        sim.initialize();
+        auto& bp = sim.collisionPipeline.broadPhase;
+        bp.twoMeshExperiment = true;                 // no scene TLAS + bidirectional
+        bp.useSubObjectBVH   = (splitS > 0);         // cloth = sub-object BVH
+        bp.subBvhSplitS      = splitS;
+        bp.subTopMode        = topMode;              // 0 CPU SAP, 1 GPU brute
+        bp.fusedRefitEnlarge = true;
+
+        profiler::FrameProfiler prof((std::size_t)(frames + 4));
+        sim.profiler = &prof;
+        auto secMs = [&](const char* nm) -> double {
+            const auto* s = prof.history().latestFrame();
+            int i = prof.history().sectionIndex(nm);
+            if (s && i >= 0 && (std::size_t)i < s->section_ms.size())
+                return (double)s->section_ms[i];
+            return 0.0;
+        };
+        const int warmup = std::min(frames / 2, 10);
+        std::vector<double> refitV, detectV, narrowV, frameV;
+        for (int f = 0; f < frames; ++f) {
+            prof.beginFrame((uint64_t)f, (double)f * (double)h);
+            auto a = Clock::now();
+            sim.update();
+            auto b = Clock::now();
+            prof.endFrame();
+            if (f < warmup) continue;
+            refitV.push_back(secMs("broad_refit_swept"));
+            detectV.push_back(secMs("broad_detect"));
+            narrowV.push_back(secMs("narrow_phase"));
+            frameV.push_back(std::chrono::duration<double, std::milli>(b - a).count());
+        }
+        sim.profiler = nullptr;
+
+        auto& pc    = Scene<Backend, Precision>::packedCollisionData;
+        auto& cloth = Scene<Backend, Precision>::meshes[0];
+        Index n = cloth.state.x.size / 3;
+        Precision minY =  std::numeric_limits<Precision>::infinity();
+        Precision maxY = -std::numeric_limits<Precision>::infinity();
+        for (Index i = 0; i < n; ++i) {
+            Precision y = cloth.state.x[i*3+1];
+            minY = std::min(minY, y); maxY = std::max(maxY, y);
+        }
+        int k = bp.objTrees.empty() ? 1 : bp.objTrees[0].numGroups;
+        return { median(refitV), median(detectV), median(narrowV), median(frameV),
+                 (uint32_t)pc.numBroadCollisions[0], (uint32_t)pc.numNarrowCollisions[0],
+                 (double)minY, (double)maxY, k };
+    };
+
+    // (splitS, topMode) variants. single-root (s=0) has no top phase → one run.
+    // Each multi s runs BOTH top modes: 0 CPU SAP, 1 GPU brute. Interleaved
+    // round-robin across repeats so thermal drift hits every variant equally.
+    std::vector<std::pair<int,int>> variants = {{0, 0}};   // single baseline
+    for (int s = 1; s <= maxSplitS; ++s) { variants.push_back({s, 0});
+                                           variants.push_back({s, 1}); }
+    std::cerr << "=== two-mesh sweep: P=" << particleNum1D << " s=0.." << maxSplitS
+              << " modes={SAP,GPU} frames=" << frames << " repeats=" << repeats
+              << " (interleaved, median) ===\n";
+    for (int r = 0; r < repeats; ++r) {
+        for (auto [s, mode] : variants) {
+            VarResult v = runVariant(s, mode);
+            const char* name = (s == 0) ? "single"
+                             : (mode == 0 ? "multi-sap" : "multi-gpu");
+            const char* modeStr = (s == 0) ? "none" : (mode == 0 ? "sap" : "gpu");
+            csv << name << ',' << s << ',' << modeStr << ',' << v.k << ',' << r
+                << ',' << v.refit << ',' << v.detect << ',' << v.narrow << ','
+                << v.frame << ',' << v.broad << ',' << v.nrw << ',' << v.minY
+                << ',' << v.maxY << '\n';
+            csv.flush();
+            std::cerr << "[twomesh r=" << r << ' ' << name << " s=" << s
+                      << " k=" << v.k << "] refit=" << v.refit << " detect="
+                      << v.detect << " narrow=" << v.narrow << " frame=" << v.frame
+                      << "ms broad=" << v.broad << " maxY=" << v.maxY << "\n";
+        }
+    }
+    csv.close();
+    std::cerr << "[twomesh DONE] wrote " << outPath << "\n";
+    return 0;
+}
+
+// Does BATCHED-COMMIT (amortized sync) reveal the sub-object combine win that
+// the per-substep sync floor hides? Two-mesh scene (static Human + cloth),
+// settle the cloth onto the Human, then for single + s=1..maxSplitS measure the
+// cloth refit under TWO sync regimes on the SAME draped geometry:
+//   (A) refit_synced  = t.refitSwept(dt) per call — commits+waits internally
+//        (5955), so each call eats the full CPU<->GPU round-trip = the live
+//        per-substep cost (sync floor + combine compute).
+//   (B) combine_amortized = the bottom-up combine kernel ONLY, `reps` dispatches
+//        batched into ONE command buffer with ONE commitAndWait — the sync floor
+//        is divided across reps, exposing the pure combine compute.
+// If sub-object's smaller tree (fewer nodes) makes combine cheaper, (B) drops
+// with k while (A) stays flat — i.e. the win exists but is masked by sync, and
+// batching commits surfaces it. (Combine cost is topology-bound, a property of
+// the cloth tree, so this is identical whether the cloth drapes a sphere or the
+// Human — same number as runSubObjectSceneBench, measured here for consistency.)
+static int runTwoMeshRefitSync(int particleNum1D, int maxSplitS, int reps) {
+    using Backend = METAL;
+    using SystemT = ExplicitSystem<Backend, Precision>;
+    using Clock = std::chrono::steady_clock;
+    if (!MetalGlobalContext::getDevice() || !MetalKernelContext::getLibrary()) {
+        std::cerr << "[twomesh-refit SKIP] metal unavailable\n";
+        return 0;
+    }
+    namespace fs = std::filesystem;
+    std::string outPath;
+#ifdef YSIM_PROJECT_ROOT
+    outPath = std::string(YSIM_PROJECT_ROOT)
+            + "/profiles/experiment/twomesh-2026-06-23/twomesh_refit.csv";
+#else
+    outPath = "profiles/experiment/twomesh-2026-06-23/twomesh_refit.csv";
+#endif
+    if (const char* o = std::getenv("YSIM_BENCH_CSV")) outPath = o;
+    fs::path csvPath(outPath);
+    if (csvPath.has_parent_path()) {
+        std::error_code ec; fs::create_directories(csvPath.parent_path(), ec);
+    }
+    std::ofstream csv(csvPath);
+    if (!csv) { std::cerr << "[twomesh-refit FAIL] open " << outPath << "\n"; return 1; }
+    csv << "variant,split_s,num_groups,num_nodes,refit_synced_us,"
+           "combine_amortized_us\n";
+
+    auto resetScene = []() {
+        for (auto& m : Scene<Backend, Precision>::meshes) m.initializer = nullptr;
+        Scene<Backend, Precision>::meshes.clear();
+        for (auto& r : Scene<Backend, Precision>::requestsGeneralMeshes) delete r.initializer;
+        Scene<Backend, Precision>::requestsGeneralMeshes.clear();
+        Scene<Backend, Precision>::numMeshes = 0;
+        Scene<Backend, Precision>::nextMeshId = 0;
+        Scene<Backend, Precision>::dirty = true;
+        Scene<Backend, Precision>::environment = SceneEnvironment{};
+    };
+    auto msSince = [](Clock::time_point a, Clock::time_point b) {
+        return std::chrono::duration<double, std::milli>(b - a).count();
+    };
+
+    resetScene();
+    Precision h = Precision(1) / Precision(60);
+    Index subSteps = 60;
+    Precision dt = h / Precision(subSteps);          // == system.subh
+    SystemT system(h, subSteps);
+    Simulator<Backend, Precision, SystemT> sim(system);
+    sim.pause = false;
+    sim.addCloth(particleNum1D, Precision(1.0), tinym::vec3(0, Precision(1.25), 0),
+                 Precision(1e5), Precision(1e5), Precision(2e5),
+                 Precision(0.01), Precision(0.1));
+    sim.addFloatMesh(ysim_paths::assetRoot(), "Human.obj",
+                     tinym::vec3(0, Precision(0.35), 0), Precision(0.04));
+    {
+        auto& humanReq = Scene<Backend, Precision>::requestsGeneralMeshes.back();
+        humanReq.isStatic = true; humanReq.applyGravity = false; humanReq.applyWind = false;
+    }
+    sim.initialize();
+    auto& bp = sim.collisionPipeline.broadPhase;
+    bp.twoMeshExperiment = true;
+    bp.useSubObjectBVH   = false;                    // settle single-root
+    bp.fusedRefitEnlarge = true;
+    for (int f = 0; f < 20; ++f) sim.update();        // drape cloth on Human
+
+    if (bp.objTrees.empty()) { std::cerr << "[twomesh-refit] no objTree\n"; return 1; }
+    auto& t = bp.objTrees[0];                         // cloth tree
+    auto& clothMesh = Scene<Backend, Precision>::meshes[0];
+    int64_t numPrims = (int64_t)(t.primitives.size / 3);
+    AABB4 sceneBox; sceneBox.i0 = (int)numPrims;
+
+    // (B) amortized: warm + 1 commit, then reps dispatches in ONE buffer, 1 sync.
+    auto microCombine = [&](auto&& dispatchOnce) -> double {
+        dispatchOnce(); MetalGlobalContext::commitAndWait();
+        auto a = Clock::now();
+        for (int r = 0; r < reps; ++r) dispatchOnce();
+        MetalGlobalContext::commitAndWait();
+        auto b = Clock::now();
+        return msSince(a, b) / reps * 1000.0;        // µs/rep
+    };
+    // (A) synced: t.refitSwept commits+waits each call (the live per-substep cost).
+    auto e2eRefitSwept = [&]() -> double {
+        t.refitSwept(dt);                            // warm
+        auto a = Clock::now();
+        for (int r = 0; r < reps; ++r) t.refitSwept(dt);
+        auto b = Clock::now();
+        return msSince(a, b) / reps * 1000.0;        // µs/call
+    };
+
+    std::cerr << "=== two-mesh refit sync A/B: P=" << particleNum1D << " prims="
+              << numPrims << " reps=" << reps << " (cloth draped on Human) ===\n";
+    // single-root baseline
+    t.useSubObjectBVH = false; t.build(clothMesh);
+    double sCombine = microCombine([&]{ t.bottomUpBoxesGPU(sceneBox); });
+    double sRefit   = e2eRefitSwept();
+    csv << "single,0,1," << (2*numPrims-1) << ',' << sRefit << ',' << sCombine << '\n';
+    csv.flush();
+    std::cerr << "[twomesh-refit single] nodes=" << (2*numPrims-1)
+              << " refit_synced=" << sRefit << "us combine_amortized=" << sCombine << "us\n";
+    for (int s = 1; s <= maxSplitS; ++s) {
+        t.useSubObjectBVH = true; t.subBvhSplitS = s; t.build(clothMesh);
+        if (!t.subObjectActive()) continue;
+        double mCombine = microCombine([&]{ t.bottomUpBoxesMultiRootGPU(sceneBox); });
+        double mRefit   = e2eRefitSwept();
+        csv << "multi," << s << ',' << t.numGroups << ',' << t.subBvhNumNodes
+            << ',' << mRefit << ',' << mCombine << '\n';
+        csv.flush();
+        std::cerr << "[twomesh-refit s=" << s << " k=" << t.numGroups << "] nodes="
+                  << t.subBvhNumNodes << " refit_synced=" << mRefit
+                  << "us combine_amortized=" << mCombine << "us\n";
+    }
+    csv.close();
+    std::cerr << "[twomesh-refit DONE] wrote " << outPath << "\n";
     return 0;
 }
 
@@ -18139,6 +18572,27 @@ int main(int argc, char** argv) {
         int F = (argc > 4) ? std::atoi(argv[4]) : 40;
         return runSubObjectValidate(P, S, F);
     }
+    if (argc > 1 && std::string(argv[1]) == "--bench-twomesh") {
+        // Two-mesh experiment: static Human + sub-object cloth, no scene TLAS,
+        // bidirectional pairwise broad phase. Sweeps s=0(single)..maxSplitS with
+        // interleaved repeats; per-variant median refit/detect/narrow/frame ms.
+        // Optional args: <particleNum1D> <maxSplitS> <frames> <repeats>.
+        int P = (argc > 2) ? std::atoi(argv[2]) : 50;
+        int S = (argc > 3) ? std::atoi(argv[3]) : 6;
+        int F = (argc > 4) ? std::atoi(argv[4]) : 30;
+        int R = (argc > 5) ? std::atoi(argv[5]) : 5;
+        return runTwoMeshExperiment(P, S, F, R);
+    }
+    if (argc > 1 && std::string(argv[1]) == "--bench-twomesh-refit") {
+        // Sync-floor isolation: cloth refit under per-call sync (A) vs amortized
+        // batched sync (B), single vs sub-object, on the draped two-mesh scene.
+        // Tests whether batched-commit surfaces the combine win. Args:
+        // <particleNum1D> <maxSplitS> <reps>.
+        int P = (argc > 2) ? std::atoi(argv[2]) : 50;
+        int S = (argc > 3) ? std::atoi(argv[3]) : 6;
+        int R = (argc > 4) ? std::atoi(argv[4]) : 200;
+        return runTwoMeshRefitSync(P, S, R);
+    }
     if (argc > 1 && std::string(argv[1]) == "--bench-bvh-build") {
         BuildBenchConfig cfg;
         cfg.cases = {BVHBuildCase::RefitWithRebuild,
@@ -18911,6 +19365,13 @@ int main(int argc, char** argv) {
             auto& bp = simulator->collisionPipeline.broadPhase;
             bp.subBvhSplitS = (bp.subBvhSplitS % 16) + 1;
             std::cout << "[main] subBvhSplitS = " << bp.subBvhSplitS << "\n";
+        } else if(key == GLFW_KEY_M && action == GLFW_PRESS) {
+            // Sub-object top-phase mode toggle. Only bites with useSubObjectBVH
+            // on + a grouped square-cloth tree; single-root meshes are unaffected.
+            auto& bp = simulator->collisionPipeline.broadPhase;
+            bp.subTopMode = (bp.subTopMode + 1) % 2;
+            const char* m[] = { "0 CPU sweep-and-prune", "1 GPU brute top" };
+            std::cout << "[main] subTopMode = " << m[bp.subTopMode] << "\n";
         }
         // NOTE: ESC-deselect is handled in the early block above
         // (before the WantCaptureKeyboard guard), not here — see the
