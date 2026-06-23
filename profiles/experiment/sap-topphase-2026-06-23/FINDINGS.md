@@ -1,62 +1,67 @@
-# SAP top-phase vs mini-TLAS — findings (2026-06-23)
+# Sub-object top-phase: mini-TLAS vs CPU-SAP vs GPU-brute (2026-06-23)
 
-Branch `feat/subobject-topphase-broadphase`. Replace the sub-object **mini-TLAS**
-(binary tree stitched over the k group roots, descended on the GPU from a
-super-root) with a **CPU sweep-and-prune top phase**: read the k group root
-boxes, emit candidate `(point, groupRoot)` pairs, GPU descends one group subtree
-per pair (`queryPointsPairs`). Point query boxes have constant width 2·margin ⇒
-"overlaps group g on X" is a contiguous slice of points sorted by x ⇒ two binary
-searches per group.
+Branch `feat/subobject-topphase-broadphase`. Three ways to do the sub-object
+broad-phase TOP level (point → which group subtree(s) to descend):
+
+- **mini-TLAS** (mode 0, baseline): k group roots stitched into a binary top
+  tree, descended on the GPU from a super-root.
+- **CPU-SAP** (mode 1): CPU sweep-and-prune over the k group root boxes emits
+  candidate (point, groupRoot) pairs; GPU descends one subtree per pair.
+- **GPU-brute** (mode 2): each point thread brute-tests the k group roots on the
+  GPU and descends overlapping subtrees inline. No CPU sort, no pair buffer.
 
 ## Setup
-Real default scene (cloth tess 50 ≈ 50×50 grid, Human declared static, 50×50 floor).
-30-frame profiler, **8 repeats** per condition, median across repeats, steady
-state = frames 15–29 (sustained cloth↔Human contact). Driver `run.sh`, analyzer
-`analyze.py` → `sap_vs_mini.png`. Conditions: regular (single-root) /
-mini_s{1,2,3} / sap_s{1,2,3}. The CPU sweep + per-pair dispatch are timed under
-`broad_detect`.
+Real default scene (cloth tess 50 ≈ 50×50 grid, Human static, 50×50 floor).
+30-frame profiler, **8 repeats**, **all conditions INTERLEAVED in one batch**
+(round-robin) so thermal/load drift averages across modes. Steady state =
+frames 15–29. Conditions: regular / {mini,sap,gpu}_s{1,2,3}. The top phase is
+timed under `broad_detect`. Driver `run.sh`, analyzer `analyze.py` →
+`sap_vs_mini.png`.
 
-## Result — steady-state median (ms)
+## The noise floor (read this first)
+`broad_refit` is **mode-invariant** — the top phase cannot change BVH refit. Yet
+across modes that must have identical refit it swings **−11% … +16%**. That is
+the noise floor: the sim is chaotic (GPU atomic append order → contact order →
+trajectory divergence → per-run workload differs). `broad_detect` and
+`narrow_phase` track `refit` almost 1:1, so most cross-condition variation is
+**common-mode workload noise, not the top-phase algorithm.**
 
-| case          | refit | detect | narrow | frame |
-|---------------|------:|-------:|-------:|------:|
-| Regular BVH   | 28.35 | 44.08  | 28.14  | 121.4 |
-| mini-TLAS s=1 | 25.32 | 37.36  | 24.08  | 116.7 |
-| **SAP s=1**   | 27.89 | 41.46  | 27.28  | 127.2 |
-| mini-TLAS s=2 | 25.75 | 40.31  | 25.08  | 120.9 |
-| **SAP s=2**   | 26.04 | 39.33  | 25.39  | 121.7 |
-| mini-TLAS s=3 | 29.54 | 45.69  | 28.70  | 141.1 |
-| **SAP s=3**   | 28.89 | 41.45  | 28.88  | 133.4 |
+The top-phase-specific effect is the **residual = detect% − refit%** (subtracting
+the workload/thermal sentinel):
 
-### SAP vs mini-TLAS (Δ%, neg = SAP faster)
-| s | k  | detect | frame |
-|---|----|-------:|------:|
-| 1 | 4  | **+11.0%** | +9.0% |
-| 2 | 16 | −2.5%  | +0.7% |
-| 3 | 49 | **−9.3%** | −5.5% |
+| s | k  | mode    | detect Δ% | refit(noise) Δ% | **residual** |
+|---|----|---------|----------:|----------------:|-------------:|
+| 1 | 4  | CPU-SAP |   +0.6    |   +2.0          | **−1.4**     |
+| 1 | 4  | GPU-top |   +1.6    |   −0.3          | **+1.9**     |
+| 2 | 16 | CPU-SAP |  −16.6    |  −10.5          | **−6.1**     |
+| 2 | 16 | GPU-top |  −19.9    |  −11.3          | **−8.6**     |
+| 3 | 49 | CPU-SAP |  +15.7    |  +16.3          | **−0.5**     |
+| 3 | 49 | GPU-top |   −6.0    |   +2.0          | **−8.0**     |
 
-## Reading
-- **Monotone in k** (+11% → −2.5% → −9.3%): the trend, not the absolute noisy
-  frame times, is the robust signal — and it matches theory.
-- **SAP trades a fixed CPU sort for saved GPU descent depth.** Small k (k=4): the
-  mini-TLAS it replaces is ~2 deep and nearly free, so SAP's O(N log N) point sort
-  every substep is pure overhead → +11% detect. Large k (k=49): the mini-TLAS is
-  ~6 deep and the per-point GPU descent over it dominates; SAP's contiguous-slice
-  cull finds the few overlapping groups directly and each per-pair descent is one
-  shallow group subtree → −9.3% detect, −5.5% frame. **Crossover ≈ s=2 (k=16).**
+## Reading (honest)
+- **Small k (s=1): all three modes are at parity** (residual ±2%, inside noise).
+- **Larger k (s≥2): a WEAK but CONSISTENT hint that GPU-brute shaves ~8% off
+  `broad_detect`** beyond workload (residual −8.6% @ s2, −8.0% @ s3). CPU-SAP is
+  inconsistent (−6.1% then −0.5%) — its fixed O(N log N) point sort eats its own
+  cull win on this small mesh.
+- The effect (~8%) is the same magnitude as the noise floor (refit ±10–16%), so
+  this is **suggestive, not conclusive**. On this ~2.5k-tri cloth the top-phase
+  cost is a small fraction of `broad_detect` (which is dominated by the actual
+  pair workload + atomic appends), so no mode robustly wins.
+
+⚠ **Correction to the earlier 2-way run** (mini vs sap only, separate batches):
+its "clean monotone −9.3%" was a batch/thermal confound + noise, not signal. The
+interleaved 3-way with the refit sentinel is the trustworthy version.
 
 ## Correctness
-SAP output verified equal to brute force (`test/test_sap_topphase.cpp`, 200
-trials); in-app `[SubObjectBVH] VALIDATE OK`; mini-vs-sap collision counts within
-run-to-run noise (sim is non-deterministic — mini-vs-mini diverges identically,
-GPU atomic append order).
+GPU-brute & CPU-SAP both: in-app `[SubObjectBVH] VALIDATE OK`, collision counts
+within run-to-run noise of mini-TLAS, 0 crashes over 80 runs. CPU-SAP slice math
+checked vs brute force (`test/test_sap_topphase.cpp`, 200 trials).
 
-## Caveats / next
-- Sim is chaotic ⇒ wide IQR bands; only the median trend across 8 repeats is
-  trustworthy. Per-frame curves diverge run-to-run by design.
-- The CPU sort is single-thread, O(N log N) × 60 substeps — the whole cost SAP
-  carries at small k. **Move the top phase to GPU** (the deferred option) to drop
-  that fixed cost; would likely push the crossover below s=2 and deepen the s=3 win.
-- This scene's mesh (~2.5k tris) is small; the subobject win itself is marginal
-  here. SAP's advantage should widen on a LARGE actively-deforming mesh where
-  group count and descent depth both grow.
+## Verdict / next
+GPU-brute is the most promising (kills both the CPU sort AND the tree depth;
+consistently slightly negative residual at k≥16) but the win is at the edge of
+noise here. To get a definitive number: a **large actively-deforming mesh** (so
+the top phase is a bigger fraction of broad_detect) and/or a **less chaotic /
+position-replayed scene** (so refit-noise shrinks and the residual is clean).
+Toggle: key M cycles mode 0→1→2; `YSIM_SUBOBJECT=s YSIM_SAP={1,2}`.

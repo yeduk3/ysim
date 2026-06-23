@@ -25,12 +25,14 @@ STEADY_FROM = 15   # cloth in sustained contact with Human from ~frame 15
 # case key -> (label, color)
 CASES = {"regular": ("Regular BVH", "#444444")}
 PALETTE = {1: ("#1f77b4", "#9ecae1"), 2: ("#ff7f0e", "#fdd0a2"), 3: ("#2ca02c", "#a1d99b")}
+GPUCOL  = {1: "#08306b", 2: "#7f2704", 3: "#00441b"}
 for s in SPLITS:
     CASES[f"mini_s{s}"] = (f"mini-TLAS s={s}", PALETTE[s][0])
     CASES[f"sap_s{s}"]  = (f"SAP s={s}",       PALETTE[s][1])
+    CASES[f"gpu_s{s}"]  = (f"GPU-top s={s}",   GPUCOL[s])
 
 def case_of(f):
-    m = re.match(r"(regular|mini_s\d+|sap_s\d+)_r\d+\.csv$", os.path.basename(f))
+    m = re.match(r"(regular|mini_s\d+|sap_s\d+|gpu_s\d+)_r\d+\.csv$", os.path.basename(f))
     return m.group(1) if m else None
 
 data = {k: {s: [] for s in SECTIONS} for k in CASES}
@@ -69,15 +71,21 @@ for ck in present:
     print(f"{CASES[ck][0]:16s} {summary[ck]['broad_refit']:10.3f} {summary[ck]['broad_detect']:11.3f} "
           f"{summary[ck]['narrow_phase']:11.3f} {summary[ck]['bvh_build']:10.3f} {summary[ck]['frame_ms']:10.2f}")
 
-# ---- head-to-head: SAP vs mini at each s (the actual question) ---------------
-print(f"\n{'SAP vs mini-TLAS (steady-state %, neg = SAP faster)':50s}")
+# ---- head-to-head: SAP & GPU-top vs mini at each s --------------------------
+# refit is mode-INVARIANT (the top phase cannot affect BVH refit) so its delta
+# is a pure noise/workload-divergence sentinel. The top-phase-specific effect is
+# the RESIDUAL: detect% - refit%. If |residual| <= |refit%|, it's not signal.
+print(f"\n{'vs mini-TLAS (steady-state %, neg = faster). refit = noise sentinel':66s}")
 for s in SPLITS:
-    mk, sk = f"mini_s{s}", f"sap_s{s}"
-    if mk not in summary or sk not in summary:
-        continue
-    def pct(sec): return 100.0*(summary[sk][sec]-summary[mk][sec])/summary[mk][sec]
-    print(f"  s={s}:  detect {pct('broad_detect'):+6.1f}%   refit {pct('broad_refit'):+6.1f}%   "
-          f"narrow {pct('narrow_phase'):+6.1f}%   frame {pct('frame_ms'):+6.1f}%")
+    mk = f"mini_s{s}"
+    if mk not in summary: continue
+    for variant in (f"sap_s{s}", f"gpu_s{s}"):
+        if variant not in summary: continue
+        def pct(sec): return 100.0*(summary[variant][sec]-summary[mk][sec])/summary[mk][sec]
+        resid = pct('broad_detect') - pct('broad_refit')
+        print(f"  {CASES[variant][0]:12s}: detect {pct('broad_detect'):+6.1f}%   "
+              f"refit(noise) {pct('broad_refit'):+6.1f}%   frame {pct('frame_ms'):+6.1f}%   "
+              f"=> detect residual {resid:+6.1f}%")
 
 # ---- charts -----------------------------------------------------------------
 x = np.arange(nframes)
@@ -98,31 +106,36 @@ def line_panel(ax, sec, title, ylab, keys):
     ax.grid(alpha=0.25); ax.legend(fontsize=7)
 
 allkeys = present
-ax1 = fig.add_subplot(2,3,1); line_panel(ax1, "broad_detect", "Broad-phase query (broad_detect) — SAP changes THIS", "ms", allkeys)
+ax1 = fig.add_subplot(2,3,1); line_panel(ax1, "broad_detect", "Broad-phase query (broad_detect) — top phase changes THIS", "ms", allkeys)
 ax2 = fig.add_subplot(2,3,2); line_panel(ax2, "frame_ms",     "Total frame time", "ms", allkeys)
 ax3 = fig.add_subplot(2,3,3); line_panel(ax3, "narrow_phase", "Narrow-phase query", "ms", allkeys)
 
-# steady-state grouped bars: broad_detect, mini vs sap per s (+ regular)
+# steady-state grouped bars: broad_detect, mini vs sap vs gpu per s (+ regular)
 ax4 = fig.add_subplot(2,3,4)
 groups = ["regular"] + [f"_s{s}" for s in SPLITS]
-xb = np.arange(len(groups)); w = 0.38
-mini_v = [summary["regular"]["broad_detect"] if "regular" in summary else 0] + \
-         [summary.get(f"mini_s{s}", {}).get("broad_detect", 0) for s in SPLITS]
-sap_v  = [0] + [summary.get(f"sap_s{s}", {}).get("broad_detect", 0) for s in SPLITS]
-ax4.bar(xb - w/2, mini_v, w, label="mini-TLAS / regular", color="#666")
-ax4.bar(xb + w/2, sap_v,  w, label="SAP", color="#5aa0d6")
+xb = np.arange(len(groups)); w = 0.27
+def col_detect(key): return summary.get(key, {}).get("broad_detect", 0)
+mini_v = [col_detect("regular")] + [col_detect(f"mini_s{s}") for s in SPLITS]
+sap_v  = [0] + [col_detect(f"sap_s{s}") for s in SPLITS]
+gpu_v  = [0] + [col_detect(f"gpu_s{s}") for s in SPLITS]
+ax4.bar(xb - w, mini_v, w, label="mini-TLAS / regular", color="#666")
+ax4.bar(xb,     sap_v,  w, label="CPU SAP", color="#5aa0d6")
+ax4.bar(xb + w, gpu_v,  w, label="GPU top", color="#08306b")
 ax4.set_xticks(xb); ax4.set_xticklabels(["regular"] + [f"s={s}" for s in SPLITS])
 ax4.set_title(f"broad_detect steady-state (frames {STEADY_FROM}-{nframes-1})", fontsize=11)
 ax4.set_ylabel("ms"); ax4.grid(alpha=0.25, axis="y"); ax4.legend(fontsize=8)
 
-# SAP vs mini delta % per s
+# detect Δ% vs mini per s: SAP and GPU
 ax5 = fig.add_subplot(2,3,5)
-ss = [s for s in SPLITS if f"sap_s{s}" in summary and f"mini_s{s}" in summary]
-for sec, col in [("broad_detect","#1f77b4"),("frame_ms","#d62728"),("narrow_phase","#2ca02c")]:
-    ys = [100.0*(summary[f"sap_s{s}"][sec]-summary[f"mini_s{s}"][sec])/summary[f"mini_s{s}"][sec] for s in ss]
-    ax5.plot([f"s={s}" for s in ss], ys, "o-", label=sec, color=col)
+ss = [s for s in SPLITS if f"mini_s{s}" in summary]
+for variant, col, mark in [("sap","#5aa0d6","o-"), ("gpu","#08306b","s-")]:
+    pts = [(s, 100.0*(summary[f"{variant}_s{s}"]["broad_detect"]-summary[f"mini_s{s}"]["broad_detect"])
+              /summary[f"mini_s{s}"]["broad_detect"]) for s in ss if f"{variant}_s{s}" in summary]
+    if pts:
+        ax5.plot([f"s={s}" for s,_ in pts], [y for _,y in pts], mark,
+                 label=f"{variant.upper()} detect", color=col)
 ax5.axhline(0, color="k", lw=0.8)
-ax5.set_title("SAP vs mini-TLAS (steady-state %, neg = SAP faster)", fontsize=11)
+ax5.set_title("detect Δ% vs mini-TLAS (neg = faster)", fontsize=11)
 ax5.set_ylabel("% change"); ax5.grid(alpha=0.25); ax5.legend(fontsize=8)
 
 ax6 = fig.add_subplot(2,3,6); line_panel(ax6, "broad_refit", "BVH refit (broad_refit)", "ms", allkeys)
