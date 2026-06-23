@@ -7054,6 +7054,15 @@ struct BVH<BE, PR, BVHMODE::SCENE, BVHPRIMITIVE::OBJECT> {
     // 1 GPU brute. Pushed to every per-mesh tree. See BVH::subTopMode.
     int subTopMode = 0;
 
+    // Two-mesh experiment (human + cloth only). When ON: (1) the scene-level
+    // TLAS (`tree`, the EDGE_LBVH over object AABBs) is NOT built/refit — the
+    // broad phase is a direct pairwise objectRootAABB overlap test, which is
+    // all detectCollisions ever uses anyway; and (2) detectCollisionsTwoMesh
+    // queries BIDIRECTIONALLY (a Float mesh — the static Human — is not
+    // skipped as a query source). Set by --bench-twomesh. Default false ⇒
+    // every existing path is bit-identical.
+    bool twoMeshExperiment = false;
+
     //BVH(SceneObject<METAL, PR>& scene) 
     //    : objTrees(scene.numMeshes), positions(scene.numMeshes*3), indices(scene.numMeshes*2) {}
 
@@ -7101,8 +7110,10 @@ struct BVH<BE, PR, BVHMODE::SCENE, BVHPRIMITIVE::OBJECT> {
             indices[ibase+1] = ibase+1;
         }
 
-        tree.useAgglomerative = useAgglomerative;
-        tree.build(-1, positions, indices);
+        if (!twoMeshExperiment) {
+            tree.useAgglomerative = useAgglomerative;
+            tree.build(-1, positions, indices);
+        }
         //print(tree.tree[0]);
     }
 
@@ -7157,7 +7168,9 @@ struct BVH<BE, PR, BVHMODE::SCENE, BVHPRIMITIVE::OBJECT> {
         MetalGlobalContext::commitAndWait();
         // Pass 2 — read each object's now-synced root AABB into the TLAS input.
         // Grouped trees: objectRootAABB() unions the k group roots on the CPU
-        // (visible after the batched sync above).
+        // (visible after the batched sync above). Skipped in the two-mesh
+        // experiment — no scene-level TLAS, broad phase reads roots directly.
+        if (!twoMeshExperiment) {
         for(Index i = 0; i < objTrees.size(); ++i) {
             Index pbase = i*6;
             AABB4 objBox = objTrees[i].objectRootAABB();
@@ -7174,6 +7187,7 @@ struct BVH<BE, PR, BVHMODE::SCENE, BVHPRIMITIVE::OBJECT> {
 
         tree.useAgglomerative = useAgglomerative;
         tree.build(-1, positions, indices);
+        }
         //    std::cout << "[tree root before scene build] scene tree "
         //      << " min=" << tree.tree[0].min
         //      << " max=" << tree.tree[0].max << std::endl;
@@ -7207,6 +7221,8 @@ struct BVH<BE, PR, BVHMODE::SCENE, BVHPRIMITIVE::OBJECT> {
         if (needSync) MetalGlobalContext::commitAndWait();
         // Pass 2 — read each root AABB into the TLAS (grouped: objectRootAABB()
         // unions the k group roots on the CPU, visible after the sync above).
+        // Skipped in the two-mesh experiment (no scene-level TLAS).
+        if (!twoMeshExperiment) {
         for(Index i = 0; i < objTrees.size(); ++i) {
             Index pbase = i*6;
             AABB4 objBox = objTrees[i].objectRootAABB();
@@ -7223,6 +7239,7 @@ struct BVH<BE, PR, BVHMODE::SCENE, BVHPRIMITIVE::OBJECT> {
 
         tree.useAgglomerative = useAgglomerative;
         tree.build(-1, positions, indices);
+        }
     }
 
     // Fused refit+enlarge (NEW, parallel to refit()+enlargeTrajectory()). One
@@ -7258,6 +7275,7 @@ struct BVH<BE, PR, BVHMODE::SCENE, BVHPRIMITIVE::OBJECT> {
                 objTrees[i].combineStaticOnce();   // one-time CPU correction (see refit())
                 objTrees[i].staticCombined = true;
             }
+            if (!twoMeshExperiment) {   // no scene-level TLAS in the experiment
             Index pbase = i*6;
             AABB4 objBox = objTrees[i].objectRootAABB();
             positions[pbase  ] = objBox.min.x;
@@ -7269,9 +7287,12 @@ struct BVH<BE, PR, BVHMODE::SCENE, BVHPRIMITIVE::OBJECT> {
             Index ibase = i*2;
             indices[ibase  ] = ibase;
             indices[ibase+1] = ibase+1;
+            }
         }
-        tree.useAgglomerative = useAgglomerative;
-        tree.build(-1, positions, indices);
+        if (!twoMeshExperiment) {
+            tree.useAgglomerative = useAgglomerative;
+            tree.build(-1, positions, indices);
+        }
     }
 
     void checkSelfCollisions(PR margin) {
@@ -7416,6 +7437,34 @@ struct BVH<BE, PR, BVHMODE::SCENE, BVHPRIMITIVE::OBJECT> {
                     }
                     checked.insert({a, b});
                 }
+            }
+        }
+        queryEnd();
+    }
+
+    // Two-mesh experiment broad phase (human + cloth). No scene-level TLAS —
+    // a direct pairwise objectRootAABB overlap test (exactly what
+    // detectCollisions already culls with). BIDIRECTIONAL: unlike
+    // detectCollisions, a Float/Kinematic mesh is NOT skipped as a query
+    // source, so when the two meshes' root AABBs overlap we run BOTH ordered
+    // directions — (q,t) visits objTrees[t].queryPoints(q), so cloth→human
+    // (cloth points vs Human tris) AND human→cloth (Human points vs cloth
+    // tris) are both emitted. The static Human contributes contact DATA in its
+    // direction without responding (Float meshes don't integrate). Grouped
+    // (sub-object) cloth trees route through queryPoints' grouped top phase.
+    void detectCollisionsTwoMesh(PR margin, bool enableSelfCollisions=false) {
+        queryBegin();
+        Scene<METAL, PR>::packedCollisionData.analyticPairs.clear();
+        for(Index q = 0; q < objTrees.size(); ++q) {
+            auto& queryTree = objTrees[q];
+            for(Index t = 0; t < objTrees.size(); ++t) {
+                if(q == t) {
+                    if(enableSelfCollisions) queryTree.checkSelfCollisions(margin);
+                    continue;
+                }
+                AABB4 qa = queryTree.objectRootAABB();
+                AABB4 ta = objTrees[t].objectRootAABB();
+                if(ta.intersect(qa)) objTrees[t].queryPoints(q, margin);
             }
         }
         queryEnd();
@@ -10222,17 +10271,20 @@ struct Simulator {
                       } // end legacy two-pass (refit + enlarge) branch
                     }
                     if (doBroad) {
+                        auto& bp = collisionPipeline.broadPhase;
+                        auto runDetect = [&]() {
+                            if (bp.twoMeshExperiment)
+                                bp.detectCollisionsTwoMesh(margin, enableSelfCollisions);
+                            else if (useSegmentedBVHQuery)
+                                bp.detectCollisionsSegmented(margin, enableSelfCollisions, useAnalyticPrimitive);
+                            else
+                                bp.detectCollisions(margin, enableSelfCollisions, useAnalyticPrimitive);
+                        };
                         if (profiler) {
                             auto scope = profiler->scoped("broad_detect");
-                            if (useSegmentedBVHQuery)
-                                collisionPipeline.broadPhase.detectCollisionsSegmented(margin, enableSelfCollisions, useAnalyticPrimitive);
-                            else
-                                collisionPipeline.broadPhase.detectCollisions(margin, enableSelfCollisions, useAnalyticPrimitive);
+                            runDetect();
                         } else {
-                            if (useSegmentedBVHQuery)
-                                collisionPipeline.broadPhase.detectCollisionsSegmented(margin, enableSelfCollisions, useAnalyticPrimitive);
-                            else
-                                collisionPipeline.broadPhase.detectCollisions(margin, enableSelfCollisions, useAnalyticPrimitive);
+                            runDetect();
                         }
                     }
                 }
@@ -12328,6 +12380,295 @@ static int runSubObjectValidate(int particleNum1D, int splitS, int frames) {
               << " frames=" << frames << " (sphere top y=+0.5) ===\n";
     runVariant(false, 0);
     for (int s = 1; s <= splitS; ++s) runVariant(true, s);
+    return 0;
+}
+
+// Two-mesh experiment: human (static, BVH built ONCE) + cloth (sub-object BVH,
+// refit every frame), NO ground and NO scene-level TLAS. Broad phase is the
+// direct pairwise-overlap BIDIRECTIONAL test (detectCollisionsTwoMesh). Scene
+// matches the default interactive demo: dt = 1/60, 60 substeps, cloth
+// stiffness k_stretch/shear/bend = 1e5/1e5/2e5, thickness 0.01, mass 0.1.
+//
+// SWEEPS the sub-object split s = 0 (single-root baseline) .. maxSplitS, with
+// `repeats` round-robin INTERLEAVED repeats (single,s1..sN, single,s1..sN, ...)
+// so thermal drift hits every variant equally (per the subobject methodology:
+// interleave conditions, use MEDIAN not mean, and watch narrow_phase — which s
+// cannot affect — as the noise floor). Per variant it attaches a FrameProfiler,
+// runs `frames` frames, and records the MEDIAN steady-frame section time for
+// broad_refit_swept (cloth multi-root combine) + broad_detect (the grouped
+// human→cloth query top phase) + narrow_phase + whole frame. The s-sensitive
+// cost lives in refit+detect; collision counts are s-INVARIANT (correctness).
+static int runTwoMeshExperiment(int particleNum1D, int maxSplitS, int frames,
+                                int repeats) {
+    using Backend = METAL;
+    using SystemT = ExplicitSystem<Backend, Precision>;
+    using Clock = std::chrono::steady_clock;
+    if (!MetalGlobalContext::getDevice() || !MetalKernelContext::getLibrary()) {
+        std::cerr << "[twomesh SKIP] metal unavailable\n";
+        return 0;
+    }
+    namespace fs = std::filesystem;
+    std::string outPath;
+#ifdef YSIM_PROJECT_ROOT
+    outPath = std::string(YSIM_PROJECT_ROOT)
+            + "/profiles/experiment/twomesh-2026-06-23/twomesh_sweep.csv";
+#else
+    outPath = "profiles/experiment/twomesh-2026-06-23/twomesh_sweep.csv";
+#endif
+    if (const char* o = std::getenv("YSIM_BENCH_CSV")) outPath = o;
+    fs::path csvPath(outPath);
+    if (csvPath.has_parent_path()) {
+        std::error_code ec; fs::create_directories(csvPath.parent_path(), ec);
+    }
+    std::ofstream csv(csvPath);
+    if (!csv) { std::cerr << "[twomesh FAIL] open " << outPath << "\n"; return 1; }
+    csv << "variant,split_s,top_mode,num_groups,repeat,refit_ms,detect_ms,"
+           "narrow_ms,frame_ms,broad_collisions,narrow_collisions,"
+           "cloth_minY,cloth_maxY\n";
+
+    auto resetScene = []() {
+        for (auto& m : Scene<Backend, Precision>::meshes) m.initializer = nullptr;
+        Scene<Backend, Precision>::meshes.clear();
+        for (auto& r : Scene<Backend, Precision>::requestsGeneralMeshes) delete r.initializer;
+        Scene<Backend, Precision>::requestsGeneralMeshes.clear();
+        Scene<Backend, Precision>::numMeshes = 0;
+        Scene<Backend, Precision>::nextMeshId = 0;
+        Scene<Backend, Precision>::dirty = true;
+        Scene<Backend, Precision>::environment = SceneEnvironment{};
+    };
+    auto median = [](std::vector<double> v) -> double {
+        if (v.empty()) return 0.0;
+        std::sort(v.begin(), v.end());
+        std::size_t n = v.size();
+        return (n & 1) ? v[n/2] : 0.5 * (v[n/2 - 1] + v[n/2]);
+    };
+
+    struct VarResult { double refit, detect, narrow, frame;
+                       uint32_t broad, nrw; double minY, maxY; int k; };
+    auto runVariant = [&](int splitS, int topMode) -> VarResult {
+        resetScene();
+        Precision h = Precision(1) / Precision(60);
+        SystemT system(h, 60);                       // dt=1/60, 60 substeps
+        Simulator<Backend, Precision, SystemT> sim(system);
+        sim.pause = false;
+        // Cloth (index 0) — default-scene stiffness kept (k_bend 2e5).
+        sim.addCloth(particleNum1D, Precision(1.0), tinym::vec3(0, Precision(1.25), 0),
+                     Precision(1e5), Precision(1e5), Precision(2e5),
+                     Precision(0.01), Precision(0.1));
+        // Human (index 1) — STATIC: BVH built once, never refit. No ground.
+        sim.addFloatMesh(ysim_paths::assetRoot(), "Human.obj",
+                         tinym::vec3(0, Precision(0.35), 0), Precision(0.04));
+        {
+            auto& humanReq = Scene<Backend, Precision>::requestsGeneralMeshes.back();
+            humanReq.isStatic     = true;
+            humanReq.applyGravity = false;
+            humanReq.applyWind    = false;
+        }
+        sim.initialize();
+        auto& bp = sim.collisionPipeline.broadPhase;
+        bp.twoMeshExperiment = true;                 // no scene TLAS + bidirectional
+        bp.useSubObjectBVH   = (splitS > 0);         // cloth = sub-object BVH
+        bp.subBvhSplitS      = splitS;
+        bp.subTopMode        = topMode;              // 0 CPU SAP, 1 GPU brute
+        bp.fusedRefitEnlarge = true;
+
+        profiler::FrameProfiler prof((std::size_t)(frames + 4));
+        sim.profiler = &prof;
+        auto secMs = [&](const char* nm) -> double {
+            const auto* s = prof.history().latestFrame();
+            int i = prof.history().sectionIndex(nm);
+            if (s && i >= 0 && (std::size_t)i < s->section_ms.size())
+                return (double)s->section_ms[i];
+            return 0.0;
+        };
+        const int warmup = std::min(frames / 2, 10);
+        std::vector<double> refitV, detectV, narrowV, frameV;
+        for (int f = 0; f < frames; ++f) {
+            prof.beginFrame((uint64_t)f, (double)f * (double)h);
+            auto a = Clock::now();
+            sim.update();
+            auto b = Clock::now();
+            prof.endFrame();
+            if (f < warmup) continue;
+            refitV.push_back(secMs("broad_refit_swept"));
+            detectV.push_back(secMs("broad_detect"));
+            narrowV.push_back(secMs("narrow_phase"));
+            frameV.push_back(std::chrono::duration<double, std::milli>(b - a).count());
+        }
+        sim.profiler = nullptr;
+
+        auto& pc    = Scene<Backend, Precision>::packedCollisionData;
+        auto& cloth = Scene<Backend, Precision>::meshes[0];
+        Index n = cloth.state.x.size / 3;
+        Precision minY =  std::numeric_limits<Precision>::infinity();
+        Precision maxY = -std::numeric_limits<Precision>::infinity();
+        for (Index i = 0; i < n; ++i) {
+            Precision y = cloth.state.x[i*3+1];
+            minY = std::min(minY, y); maxY = std::max(maxY, y);
+        }
+        int k = bp.objTrees.empty() ? 1 : bp.objTrees[0].numGroups;
+        return { median(refitV), median(detectV), median(narrowV), median(frameV),
+                 (uint32_t)pc.numBroadCollisions[0], (uint32_t)pc.numNarrowCollisions[0],
+                 (double)minY, (double)maxY, k };
+    };
+
+    // (splitS, topMode) variants. single-root (s=0) has no top phase → one run.
+    // Each multi s runs BOTH top modes: 0 CPU SAP, 1 GPU brute. Interleaved
+    // round-robin across repeats so thermal drift hits every variant equally.
+    std::vector<std::pair<int,int>> variants = {{0, 0}};   // single baseline
+    for (int s = 1; s <= maxSplitS; ++s) { variants.push_back({s, 0});
+                                           variants.push_back({s, 1}); }
+    std::cerr << "=== two-mesh sweep: P=" << particleNum1D << " s=0.." << maxSplitS
+              << " modes={SAP,GPU} frames=" << frames << " repeats=" << repeats
+              << " (interleaved, median) ===\n";
+    for (int r = 0; r < repeats; ++r) {
+        for (auto [s, mode] : variants) {
+            VarResult v = runVariant(s, mode);
+            const char* name = (s == 0) ? "single"
+                             : (mode == 0 ? "multi-sap" : "multi-gpu");
+            const char* modeStr = (s == 0) ? "none" : (mode == 0 ? "sap" : "gpu");
+            csv << name << ',' << s << ',' << modeStr << ',' << v.k << ',' << r
+                << ',' << v.refit << ',' << v.detect << ',' << v.narrow << ','
+                << v.frame << ',' << v.broad << ',' << v.nrw << ',' << v.minY
+                << ',' << v.maxY << '\n';
+            csv.flush();
+            std::cerr << "[twomesh r=" << r << ' ' << name << " s=" << s
+                      << " k=" << v.k << "] refit=" << v.refit << " detect="
+                      << v.detect << " narrow=" << v.narrow << " frame=" << v.frame
+                      << "ms broad=" << v.broad << " maxY=" << v.maxY << "\n";
+        }
+    }
+    csv.close();
+    std::cerr << "[twomesh DONE] wrote " << outPath << "\n";
+    return 0;
+}
+
+// Does BATCHED-COMMIT (amortized sync) reveal the sub-object combine win that
+// the per-substep sync floor hides? Two-mesh scene (static Human + cloth),
+// settle the cloth onto the Human, then for single + s=1..maxSplitS measure the
+// cloth refit under TWO sync regimes on the SAME draped geometry:
+//   (A) refit_synced  = t.refitSwept(dt) per call — commits+waits internally
+//        (5955), so each call eats the full CPU<->GPU round-trip = the live
+//        per-substep cost (sync floor + combine compute).
+//   (B) combine_amortized = the bottom-up combine kernel ONLY, `reps` dispatches
+//        batched into ONE command buffer with ONE commitAndWait — the sync floor
+//        is divided across reps, exposing the pure combine compute.
+// If sub-object's smaller tree (fewer nodes) makes combine cheaper, (B) drops
+// with k while (A) stays flat — i.e. the win exists but is masked by sync, and
+// batching commits surfaces it. (Combine cost is topology-bound, a property of
+// the cloth tree, so this is identical whether the cloth drapes a sphere or the
+// Human — same number as runSubObjectSceneBench, measured here for consistency.)
+static int runTwoMeshRefitSync(int particleNum1D, int maxSplitS, int reps) {
+    using Backend = METAL;
+    using SystemT = ExplicitSystem<Backend, Precision>;
+    using Clock = std::chrono::steady_clock;
+    if (!MetalGlobalContext::getDevice() || !MetalKernelContext::getLibrary()) {
+        std::cerr << "[twomesh-refit SKIP] metal unavailable\n";
+        return 0;
+    }
+    namespace fs = std::filesystem;
+    std::string outPath;
+#ifdef YSIM_PROJECT_ROOT
+    outPath = std::string(YSIM_PROJECT_ROOT)
+            + "/profiles/experiment/twomesh-2026-06-23/twomesh_refit.csv";
+#else
+    outPath = "profiles/experiment/twomesh-2026-06-23/twomesh_refit.csv";
+#endif
+    if (const char* o = std::getenv("YSIM_BENCH_CSV")) outPath = o;
+    fs::path csvPath(outPath);
+    if (csvPath.has_parent_path()) {
+        std::error_code ec; fs::create_directories(csvPath.parent_path(), ec);
+    }
+    std::ofstream csv(csvPath);
+    if (!csv) { std::cerr << "[twomesh-refit FAIL] open " << outPath << "\n"; return 1; }
+    csv << "variant,split_s,num_groups,num_nodes,refit_synced_us,"
+           "combine_amortized_us\n";
+
+    auto resetScene = []() {
+        for (auto& m : Scene<Backend, Precision>::meshes) m.initializer = nullptr;
+        Scene<Backend, Precision>::meshes.clear();
+        for (auto& r : Scene<Backend, Precision>::requestsGeneralMeshes) delete r.initializer;
+        Scene<Backend, Precision>::requestsGeneralMeshes.clear();
+        Scene<Backend, Precision>::numMeshes = 0;
+        Scene<Backend, Precision>::nextMeshId = 0;
+        Scene<Backend, Precision>::dirty = true;
+        Scene<Backend, Precision>::environment = SceneEnvironment{};
+    };
+    auto msSince = [](Clock::time_point a, Clock::time_point b) {
+        return std::chrono::duration<double, std::milli>(b - a).count();
+    };
+
+    resetScene();
+    Precision h = Precision(1) / Precision(60);
+    Index subSteps = 60;
+    Precision dt = h / Precision(subSteps);          // == system.subh
+    SystemT system(h, subSteps);
+    Simulator<Backend, Precision, SystemT> sim(system);
+    sim.pause = false;
+    sim.addCloth(particleNum1D, Precision(1.0), tinym::vec3(0, Precision(1.25), 0),
+                 Precision(1e5), Precision(1e5), Precision(2e5),
+                 Precision(0.01), Precision(0.1));
+    sim.addFloatMesh(ysim_paths::assetRoot(), "Human.obj",
+                     tinym::vec3(0, Precision(0.35), 0), Precision(0.04));
+    {
+        auto& humanReq = Scene<Backend, Precision>::requestsGeneralMeshes.back();
+        humanReq.isStatic = true; humanReq.applyGravity = false; humanReq.applyWind = false;
+    }
+    sim.initialize();
+    auto& bp = sim.collisionPipeline.broadPhase;
+    bp.twoMeshExperiment = true;
+    bp.useSubObjectBVH   = false;                    // settle single-root
+    bp.fusedRefitEnlarge = true;
+    for (int f = 0; f < 20; ++f) sim.update();        // drape cloth on Human
+
+    if (bp.objTrees.empty()) { std::cerr << "[twomesh-refit] no objTree\n"; return 1; }
+    auto& t = bp.objTrees[0];                         // cloth tree
+    auto& clothMesh = Scene<Backend, Precision>::meshes[0];
+    int64_t numPrims = (int64_t)(t.primitives.size / 3);
+    AABB4 sceneBox; sceneBox.i0 = (int)numPrims;
+
+    // (B) amortized: warm + 1 commit, then reps dispatches in ONE buffer, 1 sync.
+    auto microCombine = [&](auto&& dispatchOnce) -> double {
+        dispatchOnce(); MetalGlobalContext::commitAndWait();
+        auto a = Clock::now();
+        for (int r = 0; r < reps; ++r) dispatchOnce();
+        MetalGlobalContext::commitAndWait();
+        auto b = Clock::now();
+        return msSince(a, b) / reps * 1000.0;        // µs/rep
+    };
+    // (A) synced: t.refitSwept commits+waits each call (the live per-substep cost).
+    auto e2eRefitSwept = [&]() -> double {
+        t.refitSwept(dt);                            // warm
+        auto a = Clock::now();
+        for (int r = 0; r < reps; ++r) t.refitSwept(dt);
+        auto b = Clock::now();
+        return msSince(a, b) / reps * 1000.0;        // µs/call
+    };
+
+    std::cerr << "=== two-mesh refit sync A/B: P=" << particleNum1D << " prims="
+              << numPrims << " reps=" << reps << " (cloth draped on Human) ===\n";
+    // single-root baseline
+    t.useSubObjectBVH = false; t.build(clothMesh);
+    double sCombine = microCombine([&]{ t.bottomUpBoxesGPU(sceneBox); });
+    double sRefit   = e2eRefitSwept();
+    csv << "single,0,1," << (2*numPrims-1) << ',' << sRefit << ',' << sCombine << '\n';
+    csv.flush();
+    std::cerr << "[twomesh-refit single] nodes=" << (2*numPrims-1)
+              << " refit_synced=" << sRefit << "us combine_amortized=" << sCombine << "us\n";
+    for (int s = 1; s <= maxSplitS; ++s) {
+        t.useSubObjectBVH = true; t.subBvhSplitS = s; t.build(clothMesh);
+        if (!t.subObjectActive()) continue;
+        double mCombine = microCombine([&]{ t.bottomUpBoxesMultiRootGPU(sceneBox); });
+        double mRefit   = e2eRefitSwept();
+        csv << "multi," << s << ',' << t.numGroups << ',' << t.subBvhNumNodes
+            << ',' << mRefit << ',' << mCombine << '\n';
+        csv.flush();
+        std::cerr << "[twomesh-refit s=" << s << " k=" << t.numGroups << "] nodes="
+                  << t.subBvhNumNodes << " refit_synced=" << mRefit
+                  << "us combine_amortized=" << mCombine << "us\n";
+    }
+    csv.close();
+    std::cerr << "[twomesh-refit DONE] wrote " << outPath << "\n";
     return 0;
 }
 
@@ -18197,6 +18538,27 @@ int main(int argc, char** argv) {
         int S = (argc > 3) ? std::atoi(argv[3]) : 4;
         int F = (argc > 4) ? std::atoi(argv[4]) : 40;
         return runSubObjectValidate(P, S, F);
+    }
+    if (argc > 1 && std::string(argv[1]) == "--bench-twomesh") {
+        // Two-mesh experiment: static Human + sub-object cloth, no scene TLAS,
+        // bidirectional pairwise broad phase. Sweeps s=0(single)..maxSplitS with
+        // interleaved repeats; per-variant median refit/detect/narrow/frame ms.
+        // Optional args: <particleNum1D> <maxSplitS> <frames> <repeats>.
+        int P = (argc > 2) ? std::atoi(argv[2]) : 50;
+        int S = (argc > 3) ? std::atoi(argv[3]) : 6;
+        int F = (argc > 4) ? std::atoi(argv[4]) : 30;
+        int R = (argc > 5) ? std::atoi(argv[5]) : 5;
+        return runTwoMeshExperiment(P, S, F, R);
+    }
+    if (argc > 1 && std::string(argv[1]) == "--bench-twomesh-refit") {
+        // Sync-floor isolation: cloth refit under per-call sync (A) vs amortized
+        // batched sync (B), single vs sub-object, on the draped two-mesh scene.
+        // Tests whether batched-commit surfaces the combine win. Args:
+        // <particleNum1D> <maxSplitS> <reps>.
+        int P = (argc > 2) ? std::atoi(argv[2]) : 50;
+        int S = (argc > 3) ? std::atoi(argv[3]) : 6;
+        int R = (argc > 4) ? std::atoi(argv[4]) : 200;
+        return runTwoMeshRefitSync(P, S, R);
     }
     if (argc > 1 && std::string(argv[1]) == "--bench-bvh-build") {
         BuildBenchConfig cfg;
