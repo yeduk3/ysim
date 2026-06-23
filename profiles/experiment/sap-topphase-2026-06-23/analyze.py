@@ -18,18 +18,19 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-SPLITS = [1, 2, 3]
+SPLITS = [1, 2, 3, 4, 5, 6]
 SECTIONS = ["broad_refit", "broad_detect", "narrow_phase", "bvh_build", "frame_ms"]
 STEADY_FROM = 15   # cloth in sustained contact with Human from ~frame 15
 
-# case key -> (label, color)
+# case key -> (label, color). Mode = colour family (blue mini / orange SAP /
+# green GPU), shaded by s so 6 splits stay legible.
+import matplotlib.cm as cm
 CASES = {"regular": ("Regular BVH", "#444444")}
-PALETTE = {1: ("#1f77b4", "#9ecae1"), 2: ("#ff7f0e", "#fdd0a2"), 3: ("#2ca02c", "#a1d99b")}
-GPUCOL  = {1: "#08306b", 2: "#7f2704", 3: "#00441b"}
-for s in SPLITS:
-    CASES[f"mini_s{s}"] = (f"mini-TLAS s={s}", PALETTE[s][0])
-    CASES[f"sap_s{s}"]  = (f"SAP s={s}",       PALETTE[s][1])
-    CASES[f"gpu_s{s}"]  = (f"GPU-top s={s}",   GPUCOL[s])
+for i, s in enumerate(SPLITS):
+    f = 0.40 + 0.50 * (i / max(1, len(SPLITS) - 1))
+    CASES[f"mini_s{s}"] = (f"mini s={s}", cm.Blues(f))
+    CASES[f"sap_s{s}"]  = (f"SAP s={s}",  cm.Oranges(f))
+    CASES[f"gpu_s{s}"]  = (f"GPU s={s}",  cm.Greens(f))
 
 def case_of(f):
     m = re.match(r"(regular|mini_s\d+|sap_s\d+|gpu_s\d+)_r\d+\.csv$", os.path.basename(f))

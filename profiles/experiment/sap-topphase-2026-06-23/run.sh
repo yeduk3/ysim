@@ -12,7 +12,7 @@
 set -uo pipefail
 cd "$(git -C "$(dirname "$0")" rev-parse --show-toplevel)"
 EXP="profiles/experiment/sap-topphase-2026-06-23"; BIN=./build/ysim; TPL="$EXP/_template.scene.json"
-REPEATS=${REPEATS:-8}; SPLITS=${SPLITS:-"1 2 3"}
+REPEATS=${REPEATS:-8}; SPLITS=${SPLITS:-"1 2 3 4 5 6"}
 
 one() { # tag, sub, sap, r
   local tag="$1" sub="$2" sap="$3" r="$4"
