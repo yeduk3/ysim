@@ -135,6 +135,11 @@ struct MetalGlobalContext {
     }
     inline static MTL::CommandBuffer* commandBuffer = nullptr;
     inline static MTL::ComputeCommandEncoder* computeCommandEncoder = nullptr;
+    // Diagnostic: counts REAL CPU<->GPU syncs (a commitAndWait that actually
+    // flushed an encoder, not the no-op early-return). The update() sync
+    // refactor uses this to assert None/PerFrame do 0 in-loop syncs vs
+    // InFrame's ~3/substep. Reset at a known point, read after.
+    inline static uint64_t syncCount = 0;
     static MTL::ComputeCommandEncoder* getComputeCommandEncoder() {
         if (computeCommandEncoder) return computeCommandEncoder;
         commandBuffer = getCommandQueue()->commandBuffer();
@@ -194,6 +199,7 @@ struct MetalGlobalContext {
 
         commandBuffer = nullptr;
         computeCommandEncoder = nullptr;
+        ++syncCount;
     }
 
 };
@@ -7941,6 +7947,15 @@ struct Simulator {
     int targetFrames = 300;
     profiler::FrameProfiler* profiler = nullptr;
 
+    // Profiling/sync tier (update() sync refactor). InFrame = per-section
+    // commitAndWait (historical default); PerFrame/None run the sim loop
+    // fully async (only the frame-boundary sync). syncEachPhase() gates the
+    // 3 per-substep phase syncs (refit/detect/narrow) on InFrame.
+    sim_config::ProfileLevel profileLevel = sim_config::ProfileLevel::InFrame;
+    bool syncEachPhase() const {
+        return profileLevel == sim_config::ProfileLevel::InFrame;
+    }
+
 
     PR margin = 0.015;
     PR radius = 0.012;
@@ -12413,6 +12428,69 @@ static int runSubObjectValidate(int particleNum1D, int splitS, int frames) {
               << " frames=" << frames << " (sphere top y=+0.5) ===\n";
     runVariant(false, 0);
     for (int s = 1; s <= splitS; ++s) runVariant(true, s);
+    return 0;
+}
+
+// update() sync-refactor verifier (P0). Runs the two-mesh scene a few frames
+// at each ProfileLevel and prints the REAL CPU<->GPU sync count per frame
+// (MetalGlobalContext::syncCount delta). Proves None/PerFrame drop the in-loop
+// syncs InFrame pays. At P0 (no gating yet) all three read ~equal = the
+// baseline; later phases (P5) diverge to ~boundary-only for None/PerFrame.
+static int runSyncProbe(int particleNum1D, int frames) {
+    using Backend = METAL;
+    using SystemT = ExplicitSystem<Backend, Precision>;
+    if (!MetalGlobalContext::getDevice() || !MetalKernelContext::getLibrary()) {
+        std::cerr << "[sync-probe SKIP] metal unavailable\n";
+        return 0;
+    }
+    auto resetScene = []() {
+        for (auto& m : Scene<Backend, Precision>::meshes) m.initializer = nullptr;
+        Scene<Backend, Precision>::meshes.clear();
+        for (auto& r : Scene<Backend, Precision>::requestsGeneralMeshes) delete r.initializer;
+        Scene<Backend, Precision>::requestsGeneralMeshes.clear();
+        Scene<Backend, Precision>::numMeshes = 0;
+        Scene<Backend, Precision>::nextMeshId = 0;
+        Scene<Backend, Precision>::dirty = true;
+        Scene<Backend, Precision>::environment = SceneEnvironment{};
+    };
+    auto runLevel = [&](sim_config::ProfileLevel level, const char* name) {
+        resetScene();
+        Precision h = Precision(1) / Precision(60);
+        SystemT system(h, 60);                       // dt=1/60, 60 substeps
+        Simulator<Backend, Precision, SystemT> sim(system);
+        sim.pause = false;
+        sim.addCloth(particleNum1D, Precision(1.0), tinym::vec3(0, Precision(1.25), 0),
+                     Precision(1e5), Precision(1e5), Precision(2e5),
+                     Precision(0.01), Precision(0.1));
+        sim.addFloatMesh(ysim_paths::assetRoot(), "Human.obj",
+                         tinym::vec3(0, Precision(0.35), 0), Precision(0.04));
+        {
+            auto& humanReq = Scene<Backend, Precision>::requestsGeneralMeshes.back();
+            humanReq.isStatic = true; humanReq.applyGravity = false; humanReq.applyWind = false;
+        }
+        sim.initialize();
+        auto& bp = sim.collisionPipeline.broadPhase;
+        bp.twoMeshExperiment = true;
+        bp.fusedRefitEnlarge = true;
+        sim.profileLevel = level;
+        // None = no profiler attached; PerFrame/InFrame attach one.
+        profiler::FrameProfiler prof((std::size_t)(frames + 4));
+        sim.profiler = (level == sim_config::ProfileLevel::None) ? nullptr : &prof;
+        for (int f = 0; f < frames; ++f) {
+            uint64_t before = MetalGlobalContext::syncCount;
+            if (sim.profiler) sim.profiler->beginFrame((uint64_t)f, (double)f * (double)h);
+            sim.update();
+            if (sim.profiler) sim.profiler->endFrame();
+            std::cerr << "[sync-probe " << name << "] frame " << f
+                      << " syncs=" << (MetalGlobalContext::syncCount - before) << "\n";
+        }
+        sim.profiler = nullptr;
+    };
+    std::cerr << "=== sync probe: P=" << particleNum1D << " frames=" << frames
+              << " (60 substeps/frame) ===\n";
+    runLevel(sim_config::ProfileLevel::None,      "none     ");
+    runLevel(sim_config::ProfileLevel::PerFrame,  "per_frame");
+    runLevel(sim_config::ProfileLevel::InFrame,   "in_frame ");
     return 0;
 }
 
@@ -18582,6 +18660,14 @@ int main(int argc, char** argv) {
         int F = (argc > 4) ? std::atoi(argv[4]) : 30;
         int R = (argc > 5) ? std::atoi(argv[5]) : 5;
         return runTwoMeshExperiment(P, S, F, R);
+    }
+    if (argc > 1 && std::string(argv[1]) == "--bench-sync") {
+        // update() sync-refactor verifier: prints REAL CPU<->GPU sync count
+        // per frame at each ProfileLevel (none/per_frame/in_frame) on the
+        // two-mesh scene. Args: <particleNum1D> <frames>.
+        int P = (argc > 2) ? std::atoi(argv[2]) : 50;
+        int F = (argc > 3) ? std::atoi(argv[3]) : 12;   // reach contact (~f7)
+        return runSyncProbe(P, F);
     }
     if (argc > 1 && std::string(argv[1]) == "--bench-twomesh-refit") {
         // Sync-floor isolation: cloth refit under per-call sync (A) vs amortized
