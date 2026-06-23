@@ -2958,6 +2958,10 @@ struct Scene {
         Index maxNumCollisions;
         VectorBase<BE, NarrowCollision> vertColFacets;
         VectorBase<BE, Index> vertColFacetsOffsets;
+        // P4 GPU bucketing scratch: per-vertex running offset the scatter
+        // kernel atomic-bumps (size numPoints). vertColFacetsOffsets doubles
+        // as histogram-then-CSR (scanned in place), so no scan scratch.
+        VectorBase<BE, Index> vertColBucketCounter;
 
         // Segmented (per-threadgroup) detect+reduce scratch — used by
         // BVH::queryPointsSegmented (paper-inspired alternative to the
@@ -3417,6 +3421,7 @@ struct Scene {
         packedCollisionData.numNarrowCollisions = VectorBase<BE, Index>(1, 0);
         packedCollisionData.vertColFacets = VectorBase<BE, NarrowCollision>(packedCollisionData.maxNumCollisions);
         packedCollisionData.vertColFacetsOffsets = VectorBase<BE, Index>(numPoints+1, 0);
+        packedCollisionData.vertColBucketCounter = VectorBase<BE, Index>(numPoints, 0);
 
         // Segmented variant scratch (paper-inspired alternative path).
         // Sized so a single queryPointsSegmented dispatch over ANY mesh
@@ -7581,9 +7586,65 @@ template <typename PR>
 struct BruteForce<METAL, PR> {
     MTL::ComputePipelineState* bruteForcePSO;
     MTL::ComputePipelineState* analyticPSO;   // slice (c-1)
+    // P4 GPU per-vertex bucketing (replaces the CPU CSR-build loops).
+    MTL::ComputePipelineState* bucketZeroPSO;
+    MTL::ComputePipelineState* bucketCountPSO;
+    MTL::ComputePipelineState* bucketScanPSO;
+    MTL::ComputePipelineState* bucketScatterPSO;
+    MTL::ComputePipelineState* resetCounterPSO;
+    // update() sync refactor: InFrame commits after narrow (so the CPU can
+    // read counts) ; None/PerFrame keep the bucketing on the GPU and never
+    // sync here. Set by Simulator::update each frame.
+    bool syncEachPhase = true;
     BruteForce() {
         bruteForcePSO = MetalKernelContext::getPSO("narrow_pt_tri");
         analyticPSO   = MetalKernelContext::getPSO("narrow_pt_analytic");
+        bucketZeroPSO    = MetalKernelContext::getPSO("narrow_bucket_zero");
+        bucketCountPSO   = MetalKernelContext::getPSO("narrow_bucket_count");
+        bucketScanPSO    = MetalKernelContext::getPSO("narrow_bucket_scan");
+        bucketScatterPSO = MetalKernelContext::getPSO("narrow_bucket_scatter");
+        resetCounterPSO  = MetalKernelContext::getPSO("reset_counter");
+    }
+
+    // GPU replacement for the per-vertex CSR build in narrowAndSortByVertices.
+    // Encodes zero -> count -> scan -> scatter into the current encoder; the
+    // serial order supplies the barriers, so no commitAndWait is needed and
+    // the integrator reads vertColFacets/Offsets straight off the GPU.
+    void bucketByVerticesGPU() {
+        auto& packedMesh = Scene<METAL, PR>::packedMeshData;
+        auto& packedCol  = Scene<METAL, PR>::packedCollisionData;
+        const uint nOffsets = (uint)packedCol.vertColFacetsOffsets.size;   // numPoints+1
+        const uint maxN     = (uint)packedCol.maxNumCollisions;
+        if (nOffsets == 0) return;
+
+        // Step 0: zero offsets (n) + per-vertex counter (n-1).
+        MetalGlobalContext::setBuffer(packedCol.vertColFacetsOffsets, 0);
+        MetalGlobalContext::setBuffer(packedCol.vertColBucketCounter, 1);
+        MetalGlobalContext::setBytes(nOffsets, 2);
+        MetalGlobalContext::dispatchThreads(bucketZeroPSO, nOffsets);
+
+        // Step 1: histogram into offsets[ppid+1].
+        MetalGlobalContext::setBuffer(packedCol.narrowCollisions, 0);
+        MetalGlobalContext::setBuffer(packedCol.numNarrowCollisions, 1);
+        MetalGlobalContext::setBuffer(packedMesh.statesOffsets, 2);
+        MetalGlobalContext::setBuffer(packedCol.vertColFacetsOffsets, 3);
+        MetalGlobalContext::setBytes(maxN, 4);
+        MetalGlobalContext::dispatchThreads(bucketCountPSO, maxN);
+
+        // Step 2: in-place inclusive prefix sum (single thread).
+        MetalGlobalContext::setBuffer(packedCol.vertColFacetsOffsets, 0);
+        MetalGlobalContext::setBytes(nOffsets, 1);
+        MetalGlobalContext::dispatchThreads(bucketScanPSO, 1);
+
+        // Step 3: scatter contacts into per-vertex buckets.
+        MetalGlobalContext::setBuffer(packedCol.narrowCollisions, 0);
+        MetalGlobalContext::setBuffer(packedCol.numNarrowCollisions, 1);
+        MetalGlobalContext::setBuffer(packedMesh.statesOffsets, 2);
+        MetalGlobalContext::setBuffer(packedCol.vertColFacetsOffsets, 3);
+        MetalGlobalContext::setBuffer(packedCol.vertColBucketCounter, 4);
+        MetalGlobalContext::setBuffer(packedCol.vertColFacets, 5);
+        MetalGlobalContext::setBytes(maxN, 6);
+        MetalGlobalContext::dispatchThreads(bucketScatterPSO, maxN);
     }
     struct NarrowParams {
         uint32_t numBroadCollisions;
@@ -7638,9 +7699,49 @@ struct BruteForce<METAL, PR> {
         MetalGlobalContext::setBytes(nparams, 9);
         // xPrev (start-of-substep position) at slot 10 — D-013 swept CCD.
         MetalGlobalContext::setBuffer(packedMesh.xPrev, 10);
+        // numBroad count (slot 11) — bound for the P4 async path; redundant
+        // here (InFrame dispatches over the tight count).
+        MetalGlobalContext::setBuffer(packedCol.numBroadCollisions, 11);
 
         MetalGlobalContext::dispatchThreads(bruteForcePSO, nparams.numBroadCollisions);
         return true;
+    }
+
+    // Async narrow (None/PerFrame): no CPU read of any GPU counter. GPU-reset
+    // numNarrow, then dispatch narrow_pt_tri over maxNumCollisions with the
+    // real bound applied in-kernel from the numBroad buffer. Encodes into the
+    // current encoder (no commitAndWait). Triangle path only — the analytic
+    // path is CPU-marker driven, so callers fall back to the sync path when
+    // analytic is enabled.
+    void narrowGPU(PR radius, PR thickness) {
+        typename Scene<METAL, PR>::PackedMeshData& packedMesh = Scene<METAL, PR>::packedMeshData;
+        typename Scene<METAL, PR>::PackedCollisionData& packedCol = Scene<METAL, PR>::packedCollisionData;
+        const uint maxN = (uint)packedCol.maxNumCollisions;
+
+        // GPU-reset the narrow counter (atomic base) — no CPU touch.
+        MetalGlobalContext::setBuffer(packedCol.numNarrowCollisions, 0);
+        MetalGlobalContext::dispatchThreads(resetCounterPSO, 1);
+
+        NarrowParams nparams{};
+        nparams.numBroadCollisions = maxN;        // gate is the GPU numBroad buf
+        nparams.maxNumCollisions   = (uint32_t)packedCol.maxNumCollisions;
+        nparams.radius    = radius;
+        nparams.thickness = static_cast<float>(thickness);
+        nparams.skipSphere = 0u;
+
+        MetalGlobalContext::setBuffer(packedCol.broadCollisions, 0);
+        MetalGlobalContext::setBuffer(packedCol.numNarrowCollisions, 1);
+        MetalGlobalContext::setBuffer(packedCol.narrowCollisions, 2);
+        MetalGlobalContext::setBuffer(packedMesh.x, 3);
+        MetalGlobalContext::setBuffer(packedMesh.statesOffsets, 4);
+        MetalGlobalContext::setBuffer(packedMesh.facets, 5);
+        MetalGlobalContext::setBuffer(packedMesh.facetsOffsets, 6);
+        MetalGlobalContext::setBuffer(packedMesh.vertexAdjFacets, 7);
+        MetalGlobalContext::setBuffer(packedMesh.vertexAdjFacetsOffsets, 8);
+        MetalGlobalContext::setBytes(nparams, 9);
+        MetalGlobalContext::setBuffer(packedMesh.xPrev, 10);
+        MetalGlobalContext::setBuffer(packedCol.numBroadCollisions, 11);
+        MetalGlobalContext::dispatchThreads(bruteForcePSO, maxN);
     }
 
     // Slice (c-1) — analytic cloth-vs-primitive narrow phase. Appends
@@ -7708,6 +7809,18 @@ struct BruteForce<METAL, PR> {
 
     void narrowAndSortByVertices(PR radius, PR thickness,
                                   bool analyticEnabled = false) {
+
+        // P4 async path (None/PerFrame, non-analytic): narrow + per-vertex
+        // CSR build entirely on the GPU, no commitAndWait and no CPU read of
+        // any GPU counter. The integrator reads vertColFacets/Offsets straight
+        // off the GPU next. InFrame (and any analytic frame) falls through to
+        // the historical CPU-bucketing path below, bit-identical.
+        if (!syncEachPhase && !analyticEnabled) {
+            Scene<METAL, PR>::packedCollisionData.analyticPairs.clear();
+            narrowGPU(radius, thickness);
+            bucketByVerticesGPU();
+            return;
+        }
 
         // narrow() resets the shared narrow buffers (always), then
         // dispatches the triangle path (only when broad pairs exist).
@@ -10219,9 +10332,10 @@ struct Simulator {
                            m.transformPosition, m.state.x.ptr);
         }
 
-        // Push the per-frame sync tier into the broad phase: InFrame syncs +
-        // reads each substep; None/PerFrame run the broad phase async.
+        // Push the per-frame sync tier into the broad + narrow phases: InFrame
+        // syncs + reads each substep; None/PerFrame run them async.
         collisionPipeline.broadPhase.syncEachPhase = syncEachPhase();
+        collisionPipeline.narrowPhase.syncEachPhase = syncEachPhase();
 
         for(int i = 0; i < system.subSteps; i++) {
 
@@ -12556,8 +12670,23 @@ static int runSyncProbe(int particleNum1D, int frames) {
             if (sim.profiler) sim.profiler->beginFrame((uint64_t)f, (double)f * (double)h);
             sim.update();
             if (sim.profiler) sim.profiler->endFrame();
+            // Cloth Y range (mesh 0) — a correctness sentinel: the async GPU
+            // bucketing (None/PerFrame) must drape like the CPU path (InFrame).
+            // maxY held ~1.18 = on the Human, no tunnel; a broken bucket lets
+            // the cloth fall through (maxY plunges).
+            auto& cloth = Scene<Backend, Precision>::meshes[0];
+            Index nv = cloth.state.x.size / 3;
+            Precision mn = 1e9, mx = -1e9;
+            for (Index v = 0; v < nv; ++v) {
+                Precision y = cloth.state.x[v*3+1];
+                mn = std::min(mn, y); mx = std::max(mx, y);
+            }
+            auto& pc = Scene<Backend, Precision>::packedCollisionData;
             std::cerr << "[sync-probe " << name << "] frame " << f
-                      << " syncs=" << (MetalGlobalContext::syncCount - before) << "\n";
+                      << " syncs=" << (MetalGlobalContext::syncCount - before)
+                      << " clothY=[" << mn << "," << mx << "]"
+                      << " broad=" << pc.numBroadCollisions[0]
+                      << " narrow=" << pc.numNarrowCollisions[0] << "\n";
         }
         sim.profiler = nullptr;
     };
