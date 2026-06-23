@@ -7073,7 +7073,14 @@ struct BVH<BE, PR, BVHMODE::SCENE, BVHPRIMITIVE::OBJECT> {
     // every existing path is bit-identical.
     bool twoMeshExperiment = false;
 
-    //BVH(SceneObject<METAL, PR>& scene) 
+    // update() sync refactor: when true (ProfileLevel::InFrame) each broad
+    // phase commits+waits per substep and the CPU-side overflow/flag reads
+    // run; when false (None/PerFrame) the broad phase stays async and those
+    // CPU reads are skipped. Set by Simulator::update each frame. Default
+    // true ⇒ historical per-section-sync behavior.
+    bool syncEachPhase = true;
+
+    //BVH(SceneObject<METAL, PR>& scene)
     //    : objTrees(scene.numMeshes), positions(scene.numMeshes*3), indices(scene.numMeshes*2) {}
 
     void build(Scene<METAL, PR>& scene) {
@@ -7481,6 +7488,11 @@ struct BVH<BE, PR, BVHMODE::SCENE, BVHPRIMITIVE::OBJECT> {
     }
     void queryEnd() {
         MetalGlobalContext::commitAndWait();
+        // Overflow-flag reads are CPU reads of GPU-written flags — they need
+        // the sync above and are diagnostic only, so run them only in InFrame.
+        // None/PerFrame skip them (the GPU atomics self-clamp; the count stays
+        // accurate). P5 makes the commitAndWait above conditional too.
+        if (!syncEachPhase) return;
         for(auto& tree : objTrees) {
             if(tree.qFlag[0].stackOverflow) std::cout << "[Scene BVH detect collisions] " << tree.objid << "'s tree got query stack overflowed\n";
             if(tree.qFlag[0].collisionOverflow) {
@@ -10176,6 +10188,10 @@ struct Simulator {
                            m.transformPosition, m.state.x.ptr);
         }
 
+        // Push the per-frame sync tier into the broad phase: InFrame syncs +
+        // reads each substep; None/PerFrame run the broad phase async.
+        collisionPipeline.broadPhase.syncEachPhase = syncEachPhase();
+
         for(int i = 0; i < system.subSteps; i++) {
 
             //if(i % 10 == 0) checkCollision = true;
@@ -10339,7 +10355,11 @@ struct Simulator {
                     collisionPipeline.narrowPhase.narrowAndSortByVertices(radius, margin, analyticNarrow);
                 }
 
-                if (profiler) {
+                // Per-substep collision counters are CPU reads of GPU atomics —
+                // they force coherence, so only InFrame pays them. PerFrame is
+                // frame-granularity only (no inside-frame breakdown); None has
+                // no profiler. This keeps the substep loop async off InFrame.
+                if (profiler && syncEachPhase()) {
                     // Broad pairs counted only on a fresh detect (numBroad
                     // persists between, would double-count otherwise); narrow
                     // contacts counted every substep since narrow runs always.
