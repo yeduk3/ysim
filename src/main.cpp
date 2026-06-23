@@ -5231,6 +5231,11 @@ struct BVH<BE, PR, BVHMODE::LINEAR, PRIMITIVE> {
     //       no CPU sort, no pair buffer. Parity with SAP in the experiment.
     // Mode is live (read at query time).
     int subTopMode = 0;
+    // update() sync refactor: pushed from BroadPhase each detect. When false
+    // (None/PerFrame) a grouped query MUST use the GPU-brute top phase — the
+    // CPU-SAP path reads group roots + query positions on the CPU and would
+    // force a sync. Default true ⇒ honor subTopMode as authored.
+    bool syncEachPhase = true;
     struct SAPPair { uint32_t pointId; uint32_t entryRoot; };
     VectorBase<METAL, SAPPair> sapPairs;           // [cap] candidate pairs (GPU)
     uint32_t sapPairsCap = 0;                       // capacity in pairs
@@ -6661,8 +6666,12 @@ struct BVH<BE, PR, BVHMODE::LINEAR, PRIMITIVE> {
         const bool grouped = subObjectActive()
                           && groupOfPrim.size == primitives.size / PRIMITIVE;
         if (grouped) {
-            if (subTopMode == 1 && queryPointsGroupedPSO) queryPointsGPUTop(qIndex, queryMargin);
-            else                                          queryPointsSAP(qIndex, queryMargin);
+            // None/PerFrame (!syncEachPhase) force GPU-brute: the CPU-SAP top
+            // phase reads roots + positions on the CPU and would force a sync.
+            if ((subTopMode == 1 || !syncEachPhase) && queryPointsGroupedPSO)
+                queryPointsGPUTop(qIndex, queryMargin);
+            else
+                queryPointsSAP(qIndex, queryMargin);
             return;
         }
         QueryPointsParams qParams = {
@@ -6867,8 +6876,12 @@ struct BVH<BE, PR, BVHMODE::LINEAR, PRIMITIVE> {
         const bool grouped = subObjectActive()
                           && groupOfPrim.size == primitives.size / PRIMITIVE;
         if (grouped) {
-            if (subTopMode == 1 && queryPointsGroupedPSO) queryPointsGPUTop(qIndex, queryMargin);
-            else                                          queryPointsSAP(qIndex, queryMargin);
+            // None/PerFrame (!syncEachPhase) force GPU-brute: the CPU-SAP top
+            // phase reads roots + positions on the CPU and would force a sync.
+            if ((subTopMode == 1 || !syncEachPhase) && queryPointsGroupedPSO)
+                queryPointsGPUTop(qIndex, queryMargin);
+            else
+                queryPointsSAP(qIndex, queryMargin);
             return;
         }
         // (1) detection: per-TG private writes via threadgroup atomics.
@@ -7331,6 +7344,8 @@ struct BVH<BE, PR, BVHMODE::SCENE, BVHPRIMITIVE::OBJECT> {
     void detectCollisions(PR margin, bool enableSelfCollisions=true,
                           bool analyticEnabled=false) {
         queryBegin();
+        // Push the sync tier so grouped queries pick GPU-brute off InFrame.
+        for (auto& tr : objTrees) tr.syncEachPhase = syncEachPhase;
         // Slice (c-2): fresh analytic markers each broad detect.
         Scene<METAL, PR>::packedCollisionData.analyticPairs.clear();
 
@@ -7360,9 +7375,16 @@ struct BVH<BE, PR, BVHMODE::SCENE, BVHPRIMITIVE::OBJECT> {
                 }
                 // Phase 2: union of k group roots, not slot 0 (= group 0
                 // only), else multi-root objects under-cull and miss pairs.
-                AABB4 qa = queryTree.objectRootAABB();
-                AABB4 ta = objTrees[t].objectRootAABB();
-                bool hit = ta.intersect(qa);
+                // None/PerFrame (!syncEachPhase) skip this CPU cull —
+                // objectRootAABB() reads the GPU-built tree nodes on the CPU,
+                // which would force a sync; the GPU query kernel culls per
+                // node internally, so always dispatch.
+                bool hit = true;
+                if (syncEachPhase) {
+                    AABB4 qa = queryTree.objectRootAABB();
+                    AABB4 ta = objTrees[t].objectRootAABB();
+                    hit = ta.intersect(qa);
+                }
                 if(hit) {
                     // Slice (c-2): when the analytic toggle is on and either
                     // side is a Sphere, DON'T descend the sphere's triangle
@@ -7471,6 +7493,8 @@ struct BVH<BE, PR, BVHMODE::SCENE, BVHPRIMITIVE::OBJECT> {
     // (sub-object) cloth trees route through queryPoints' grouped top phase.
     void detectCollisionsTwoMesh(PR margin, bool enableSelfCollisions=false) {
         queryBegin();
+        // Push the sync tier so grouped queries pick GPU-brute off InFrame.
+        for (auto& tr : objTrees) tr.syncEachPhase = syncEachPhase;
         Scene<METAL, PR>::packedCollisionData.analyticPairs.clear();
         for(Index q = 0; q < objTrees.size(); ++q) {
             auto& queryTree = objTrees[q];
@@ -7479,9 +7503,16 @@ struct BVH<BE, PR, BVHMODE::SCENE, BVHPRIMITIVE::OBJECT> {
                     if(enableSelfCollisions) queryTree.checkSelfCollisions(margin);
                     continue;
                 }
-                AABB4 qa = queryTree.objectRootAABB();
-                AABB4 ta = objTrees[t].objectRootAABB();
-                if(ta.intersect(qa)) objTrees[t].queryPoints(q, margin);
+                // None/PerFrame skip the CPU root-AABB cull (objectRootAABB
+                // reads GPU tree nodes on the CPU → would force a sync); the
+                // GPU query kernel culls per node, so always dispatch.
+                bool hit = true;
+                if (syncEachPhase) {
+                    AABB4 qa = queryTree.objectRootAABB();
+                    AABB4 ta = objTrees[t].objectRootAABB();
+                    hit = ta.intersect(qa);
+                }
+                if(hit) objTrees[t].queryPoints(q, margin);
             }
         }
         queryEnd();
