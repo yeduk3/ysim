@@ -1411,6 +1411,39 @@ kernel void queryPoints(
     queryAABB(qmin, qmax, facets, tree, qParams, broadCollisions, numBroadCollisions, qFlag, id, qParams.entryRoot);
 }
 
+// GPU top phase (no CPU sort). One workitem per query point: brute-test the k
+// group root boxes and descend each overlapping group's subtree inline. k is
+// tiny (<=49) and all threads read the same group roots (cache-friendly), so
+// the per-point k-scan is cheap; the expensive subtree descent only runs for
+// overlapping groups (same as the mini-TLAS, minus the tree-depth overhead and
+// the CPU-SAP sort). groupNodeBase[g] is group g's root slot; qParams.entryRoot
+// is repurposed as the group count for this kernel.
+kernel void queryPointsGrouped(
+    device const packed_float3* x [[buffer(0)]],
+    device const packed_uint3* facets [[buffer(1)]],
+    device const BVHNode* tree [[buffer(2)]],
+    constant QueryPointsParams& qParams [[buffer(3)]],
+    device BroadCollision* broadCollisions [[buffer(4)]],
+    device atomic_uint* numBroadCollisions [[buffer(5)]],
+    device QueryFlag* qFlag [[buffer(6)]],
+    device const uint* groupNodeBase [[buffer(7)]],
+    uint id [[thread_position_in_grid]]
+) {
+    if(id >= qParams.numPoints) return;
+
+    float3 pos = x[id];
+    float3 margin = float3(qParams.queryMargin);
+    float3 qmin = pos-margin, qmax = pos+margin;
+
+    const uint numGroups = qParams.entryRoot;   // repurposed
+    for(uint g = 0; g < numGroups; ++g) {
+        // queryAABB rejects immediately at the root if no overlap, so the
+        // non-overlapping groups cost one AABB test each.
+        queryAABB(qmin, qmax, facets, tree, qParams,
+                  broadCollisions, numBroadCollisions, qFlag, id, groupNodeBase[g]);
+    }
+}
+
 // SAP top-phase narrow descent. One workitem per CPU-emitted candidate pair:
 // descend the pair's group root for the pair's query point. qParams.numPoints
 // is repurposed as the pair count; qParams.entryRoot is unused (per-pair root).

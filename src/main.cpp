@@ -5218,15 +5218,20 @@ struct BVH<BE, PR, BVHMODE::LINEAR, PRIMITIVE> {
     int subBvhSuperRoot = 0;                       // entry slot for grouped query
     std::vector<int> subBvhTopCombineOrder;        // top internals, child-before-parent
 
-    // ---- SAP top phase (experiment): replace the mini-TLAS descent ----
-    // Instead of stitching the k group roots into a binary top tree and
-    // descending it on the GPU, a CPU sweep-and-prune over the k group root
-    // boxes emits candidate (queryPoint, groupRoot) pairs; the GPU then
-    // descends one group subtree per pair (queryPointsPairs). Point query
-    // boxes have constant width 2·margin, so "overlaps group g on X" is a
-    // CONTIGUOUS slice of points sorted by x.min → two binary searches/group.
-    // Toggle is live (read at query time); default off ⇒ mini-TLAS path.
-    bool useSAPTopPhase = false;
+    // ---- Sub-object top-phase mode (experiment) — replace the mini-TLAS ----
+    // The mini-TLAS stitches the k group roots into a binary top tree descended
+    // on the GPU from a super-root. Two alternatives cull point→group instead:
+    //   0 = mini-TLAS (default; GPU super-root descent)
+    //   1 = CPU SAP   (queryPointsSAP): CPU sweep-and-prune over the k group
+    //       root boxes emits candidate (point, groupRoot) pairs, GPU descends
+    //       one subtree per pair. Point boxes have constant width 2·margin, so
+    //       "overlaps group g on X" is a contiguous slice of x-sorted points →
+    //       two binary searches/group. Wins at large k, loses the CPU sort cost.
+    //   2 = GPU brute (queryPointsGPUTop): each point thread brute-tests the k
+    //       group roots on the GPU and descends overlapping subtrees inline —
+    //       no CPU sort, no pair buffer. Kills the mode-1 fixed cost.
+    // Mode is live (read at query time); 0 ⇒ mini-TLAS path bit-identical.
+    int subTopMode = 0;
     struct SAPPair { uint32_t pointId; uint32_t entryRoot; };
     VectorBase<METAL, SAPPair> sapPairs;           // [cap] candidate pairs (GPU)
     uint32_t sapPairsCap = 0;                       // capacity in pairs
@@ -5313,6 +5318,7 @@ struct BVH<BE, PR, BVHMODE::LINEAR, PRIMITIVE> {
     MTL::ComputePipelineState* buildSweptLeafGroupedPSO = nullptr; // fused (multi-root)
     MTL::ComputePipelineState* queryPointsPSO;
     MTL::ComputePipelineState* queryPointsPairsPSO = nullptr;  // SAP top-phase descent
+    MTL::ComputePipelineState* queryPointsGroupedPSO = nullptr; // GPU brute top-phase
     // Segmented (per-threadgroup) detect+reduce variant — three PSOs
     // matching bvh.metal's queryPointsSegmented → scanReserveSegmented
     // → compactSegmented pipeline. Loaded unconditionally so a runtime
@@ -5368,6 +5374,7 @@ struct BVH<BE, PR, BVHMODE::LINEAR, PRIMITIVE> {
         agglomerativeSwapRootPSO = MetalKernelContext::getPSO("agglomerativeSwapRoot");
         queryPointsPSO = MetalKernelContext::getPSO("queryPoints");
         queryPointsPairsPSO = MetalKernelContext::getPSO("queryPointsPairs");  // SAP top phase
+        queryPointsGroupedPSO = MetalKernelContext::getPSO("queryPointsGrouped");  // GPU top phase
         queryPointsSegmentedPSO = MetalKernelContext::getPSO("queryPointsSegmented");
         scanReserveSegmentedPSO = MetalKernelContext::getPSO("scanReserveSegmented");
         compactSegmentedPSO     = MetalKernelContext::getPSO("compactSegmented");
@@ -6709,10 +6716,14 @@ struct BVH<BE, PR, BVHMODE::LINEAR, PRIMITIVE> {
         // O(log N) traversal); single-root enters at slot 0.
         const bool grouped = subObjectActive()
                           && groupOfPrim.size == primitives.size / PRIMITIVE;
-        // SAP top-phase experiment: when on (and grouped), the CPU sweep
-        // replaces the mini-TLAS descent entirely — see queryPointsSAP.
-        if (grouped && useSAPTopPhase && queryPointsPairsPSO) {
+        // Top-phase mode experiment: when grouped, mode 1/2 replace the
+        // mini-TLAS descent (CPU SAP / GPU brute). Mode 0 falls through.
+        if (grouped && subTopMode == 1 && queryPointsPairsPSO) {
             queryPointsSAP(qIndex, queryMargin);
+            return;
+        }
+        if (grouped && subTopMode == 2 && queryPointsGroupedPSO) {
+            queryPointsGPUTop(qIndex, queryMargin);
             return;
         }
         QueryPointsParams qParams = {
@@ -6819,6 +6830,37 @@ struct BVH<BE, PR, BVHMODE::LINEAR, PRIMITIVE> {
         MetalGlobalContext::setBuffer(qFlag, 6);
         MetalGlobalContext::setBuffer(sapPairs, 7);
         MetalGlobalContext::dispatchThreads(queryPointsPairsPSO, numPairs);
+    }
+
+    // GPU top phase (mode 2). One thread per query point brute-tests the k
+    // group root boxes on the GPU and descends overlapping subtrees inline —
+    // no CPU sort, no pair buffer (vs queryPointsSAP). qParams.entryRoot is
+    // repurposed as the group count; groupNodeBase[] holds the k root slots.
+    void queryPointsGPUTop(Index qIndex, PR queryMargin) {
+        if (qIndex < 0 || qIndex >= (Index)Scene<METAL, PR>::meshes.size()) return;
+        auto& qmesh = Scene<METAL, PR>::meshes[qIndex];
+        auto& qpos  = qmesh.state.x;
+        Index qnumPoints = qpos.size / 3;
+        if (qnumPoints == 0 || numGroups <= 0) return;
+        typename Scene<METAL, PR>::PackedCollisionData& packedCol =
+            Scene<METAL, PR>::packedCollisionData;
+
+        QueryPointsParams qParams = {
+            queryMargin, (uint32_t)qnumPoints, (Index)qIndex, (Index)objIndex,
+            packedCol.maxNumCollisions,
+            (Index)qmesh.behaviorType, (Index)objBehavior,
+            (Index)qmesh.shapeType, (Index)objShape,
+            (uint32_t)tree.size, (uint32_t)numGroups  // entryRoot repurposed = group count
+        };
+        MetalGlobalContext::setBuffer(qpos, 0);
+        MetalGlobalContext::setBuffer(primitives, 1);
+        MetalGlobalContext::setBuffer(tree, 2);
+        MetalGlobalContext::setBytes(qParams, 3);
+        MetalGlobalContext::setBuffer(packedCol.broadCollisions, 4);
+        MetalGlobalContext::setBuffer(packedCol.numBroadCollisions, 5);
+        MetalGlobalContext::setBuffer(qFlag, 6);
+        MetalGlobalContext::setBuffer(groupNodeBase, 7);
+        MetalGlobalContext::dispatchThreads(queryPointsGroupedPSO, qnumPoints);
     }
 
     // ===== Segmented (per-threadgroup) detect+reduce variant =====
@@ -7071,10 +7113,9 @@ struct BVH<BE, PR, BVHMODE::SCENE, BVHPRIMITIVE::OBJECT> {
     bool useSubObjectBVH = false;
     int  subBvhSplitS = 1;       // s: k = 4^s groups
     bool validateSubObject = false;  // one-shot CPU correctness check on build
-    // SAP top-phase experiment: when on (with useSubObjectBVH), grouped
-    // queries replace the mini-TLAS descent with a CPU sweep-and-prune over
-    // the k group root boxes. Pushed to every per-mesh tree. Default false.
-    bool useSAPTopPhase = false;
+    // Sub-object top-phase mode (with useSubObjectBVH): 0 mini-TLAS (default),
+    // 1 CPU SAP, 2 GPU brute. Pushed to every per-mesh tree. See BVH::subTopMode.
+    int subTopMode = 0;
 
     //BVH(SceneObject<METAL, PR>& scene) 
     //    : objTrees(scene.numMeshes), positions(scene.numMeshes*3), indices(scene.numMeshes*2) {}
@@ -7104,7 +7145,7 @@ struct BVH<BE, PR, BVHMODE::SCENE, BVHPRIMITIVE::OBJECT> {
             }
             objTrees[i].useAgglomerative = useAgglomerative;
             objTrees[i].useSubObjectBVH = useSubObjectBVH;
-            objTrees[i].useSAPTopPhase = useSAPTopPhase;
+            objTrees[i].subTopMode = subTopMode;
             objTrees[i].subBvhSplitS = subBvhSplitS;
             objTrees[i].build(scene.meshes[i]);
             objTrees[i].objIndex = (int)i;  // D-041 turn-3
@@ -7159,7 +7200,7 @@ struct BVH<BE, PR, BVHMODE::SCENE, BVHPRIMITIVE::OBJECT> {
             if (!objTrees[i].objStatic) {
                 objTrees[i].useAgglomerative = useAgglomerative;
                 objTrees[i].useSubObjectBVH = useSubObjectBVH;
-                objTrees[i].useSAPTopPhase = useSAPTopPhase;
+                objTrees[i].subTopMode = subTopMode;
                 objTrees[i].subBvhSplitS = subBvhSplitS;
                 objTrees[i].refit();
                 objTrees[i].staticCombined = false;  // dynamic frame re-breaks the GPU combine
@@ -7215,7 +7256,7 @@ struct BVH<BE, PR, BVHMODE::SCENE, BVHPRIMITIVE::OBJECT> {
             if (!objTrees[i].objStatic) {
                 objTrees[i].useAgglomerative = useAgglomerative;
                 objTrees[i].useSubObjectBVH = useSubObjectBVH;
-                objTrees[i].useSAPTopPhase = useSAPTopPhase;
+                objTrees[i].subTopMode = subTopMode;
                 objTrees[i].subBvhSplitS = subBvhSplitS;
                 objTrees[i].enlargeTrajectory(dt);
                 needSync |= objTrees[i].subObjectActive();   // grouped → GPU combine pending
@@ -7268,7 +7309,7 @@ struct BVH<BE, PR, BVHMODE::SCENE, BVHPRIMITIVE::OBJECT> {
             if (!objTrees[i].objStatic) {
                 objTrees[i].useAgglomerative = useAgglomerative;
                 objTrees[i].useSubObjectBVH = useSubObjectBVH;
-                objTrees[i].useSAPTopPhase = useSAPTopPhase;
+                objTrees[i].subTopMode = subTopMode;
                 objTrees[i].subBvhSplitS = subBvhSplitS;
                 if (objTrees[i].buildSweptLeafPSO) {
                     objTrees[i].refitSwept(dt);
@@ -9767,12 +9808,13 @@ struct Simulator {
                 collisionPipeline.broadPhase.validateSubObject = true;
             }
         }
-        // SAP top-phase headless hook: YSIM_SAP=1 replaces the mini-TLAS
-        // descent with the CPU sweep-and-prune top phase (needs YSIM_SUBOBJECT
-        // for the grouped path; otherwise the grouped gate self-falls-back).
+        // Top-phase mode headless hook: YSIM_SAP=1 (CPU SAP) or 2 (GPU brute)
+        // replaces the mini-TLAS descent (needs YSIM_SUBOBJECT for the grouped
+        // path; otherwise the grouped gate self-falls-back to mini-TLAS).
         if (const char* sap = std::getenv("YSIM_SAP")) {
-            if (std::atoi(sap) >= 1)
-                collisionPipeline.broadPhase.useSAPTopPhase = true;
+            int m = std::atoi(sap);
+            if (m == 1 || m == 2)
+                collisionPipeline.broadPhase.subTopMode = m;
         }
 
         collisionPipeline.broadPhase.build(scene);
@@ -18998,15 +19040,15 @@ int main(int argc, char** argv) {
             bp.subBvhSplitS = (bp.subBvhSplitS % 16) + 1;
             std::cout << "[main] subBvhSplitS = " << bp.subBvhSplitS << "\n";
         } else if(key == GLFW_KEY_M && action == GLFW_PRESS) {
-            // SAP top-phase A/B toggle (experiment). Only bites with
+            // Sub-object top-phase mode cycle (experiment). Only bites with
             // useSubObjectBVH on + a grouped square-cloth tree; otherwise the
             // grouped gate self-falls-back to the mini-TLAS / single-root path.
             auto& bp = simulator->collisionPipeline.broadPhase;
-            bp.useSAPTopPhase = !bp.useSAPTopPhase;
-            std::cout << "[main] useSAPTopPhase = "
-                      << (bp.useSAPTopPhase ? "on (CPU sweep-and-prune top phase)"
-                                            : "off (mini-TLAS descent)")
-                      << "\n";
+            bp.subTopMode = (bp.subTopMode + 1) % 3;
+            const char* m[] = { "0 mini-TLAS descent",
+                                "1 CPU sweep-and-prune",
+                                "2 GPU brute top" };
+            std::cout << "[main] subTopMode = " << m[bp.subTopMode] << "\n";
         }
         // NOTE: ESC-deselect is handled in the early block above
         // (before the WantCaptureKeyboard guard), not here — see the
