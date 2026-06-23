@@ -10356,18 +10356,12 @@ struct Simulator {
             // acceptable for cloth-on-static surfaces: the integrator's
             // contact response in the next substep pushes tunneled
             // particles back before the cloth drifts further than thickness.
-            for (auto& m : Scene<BE, PR>::meshes) {
-                if (m.behaviorType == BehaviorType::Float) continue;
-                // Kinematic keeps the per-FRAME xPrev written by the
-                // kinematic update block (previous pose), so the swept
-                // narrow phase sees the body's real frame motion instead
-                // of a degenerate x==xPrev snapshot.
-                if (m.behaviorType == BehaviorType::Kinematic) continue;
-                if (!m.state.x.ptr || !m.state.xPrev.ptr) continue;
-                std::memcpy(m.state.xPrev.ptr,
-                            m.state.x.ptr,
-                            m.state.x.size * sizeof(PR));
-            }
+            // GPU snapshot (xPrev := x) so the substep loop needs no CPU read
+            // of x — None/PerFrame run fully async. Excludes Float (never
+            // moves) and Kinematic (keeps its per-FRAME xPrev = previous pose
+            // so the swept narrow phase sees real frame motion), matching the
+            // old CPU memcpy loop. Rides the current encoder (no sync).
+            system.snapshotXPrev(scene);
 
             if (profiler) {
                 auto scope = profiler->scoped("system_update");
@@ -11373,6 +11367,7 @@ struct ExplicitSystem<METAL, PR> {
     MTL::ComputePipelineState* integrateClothGridPSO;
     MTL::ComputePipelineState* refCopyPosPSO = nullptr;
     MTL::ComputePipelineState* refCopyForcePSO = nullptr;
+    MTL::ComputePipelineState* snapshotXPrevPSO = nullptr;
     // Dedicated shared buffer of pre-resolved {queryGlobalVid,
     // targetGlobalVid} uint2 pairs for the reference-point constraint
     // kernels. Grown on demand; never freed (lives as long as the
@@ -11418,6 +11413,35 @@ struct ExplicitSystem<METAL, PR> {
         integrateClothGridPSO = MetalKernelContext::getPSO("integrate_cloth_grid");
         refCopyPosPSO   = MetalKernelContext::getPSO("ref_constraint_copy_pos");
         refCopyForcePSO = MetalKernelContext::getPSO("ref_constraint_copy_force");
+        snapshotXPrevPSO = MetalKernelContext::getPSO("snapshot_xprev_range");
+    }
+
+    // GPU replacement for the per-substep CPU xPrev memcpy loop. For each
+    // non-Float/non-Kinematic mesh, dispatch a range copy xPrev := x over its
+    // contiguous packed-vertex range [statesOffsets[i], +count). All dispatches
+    // ride the current encoder (no commitAndWait) so the substep loop stays
+    // async under None/PerFrame. m.state.x/xPrev are subspan views into the
+    // global packed buffers, so a global-range copy IS the per-mesh copy.
+    void snapshotXPrev(Scene<METAL, PR>& scene) {
+        auto& off = Scene<METAL, PR>::packedMeshData.statesOffsets;
+        if (!off.ptr || off.size == 0 || !snapshotXPrevPSO) return;
+        auto& gx     = Scene<METAL, PR>::packedMeshData.x;
+        auto& gxprev = Scene<METAL, PR>::packedMeshData.xPrev;
+        for (Index i = 0; i < (Index)scene.meshes.size(); ++i) {
+            auto& m = scene.meshes[i];
+            // Mirror the old CPU loop's exclusions exactly.
+            if (m.behaviorType == BehaviorType::Float) continue;
+            if (m.behaviorType == BehaviorType::Kinematic) continue;
+            if (!m.state.x.ptr || !m.state.xPrev.ptr) continue;
+            uint base  = (uint)off.ptr[i];                  // float3 units
+            uint count = (uint)off.ptr[i + 1] - base;
+            if (count == 0) continue;
+            MetalGlobalContext::setBuffer(gx, 0);
+            MetalGlobalContext::setBuffer(gxprev, 1);
+            MetalGlobalContext::setBytes(base, 2);
+            MetalGlobalContext::setBytes(count, 3);
+            MetalGlobalContext::dispatchThreads(snapshotXPrevPSO, count);
+        }
     }
 
     // Resolve Scene::referenceConstraints into global vertex-index pairs

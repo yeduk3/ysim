@@ -510,6 +510,24 @@ kernel void ref_constraint_copy_force(
     v[q] = v[t];
 }
 
+// Start-of-substep snapshot: xprev := x over one mesh's contiguous global
+// vertex range [base, base+count). Replaces the per-substep CPU memcpy loop
+// in Simulator::update so the substep loop needs no CPU read of x (the
+// update() sync refactor — None/PerFrame run fully async). Dispatched once
+// per non-Float/non-Kinematic mesh; those are excluded on the host exactly
+// as the old CPU loop did (Float never moves so x==xprev anyway; Kinematic
+// keeps its per-frame xprev = previous pose for the swept narrow phase).
+kernel void snapshot_xprev_range(
+    device const packed_float3* x [[buffer(0)]],
+    device packed_float3* xprev [[buffer(1)]],
+    constant uint& base [[buffer(2)]],
+    constant uint& count [[buffer(3)]],
+    uint id [[thread_position_in_grid]]
+) {
+    if (id >= count) return;
+    xprev[base + id] = x[base + id];
+}
+
 //kernel void integrate_all(
 //    device packed_float3* x [[buffer(0)]],
 //    device packed_float3* v [[buffer(1)]],
