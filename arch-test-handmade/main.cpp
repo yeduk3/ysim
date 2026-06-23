@@ -2,7 +2,6 @@
 
 int main() { 
     Runner runner;
-    runner.init();
 
     runner.run();
 }
