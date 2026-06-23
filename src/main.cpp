@@ -5244,7 +5244,11 @@ struct BVH<BE, PR, BVHMODE::LINEAR, PRIMITIVE> {
     struct SAPPair { uint32_t pointId; uint32_t entryRoot; };
     VectorBase<METAL, SAPPair> sapPairs;           // [cap] candidate pairs (GPU)
     uint32_t sapPairsCap = 0;                       // capacity in pairs
-    std::vector<uint32_t> sapOrder;                 // point ids sorted by x.min (reused)
+    // Per query-mesh persistent x-order. Two-mesh broad phase is bidirectional ⇒
+    // qIndex alternates each substep; a single shared order would thrash, so key
+    // by qIndex. Retained across calls so the previous (near-sorted) order feeds
+    // an insertion sort instead of a full std::sort every frame.
+    std::unordered_map<Index, std::vector<uint32_t>> sapOrderByQ;
     std::vector<SAPPair>  sapBuild_;                 // CPU pair build scratch (reused)
 
     // Runtime toggle between the two BVH construction paths. Default is
@@ -6724,10 +6728,27 @@ struct BVH<BE, PR, BVHMODE::LINEAR, PRIMITIVE> {
         const float* xp = qpos.ptr;   // unified memory: CPU-visible positions
 
         // Sort point ids by x.min (= x - m, monotone in x ⇒ sort by x).
-        sapOrder.resize((size_t)qnumPoints);
-        for (Index i = 0; i < qnumPoints; ++i) sapOrder[i] = (uint32_t)i;
-        std::sort(sapOrder.begin(), sapOrder.end(),
-                  [xp](uint32_t a, uint32_t b) { return xp[3*a] < xp[3*b]; });
+        // The order is RETAINED per query mesh: frame-to-frame (and substep-to-
+        // substep) points drift only a little, so last call's order is nearly
+        // sorted. First call / size change → identity + full sort; otherwise
+        // insertion sort the previous order = O(n + inversions), ~O(n) on the
+        // coherent case (a static query mesh is already exactly sorted) vs
+        // std::sort's O(n log n) every call.
+        std::vector<uint32_t>& sapOrder = sapOrderByQ[qIndex];
+        if ((Index)sapOrder.size() != qnumPoints) {
+            sapOrder.resize((size_t)qnumPoints);
+            for (Index i = 0; i < qnumPoints; ++i) sapOrder[i] = (uint32_t)i;
+            std::sort(sapOrder.begin(), sapOrder.end(),
+                      [xp](uint32_t a, uint32_t b) { return xp[3*a] < xp[3*b]; });
+        } else {
+            for (Index i = 1; i < qnumPoints; ++i) {
+                uint32_t v = sapOrder[i];
+                float vk = xp[3*v];
+                Index j = i;
+                while (j > 0 && xp[3*sapOrder[j-1]] > vk) { sapOrder[j] = sapOrder[j-1]; --j; }
+                sapOrder[j] = v;
+            }
+        }
 
         // Per group: X-slice of points whose box overlaps the group box on X.
         // Point box = [x-m, x+m] (constant width 2m) ⇒ overlap on X iff
@@ -12760,13 +12781,24 @@ static int runTwoMeshExperiment(int particleNum1D, int maxSplitS, int frames,
         std::cerr << "[twomesh SKIP] metal unavailable\n";
         return 0;
     }
+    // PerFrame (async, 1 sync/frame) is the default measurement tier now: it is
+    // the real cost the live loop pays. Under PerFrame the per-section timers are
+    // dead (in-loop syncs gone) so frame_ms is the ONLY valid metric, and the
+    // top-mode is forced to GPU-brute (P3) ⇒ the SAP variant is dropped.
+    // YSIM_TWOMESH_INFRAME=1 restores the old InFrame dual-top-mode sweep.
+    bool perFrame = true;
+    if (const char* p = std::getenv("YSIM_TWOMESH_INFRAME")) perFrame = (std::atoi(p) == 0);
+    auto level = perFrame ? sim_config::ProfileLevel::PerFrame
+                          : sim_config::ProfileLevel::InFrame;
+
     namespace fs = std::filesystem;
     std::string outPath;
 #ifdef YSIM_PROJECT_ROOT
-    outPath = std::string(YSIM_PROJECT_ROOT)
-            + "/profiles/experiment/twomesh-2026-06-23/twomesh_sweep.csv";
+    outPath = std::string(YSIM_PROJECT_ROOT) + "/profiles/experiment/twomesh-2026-06-23/"
+            + (perFrame ? "twomesh_sweep_perframe.csv" : "twomesh_sweep.csv");
 #else
-    outPath = "profiles/experiment/twomesh-2026-06-23/twomesh_sweep.csv";
+    outPath = std::string("profiles/experiment/twomesh-2026-06-23/")
+            + (perFrame ? "twomesh_sweep_perframe.csv" : "twomesh_sweep.csv");
 #endif
     if (const char* o = std::getenv("YSIM_BENCH_CSV")) outPath = o;
     fs::path csvPath(outPath);
@@ -12824,6 +12856,7 @@ static int runTwoMeshExperiment(int particleNum1D, int maxSplitS, int frames,
         bp.subBvhSplitS      = splitS;
         bp.subTopMode        = topMode;              // 0 CPU SAP, 1 GPU brute
         bp.fusedRefitEnlarge = true;
+        sim.profileLevel     = level;                // PerFrame ⇒ async, 1 sync/frame
 
         profiler::FrameProfiler prof((std::size_t)(frames + 4));
         sim.profiler = &prof;
@@ -12869,10 +12902,14 @@ static int runTwoMeshExperiment(int particleNum1D, int maxSplitS, int frames,
     // Each multi s runs BOTH top modes: 0 CPU SAP, 1 GPU brute. Interleaved
     // round-robin across repeats so thermal drift hits every variant equally.
     std::vector<std::pair<int,int>> variants = {{0, 0}};   // single baseline
-    for (int s = 1; s <= maxSplitS; ++s) { variants.push_back({s, 0});
-                                           variants.push_back({s, 1}); }
+    for (int s = 1; s <= maxSplitS; ++s) {
+        if (perFrame) variants.push_back({s, 1});          // async ⇒ GPU-brute only
+        else { variants.push_back({s, 0}); variants.push_back({s, 1}); }
+    }
     std::cerr << "=== two-mesh sweep: P=" << particleNum1D << " s=0.." << maxSplitS
-              << " modes={SAP,GPU} frames=" << frames << " repeats=" << repeats
+              << (perFrame ? " level=PerFrame mode={GPU} (frame_ms only)"
+                           : " level=InFrame modes={SAP,GPU}")
+              << " frames=" << frames << " repeats=" << repeats
               << " (interleaved, median) ===\n";
     for (int r = 0; r < repeats; ++r) {
         for (auto [s, mode] : variants) {
