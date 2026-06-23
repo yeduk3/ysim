@@ -395,9 +395,21 @@ void drawMeshInspectorWindow(MeshInspectorWindowState& st, const MeshInspectorTa
                     t.on_kin_scrub(t.mesh_id,tm);
             };
             auto speedRow=[&](){
-                float sp=t.kin_speed;
-                if(InlineSlider("재생 속도",&sp,0.0f,3.0f)&&t.on_kin_speed)
-                    t.on_kin_speed(t.mesh_id,sp);
+                // 0.25 step, 0.25–2.0, dropdown.
+                static const float kSpeeds[]={0.25f,0.5f,0.75f,1.0f,1.25f,1.5f,1.75f,2.0f};
+                ImGui::PushStyleColor(ImGuiCol_Text,kG60);ImGui::TextUnformatted("재생 속도");ImGui::PopStyleColor();
+                ImGui::SameLine(kP+60);
+                char cur[8]; snprintf(cur,sizeof(cur),"%.2fx",t.kin_speed);
+                ImGui::SetNextItemWidth(CW()-60);
+                if(ImGui::BeginCombo("##kspeed",cur)){
+                    for(float s:kSpeeds){
+                        char lbl[8]; snprintf(lbl,sizeof(lbl),"%.2fx",s);
+                        bool sel=std::abs(t.kin_speed-s)<0.01f;
+                        if(ImGui::Selectable(lbl,sel)&&t.on_kin_speed)t.on_kin_speed(t.mesh_id,s);
+                        if(sel)ImGui::SetItemDefaultFocus();
+                    }
+                    ImGui::EndCombo();
+                }
             };
             auto thresholdRow=[&](){
                 float th=t.kin_threshold;
@@ -564,6 +576,11 @@ void drawMeshInspectorWindow(MeshInspectorWindowState& st, const MeshInspectorTa
                 if(t.kin_graph_ready){
                     ImGui::Dummy({0,16});
                     labelRow();
+                    ImGui::PushStyleColor(ImGuiCol_Text,kG60);ImGui::TextUnformatted("소스 색 섞기");ImGui::PopStyleColor();
+                    ImGui::SameLine(0,10);
+                    bool bc=t.kin_blend_colorize;
+                    if(PillToggle("##kbcol",&bc)&&t.on_kin_blend_colorize)t.on_kin_blend_colorize(t.mesh_id,bc);
+                    ImGui::Dummy({0,12});
                     playRow(true);
                     ImGui::Dummy({0,16});
                     scrubRow();

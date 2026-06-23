@@ -10,4 +10,5 @@ concept Solver = requires(SolverT& solver, CDPT& cd, SceneT& scene, Real dt) {
     { solver.integrate(scene, dt) } -> std::same_as<void>;
 };
 
+
 #endif // !SOLVER_HPP

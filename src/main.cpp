@@ -2362,6 +2362,10 @@ struct MeshKinematicInitializer : GeneralMeshInitializer<BE, PR> {
     bool previewA = false, previewB = false;
     std::array<float, 3> previewColA{0.95f, 0.25f, 0.25f};  // motion 1 (red)
     std::array<float, 3> previewColB{0.30f, 0.45f, 0.95f};  // motion 2 (blue)
+    // Blend playback tint: when on (blend mode only), the live body is colored
+    // by mixing previewColA/B by the current blend source weight, so you see
+    // which source motion dominates as the crossfade plays.
+    bool blendColorize = false;
     mograph::Clip previewClipA, previewClipB;
     std::string previewFileA, previewFileB;  // which file each cache holds
     // One-shot opaque playback (paused-only, render-loop driven): 0 none,
@@ -7939,12 +7943,13 @@ struct Simulator {
             shader.setUniform("hoveredId", -1);   // keep outline off the ghosts
             shader.setUniform("selectedId", -1);
 
-            // Strobe pass (translucent). Skip the clip currently playing opaque.
+            // Strobe pass (translucent). The 동선 stays visible even while a
+            // clip plays opaque on top (existing trail + moving preview).
             if (wantStrobe) {
                 glEnable(GL_BLEND);
                 glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
                 glDepthMask(GL_FALSE);
-                shader.setUniform("opacity", 0.30f);
+                shader.setUniform("opacity", 0.15f);
                 const int N = 7;
                 auto strobe = [&](const mograph::Clip& c,
                                   const std::array<float, 3>& col) {
@@ -7965,9 +7970,9 @@ struct Simulator {
                         ghostGL_.draw(shader, base, 0.0f, 1.0f, 0.0f, emis);
                     }
                 };
-                if (kin->previewA && kin->previewPlay != 1)
+                if (kin->previewA)
                     strobe(kin->previewClipA, kin->previewColA);
-                if (kin->previewB && kin->previewPlay != 2)
+                if (kin->previewB)
                     strobe(kin->previewClipB, kin->previewColB);
             }
 
@@ -9574,14 +9579,19 @@ struct Simulator {
     // the request IS the reset (sim state returns to the authored
     // configuration; transforms/pins/constraints are preserved because
     // they live on the request).
-    void reset() {
-        // Kinematic playback rewinds to frame 0 on reset. The clock lives
-        // on the initializer precisely so it SURVIVES ordinary re-packs
-        // (file swap, mesh add); reset is the one path that explicitly
-        // rewinds it — initialize() then bakes the t=0 pose into state.x.
+    // Rewind every kinematic body's playback clock to frame 0. The clock
+    // lives on the initializer precisely so it SURVIVES ordinary re-packs
+    // (file swap, mesh add) — so initialize() must NOT do this. The two
+    // callers that DO mean "fresh run" (reset, target-frame restart) call
+    // this explicitly; a following initialize() then bakes the t=0 pose.
+    void rewindKinematicClocks() {
         for (auto& req : Scene<BE, PR>::requestsGeneralMeshes)
             if (auto* kin = dynamic_cast<MeshKinematicInitializer<BE, PR>*>(req.initializer))
                 kin->localTime = 0.0;
+    }
+
+    void reset() {
+        rewindKinematicClocks();
         initialize();
     }
 
@@ -9821,6 +9831,11 @@ struct Simulator {
         {
             const Index tgt = (Index)(targetFrames < 1 ? 1 : targetFrames);
             if (frame >= tgt) {
+                // Fresh run: rewind kinematic clocks too. initialize() (next
+                // update's top) only resets `frame`, so without this the body
+                // would resume mid-clip while the sim restarts from frame 0.
+                // Pure field sets — no pool/pack work, safe mid-update.
+                rewindKinematicClocks();
                 Scene<BE, PR>::dirty = true;
                 return;
             }
@@ -10314,8 +10329,26 @@ struct Simulator {
                 }
             }
             shader.setUniform("checkerOn", checkerOn ? 1 : 0);
+            // Blend-source tint: a kinematic body in blend playback with the
+            // toggle on is colored by mixing its two source-clip colors by the
+            // live blend weight (1 → A's color, 0 → B's, crossfade between).
+            tinym::vec3 drawColor = mesh.material.baseColor;
+            if (auto* kin =
+                    dynamic_cast<MeshKinematicInitializer<BE, PR>*>(mesh.initializer)) {
+                if (kin->blendColorize && kin->motionMode == 3 && kin->graphActive()) {
+                    const float wa = kin->graphSession.blendWeightA(kin->localTime);
+                    if (wa >= 0.0f) {
+                        const auto& a = kin->previewColA;
+                        const auto& b = kin->previewColB;
+                        const float wb = 1.0f - wa;
+                        drawColor = tinym::vec3(a[0]*wa + b[0]*wb,
+                                                a[1]*wa + b[1]*wb,
+                                                a[2]*wa + b[2]*wb);
+                    }
+                }
+            }
             renderState.getOrCreate(mesh).draw(shader,
-                mesh.material.baseColor,
+                drawColor,
                 mesh.material.metallic,
                 mesh.material.roughness,
                 mesh.material.specularWeight,
@@ -19341,6 +19374,7 @@ int main(int argc, char** argv) {
                     target.kin_preview_b = kin->previewB;
                     target.kin_preview_col_a = kin->previewColA.data();
                     target.kin_preview_col_b = kin->previewColB.data();
+                    target.kin_blend_colorize = kin->blendColorize;
                     target.kin_sim_paused = simulator.pause;
                     target.kin_status = kin->graphStatus;
                     if (kin->graphActive())
@@ -19446,6 +19480,9 @@ int main(int argc, char** argv) {
                     };
                     target.on_kin_preview_play_b = [&simulator](int id) {
                         simulator.startPreviewPlayback(id, 2);
+                    };
+                    target.on_kin_blend_colorize = [&simulator](int id, bool on) {
+                        if (auto* k = simulator.kinematicOf(id)) k->blendColorize = on;
                     };
                 }
             }
