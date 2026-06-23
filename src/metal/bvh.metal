@@ -1469,6 +1469,69 @@ kernel void queryPointsPairs(
 
 
 // ============================================================
+// Phase 3: cluster-pair broad phase via a uniform grid over cluster AABBs.
+//
+// One object's clusters (the static target, e.g. Human) are inserted into grid
+// cells on the CPU once (cellStart/cellClusters CSR). Here one thread per QUERY
+// cluster (e.g. a cloth sub-object) walks the cells its AABB covers, AABB-tests
+// the target clusters parked there, and emits each overlapping (query,target)
+// cluster pair EXACTLY ONCE via min-cell dedup: a pair is emitted only from the
+// cell that holds the minimum corner of the two AABBs' overlap box — that cell
+// is covered by both AABBs, so it is visited once and only once. The emitted
+// pairs are the bidirectional VF dispatch units for Phase 4.
+struct ClusterPair { uint a; uint b; };      // (query cluster, target cluster)
+struct ClusterGridParams {
+    float ox, oy, oz;     // grid origin (min corner)
+    float cellSize;       // uniform cell size (~ max cluster extent)
+    int   dx, dy, dz;     // grid dims (cells per axis)
+    uint  numQuery;       // # query clusters
+    uint  maxPairs;       // pair buffer capacity
+};
+
+kernel void clusterpair_query(
+    device const float* qAabb [[buffer(0)]],            // [6*numQuery] query cluster AABBs
+    device const float* tAabb [[buffer(1)]],            // [6*numTarget] target cluster AABBs
+    device const uint* cellStart [[buffer(2)]],         // [numCells+1] CSR offsets
+    device const uint* cellClusters [[buffer(3)]],      // CSR target cluster ids per cell
+    constant ClusterGridParams& gp [[buffer(4)]],
+    device ClusterPair* pairs [[buffer(5)]],
+    device atomic_uint* pairCount [[buffer(6)]],
+    uint id [[thread_position_in_grid]]
+) {
+    if (id >= gp.numQuery) return;
+    float3 origin = float3(gp.ox, gp.oy, gp.oz);
+    float inv = 1.0f / gp.cellSize;
+    int3 dims = int3(gp.dx, gp.dy, gp.dz);
+
+    float3 qmin = float3(qAabb[6*id+0], qAabb[6*id+1], qAabb[6*id+2]);
+    float3 qmax = float3(qAabb[6*id+3], qAabb[6*id+4], qAabb[6*id+5]);
+
+    int3 lo = clamp(int3(floor((qmin - origin) * inv)), int3(0), dims - 1);
+    int3 hi = clamp(int3(floor((qmax - origin) * inv)), int3(0), dims - 1);
+
+    for (int cz = lo.z; cz <= hi.z; ++cz)
+    for (int cy = lo.y; cy <= hi.y; ++cy)
+    for (int cx = lo.x; cx <= hi.x; ++cx) {
+        uint cell = (uint)((cz * dims.y + cy) * dims.x + cx);
+        for (uint p = cellStart[cell]; p < cellStart[cell+1]; ++p) {
+            uint j = cellClusters[p];
+            float3 tmin = float3(tAabb[6*j+0], tAabb[6*j+1], tAabb[6*j+2]);
+            float3 tmax = float3(tAabb[6*j+3], tAabb[6*j+4], tAabb[6*j+5]);
+            if (qmax.x < tmin.x || qmin.x > tmax.x ||
+                qmax.y < tmin.y || qmin.y > tmax.y ||
+                qmax.z < tmin.z || qmin.z > tmax.z) continue;
+            // min-cell dedup: emit only from the cell holding the overlap min.
+            float3 omin = max(qmin, tmin);
+            int3 mc = clamp(int3(floor((omin - origin) * inv)), int3(0), dims - 1);
+            if (mc.x != cx || mc.y != cy || mc.z != cz) continue;
+            uint slot = atomic_fetch_add_explicit(pairCount, 1u, memory_order_relaxed);
+            if (slot < gp.maxPairs) { pairs[slot].a = id; pairs[slot].b = j; }
+        }
+    }
+}
+
+
+// ============================================================
 // Segmented (per-threadgroup) detect + reduce variant.
 //
 // Motivation (Tang et al. 2011, "Collision-Streams", §3.4 / Alg.2):

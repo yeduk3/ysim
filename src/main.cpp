@@ -12849,6 +12849,16 @@ static int runSyncProbe(int particleNum1D, int frames) {
 // broad_refit_swept (cloth multi-root combine) + broad_detect (the grouped
 // human→cloth query top phase) + narrow_phase + whole frame. The s-sensitive
 // cost lives in refit+detect; collision counts are s-INVARIANT (correctness).
+// Phase 3: cluster-pair broad phase structs (MUST match bvh.metal byte layout).
+struct ClusterPair { uint32_t a; uint32_t b; };   // (query cluster, target cluster)
+struct ClusterGridParams {
+    float ox, oy, oz;     // grid origin (min corner)
+    float cellSize;       // uniform cell size (~ max cluster extent)
+    int   dx, dy, dz;     // grid dims
+    uint32_t numQuery;    // # query clusters
+    uint32_t maxPairs;    // pair buffer capacity
+};
+
 // Phase 2: build the static Human as a CONNECTIVITY-CLUSTER sub-object BVH and
 // validate it. Same two-mesh scene (cloth + static Human); the Human tree gets
 // useClusterBVH so its k group subtrees come from face dual-graph flood fill
@@ -12924,6 +12934,156 @@ static int runClusterBVHTest(int particleNum1D, int splitS) {
     printf("[clusterbvh] s=%d  Human N=%u V=%u -> k=%d  faces/cluster=[%u,%u] ownedV=%u  cloth tile-split k=%d\n",
            splitS, N, V, k, mnF, mxF, vtot, bp.objTrees[0].numGroups);
     printf("=== test-clusterbvh %s ===\n", ok ? "PASS" : "FAIL");
+    return ok ? 0 : 1;
+}
+
+// Phase 3: cluster-pair broad phase via a uniform grid over cluster AABBs.
+// Builds the two-mesh scene (cloth sub-object + Human cluster), settles the
+// cloth a few frames so the clusters overlap, then finds candidate (cloth,
+// human) cluster pairs two ways: (A) GPU grid kernel clusterpair_query (Human
+// clusters inserted into grid cells on the CPU once; one thread per cloth
+// cluster walks its cells, AABB-tests + min-cell-dedup), and (B) CPU brute
+// O(Kc·Ks) AABB overlap as ground truth. Asserts the GPU pair SET == the brute
+// set. cell size = max cluster extent across both objects (the doc's rule).
+static int runClusterPairTest(int particleNum1D, int splitS, int settleFrames) {
+    using Backend = METAL;
+    using SystemT = ExplicitSystem<Backend, Precision>;
+    if (!MetalGlobalContext::getDevice() || !MetalKernelContext::getLibrary()) {
+        std::cerr << "[clusterpair SKIP] metal unavailable\n";
+        return 0;
+    }
+    for (auto& m : Scene<Backend, Precision>::meshes) m.initializer = nullptr;
+    Scene<Backend, Precision>::meshes.clear();
+    for (auto& r : Scene<Backend, Precision>::requestsGeneralMeshes) delete r.initializer;
+    Scene<Backend, Precision>::requestsGeneralMeshes.clear();
+    Scene<Backend, Precision>::numMeshes = 0;
+    Scene<Backend, Precision>::nextMeshId = 0;
+    Scene<Backend, Precision>::dirty = true;
+    Scene<Backend, Precision>::environment = SceneEnvironment{};
+
+    Precision h = Precision(1) / Precision(60);
+    SystemT system(h, 60);
+    Simulator<Backend, Precision, SystemT> sim(system);
+    sim.pause = false;
+    sim.addCloth(particleNum1D, Precision(1.0), tinym::vec3(0, Precision(1.25), 0),
+                 Precision(1e5), Precision(1e5), Precision(2e5),
+                 Precision(0.01), Precision(0.1));
+    sim.addFloatMesh(ysim_paths::assetRoot(), "Human.obj",
+                     tinym::vec3(0, Precision(0.35), 0), Precision(0.04));
+    {
+        auto& humanReq = Scene<Backend, Precision>::requestsGeneralMeshes.back();
+        humanReq.isStatic = true; humanReq.applyGravity = false; humanReq.applyWind = false;
+    }
+    sim.initialize();
+    auto& bp = sim.collisionPipeline.broadPhase;
+    bp.twoMeshExperiment = true;
+    bp.useSubObjectBVH   = true;
+    bp.subBvhSplitS      = splitS;
+    bp.clusterNonGridBVH = true;       // Human → connectivity cluster
+    bp.fusedRefitEnlarge = true;
+    if (bp.objTrees.size() > 1) bp.objTrees[1].builtForLifetimeId = -1;   // force Human rebuild
+    for (int f = 0; f < std::max(1, settleFrames); ++f) sim.update();     // settle cloth onto Human
+
+    // Gather group-root AABBs (CPU-visible after the InFrame refit sync).
+    auto gather = [](auto& t, std::vector<float>& out) {
+        out.assign(6 * (size_t)t.numGroups, 0.0f);
+        for (int g = 0; g < t.numGroups; ++g) {
+            auto& r = t.tree[t.groupNodeBase[g]];
+            for (int c = 0; c < 3; ++c) { out[6*g+c] = r.min[c]; out[6*g+3+c] = r.max[c]; }
+        }
+    };
+    std::vector<float> qA, tA;            // cloth (query), human (target)
+    gather(bp.objTrees[0], qA);
+    gather(bp.objTrees[1], tA);
+    int kc = bp.objTrees[0].numGroups, ks = bp.objTrees[1].numGroups;
+    if (kc == 0 || ks == 0) { printf("[clusterpair] empty groups kc=%d ks=%d\n", kc, ks); return 1; }
+
+    // Grid params: bounds = union of all cluster AABBs; cell = max cluster extent.
+    float bmin[3] = { 1e30f,1e30f,1e30f }, bmax[3] = { -1e30f,-1e30f,-1e30f }, maxExt = 0.0f;
+    auto scan = [&](std::vector<float>& a, int k) {
+        for (int g = 0; g < k; ++g) {
+            for (int c = 0; c < 3; ++c) {
+                bmin[c] = std::min(bmin[c], a[6*g+c]); bmax[c] = std::max(bmax[c], a[6*g+3+c]);
+                maxExt = std::max(maxExt, a[6*g+3+c] - a[6*g+c]);
+            }
+        }
+    };
+    scan(qA, kc); scan(tA, ks);
+    float cell = maxExt > 1e-6f ? maxExt : 1.0f;
+    int dims[3];
+    for (int c = 0; c < 3; ++c) dims[c] = std::max(1, (int)std::ceil((bmax[c]-bmin[c]) / cell));
+    size_t numCells = (size_t)dims[0]*dims[1]*dims[2];
+
+    // Insert Human clusters into grid cells (CPU, CSR) — static, build once.
+    auto cellRange = [&](std::vector<float>& a, int g, int lo[3], int hi[3]) {
+        for (int c = 0; c < 3; ++c) {
+            lo[c] = std::min(std::max(0, (int)std::floor((a[6*g+c]   - bmin[c]) / cell)), dims[c]-1);
+            hi[c] = std::min(std::max(0, (int)std::floor((a[6*g+3+c] - bmin[c]) / cell)), dims[c]-1);
+        }
+    };
+    std::vector<uint32_t> cellStart(numCells + 1, 0);
+    for (int g = 0; g < ks; ++g) {
+        int lo[3], hi[3]; cellRange(tA, g, lo, hi);
+        for (int z=lo[2]; z<=hi[2]; ++z) for (int y=lo[1]; y<=hi[1]; ++y) for (int x=lo[0]; x<=hi[0]; ++x)
+            cellStart[(size_t)((z*dims[1]+y)*dims[0]+x) + 1]++;
+    }
+    for (size_t i = 0; i < numCells; ++i) cellStart[i+1] += cellStart[i];
+    std::vector<uint32_t> cellClusters(cellStart[numCells], 0);
+    { std::vector<uint32_t> w(cellStart.begin(), cellStart.end()-1);
+      for (int g = 0; g < ks; ++g) {
+          int lo[3], hi[3]; cellRange(tA, g, lo, hi);
+          for (int z=lo[2]; z<=hi[2]; ++z) for (int y=lo[1]; y<=hi[1]; ++y) for (int x=lo[0]; x<=hi[0]; ++x)
+              cellClusters[w[(size_t)((z*dims[1]+y)*dims[0]+x)]++] = (uint32_t)g;
+      } }
+
+    // Upload + GPU dispatch (one thread per cloth cluster).
+    uint32_t maxPairs = (uint32_t)kc * (uint32_t)ks;
+    VectorBase<METAL, float>       qAbuf(6*kc), tAbuf(6*ks);
+    std::copy(qA.begin(), qA.end(), qAbuf.ptr);
+    std::copy(tA.begin(), tA.end(), tAbuf.ptr);
+    VectorBase<METAL, uint32_t>    cellStartBuf((Index)cellStart.size());
+    std::copy(cellStart.begin(), cellStart.end(), cellStartBuf.ptr);
+    VectorBase<METAL, uint32_t>    cellClustersBuf((Index)std::max<size_t>(1, cellClusters.size()));
+    std::copy(cellClusters.begin(), cellClusters.end(), cellClustersBuf.ptr);
+    VectorBase<METAL, ClusterPair> pairBuf((Index)maxPairs);
+    VectorBase<METAL, uint32_t>    pairCount(1, 0u);
+    ClusterGridParams gp{ bmin[0],bmin[1],bmin[2], cell, dims[0],dims[1],dims[2],
+                          (uint32_t)kc, maxPairs };
+    MetalGlobalContext::setBuffer(qAbuf, 0);
+    MetalGlobalContext::setBuffer(tAbuf, 1);
+    MetalGlobalContext::setBuffer(cellStartBuf, 2);
+    MetalGlobalContext::setBuffer(cellClustersBuf, 3);
+    MetalGlobalContext::setBytes(gp, 4);
+    MetalGlobalContext::setBuffer(pairBuf, 5);
+    MetalGlobalContext::setBuffer(pairCount, 6);
+    MetalGlobalContext::dispatchThreads(MetalKernelContext::getPSO("clusterpair_query"), (Index)kc);
+    MetalGlobalContext::commitAndWait();
+
+    uint32_t gpuCount = pairCount[0];
+    std::set<std::pair<uint32_t,uint32_t>> gpuSet;
+    for (uint32_t i = 0; i < gpuCount && i < maxPairs; ++i) gpuSet.insert({ pairBuf[i].a, pairBuf[i].b });
+
+    // CPU brute ground truth.
+    std::set<std::pair<uint32_t,uint32_t>> bruteSet;
+    for (int i = 0; i < kc; ++i) for (int j = 0; j < ks; ++j) {
+        bool ov = !(qA[6*i+3] < tA[6*j+0] || qA[6*i+0] > tA[6*j+3] ||
+                    qA[6*i+4] < tA[6*j+1] || qA[6*i+1] > tA[6*j+4] ||
+                    qA[6*i+5] < tA[6*j+2] || qA[6*i+2] > tA[6*j+5]);
+        if (ov) bruteSet.insert({ (uint32_t)i, (uint32_t)j });
+    }
+    bool ok = (gpuSet == bruteSet) && (gpuCount == gpuSet.size());   // no dup emissions
+    printf("[clusterpair] s=%d  kc=%d ks=%d  grid=%dx%dx%d cell=%.4f cells=%zu  "
+           "GPU pairs=%u(set %zu) brute=%zu  %s\n",
+           splitS, kc, ks, dims[0],dims[1],dims[2], cell, numCells,
+           gpuCount, gpuSet.size(), bruteSet.size(),
+           ok ? "MATCH" : "MISMATCH");
+    if (!ok) {
+        int shown = 0;
+        for (auto& p : bruteSet) if (!gpuSet.count(p) && shown++ < 8) printf("  miss (%u,%u)\n", p.first, p.second);
+        shown = 0;
+        for (auto& p : gpuSet) if (!bruteSet.count(p) && shown++ < 8) printf("  extra (%u,%u)\n", p.first, p.second);
+    }
+    printf("=== test-clusterpair %s ===\n", ok ? "PASS" : "FAIL");
     return ok ? 0 : 1;
 }
 
@@ -19152,6 +19312,14 @@ int main(int argc, char** argv) {
         int P = (argc > 2) ? std::atoi(argv[2]) : 50;
         int S = (argc > 3) ? std::atoi(argv[3]) : 3;
         return runClusterBVHTest(P, S);
+    }
+    if (argc > 1 && std::string(argv[1]) == "--test-clusterpair") {
+        // Phase 3: grid cluster-pair broad phase vs CPU brute. Args:
+        // <particleNum1D=50> <splitS=3> <settleFrames=15>.
+        int P = (argc > 2) ? std::atoi(argv[2]) : 50;
+        int S = (argc > 3) ? std::atoi(argv[3]) : 3;
+        int Fr = (argc > 4) ? std::atoi(argv[4]) : 15;
+        return runClusterPairTest(P, S, Fr);
     }
     if (argc > 1 && std::string(argv[1]) == "--bench-twomesh") {
         // Two-mesh experiment: static Human + sub-object cloth, no scene TLAS,
