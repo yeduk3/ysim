@@ -5205,32 +5205,21 @@ struct BVH<BE, PR, BVHMODE::LINEAR, PRIMITIVE> {
     VectorBase<METAL, uint32_t> groupNodeBase;     // [k] Σ (2 M_h - 1)  (h<g)
     uint32_t subBvhNumNodes = 0;                   // 2N - (#nonempty groups)
 
-    // ---- Phase 2b: mini-TLAS over the k group roots ----
-    // The k group subtrees occupy slots [0, 2N-k); the TAIL slots
-    // [2N-k, 2N-1) (exactly k-1) host a binary top tree whose k leaves ARE
-    // the group roots. Stitching the k roots under one super-root turns the
-    // multi-root query back into a SINGLE-root traversal (enter at superRoot),
-    // O(log N) — replacing Phase 2a's O(k) per-point root scan. Top-tree
-    // topology is FIXED (material-space tile grid) so it is built once; only
-    // its internal AABBs are recombined per refit (topCombineCPU, cheap: k-1
-    // CPU unions after the GPU multi-root combine). The GPU combine stops at
-    // group roots and never touches the tail, so it is unaffected.
-    int subBvhSuperRoot = 0;                       // entry slot for grouped query
-    std::vector<int> subBvhTopCombineOrder;        // top internals, child-before-parent
-
-    // ---- Sub-object top-phase mode (experiment) — replace the mini-TLAS ----
-    // The mini-TLAS stitches the k group roots into a binary top tree descended
-    // on the GPU from a super-root. Two alternatives cull point→group instead:
-    //   0 = mini-TLAS (default; GPU super-root descent)
-    //   1 = CPU SAP   (queryPointsSAP): CPU sweep-and-prune over the k group
-    //       root boxes emits candidate (point, groupRoot) pairs, GPU descends
-    //       one subtree per pair. Point boxes have constant width 2·margin, so
-    //       "overlaps group g on X" is a contiguous slice of x-sorted points →
-    //       two binary searches/group. Wins at large k, loses the CPU sort cost.
-    //   2 = GPU brute (queryPointsGPUTop): each point thread brute-tests the k
+    // ---- Sub-object top phase: which group subtree(s) does a query point
+    // descend? The k group subtrees occupy node slots [0, 2N-k); the top level
+    // (point → candidate groups) is a flat cull over the k group root boxes —
+    // NOT a tree. (The old binary mini-TLAS was removed: experiments showed it
+    // gives no win over a flat cull, and a tree over k boxes has no
+    // justification — profiles/experiment/sap-topphase-2026-06-23/FINDINGS.md.)
+    //   0 = CPU SAP (default, queryPointsSAP): CPU sweep-and-prune over the k
+    //       group root boxes emits candidate (point, groupRoot) pairs, GPU
+    //       descends one subtree per pair. Point boxes have constant width
+    //       2·margin, so "overlaps group g on X" is a contiguous slice of
+    //       x-sorted points → two binary searches/group.
+    //   1 = GPU brute (queryPointsGPUTop): each point thread brute-tests the k
     //       group roots on the GPU and descends overlapping subtrees inline —
-    //       no CPU sort, no pair buffer. Kills the mode-1 fixed cost.
-    // Mode is live (read at query time); 0 ⇒ mini-TLAS path bit-identical.
+    //       no CPU sort, no pair buffer. Parity with SAP in the experiment.
+    // Mode is live (read at query time).
     int subTopMode = 0;
     struct SAPPair { uint32_t pointId; uint32_t entryRoot; };
     VectorBase<METAL, SAPPair> sapPairs;           // [cap] candidate pairs (GPU)
@@ -5848,62 +5837,6 @@ struct BVH<BE, PR, BVHMODE::LINEAR, PRIMITIVE> {
         std::copy(mortonsTemp.ptr, mortonsTemp.ptr + N, mortons.ptr);
     }
 
-    // Phase 2b: recursive median-split over the group set `gs[0..n)` on the
-    // TR×TR tile grid (group g at tile (g/TR, g%TR)). Returns the node slot for
-    // this subtree: a group root (leaf, slot groupNodeBase[g]) for n==1, else a
-    // freshly-allocated tail internal. Sets childA/childB and records the
-    // internal in `subBvhTopCombineOrder` AFTER its children (post-order) so a
-    // single forward pass combines bottom-up. treeParent is left untouched so
-    // the GPU multi-root combine (which walks only WITHIN group windows) is
-    // unaffected. `internalNext` consumes exactly k-1 tail slots.
-    int buildTopRec(int* gs, int n, int TR, int& internalNext) {
-        if (n <= 1) return (int)groupNodeBase[gs[0]];
-        int minR = INT_MAX, maxR = INT_MIN, minC = INT_MAX, maxC = INT_MIN;
-        for (int i = 0; i < n; ++i) {
-            int r = gs[i] / TR, c = gs[i] % TR;
-            minR = std::min(minR, r); maxR = std::max(maxR, r);
-            minC = std::min(minC, c); maxC = std::max(maxC, c);
-        }
-        bool splitRow = (maxR - minR) >= (maxC - minC);
-        std::sort(gs, gs + n, [TR, splitRow](int x, int y) {
-            return splitRow ? (x / TR < y / TR) : (x % TR < y % TR);
-        });
-        int mid = n / 2;
-        int a = buildTopRec(gs, mid, TR, internalNext);
-        int b = buildTopRec(gs + mid, n - mid, TR, internalNext);
-        int slot = internalNext++;
-        tree[slot].childA = a;
-        tree[slot].childB = b;
-        subBvhTopCombineOrder.push_back(slot);
-        return slot;
-    }
-
-    // Build the mini-TLAS over the k group roots into the tail slots. Topology
-    // only (depends on the fixed tile grid) — call once when the group tables
-    // are (re)built. AABBs are filled per refit by topCombineCPU().
-    void buildSubObjectTopTree() {
-        subBvhTopCombineOrder.clear();
-        int k = numGroups;
-        if (k <= 1) { subBvhSuperRoot = (k == 1) ? (int)groupNodeBase[0] : 0; return; }
-        int TR = (int)std::lround(std::sqrt((double)k));   // k == TR²
-        int internalNext = (int)subBvhNumNodes;            // first free tail slot (2N-k)
-        std::vector<int> all(k);
-        for (int g = 0; g < k; ++g) all[g] = g;
-        subBvhSuperRoot = buildTopRec(all.data(), k, TR, internalNext);
-    }
-
-    // Combine the top-tree internal AABBs from the group roots up to the
-    // super-root. min/max ONLY (childA/childB preserved — they alias the same
-    // 32B node). Run AFTER bottomUpBoxesMultiRootGPU has committed (group roots
-    // CPU-visible). Child-before-parent order → one forward pass.
-    void topCombineCPU() {
-        for (int slot : subBvhTopCombineOrder) {
-            int a = tree[slot].childA, b = tree[slot].childB;
-            tree[slot].min = tinym::min(tree[a].min, tree[b].min);
-            tree[slot].max = tinym::max(tree[a].max, tree[b].max);
-        }
-    }
-
     void buildTreeGroupedGPU() {
         int numPrimitives = primitives.size / PRIMITIVE;
         if (numPrimitives == 0) return;
@@ -6020,7 +5953,6 @@ struct BVH<BE, PR, BVHMODE::LINEAR, PRIMITIVE> {
             bottomUpBoxesGPU(sceneBox);
         }
         MetalGlobalContext::commitAndWait();
-        if (grouped) topCombineCPU();   // Phase 2b: refresh mini-TLAS AABBs
     }
     // Multi-root combine. Mirrors bottomUpBoxesGPU (zero visit-counts +
     // dispatch) but the kernel stops each leaf walk at its group root.
@@ -6087,13 +6019,17 @@ struct BVH<BE, PR, BVHMODE::LINEAR, PRIMITIVE> {
 
     // Object-level AABB for the scene TLAS. Single-root: slot 0. Multi-root:
     // union of the k group roots (slot 0 is only group 0's root, so reading
-    // tree[0] alone would under-cull this object in the broad phase).
+    // tree[0] alone would under-cull this object in the broad phase). Group
+    // roots (slot groupNodeBase[g]) are CPU-visible after the GPU multi-root
+    // combine + commitAndWait, so this k-loop runs in the BroadPhase refit's
+    // post-sync pass. k is tiny vs the per-substep work.
     AABB4 objectRootAABB() {
         if (!subObjectActive() || groupOfPrim.size != primitives.size / PRIMITIVE)
             return tree[0].aabb;
-        // Phase 2b: the mini-TLAS super-root box IS the union of all k group
-        // roots (filled by topCombineCPU) → O(1), no per-call k-loop.
-        return tree[subBvhSuperRoot].aabb;
+        AABB4 box = tree[groupNodeBase[0]].aabb;
+        for (int g = 1; g < numGroups; ++g)
+            if (groupSize[g] > 0) box.combine(tree[groupNodeBase[g]].aabb);
+        return box;
     }
 
     void build(int oid, VectorBase<METAL, PR>& pos, VectorBase<METAL, Index>& prim) {
@@ -6168,14 +6104,12 @@ struct BVH<BE, PR, BVHMODE::LINEAR, PRIMITIVE> {
             // when the prim count changes.
             if (groupOfPrim.size != numPrimitives || subBvhBuiltS != subBvhSplitS) {
                 computeSubObjectGroups();
-                buildSubObjectTopTree();           // Phase 2b: mini-TLAS topology (once)
             }
             MetalGlobalContext::commitAndWait();   // Morton sort visible to CPU
             cpuStableGroupPartition();
             buildTreeGroupedGPU();
             bottomUpBoxesMultiRootGPU(sceneBox);
             MetalGlobalContext::commitAndWait();
-            topCombineCPU();                        // Phase 2b: fill mini-TLAS AABBs
         } else if (useAgglomerative) {
             agglomerativeBuildGPU();
             agglomerativeSwapRootGPU();
@@ -6488,12 +6422,11 @@ struct BVH<BE, PR, BVHMODE::LINEAR, PRIMITIVE> {
         if (subObjectActive() && groupOfPrim.size == numPrimitives) {
             buildLeafGroupedGPU();
             bottomUpBoxesMultiRootGPU(sceneBox);
-            // No commitAndWait / topCombineCPU — only the GPU multi-root combine
-            // is dispatched. The caller batches ONE commitAndWait then calls
-            // topCombineCPU for grouped trees (see BroadPhase::refit), matching the
-            // non-grouped path and enlargeTrajectory's grouped externalization.
-            // Batching this sync cut refit ~13% / frame ~19% (vs the old inline)
-            // on the sub-object scene.
+            // No commitAndWait — only the GPU multi-root combine is dispatched.
+            // The caller batches ONE commitAndWait, after which the group roots
+            // are CPU-visible for objectRootAABB() and the SAP top phase (see
+            // BroadPhase::refit). Batching this sync cut refit ~13% / frame ~19%
+            // (vs the old inline) on the sub-object scene.
             return;
         }
 
@@ -6506,8 +6439,7 @@ struct BVH<BE, PR, BVHMODE::LINEAR, PRIMITIVE> {
         // after dispatching every object's refit, so N objects share a single
         // GPU round-trip instead of paying N per-substep syncs. Any caller that
         // reads this tree on the CPU (objectRootAABB, the CPU enlarge leaf loop,
-        // a timing bench) must commitAndWait first. The grouped path above keeps
-        // its own commit because topCombineCPU reads the GPU group-roots inline.
+        // a timing bench) must commitAndWait first.
     }
 
     void enlargeTrajectory(PR dt) {
@@ -6537,9 +6469,9 @@ struct BVH<BE, PR, BVHMODE::LINEAR, PRIMITIVE> {
                 enlargeLeafGPU(dt);
                 bottomUpBoxesGPU(sceneBox);
             }
-            // No commitAndWait / topCombineCPU here — the GPU combine is only
-            // dispatched. The caller batches ONE commitAndWait, then calls
-            // topCombineCPU for grouped trees (see BroadPhase::enlargeTrajectory).
+            // No commitAndWait here — the GPU combine is only dispatched. The
+            // caller batches ONE commitAndWait (group roots then CPU-visible for
+            // objectRootAABB / SAP; see BroadPhase::enlargeTrajectory).
             return;
         }
 
@@ -6564,11 +6496,11 @@ struct BVH<BE, PR, BVHMODE::LINEAR, PRIMITIVE> {
             }
             AABB4 sceneBox; sceneBox.i0 = numPrimitives;
             bottomUpBoxesMultiRootGPU(sceneBox);
-            // No commitAndWait / topCombineCPU here — only the GPU multi-root
-            // combine is dispatched. The caller batches ONE commitAndWait then
-            // calls topCombineCPU (see BroadPhase::enlargeTrajectory). This is
-            // the per-substep sync that made sub-object enlarge +67%; batching it
-            // cut frame time ~11% (vs the old inline sync) on the sub-object scene.
+            // No commitAndWait here — only the GPU multi-root combine is
+            // dispatched. The caller batches ONE commitAndWait (group roots then
+            // CPU-visible for objectRootAABB / SAP; see BroadPhase). This is the
+            // per-substep sync that made sub-object enlarge +67%; batching it cut
+            // frame time ~11% (vs the old inline sync) on the sub-object scene.
             return;
         }
         for(Index i = 0; i < numPrimitives; ++i) {
@@ -6687,7 +6619,7 @@ struct BVH<BE, PR, BVHMODE::LINEAR, PRIMITIVE> {
         uint32_t qShape;
         uint32_t tShape;
         uint32_t numNodes;   // queried tree's node count → traversal index bound
-        uint32_t entryRoot;  // Phase 2b: traversal entry slot (super-root; 0 single)
+        uint32_t entryRoot;  // single-root entry slot (0); repurposed by SAP/GPU kernels
     };
 
     void queryBegin() {
@@ -6712,25 +6644,22 @@ struct BVH<BE, PR, BVHMODE::LINEAR, PRIMITIVE> {
         Index qnumPoints = qpos.size/3;
         //auto& constraints = qmesh->constraints;
         typename Scene<METAL, PR>::PackedCollisionData& packedCol = Scene<METAL, PR>::packedCollisionData;
-        // Phase 2b: grouped query enters at the mini-TLAS super-root (one
-        // O(log N) traversal); single-root enters at slot 0.
+        // Sub-object top phase (no mini-TLAS): a grouped query culls point→group
+        // via a flat top phase, then descends only the overlapping subtrees.
+        // subTopMode 0 = CPU SAP (default), 1 = GPU brute. Single-root meshes
+        // (non-grouped) fall through to the slot-0 descent below.
         const bool grouped = subObjectActive()
                           && groupOfPrim.size == primitives.size / PRIMITIVE;
-        // Top-phase mode experiment: when grouped, mode 1/2 replace the
-        // mini-TLAS descent (CPU SAP / GPU brute). Mode 0 falls through.
-        if (grouped && subTopMode == 1 && queryPointsPairsPSO) {
-            queryPointsSAP(qIndex, queryMargin);
-            return;
-        }
-        if (grouped && subTopMode == 2 && queryPointsGroupedPSO) {
-            queryPointsGPUTop(qIndex, queryMargin);
+        if (grouped) {
+            if (subTopMode == 1 && queryPointsGroupedPSO) queryPointsGPUTop(qIndex, queryMargin);
+            else                                          queryPointsSAP(qIndex, queryMargin);
             return;
         }
         QueryPointsParams qParams = {
             queryMargin, qnumPoints, qIndex, (Index)objIndex, packedCol.maxNumCollisions,
             (Index)qmesh.behaviorType, (Index)objBehavior, (Index)qmesh.shapeType, (Index)objShape,
             (uint32_t)tree.size,
-            grouped ? (uint32_t)subBvhSuperRoot : 0u
+            0u   // single-root: enter at slot 0
         };
 
         MetalGlobalContext::setBuffer(qpos, 0);
@@ -6887,7 +6816,7 @@ struct BVH<BE, PR, BVHMODE::LINEAR, PRIMITIVE> {
         uint32_t qShape;
         uint32_t tShape;
         uint32_t numNodes;   // queried tree's node count → traversal index bound
-        uint32_t entryRoot;  // Phase 2b: traversal entry slot (super-root; 0 single)
+        uint32_t entryRoot;  // single-root entry slot (0); repurposed by SAP/GPU kernels
     };
     struct SegScanParams {
         uint32_t numTGs;
@@ -6920,11 +6849,19 @@ struct BVH<BE, PR, BVHMODE::LINEAR, PRIMITIVE> {
             return;
         }
 
-        // (1) detection: per-TG private writes via threadgroup atomics.
-        // Phase 2b: grouped query enters at the mini-TLAS super-root (one
-        // O(log N) traversal); single-root enters at slot 0.
+        // Sub-object has no mini-TLAS to descend, so a grouped query can't use
+        // the segmented single-tree pipeline. Delegate to the flat top phase
+        // (SAP/GPU), which writes straight to the global broadCollisions (the
+        // same counter the segmented compact biases from) and skips the
+        // per-TG reduce/compact below.
         const bool grouped = subObjectActive()
                           && groupOfPrim.size == primitives.size / PRIMITIVE;
+        if (grouped) {
+            if (subTopMode == 1 && queryPointsGroupedPSO) queryPointsGPUTop(qIndex, queryMargin);
+            else                                          queryPointsSAP(qIndex, queryMargin);
+            return;
+        }
+        // (1) detection: per-TG private writes via threadgroup atomics.
         QuerySegParams qParams = {
             (float)queryMargin, (uint32_t)qnumPoints,
             (uint32_t)qIndex, (uint32_t)objIndex,
@@ -6932,7 +6869,7 @@ struct BVH<BE, PR, BVHMODE::LINEAR, PRIMITIVE> {
             (uint32_t)qmesh.behaviorType, (uint32_t)objBehavior,
             (uint32_t)qmesh.shapeType,    (uint32_t)objShape,
             (uint32_t)tree.size,
-            grouped ? (uint32_t)subBvhSuperRoot : 0u
+            0u   // single-root: enter at slot 0
         };
         MetalGlobalContext::setBuffer(qpos, 0);
         MetalGlobalContext::setBuffer(primitives, 1);
@@ -7113,8 +7050,8 @@ struct BVH<BE, PR, BVHMODE::SCENE, BVHPRIMITIVE::OBJECT> {
     bool useSubObjectBVH = false;
     int  subBvhSplitS = 1;       // s: k = 4^s groups
     bool validateSubObject = false;  // one-shot CPU correctness check on build
-    // Sub-object top-phase mode (with useSubObjectBVH): 0 mini-TLAS (default),
-    // 1 CPU SAP, 2 GPU brute. Pushed to every per-mesh tree. See BVH::subTopMode.
+    // Sub-object top-phase mode (with useSubObjectBVH): 0 CPU SAP (default),
+    // 1 GPU brute. Pushed to every per-mesh tree. See BVH::subTopMode.
     int subTopMode = 0;
 
     //BVH(SceneObject<METAL, PR>& scene) 
@@ -7218,12 +7155,10 @@ struct BVH<BE, PR, BVHMODE::SCENE, BVHPRIMITIVE::OBJECT> {
         // commit (refit 58.9→38.9 ms, frame 190→169 ms on the static-Human scene),
         // even with a single dynamic mesh. (Grouped/static objects sync inline.)
         MetalGlobalContext::commitAndWait();
-        // Pass 2 — grouped trees finalize their mini-TLAS on the CPU (the GPU
-        // group roots are visible after the batched sync), then read each object's
-        // now-synced root AABB into the TLAS input.
+        // Pass 2 — read each object's now-synced root AABB into the TLAS input.
+        // Grouped trees: objectRootAABB() unions the k group roots on the CPU
+        // (visible after the batched sync above).
         for(Index i = 0; i < objTrees.size(); ++i) {
-            if (!objTrees[i].objStatic && objTrees[i].subObjectActive())
-                objTrees[i].topCombineCPU();
             Index pbase = i*6;
             AABB4 objBox = objTrees[i].objectRootAABB();
             positions[pbase  ] = objBox.min.x;
@@ -7270,11 +7205,9 @@ struct BVH<BE, PR, BVHMODE::SCENE, BVHPRIMITIVE::OBJECT> {
         // dispatched grouped/GPU combines. Skipped entirely when every dynamic
         // object took the pure-CPU path → the regular scene pays NO new sync.
         if (needSync) MetalGlobalContext::commitAndWait();
-        // Pass 2 — grouped trees finalize their mini-TLAS on the CPU (now that the
-        // GPU group roots are visible), then read each root AABB into the TLAS.
+        // Pass 2 — read each root AABB into the TLAS (grouped: objectRootAABB()
+        // unions the k group roots on the CPU, visible after the sync above).
         for(Index i = 0; i < objTrees.size(); ++i) {
-            if (!objTrees[i].objStatic && objTrees[i].subObjectActive())
-                objTrees[i].topCombineCPU();
             Index pbase = i*6;
             AABB4 objBox = objTrees[i].objectRootAABB();
             positions[pbase  ] = objBox.min.x;
@@ -9808,13 +9741,11 @@ struct Simulator {
                 collisionPipeline.broadPhase.validateSubObject = true;
             }
         }
-        // Top-phase mode headless hook: YSIM_SAP=1 (CPU SAP) or 2 (GPU brute)
-        // replaces the mini-TLAS descent (needs YSIM_SUBOBJECT for the grouped
-        // path; otherwise the grouped gate self-falls-back to mini-TLAS).
-        if (const char* sap = std::getenv("YSIM_SAP")) {
-            int m = std::atoi(sap);
-            if (m == 1 || m == 2)
-                collisionPipeline.broadPhase.subTopMode = m;
+        // Sub-object top-phase mode headless hook (needs YSIM_SUBOBJECT for the
+        // grouped path). Default 0 = CPU SAP; YSIM_SUBTOP=gpu (or 1) = GPU brute.
+        if (const char* st = std::getenv("YSIM_SUBTOP")) {
+            std::string v(st);
+            collisionPipeline.broadPhase.subTopMode = (v == "gpu" || v == "1") ? 1 : 0;
         }
 
         collisionPipeline.broadPhase.build(scene);
@@ -12191,9 +12122,9 @@ static int runSubObjectSceneBench(const SubObjectSceneBenchConfig& cfg) {
     return 0;
 }
 
-// Phase 2a QUERY COST: multi-root query enters at all k group roots (O(k)
-// entry-scan per query point). This bench quantifies that vs single-root so
-// the Phase 2b mini-TLAS payoff (log k instead of k) is sized. Same draped
+// SUB-OBJECT QUERY COST: the grouped top phase (SAP / GPU brute) culls each
+// query point to its overlapping group roots, then descends those subtrees.
+// This bench quantifies the grouped detect vs single-root. Same draped
 // cloth-on-sphere state as the refit bench; measures broad `detectCollisions`
 // e2e (one synced broad detect — the per-cdP-substep cost in the real frame).
 // Correctness gate: broad_collisions MUST match single across all s (else the
@@ -19040,14 +18971,11 @@ int main(int argc, char** argv) {
             bp.subBvhSplitS = (bp.subBvhSplitS % 16) + 1;
             std::cout << "[main] subBvhSplitS = " << bp.subBvhSplitS << "\n";
         } else if(key == GLFW_KEY_M && action == GLFW_PRESS) {
-            // Sub-object top-phase mode cycle (experiment). Only bites with
-            // useSubObjectBVH on + a grouped square-cloth tree; otherwise the
-            // grouped gate self-falls-back to the mini-TLAS / single-root path.
+            // Sub-object top-phase mode toggle. Only bites with useSubObjectBVH
+            // on + a grouped square-cloth tree; single-root meshes are unaffected.
             auto& bp = simulator->collisionPipeline.broadPhase;
-            bp.subTopMode = (bp.subTopMode + 1) % 3;
-            const char* m[] = { "0 mini-TLAS descent",
-                                "1 CPU sweep-and-prune",
-                                "2 GPU brute top" };
+            bp.subTopMode = (bp.subTopMode + 1) % 2;
+            const char* m[] = { "0 CPU sweep-and-prune", "1 GPU brute top" };
             std::cout << "[main] subTopMode = " << m[bp.subTopMode] << "\n";
         }
         // NOTE: ESC-deselect is handled in the early block above
