@@ -5218,6 +5218,21 @@ struct BVH<BE, PR, BVHMODE::LINEAR, PRIMITIVE> {
     int subBvhSuperRoot = 0;                       // entry slot for grouped query
     std::vector<int> subBvhTopCombineOrder;        // top internals, child-before-parent
 
+    // ---- SAP top phase (experiment): replace the mini-TLAS descent ----
+    // Instead of stitching the k group roots into a binary top tree and
+    // descending it on the GPU, a CPU sweep-and-prune over the k group root
+    // boxes emits candidate (queryPoint, groupRoot) pairs; the GPU then
+    // descends one group subtree per pair (queryPointsPairs). Point query
+    // boxes have constant width 2·margin, so "overlaps group g on X" is a
+    // CONTIGUOUS slice of points sorted by x.min → two binary searches/group.
+    // Toggle is live (read at query time); default off ⇒ mini-TLAS path.
+    bool useSAPTopPhase = false;
+    struct SAPPair { uint32_t pointId; uint32_t entryRoot; };
+    VectorBase<METAL, SAPPair> sapPairs;           // [cap] candidate pairs (GPU)
+    uint32_t sapPairsCap = 0;                       // capacity in pairs
+    std::vector<uint32_t> sapOrder;                 // point ids sorted by x.min (reused)
+    std::vector<SAPPair>  sapBuild_;                 // CPU pair build scratch (reused)
+
     // Runtime toggle between the two BVH construction paths. Default is
     // the existing Karras pipeline (`buildTree_*` + `bottomUpBoxes`); set
     // to true to use the Apetrei agglomerative single-kernel build
@@ -5297,6 +5312,7 @@ struct BVH<BE, PR, BVHMODE::LINEAR, PRIMITIVE> {
     MTL::ComputePipelineState* buildSweptLeafPSO = nullptr;        // fused refit+enlarge
     MTL::ComputePipelineState* buildSweptLeafGroupedPSO = nullptr; // fused (multi-root)
     MTL::ComputePipelineState* queryPointsPSO;
+    MTL::ComputePipelineState* queryPointsPairsPSO = nullptr;  // SAP top-phase descent
     // Segmented (per-threadgroup) detect+reduce variant — three PSOs
     // matching bvh.metal's queryPointsSegmented → scanReserveSegmented
     // → compactSegmented pipeline. Loaded unconditionally so a runtime
@@ -5351,6 +5367,7 @@ struct BVH<BE, PR, BVHMODE::LINEAR, PRIMITIVE> {
         zeroVisitCountsPSO = MetalKernelContext::getPSO("zeroVisitCounts"); // D-029
         agglomerativeSwapRootPSO = MetalKernelContext::getPSO("agglomerativeSwapRoot");
         queryPointsPSO = MetalKernelContext::getPSO("queryPoints");
+        queryPointsPairsPSO = MetalKernelContext::getPSO("queryPointsPairs");  // SAP top phase
         queryPointsSegmentedPSO = MetalKernelContext::getPSO("queryPointsSegmented");
         scanReserveSegmentedPSO = MetalKernelContext::getPSO("scanReserveSegmented");
         compactSegmentedPSO     = MetalKernelContext::getPSO("compactSegmented");
@@ -6692,6 +6709,12 @@ struct BVH<BE, PR, BVHMODE::LINEAR, PRIMITIVE> {
         // O(log N) traversal); single-root enters at slot 0.
         const bool grouped = subObjectActive()
                           && groupOfPrim.size == primitives.size / PRIMITIVE;
+        // SAP top-phase experiment: when on (and grouped), the CPU sweep
+        // replaces the mini-TLAS descent entirely — see queryPointsSAP.
+        if (grouped && useSAPTopPhase && queryPointsPairsPSO) {
+            queryPointsSAP(qIndex, queryMargin);
+            return;
+        }
         QueryPointsParams qParams = {
             queryMargin, qnumPoints, qIndex, (Index)objIndex, packedCol.maxNumCollisions,
             (Index)qmesh.behaviorType, (Index)objBehavior, (Index)qmesh.shapeType, (Index)objShape,
@@ -6715,6 +6738,87 @@ struct BVH<BE, PR, BVHMODE::LINEAR, PRIMITIVE> {
 
         // D-041 turn-3: self-pair uses this tree's INDEX (not mesh.id).
         queryPoints(objIndex, queryMargin);
+    }
+
+    // SAP top phase (experiment). CPU sweep-and-prune over the k group root
+    // boxes vs the qnumPoints query boxes emits candidate (point, groupRoot)
+    // pairs; the GPU then descends one group subtree per pair. Replaces the
+    // mini-TLAS GPU descent (Phase 2b). Pre: refit committed (group root boxes
+    // CPU-visible) and the querying mesh's positions are current on the CPU.
+    void queryPointsSAP(Index qIndex, PR queryMargin) {
+        if (qIndex < 0 || qIndex >= (Index)Scene<METAL, PR>::meshes.size()) return;
+        auto& qmesh = Scene<METAL, PR>::meshes[qIndex];
+        auto& qpos  = qmesh.state.x;
+        Index qnumPoints = qpos.size / 3;
+        if (qnumPoints == 0 || numGroups <= 0) return;
+        typename Scene<METAL, PR>::PackedCollisionData& packedCol =
+            Scene<METAL, PR>::packedCollisionData;
+
+        const float m = (float)queryMargin;
+        const float* xp = qpos.ptr;   // unified memory: CPU-visible positions
+
+        // Sort point ids by x.min (= x - m, monotone in x ⇒ sort by x).
+        sapOrder.resize((size_t)qnumPoints);
+        for (Index i = 0; i < qnumPoints; ++i) sapOrder[i] = (uint32_t)i;
+        std::sort(sapOrder.begin(), sapOrder.end(),
+                  [xp](uint32_t a, uint32_t b) { return xp[3*a] < xp[3*b]; });
+
+        // Per group: X-slice of points whose box overlaps the group box on X.
+        // Point box = [x-m, x+m] (constant width 2m) ⇒ overlap on X iff
+        //   x - m <= gxmax  &&  x + m >= gxmin  ⇔  gxmin-2m <= (x-m) <= gxmax
+        // i.e. a contiguous run in sapOrder (sorted by x). Within it, confirm
+        // Y/Z overlap, then emit (pointId, groupRoot).
+        auto xkey = [xp](uint32_t id) { return xp[3*id]; };  // sort key (x)
+        std::vector<SAPPair>& out = sapBuild_;
+        out.clear();
+        for (int g = 0; g < numGroups; ++g) {
+            if (groupSize[g] == 0) continue;
+            const BVHNode& gb = tree[groupNodeBase[g]];
+            const float gxmin = gb.min.x, gxmax = gb.max.x;
+            const float gymin = gb.min.y, gymax = gb.max.y;
+            const float gzmin = gb.min.z, gzmax = gb.max.z;
+            // run = [lo, hi) over sapOrder where x in [gxmin - m, gxmax + m]
+            // (x-m <= gxmax ⇒ x <= gxmax+m ; x+m >= gxmin ⇒ x >= gxmin-m).
+            auto lo = std::lower_bound(sapOrder.begin(), sapOrder.end(), gxmin - m,
+                          [&](uint32_t id, float v) { return xkey(id) < v; });
+            auto hi = std::upper_bound(sapOrder.begin(), sapOrder.end(), gxmax + m,
+                          [&](float v, uint32_t id) { return v < xkey(id); });
+            const uint32_t root = groupNodeBase[g];
+            for (auto it = lo; it != hi; ++it) {
+                uint32_t id = *it;
+                float y = xp[3*id+1], z = xp[3*id+2];
+                if (y + m < gymin || y - m > gymax) continue;
+                if (z + m < gzmin || z - m > gzmax) continue;
+                out.push_back({ id, root });
+            }
+        }
+
+        const uint32_t numPairs = (uint32_t)out.size();
+        if (numPairs == 0) return;
+
+        // Grow the GPU pair buffer geometrically; refill each call.
+        if (numPairs > sapPairsCap) {
+            sapPairsCap = numPairs + numPairs / 2 + 64;
+            sapPairs = VectorBase<METAL, SAPPair>(sapPairsCap);
+        }
+        std::copy(out.begin(), out.end(), sapPairs.ptr);
+
+        QueryPointsParams qParams = {
+            queryMargin, numPairs, (Index)qIndex, (Index)objIndex,
+            packedCol.maxNumCollisions,
+            (Index)qmesh.behaviorType, (Index)objBehavior,
+            (Index)qmesh.shapeType, (Index)objShape,
+            (uint32_t)tree.size, 0u  // entryRoot unused (per-pair)
+        };
+        MetalGlobalContext::setBuffer(qpos, 0);
+        MetalGlobalContext::setBuffer(primitives, 1);
+        MetalGlobalContext::setBuffer(tree, 2);
+        MetalGlobalContext::setBytes(qParams, 3);
+        MetalGlobalContext::setBuffer(packedCol.broadCollisions, 4);
+        MetalGlobalContext::setBuffer(packedCol.numBroadCollisions, 5);
+        MetalGlobalContext::setBuffer(qFlag, 6);
+        MetalGlobalContext::setBuffer(sapPairs, 7);
+        MetalGlobalContext::dispatchThreads(queryPointsPairsPSO, numPairs);
     }
 
     // ===== Segmented (per-threadgroup) detect+reduce variant =====
@@ -6967,6 +7071,10 @@ struct BVH<BE, PR, BVHMODE::SCENE, BVHPRIMITIVE::OBJECT> {
     bool useSubObjectBVH = false;
     int  subBvhSplitS = 1;       // s: k = 4^s groups
     bool validateSubObject = false;  // one-shot CPU correctness check on build
+    // SAP top-phase experiment: when on (with useSubObjectBVH), grouped
+    // queries replace the mini-TLAS descent with a CPU sweep-and-prune over
+    // the k group root boxes. Pushed to every per-mesh tree. Default false.
+    bool useSAPTopPhase = false;
 
     //BVH(SceneObject<METAL, PR>& scene) 
     //    : objTrees(scene.numMeshes), positions(scene.numMeshes*3), indices(scene.numMeshes*2) {}
@@ -6996,6 +7104,7 @@ struct BVH<BE, PR, BVHMODE::SCENE, BVHPRIMITIVE::OBJECT> {
             }
             objTrees[i].useAgglomerative = useAgglomerative;
             objTrees[i].useSubObjectBVH = useSubObjectBVH;
+            objTrees[i].useSAPTopPhase = useSAPTopPhase;
             objTrees[i].subBvhSplitS = subBvhSplitS;
             objTrees[i].build(scene.meshes[i]);
             objTrees[i].objIndex = (int)i;  // D-041 turn-3
@@ -7050,6 +7159,7 @@ struct BVH<BE, PR, BVHMODE::SCENE, BVHPRIMITIVE::OBJECT> {
             if (!objTrees[i].objStatic) {
                 objTrees[i].useAgglomerative = useAgglomerative;
                 objTrees[i].useSubObjectBVH = useSubObjectBVH;
+                objTrees[i].useSAPTopPhase = useSAPTopPhase;
                 objTrees[i].subBvhSplitS = subBvhSplitS;
                 objTrees[i].refit();
                 objTrees[i].staticCombined = false;  // dynamic frame re-breaks the GPU combine
@@ -7105,6 +7215,7 @@ struct BVH<BE, PR, BVHMODE::SCENE, BVHPRIMITIVE::OBJECT> {
             if (!objTrees[i].objStatic) {
                 objTrees[i].useAgglomerative = useAgglomerative;
                 objTrees[i].useSubObjectBVH = useSubObjectBVH;
+                objTrees[i].useSAPTopPhase = useSAPTopPhase;
                 objTrees[i].subBvhSplitS = subBvhSplitS;
                 objTrees[i].enlargeTrajectory(dt);
                 needSync |= objTrees[i].subObjectActive();   // grouped → GPU combine pending
@@ -7157,6 +7268,7 @@ struct BVH<BE, PR, BVHMODE::SCENE, BVHPRIMITIVE::OBJECT> {
             if (!objTrees[i].objStatic) {
                 objTrees[i].useAgglomerative = useAgglomerative;
                 objTrees[i].useSubObjectBVH = useSubObjectBVH;
+                objTrees[i].useSAPTopPhase = useSAPTopPhase;
                 objTrees[i].subBvhSplitS = subBvhSplitS;
                 if (objTrees[i].buildSweptLeafPSO) {
                     objTrees[i].refitSwept(dt);
@@ -9654,6 +9766,13 @@ struct Simulator {
                 collisionPipeline.broadPhase.subBvhSplitS = s;
                 collisionPipeline.broadPhase.validateSubObject = true;
             }
+        }
+        // SAP top-phase headless hook: YSIM_SAP=1 replaces the mini-TLAS
+        // descent with the CPU sweep-and-prune top phase (needs YSIM_SUBOBJECT
+        // for the grouped path; otherwise the grouped gate self-falls-back).
+        if (const char* sap = std::getenv("YSIM_SAP")) {
+            if (std::atoi(sap) >= 1)
+                collisionPipeline.broadPhase.useSAPTopPhase = true;
         }
 
         collisionPipeline.broadPhase.build(scene);
@@ -18878,6 +18997,16 @@ int main(int argc, char** argv) {
             auto& bp = simulator->collisionPipeline.broadPhase;
             bp.subBvhSplitS = (bp.subBvhSplitS % 16) + 1;
             std::cout << "[main] subBvhSplitS = " << bp.subBvhSplitS << "\n";
+        } else if(key == GLFW_KEY_M && action == GLFW_PRESS) {
+            // SAP top-phase A/B toggle (experiment). Only bites with
+            // useSubObjectBVH on + a grouped square-cloth tree; otherwise the
+            // grouped gate self-falls-back to the mini-TLAS / single-root path.
+            auto& bp = simulator->collisionPipeline.broadPhase;
+            bp.useSAPTopPhase = !bp.useSAPTopPhase;
+            std::cout << "[main] useSAPTopPhase = "
+                      << (bp.useSAPTopPhase ? "on (CPU sweep-and-prune top phase)"
+                                            : "off (mini-TLAS descent)")
+                      << "\n";
         }
         // NOTE: ESC-deselect is handled in the early block above
         // (before the WantCaptureKeyboard guard), not here — see the

@@ -1309,18 +1309,27 @@ struct QueryFlag {
     uint collisionOverflow;
 };
 
+// SAP top-phase candidate: a query point that overlaps a group root box.
+// Produced on CPU (sweep-and-prune over the k group boxes), consumed by
+// queryPointsPairs — one workitem descends `entryRoot` (the group's root
+// slot) for `pointId`, replacing the mini-TLAS super-root descent.
+struct SAPPair {
+    uint pointId;
+    uint entryRoot;
+};
 
 
 void queryAABB(
-    const float3 qmin, 
-    const float3 qmax, 
+    const float3 qmin,
+    const float3 qmax,
     device const packed_uint3* facets,
     device const BVHNode* tree,
     constant QueryPointsParams& qParams,
     device BroadCollision* broadCollisions,
     device atomic_uint* numBroadCollisions,
     device QueryFlag* qFlag,
-    uint id
+    uint id,
+    uint entrySlot   // traversal entry (super-root single descent; or a group root)
 ) {
     const int stackDepth = 64;
 
@@ -1330,7 +1339,9 @@ void queryAABB(
     // ONE O(log N) traversal — the super-root box unions all k group roots, so
     // descending it reaches every group whose AABB overlaps the query (Phase 2a
     // looped all k roots = O(k)/point; this is the log-k replacement).
-    stack[sp++] = (int)qParams.entryRoot;
+    // SAP top-phase: entrySlot is instead a single group root (the CPU sweep
+    // already culled to overlapping groups), so this descends one subtree.
+    stack[sp++] = (int)entrySlot;
 
     // WEDGE GUARD: a healthy traversal visits at most the node count of
     // the tree (~2M for a 1M-facet mesh). A corrupted topology (child
@@ -1397,7 +1408,30 @@ kernel void queryPoints(
     float3 qmin = pos-margin;
     float3 qmax = pos+margin;
 
-    queryAABB(qmin, qmax, facets, tree, qParams, broadCollisions, numBroadCollisions, qFlag, id);
+    queryAABB(qmin, qmax, facets, tree, qParams, broadCollisions, numBroadCollisions, qFlag, id, qParams.entryRoot);
+}
+
+// SAP top-phase narrow descent. One workitem per CPU-emitted candidate pair:
+// descend the pair's group root for the pair's query point. qParams.numPoints
+// is repurposed as the pair count; qParams.entryRoot is unused (per-pair root).
+kernel void queryPointsPairs(
+    device const packed_float3* x [[buffer(0)]],
+    device const packed_uint3* facets [[buffer(1)]],
+    device const BVHNode* tree [[buffer(2)]],
+    constant QueryPointsParams& qParams [[buffer(3)]],
+    device BroadCollision* broadCollisions [[buffer(4)]],
+    device atomic_uint* numBroadCollisions [[buffer(5)]],
+    device QueryFlag* qFlag [[buffer(6)]],
+    device const SAPPair* pairs [[buffer(7)]],
+    uint id [[thread_position_in_grid]]
+) {
+    if(id >= qParams.numPoints) return;   // numPoints repurposed = pair count
+
+    SAPPair pr = pairs[id];
+    float3 pos = x[pr.pointId];
+    float3 margin = float3(qParams.queryMargin);
+    queryAABB(pos-margin, pos+margin, facets, tree, qParams,
+              broadCollisions, numBroadCollisions, qFlag, pr.pointId, pr.entryRoot);
 }
 
 
