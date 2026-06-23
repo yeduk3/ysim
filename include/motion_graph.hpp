@@ -1276,6 +1276,20 @@ struct Session {
         }
         return "";
     }
+
+    // Source mix at `t` for the Blend track: 1 = pure clip A, 0 = pure clip B,
+    // smooth crossfade (same w_A = 2u³-3u²+1 curve the bake uses) across the
+    // blend region. -1 when not a built blend (caller falls back to no tint).
+    float blendWeightA(double t) const {
+        if (mode != Mode::Blend || track.empty() || trans.blendFrames <= 0)
+            return -1.0f;
+        const double f = t / dt;
+        if (f <= double(trans.prefixFrames)) return 1.0f;
+        const double d = f - double(trans.prefixFrames);
+        if (d >= double(trans.blendFrames)) return 0.0f;
+        const float u = float((d + 1.0) / double(trans.blendFrames));
+        return 2.0f * u * u * u - 3.0f * u * u + 1.0f;
+    }
 };
 
 }  // namespace mograph

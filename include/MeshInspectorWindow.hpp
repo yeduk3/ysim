@@ -345,6 +345,10 @@ struct MeshInspectorTarget {
     bool kin_sim_paused = false;
     std::function<void(int /*meshId*/)> on_kin_preview_play_a;
     std::function<void(int /*meshId*/)> on_kin_preview_play_b;
+    // Blend playback: tint the live body by the current blend source weight
+    // (mixes the two preview colors). Blend mode only; per-frame snapshot.
+    bool kin_blend_colorize = false;
+    std::function<void(int /*meshId*/, bool /*on*/)> on_kin_blend_colorize;
 
     // No-selection branch: when mesh_id < 0 the right panel renders these
     // Add-Object buttons instead of the per-mesh editors. Callbacks
