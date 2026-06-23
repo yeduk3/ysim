@@ -15,6 +15,7 @@
 #include "scene_format.hpp"
 #include "sim_config.hpp"
 #include "ysim_paths.hpp"
+#include "mesh_cluster.hpp"
 #include "MeshGL.hpp"
 #include "MeshRenderState.hpp"
 #include "HiddenGLContext.hpp"
@@ -5220,6 +5221,16 @@ struct BVH<BE, PR, BVHMODE::LINEAR, PRIMITIVE> {
     VectorBase<METAL, uint32_t> groupNodeBase;     // [k] Σ (2 M_h - 1)  (h<g)
     uint32_t subBvhNumNodes = 0;                   // 2N - (#nonempty groups)
 
+    // Connectivity clustering (mesh_cluster.hpp) as the grouping source instead
+    // of the cloth grid tile-split. Set for ARBITRARY meshes (e.g. the static
+    // Human) where deriveSquareClothP() is 0 so the tile-split can't apply. When
+    // on, computeSubObjectGroupsClustered() fills groupOfPrim via face dual-graph
+    // flood fill and also records each cluster's single-owned vertex list (CSR)
+    // for the bidirectional VF phase (Phase 4).
+    bool useClusterBVH = false;
+    VectorBase<METAL, uint32_t> clusterVertOffsets; // [k+1] CSR offsets
+    VectorBase<METAL, uint32_t> clusterVerts;       // [<=V] vertices, single-owned
+
     // ---- Sub-object top phase: which group subtree(s) does a query point
     // descend? The k group subtrees occupy node slots [0, 2N-k); the top level
     // (point → candidate groups) is a flat cull over the k group root boxes —
@@ -5782,7 +5793,8 @@ struct BVH<BE, PR, BVHMODE::LINEAR, PRIMITIVE> {
     // detectable square cloth with the toggle on and a built grouped PSO.
     bool subObjectActive() const {
         return useSubObjectBVH && buildTreeGroupedPSO
-               && (primitives.size / PRIMITIVE) > 1 && deriveSquareClothP() >= 2;
+               && (primitives.size / PRIMITIVE) > 1
+               && (deriveSquareClothP() >= 2 || useClusterBVH);   // cluster mode: any mesh
     }
 
     // Assign each triangle prim to a material-space tile group and build the
@@ -5840,6 +5852,61 @@ struct BVH<BE, PR, BVHMODE::LINEAR, PRIMITIVE> {
         }
         std::cout << "[SubObjectBVH] s=" << subBvhSplitS << " tiles/side=" << TR
                   << " groups=" << k << " nodes=" << subBvhNumNodes
+                  << " (vs single-root " << (2 * N - 1) << ")" << std::endl;
+    }
+
+    // Connectivity-clustering grouping (cluster mode): assign each triangle prim
+    // to a connected balanced cluster via the face dual graph (mesh_cluster.hpp),
+    // then build the SAME offset tables computeSubObjectGroups() produces (the
+    // tables are grouping-source-agnostic). Also records each cluster's
+    // single-owned vertex list as a GPU CSR for the bidirectional VF phase.
+    // Runs on the CPU once at build time (positions/primitives are CPU-visible);
+    // flood fill is sequential, so a one-shot CPU build is the right tool.
+    void computeSubObjectGroupsClustered() {
+        Index N = primitives.size / PRIMITIVE;
+        Index V = positions.size / 3;
+        meshcluster::ClusterResult R = meshcluster::clusterMeshDualGraph(
+            primitives.ptr, (size_t)N, positions.ptr, (size_t)V, subBvhSplitS);
+        int k = R.numClusters;
+        numGroups = k;
+
+        groupOfPrim      = VectorBase<METAL, uint32_t>(N);
+        sortedPosToGroup = VectorBase<METAL, uint32_t>(N);
+        groupSize        = VectorBase<METAL, uint32_t>(k);
+        groupPrimBase    = VectorBase<METAL, uint32_t>(k);
+        groupNodeBase    = VectorBase<METAL, uint32_t>(k);
+
+        for (int g = 0; g < k; ++g) groupSize[g] = 0u;
+        for (Index t = 0; t < N; ++t) {
+            uint32_t g = (uint32_t)R.faceCluster[t];
+            groupOfPrim[t] = g;
+            groupSize[g]++;
+        }
+        uint32_t pacc = 0, nacc = 0;
+        for (int g = 0; g < k; ++g) {
+            groupPrimBase[g] = pacc;
+            groupNodeBase[g] = nacc;
+            uint32_t M = groupSize[g];
+            pacc += M;
+            nacc += (M > 0) ? (2u * M - 1u) : 0u;
+        }
+        subBvhNumNodes = nacc;               // = 2N - (#nonempty groups)
+        subBvhBuiltS = subBvhSplitS;
+        for (int g = 0; g < k; ++g) {
+            uint32_t base = groupPrimBase[g], M = groupSize[g];
+            for (uint32_t i = 0; i < M; ++i) sortedPosToGroup[base + i] = (uint32_t)g;
+        }
+        // Per-cluster single-owned vertex CSR → GPU (Phase 4 bidirectional VF).
+        clusterVertOffsets = VectorBase<METAL, uint32_t>((Index)R.vertOffsets.size());
+        std::copy(R.vertOffsets.begin(), R.vertOffsets.end(), clusterVertOffsets.ptr);
+        clusterVerts = VectorBase<METAL, uint32_t>((Index)std::max<size_t>(1, R.clusterVerts.size()));
+        std::copy(R.clusterVerts.begin(), R.clusterVerts.end(), clusterVerts.ptr);
+
+        uint32_t mnF = N, mxF = 0;
+        for (int g = 0; g < k; ++g) { uint32_t M = groupSize[g]; mnF = std::min(mnF, M); mxF = std::max(mxF, M); }
+        std::cout << "[ClusterBVH] s=" << subBvhSplitS << " clusters=" << k
+                  << " nodes=" << subBvhNumNodes << " faces/cluster=[" << mnF << ',' << mxF
+                  << "] ownedV=" << R.clusterVerts.size()
                   << " (vs single-root " << (2 * N - 1) << ")" << std::endl;
     }
 
@@ -6128,8 +6195,12 @@ struct BVH<BE, PR, BVHMODE::LINEAR, PRIMITIVE> {
             // Morton-sorted prims (CPU; build is rare) then grouped Karras
             // hierarchy + multi-root combine. Tables are (re)built lazily
             // when the prim count changes.
+            // Cluster mode applies to NON-grid meshes (the Human); a square cloth
+            // grid keeps its tile-split even with useClusterBVH propagated on.
+            bool clusterMode = useClusterBVH && deriveSquareClothP() < 2;
             if (groupOfPrim.size != numPrimitives || subBvhBuiltS != subBvhSplitS) {
-                computeSubObjectGroups();
+                if (clusterMode) computeSubObjectGroupsClustered();    // connectivity (any mesh)
+                else             computeSubObjectGroups();             // cloth grid tile-split
             }
             MetalGlobalContext::commitAndWait();   // Morton sort visible to CPU
             cpuStableGroupPartition();
@@ -7101,6 +7172,11 @@ struct BVH<BE, PR, BVHMODE::SCENE, BVHPRIMITIVE::OBJECT> {
     bool useSubObjectBVH = false;
     int  subBvhSplitS = 1;       // s: k = 4^s groups
     bool validateSubObject = false;  // one-shot CPU correctness check on build
+    // Connectivity clustering for NON-grid meshes (the static Human): when ON,
+    // every tree gets useClusterBVH; grid cloth ignores it (keeps tile-split),
+    // non-grid meshes group by face dual-graph flood fill. Default false ⇒
+    // existing sub-object paths bit-identical. Pushed to every per-mesh tree.
+    bool clusterNonGridBVH = false;
     // Sub-object top-phase mode (with useSubObjectBVH): 0 CPU SAP (default),
     // 1 GPU brute. Pushed to every per-mesh tree. See BVH::subTopMode.
     int subTopMode = 0;
@@ -7151,6 +7227,7 @@ struct BVH<BE, PR, BVHMODE::SCENE, BVHPRIMITIVE::OBJECT> {
             objTrees[i].useSubObjectBVH = useSubObjectBVH;
             objTrees[i].subTopMode = subTopMode;
             objTrees[i].subBvhSplitS = subBvhSplitS;
+            objTrees[i].useClusterBVH = clusterNonGridBVH;   // non-grid → connectivity cluster
             objTrees[i].build(scene.meshes[i]);
             objTrees[i].objIndex = (int)i;  // D-041 turn-3
             if (validateSubObject && objTrees[i].subObjectActive())
@@ -12772,6 +12849,84 @@ static int runSyncProbe(int particleNum1D, int frames) {
 // broad_refit_swept (cloth multi-root combine) + broad_detect (the grouped
 // human→cloth query top phase) + narrow_phase + whole frame. The s-sensitive
 // cost lives in refit+detect; collision counts are s-INVARIANT (correctness).
+// Phase 2: build the static Human as a CONNECTIVITY-CLUSTER sub-object BVH and
+// validate it. Same two-mesh scene (cloth + static Human); the Human tree gets
+// useClusterBVH so its k group subtrees come from face dual-graph flood fill
+// (not the cloth grid tile-split). Asserts: grouped tree active, group root
+// AABBs enclose their cluster prims (validateSubObjectBVH), groupSize sums to N,
+// per-cluster single-owned vertex CSR is well formed. One update() builds it.
+static int runClusterBVHTest(int particleNum1D, int splitS) {
+    using Backend = METAL;
+    using SystemT = ExplicitSystem<Backend, Precision>;
+    if (!MetalGlobalContext::getDevice() || !MetalKernelContext::getLibrary()) {
+        std::cerr << "[clusterbvh SKIP] metal unavailable\n";
+        return 0;
+    }
+    for (auto& m : Scene<Backend, Precision>::meshes) m.initializer = nullptr;
+    Scene<Backend, Precision>::meshes.clear();
+    for (auto& r : Scene<Backend, Precision>::requestsGeneralMeshes) delete r.initializer;
+    Scene<Backend, Precision>::requestsGeneralMeshes.clear();
+    Scene<Backend, Precision>::numMeshes = 0;
+    Scene<Backend, Precision>::nextMeshId = 0;
+    Scene<Backend, Precision>::dirty = true;
+    Scene<Backend, Precision>::environment = SceneEnvironment{};
+
+    Precision h = Precision(1) / Precision(60);
+    SystemT system(h, 60);
+    Simulator<Backend, Precision, SystemT> sim(system);
+    sim.pause = false;
+    sim.addCloth(particleNum1D, Precision(1.0), tinym::vec3(0, Precision(1.25), 0),
+                 Precision(1e5), Precision(1e5), Precision(2e5),
+                 Precision(0.01), Precision(0.1));
+    sim.addFloatMesh(ysim_paths::assetRoot(), "Human.obj",
+                     tinym::vec3(0, Precision(0.35), 0), Precision(0.04));
+    {
+        auto& humanReq = Scene<Backend, Precision>::requestsGeneralMeshes.back();
+        humanReq.isStatic = true; humanReq.applyGravity = false; humanReq.applyWind = false;
+    }
+    sim.initialize();
+    auto& bp = sim.collisionPipeline.broadPhase;
+    bp.twoMeshExperiment   = true;
+    bp.useSubObjectBVH     = true;
+    bp.subBvhSplitS        = splitS;
+    bp.clusterNonGridBVH   = true;     // Human → connectivity cluster (cloth stays tile-split)
+    bp.validateSubObject   = true;     // prints [SubObjectBVH] VALIDATE OK/FAIL per tree
+    bp.fusedRefitEnlarge   = true;
+    // The static Human (Float, index 1) was built single-root during initialize
+    // and would be SKIPPED on every later build(scene) (the Float + lifetimeId
+    // skip), so it would never pick up cluster mode. Invalidate its build stamp
+    // to force ONE rebuild that applies clusterNonGridBVH.
+    if (bp.objTrees.size() > 1) bp.objTrees[1].builtForLifetimeId = -1;
+    sim.update();                      // builds both trees (validate runs on build)
+
+    auto& human = bp.objTrees[1];
+    bool ok = true;
+    auto check = [&](bool c, const char* msg) { if (!c) { ok = false; printf("  [FAIL] %s\n", msg); } };
+    check(human.useClusterBVH,   "human useClusterBVH");
+    check(human.subObjectActive(), "human subObjectActive");
+    Index N = human.primitives.size / 3;
+    Index V = human.positions.size / 3;
+    int k = human.numGroups;
+    check(k > 1, "k > 1 clusters");
+    uint32_t sum = 0, mnF = N, mxF = 0;
+    for (int g = 0; g < k; ++g) { uint32_t M = human.groupSize[g]; sum += M; mnF = std::min(mnF, M); mxF = std::max(mxF, M); }
+    check(sum == N, "groupSize sums to N");
+    check(human.groupOfPrim.size == N, "groupOfPrim sized N");
+    // Per-cluster single-owned vertex CSR
+    check(human.clusterVertOffsets.size == (Index)(k + 1), "clusterVertOffsets size k+1");
+    bool mono = true; for (int g = 0; g < k; ++g) if (human.clusterVertOffsets[g+1] < human.clusterVertOffsets[g]) mono = false;
+    check(mono, "clusterVertOffsets monotone");
+    uint32_t vtot = human.clusterVertOffsets.size ? human.clusterVertOffsets[k] : 0;
+    check(vtot > 0 && vtot <= V, "owned verts in (0, V]");
+    // The cloth (index 0) must still be tile-split, not clustered.
+    check(!bp.objTrees[0].useClusterBVH || bp.objTrees[0].deriveSquareClothP() >= 2, "cloth not cluster-grouped");
+
+    printf("[clusterbvh] s=%d  Human N=%u V=%u -> k=%d  faces/cluster=[%u,%u] ownedV=%u  cloth tile-split k=%d\n",
+           splitS, N, V, k, mnF, mxF, vtot, bp.objTrees[0].numGroups);
+    printf("=== test-clusterbvh %s ===\n", ok ? "PASS" : "FAIL");
+    return ok ? 0 : 1;
+}
+
 static int runTwoMeshExperiment(int particleNum1D, int maxSplitS, int frames,
                                 int repeats) {
     using Backend = METAL;
@@ -18928,6 +19083,75 @@ int main(int argc, char** argv) {
         int S = (argc > 3) ? std::atoi(argv[3]) : 4;
         int F = (argc > 4) ? std::atoi(argv[4]) : 40;
         return runSubObjectValidate(P, S, F);
+    }
+    if (argc > 1 && std::string(argv[1]) == "--test-cluster") {
+        // Phase 1: connectivity-based mesh clustering (face dual graph + recursive
+        // 4-way balanced flood fill). Synthetic-grid self-test asserts the
+        // invariants (connected / balanced / single-owned verts); then cluster the
+        // real Human.obj at a few s and print stats. Args: <s> (default 3).
+        int s = (argc > 2) ? std::atoi(argv[2]) : 3;
+        bool ok = true;
+        for (int ss = 1; ss <= s; ++ss) ok &= meshcluster::selfTest(64, ss, true);
+        // Real mesh sanity (skips silently if the asset is missing).
+        ObjData obj;
+        obj.loadObject(ysim_paths::assetRoot(), "Human.obj");
+        if (!obj.elements3.empty()) {
+            size_t V = obj.vertices.size(), F = obj.elements3.size();
+            std::vector<float> pos(3 * V);
+            for (size_t v = 0; v < V; ++v) {
+                pos[3*v]=obj.vertices[v].x; pos[3*v+1]=obj.vertices[v].y; pos[3*v+2]=obj.vertices[v].z;
+            }
+            std::vector<uint32_t> fac(3 * F);
+            for (size_t f = 0; f < F; ++f) {
+                fac[3*f]=obj.elements3[f].x; fac[3*f+1]=obj.elements3[f].y; fac[3*f+2]=obj.elements3[f].z;
+            }
+            std::string vizDir;
+#ifdef YSIM_PROJECT_ROOT
+            vizDir = std::string(YSIM_PROJECT_ROOT) + "/profiles/experiment/cluster";
+#else
+            vizDir = "profiles/experiment/cluster";
+#endif
+            { std::error_code ec; std::filesystem::create_directories(vizDir, ec); }
+            for (int ss = 1; ss <= s; ++ss) {
+                auto R = meshcluster::clusterMeshDualGraph(fac.data(), F, pos.data(), V, ss);
+                uint32_t mn = (uint32_t)F, mx = 0;
+                for (int g = 0; g < R.numClusters; ++g) {
+                    uint32_t c = R.faceOffsets[g+1]-R.faceOffsets[g]; mn=std::min(mn,c); mx=std::max(mx,c);
+                }
+                size_t usedV = 0; for (int vc : R.vertCluster) if (vc >= 0) usedV++;
+                printf("[Human.obj] s=%d  V=%zu F=%zu -> k=%d  faces/cluster=[%u,%u] ratio=%.2f  ownedV=%zu\n",
+                       ss, V, F, R.numClusters, mn, mx, mn ? (double)mx/mn : 0.0, usedV);
+                // Dump face centroid + outward normal + cluster id. The viewer
+                // back-face culls per view (normal facing the camera) so front and
+                // back surface clusters don't overlap in the 2D projection.
+                std::ofstream vc(vizDir + "/human_cluster_s" + std::to_string(ss) + ".csv");
+                vc << "cx,cy,cz,nx,ny,nz,cluster\n";
+                for (size_t f = 0; f < F; ++f) {
+                    const float* a = pos.data()+3*fac[3*f];
+                    const float* b = pos.data()+3*fac[3*f+1];
+                    const float* d = pos.data()+3*fac[3*f+2];
+                    float cx=(a[0]+b[0]+d[0])/3, cy=(a[1]+b[1]+d[1])/3, cz=(a[2]+b[2]+d[2])/3;
+                    float ux=b[0]-a[0], uy=b[1]-a[1], uz=b[2]-a[2];
+                    float vx=d[0]-a[0], vy=d[1]-a[1], vz=d[2]-a[2];
+                    float nx=uy*vz-uz*vy, ny=uz*vx-ux*vz, nz=ux*vy-uy*vx;
+                    float L=std::sqrt(nx*nx+ny*ny+nz*nz); if (L>0){nx/=L;ny/=L;nz/=L;}
+                    vc << cx << ',' << cy << ',' << cz << ',' << nx << ',' << ny << ',' << nz
+                       << ',' << R.faceCluster[f] << '\n';
+                }
+            }
+        } else {
+            printf("[Human.obj] not found under %s — skipped real-mesh sanity\n",
+                   ysim_paths::assetRoot().c_str());
+        }
+        printf("=== test-cluster %s ===\n", ok ? "PASS" : "FAIL");
+        return ok ? 0 : 1;
+    }
+    if (argc > 1 && std::string(argv[1]) == "--test-clusterbvh") {
+        // Phase 2: static Human as a connectivity-cluster sub-object BVH + validate.
+        // Args: <particleNum1D=50> <splitS=3>.
+        int P = (argc > 2) ? std::atoi(argv[2]) : 50;
+        int S = (argc > 3) ? std::atoi(argv[3]) : 3;
+        return runClusterBVHTest(P, S);
     }
     if (argc > 1 && std::string(argv[1]) == "--bench-twomesh") {
         // Two-mesh experiment: static Human + sub-object cloth, no scene TLAS,
