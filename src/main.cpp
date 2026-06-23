@@ -1871,6 +1871,17 @@ struct alignas(32) BroadCollision {
     IndexPair shapePair;
 };
 
+// Cluster-pair broad phase (cluster VF pipeline) — MUST match bvh.metal layout.
+struct ClusterPair { uint32_t a; uint32_t b; };   // (query cluster, target cluster)
+struct ClusterGridParams {
+    float ox, oy, oz;     // grid origin (min corner)
+    float cellSize;       // uniform cell size (~ max cluster extent)
+    int   dx, dy, dz;     // grid dims
+    uint32_t numQuery;    // # query clusters
+    uint32_t maxPairs;    // pair buffer capacity
+    float margin;         // inflate query AABBs (VF needs margin-expanded pairs)
+};
+
 struct NarrowCollision {
     IndexPair indexPair;
     IndexPair objPair;
@@ -5343,6 +5354,8 @@ struct BVH<BE, PR, BVHMODE::LINEAR, PRIMITIVE> {
     MTL::ComputePipelineState* queryPointsPSO;
     MTL::ComputePipelineState* queryPointsPairsPSO = nullptr;  // SAP top-phase descent
     MTL::ComputePipelineState* queryPointsGroupedPSO = nullptr; // GPU brute top-phase
+    MTL::ComputePipelineState* clusterAABBPSO = nullptr;        // per-cluster AABB (cluster VF)
+    MTL::ComputePipelineState* queryPointsPairsBoundedPSO = nullptr;  // async per-pair descent
     // Segmented (per-threadgroup) detect+reduce variant — three PSOs
     // matching bvh.metal's queryPointsSegmented → scanReserveSegmented
     // → compactSegmented pipeline. Loaded unconditionally so a runtime
@@ -5399,6 +5412,8 @@ struct BVH<BE, PR, BVHMODE::LINEAR, PRIMITIVE> {
         queryPointsPSO = MetalKernelContext::getPSO("queryPoints");
         queryPointsPairsPSO = MetalKernelContext::getPSO("queryPointsPairs");  // SAP top phase
         queryPointsGroupedPSO = MetalKernelContext::getPSO("queryPointsGrouped");  // GPU top phase
+        clusterAABBPSO = MetalKernelContext::getPSO("cluster_aabb");           // cluster pipeline
+        queryPointsPairsBoundedPSO = MetalKernelContext::getPSO("queryPointsPairsBounded");
         queryPointsSegmentedPSO = MetalKernelContext::getPSO("queryPointsSegmented");
         scanReserveSegmentedPSO = MetalKernelContext::getPSO("scanReserveSegmented");
         compactSegmentedPSO     = MetalKernelContext::getPSO("compactSegmented");
@@ -6948,6 +6963,76 @@ struct BVH<BE, PR, BVHMODE::LINEAR, PRIMITIVE> {
         MetalGlobalContext::dispatchThreads(queryPointsPairsPSO, numPairs);
     }
 
+    // Cluster pipeline (GPU): compute per-cluster AABB (tight box over current
+    // face verts ∪ swept group root) into `out` (6 floats/cluster). One thread per
+    // cluster over its Morton-partitioned prim slice. Pre: grouped tree built/refit.
+    void computeClusterAABBGPU(VectorBase<METAL, float>& out) {
+        if (numGroups <= 0 || !clusterAABBPSO) return;
+        if (out.size != (Index)(6 * numGroups)) out = VectorBase<METAL, float>(6 * numGroups);
+        uint32_t k = (uint32_t)numGroups;
+        MetalGlobalContext::setBuffer(positions, 0);
+        MetalGlobalContext::setBuffer(primitives, 1);
+        MetalGlobalContext::setBuffer(mortons, 2);
+        MetalGlobalContext::setBuffer(groupPrimBase, 3);
+        MetalGlobalContext::setBuffer(groupSize, 4);
+        MetalGlobalContext::setBuffer(tree, 5);
+        MetalGlobalContext::setBuffer(groupNodeBase, 6);
+        MetalGlobalContext::setBuffer(out, 7);
+        MetalGlobalContext::setBytes(k, 8);
+        MetalGlobalContext::dispatchThreads(clusterAABBPSO, k);
+    }
+
+    // Like dispatchPointPairs but the SAPPair list is already a GPU buffer (from
+    // the cluster-pair expansion kernel); `count` is the CPU-read pair count.
+    void dispatchPointPairsGPU(Index qIndex, PR queryMargin,
+                               VectorBase<METAL, SAPPair>& sapBuf, uint32_t count) {
+        if (count == 0 || qIndex < 0 || qIndex >= (Index)Scene<METAL, PR>::meshes.size()) return;
+        auto& qmesh = Scene<METAL, PR>::meshes[qIndex];
+        auto& qpos  = qmesh.state.x;
+        typename Scene<METAL, PR>::PackedCollisionData& packedCol =
+            Scene<METAL, PR>::packedCollisionData;
+        QueryPointsParams qParams = {
+            queryMargin, count, (Index)qIndex, (Index)objIndex, packedCol.maxNumCollisions,
+            (Index)qmesh.behaviorType, (Index)objBehavior,
+            (Index)qmesh.shapeType, (Index)objShape, (uint32_t)tree.size, 0u };
+        MetalGlobalContext::setBuffer(qpos, 0);
+        MetalGlobalContext::setBuffer(primitives, 1);
+        MetalGlobalContext::setBuffer(tree, 2);
+        MetalGlobalContext::setBytes(qParams, 3);
+        MetalGlobalContext::setBuffer(packedCol.broadCollisions, 4);
+        MetalGlobalContext::setBuffer(packedCol.numBroadCollisions, 5);
+        MetalGlobalContext::setBuffer(qFlag, 6);
+        MetalGlobalContext::setBuffer(sapBuf, 7);
+        MetalGlobalContext::dispatchThreads(queryPointsPairsPSO, count);
+    }
+
+    // Async per-pair descent: the pair count is a GPU buffer (countBuf), so we
+    // over-dispatch `maxThreads` (the SAPPair buffer capacity) and each thread
+    // bounds itself — no CPU readback ⇒ no extra sync in the live loop.
+    void dispatchPointPairsGPUBounded(Index qIndex, PR queryMargin,
+                                      VectorBase<METAL, SAPPair>& sapBuf,
+                                      VectorBase<METAL, uint32_t>& countBuf, uint32_t maxThreads) {
+        if (maxThreads == 0 || qIndex < 0 || qIndex >= (Index)Scene<METAL, PR>::meshes.size()) return;
+        auto& qmesh = Scene<METAL, PR>::meshes[qIndex];
+        auto& qpos  = qmesh.state.x;
+        typename Scene<METAL, PR>::PackedCollisionData& packedCol =
+            Scene<METAL, PR>::packedCollisionData;
+        QueryPointsParams qParams = {
+            queryMargin, maxThreads, (Index)qIndex, (Index)objIndex, packedCol.maxNumCollisions,
+            (Index)qmesh.behaviorType, (Index)objBehavior,
+            (Index)qmesh.shapeType, (Index)objShape, (uint32_t)tree.size, 0u };
+        MetalGlobalContext::setBuffer(qpos, 0);
+        MetalGlobalContext::setBuffer(primitives, 1);
+        MetalGlobalContext::setBuffer(tree, 2);
+        MetalGlobalContext::setBytes(qParams, 3);
+        MetalGlobalContext::setBuffer(packedCol.broadCollisions, 4);
+        MetalGlobalContext::setBuffer(packedCol.numBroadCollisions, 5);
+        MetalGlobalContext::setBuffer(qFlag, 6);
+        MetalGlobalContext::setBuffer(sapBuf, 7);
+        MetalGlobalContext::setBuffer(countBuf, 8);
+        MetalGlobalContext::dispatchThreads(queryPointsPairsBoundedPSO, maxThreads);
+    }
+
     // GPU top phase (mode 2). One thread per query point brute-tests the k
     // group root boxes on the GPU and descends overlapping subtrees inline —
     // no CPU sort, no pair buffer (vs queryPointsSAP). qParams.entryRoot is
@@ -7246,6 +7331,22 @@ struct BVH<BE, PR, BVHMODE::SCENE, BVHPRIMITIVE::OBJECT> {
     // non-grid meshes group by face dual-graph flood fill. Default false ⇒
     // existing sub-object paths bit-identical. Pushed to every per-mesh tree.
     bool clusterNonGridBVH = false;
+
+    // Cluster VF pipeline (live): cluster-pair broad (grid over cluster AABBs) +
+    // bidirectional per-pair VF, replacing the per-(q,t) full broad phase. Two-mesh
+    // only: cloth=objTrees[0] (grouped), static cluster Human=objTrees[1]. Default
+    // OFF ⇒ detectCollisionsTwoMesh path unchanged.
+    bool clusterVFPipeline = false;
+    VectorBase<METAL, float>    clothClusterAABB;      // [6*kc] recomputed each frame (GPU)
+    VectorBase<METAL, float>    humanClusterAABB;      // [6*ks] static, built once (CPU→GPU)
+    VectorBase<METAL, uint32_t> gridCellStart, gridCellClusters;  // human cell CSR (static)
+    ClusterGridParams           clusterGrid{};
+    bool clusterGridBuilt = false;
+    VectorBase<METAL, ClusterPair>       clusterPairBuf;  VectorBase<METAL, uint32_t> clusterPairCount;
+    uint32_t clusterPairCap = 0;
+    VectorBase<METAL, typename TRI_LBVH::SAPPair> clusterDirA, clusterDirB;
+    VectorBase<METAL, uint32_t>          clusterDirACount, clusterDirBCount;
+    uint32_t clusterDirCapA = 0, clusterDirCapB = 0;
     // Sub-object top-phase mode (with useSubObjectBVH): 0 CPU SAP (default),
     // 1 GPU brute. Pushed to every per-mesh tree. See BVH::subTopMode.
     int subTopMode = 0;
@@ -7708,6 +7809,121 @@ struct BVH<BE, PR, BVHMODE::SCENE, BVHPRIMITIVE::OBJECT> {
                 if(hit) objTrees[t].queryPoints(q, margin);
             }
         }
+        queryEnd();
+    }
+
+    // Static Human cluster grid: insert each Human cluster's AABB (tight ∪ swept
+    // root, CPU union gather) into uniform grid cells (CSR). cell = max cluster
+    // extent. Built ONCE (Human static); also uploads the Human cluster AABBs to
+    // GPU for the pair-query overlap test.
+    void buildHumanClusterGrid(TRI_LBVH& human, PR margin) {
+        int ks = human.numGroups; if (ks <= 0) return;
+        std::vector<float> hA(6 * ks);
+        for (int g = 0; g < ks; ++g) { for (int c=0;c<3;++c){ hA[6*g+c]=1e30f; hA[6*g+3+c]=-1e30f; } }
+        Index N = human.primitives.size / 3;
+        for (Index t = 0; t < N; ++t) { int g = (int)human.groupOfPrim[t];
+            for (int p = 0; p < 3; ++p) { uint32_t v = human.primitives[t*3+p];
+                const float* q = human.positions.ptr + 3*v;
+                for (int c=0;c<3;++c){ hA[6*g+c]=std::min(hA[6*g+c],q[c]); hA[6*g+3+c]=std::max(hA[6*g+3+c],q[c]); } } }
+        for (int g = 0; g < ks; ++g) { auto& r = human.tree[human.groupNodeBase[g]];
+            for (int c=0;c<3;++c){ hA[6*g+c]=std::min(hA[6*g+c],(float)r.min[c]); hA[6*g+3+c]=std::max(hA[6*g+3+c],(float)r.max[c]); } }
+
+        float bmin[3]={1e30f,1e30f,1e30f}, bmax[3]={-1e30f,-1e30f,-1e30f}, maxExt=0.0f;
+        for (int g=0; g<ks; ++g) for (int c=0;c<3;++c){ bmin[c]=std::min(bmin[c],hA[6*g+c]); bmax[c]=std::max(bmax[c],hA[6*g+3+c]); maxExt=std::max(maxExt,hA[6*g+3+c]-hA[6*g+c]); }
+        float cell = maxExt > 1e-6f ? maxExt : 1.0f;
+        int dims[3]; for (int c=0;c<3;++c) dims[c]=std::max(1,(int)std::ceil((bmax[c]-bmin[c])/cell));
+        size_t numCells = (size_t)dims[0]*dims[1]*dims[2];
+        auto cellRange = [&](int g, int lo[3], int hi[3]) { for (int c=0;c<3;++c){
+            lo[c]=std::min(std::max(0,(int)std::floor((hA[6*g+c]-bmin[c])/cell)),dims[c]-1);
+            hi[c]=std::min(std::max(0,(int)std::floor((hA[6*g+3+c]-bmin[c])/cell)),dims[c]-1); } };
+        std::vector<uint32_t> cs(numCells+1, 0);
+        for (int g=0; g<ks; ++g){ int lo[3],hi[3]; cellRange(g,lo,hi);
+            for (int z=lo[2];z<=hi[2];++z) for (int y=lo[1];y<=hi[1];++y) for (int x=lo[0];x<=hi[0];++x) cs[(size_t)((z*dims[1]+y)*dims[0]+x)+1]++; }
+        for (size_t i=0;i<numCells;++i) cs[i+1]+=cs[i];
+        std::vector<uint32_t> cc(cs[numCells], 0);
+        { std::vector<uint32_t> w(cs.begin(), cs.end()-1);
+          for (int g=0; g<ks; ++g){ int lo[3],hi[3]; cellRange(g,lo,hi);
+            for (int z=lo[2];z<=hi[2];++z) for (int y=lo[1];y<=hi[1];++y) for (int x=lo[0];x<=hi[0];++x) cc[w[(size_t)((z*dims[1]+y)*dims[0]+x)]++]=(uint32_t)g; } }
+
+        gridCellStart = VectorBase<METAL, uint32_t>((Index)cs.size()); std::copy(cs.begin(), cs.end(), gridCellStart.ptr);
+        gridCellClusters = VectorBase<METAL, uint32_t>((Index)std::max<size_t>(1, cc.size())); std::copy(cc.begin(), cc.end(), gridCellClusters.ptr);
+        humanClusterAABB = VectorBase<METAL, float>((Index)hA.size()); std::copy(hA.begin(), hA.end(), humanClusterAABB.ptr);
+        clusterGrid = ClusterGridParams{ bmin[0],bmin[1],bmin[2], cell, dims[0],dims[1],dims[2], 0u, 0u, (float)margin };
+        clusterGridBuilt = true;
+    }
+
+    // Live cluster VF pipeline (replaces detectCollisionsTwoMesh when enabled):
+    // cloth cluster AABBs (GPU) → grid pair query (GPU) → pair expansion (GPU) →
+    // bidirectional per-pair descent (GPU). Two reads of GPU counts (pair count;
+    // dir counts) drive tight dispatches — InFrame-style; an async (bounded
+    // over-dispatch) variant is a follow-up. Requires objTrees[0]=cloth grouped,
+    // objTrees[1]=static cluster Human.
+    void detectCollisionsCluster(PR margin) {
+        if (objTrees.size() < 2) { detectCollisionsTwoMesh(margin); return; }
+        TRI_LBVH& cloth = objTrees[0];
+        TRI_LBVH& human = objTrees[1];
+        int kc = cloth.numGroups, ks = human.numGroups;
+        if (kc <= 0 || ks <= 0) { detectCollisionsTwoMesh(margin); return; }
+        for (auto& tr : objTrees) tr.syncEachPhase = true;
+        Scene<METAL, PR>::packedCollisionData.analyticPairs.clear();
+        queryBegin();
+
+        // FULLY ASYNC: no count readbacks. GPU counters bound over-dispatched
+        // kernels, so the whole pipeline is one command stream with a single sync
+        // at queryEnd (matching detectCollisionsTwoMesh's 1 sync/substep) — the 2
+        // readback syncs of a tight pipeline would explode the per-substep sync
+        // floor and lose to the full path.
+        static MTL::ComputePipelineState* resetPSO = MetalKernelContext::getPSO("reset_counter");
+        cloth.computeClusterAABBGPU(clothClusterAABB);          // (1) cloth AABBs (GPU)
+        if (!clusterGridBuilt) { MetalGlobalContext::commitAndWait(); buildHumanClusterGrid(human, margin); }
+
+        // (2) grid pair query (GPU). Reset count on GPU, dispatch over kc.
+        uint32_t maxPairs = (uint32_t)kc * (uint32_t)ks;
+        if (clusterPairCap < maxPairs) { clusterPairCap = maxPairs; clusterPairBuf = VectorBase<METAL, ClusterPair>((Index)maxPairs); }
+        if (!clusterPairCount.ptr) clusterPairCount = VectorBase<METAL, uint32_t>(1, 0u);
+        MetalGlobalContext::setBuffer(clusterPairCount, 0); MetalGlobalContext::dispatchThreads(resetPSO, 1);
+        ClusterGridParams gp = clusterGrid; gp.numQuery = (uint32_t)kc; gp.maxPairs = maxPairs; gp.margin = (float)margin;
+        MTL::ComputePipelineState* qpso = MetalKernelContext::getPSO("clusterpair_query");
+        MetalGlobalContext::setBuffer(clothClusterAABB, 0);
+        MetalGlobalContext::setBuffer(humanClusterAABB, 1);
+        MetalGlobalContext::setBuffer(gridCellStart, 2);
+        MetalGlobalContext::setBuffer(gridCellClusters, 3);
+        MetalGlobalContext::setBytes(gp, 4);
+        MetalGlobalContext::setBuffer(clusterPairBuf, 5);
+        MetalGlobalContext::setBuffer(clusterPairCount, 6);
+        MetalGlobalContext::dispatchThreads(qpso, (Index)kc);
+
+        // (3) expand pairs → dirA/dirB SAPPairs (GPU), over-dispatched maxPairs and
+        // bounded by the GPU pair count. A vertex can appear in multiple pairs, so
+        // size the dir buffers by vertCount × (a safe partner-cluster fanout).
+        uint32_t capA = (uint32_t)(cloth.positions.size/3) * 16u + 64u;
+        uint32_t capB = (uint32_t)(human.positions.size/3) * 16u + 64u;
+        if (clusterDirCapA < capA) { clusterDirCapA = capA; clusterDirA = VectorBase<METAL, typename TRI_LBVH::SAPPair>((Index)capA); }
+        if (clusterDirCapB < capB) { clusterDirCapB = capB; clusterDirB = VectorBase<METAL, typename TRI_LBVH::SAPPair>((Index)capB); }
+        if (!clusterDirACount.ptr) clusterDirACount = VectorBase<METAL, uint32_t>(1, 0u);
+        if (!clusterDirBCount.ptr) clusterDirBCount = VectorBase<METAL, uint32_t>(1, 0u);
+        MetalGlobalContext::setBuffer(clusterDirACount, 0); MetalGlobalContext::dispatchThreads(resetPSO, 1);
+        MetalGlobalContext::setBuffer(clusterDirBCount, 0); MetalGlobalContext::dispatchThreads(resetPSO, 1);
+        MTL::ComputePipelineState* epso = MetalKernelContext::getPSO("clusterpair_expand");
+        MetalGlobalContext::setBuffer(clusterPairBuf, 0);
+        MetalGlobalContext::setBuffer(clusterPairCount, 1);     // GPU bound (no readback)
+        MetalGlobalContext::setBuffer(cloth.clusterVertOffsets, 2);
+        MetalGlobalContext::setBuffer(cloth.clusterVerts, 3);
+        MetalGlobalContext::setBuffer(cloth.groupNodeBase, 4);
+        MetalGlobalContext::setBuffer(human.clusterVertOffsets, 5);
+        MetalGlobalContext::setBuffer(human.clusterVerts, 6);
+        MetalGlobalContext::setBuffer(human.groupNodeBase, 7);
+        MetalGlobalContext::setBuffer(clusterDirA, 8);
+        MetalGlobalContext::setBuffer(clusterDirACount, 9);
+        MetalGlobalContext::setBuffer(clusterDirB, 10);
+        MetalGlobalContext::setBuffer(clusterDirBCount, 11);
+        MetalGlobalContext::setBytes(capA, 12);
+        MetalGlobalContext::setBytes(capB, 13);
+        MetalGlobalContext::dispatchThreads(epso, (Index)maxPairs);
+
+        // (4) bidirectional per-pair descent (GPU), over-dispatched + GPU-bounded.
+        human.dispatchPointPairsGPUBounded(0, margin, clusterDirA, clusterDirACount, capA);  // cloth V → human tree
+        cloth.dispatchPointPairsGPUBounded(1, margin, clusterDirB, clusterDirBCount, capB);  // human V → cloth tree
         queryEnd();
     }
     void queryEnd() {
@@ -10651,7 +10867,9 @@ struct Simulator {
                     if (doBroad) {
                         auto& bp = collisionPipeline.broadPhase;
                         auto runDetect = [&]() {
-                            if (bp.twoMeshExperiment)
+                            if (bp.twoMeshExperiment && bp.clusterVFPipeline)
+                                bp.detectCollisionsCluster(margin);
+                            else if (bp.twoMeshExperiment)
                                 bp.detectCollisionsTwoMesh(margin, enableSelfCollisions);
                             else if (useSegmentedBVHQuery)
                                 bp.detectCollisionsSegmented(margin, enableSelfCollisions, useAnalyticPrimitive);
@@ -12918,16 +13136,6 @@ static int runSyncProbe(int particleNum1D, int frames) {
 // broad_refit_swept (cloth multi-root combine) + broad_detect (the grouped
 // human→cloth query top phase) + narrow_phase + whole frame. The s-sensitive
 // cost lives in refit+detect; collision counts are s-INVARIANT (correctness).
-// Phase 3: cluster-pair broad phase structs (MUST match bvh.metal byte layout).
-struct ClusterPair { uint32_t a; uint32_t b; };   // (query cluster, target cluster)
-struct ClusterGridParams {
-    float ox, oy, oz;     // grid origin (min corner)
-    float cellSize;       // uniform cell size (~ max cluster extent)
-    int   dx, dy, dz;     // grid dims
-    uint32_t numQuery;    // # query clusters
-    uint32_t maxPairs;    // pair buffer capacity
-};
-
 // Phase 2: build the static Human as a CONNECTIVITY-CLUSTER sub-object BVH and
 // validate it. Same two-mesh scene (cloth + static Human); the Human tree gets
 // useClusterBVH so its k group subtrees come from face dual-graph flood fill
@@ -13117,7 +13325,7 @@ static int runClusterPairTest(int particleNum1D, int splitS, int settleFrames) {
     VectorBase<METAL, ClusterPair> pairBuf((Index)maxPairs);
     VectorBase<METAL, uint32_t>    pairCount(1, 0u);
     ClusterGridParams gp{ bmin[0],bmin[1],bmin[2], cell, dims[0],dims[1],dims[2],
-                          (uint32_t)kc, maxPairs };
+                          (uint32_t)kc, maxPairs, 0.0f };   // margin 0: validate raw overlap
     MetalGlobalContext::setBuffer(qAbuf, 0);
     MetalGlobalContext::setBuffer(tAbuf, 1);
     MetalGlobalContext::setBuffer(cellStartBuf, 2);
@@ -13438,6 +13646,76 @@ static int runClusterVFBench(int particleNum1D, int splitS, int settleFrames, in
     printf("  cluster     = %.3f ms  (cpu pairgen+expand %.3f + gpu dispatch+sync %.3f)\n", tot, cpu, gpu);
     printf("  speedup full/cluster_total = %.2fx   full/cluster_gpu = %.2fx\n",
            tot>0?full/tot:0.0, gpu>0?full/gpu:0.0);
+    return 0;
+}
+
+// Live cluster VF pipeline: (A) validate the GPU-driven detectCollisionsCluster
+// broad SET == detectCollisionsTwoMesh on the settled scene, then (B) run the full
+// sim each way (flag on/off) and compare median frame time + cloth drape (maxY).
+static int runClusterLive(int particleNum1D, int splitS, int frames, int reps) {
+    using Backend = METAL;
+    using SystemT = ExplicitSystem<Backend, Precision>;
+    using Clock = std::chrono::steady_clock;
+    if (!MetalGlobalContext::getDevice() || !MetalKernelContext::getLibrary()) {
+        std::cerr << "[cluster-live SKIP] metal unavailable\n"; return 0;
+    }
+    const Precision margin = Precision(0.015);
+    auto resetScene = []() {
+        for (auto& m : Scene<Backend, Precision>::meshes) m.initializer = nullptr;
+        Scene<Backend, Precision>::meshes.clear();
+        for (auto& r : Scene<Backend, Precision>::requestsGeneralMeshes) delete r.initializer;
+        Scene<Backend, Precision>::requestsGeneralMeshes.clear();
+        Scene<Backend, Precision>::numMeshes = 0; Scene<Backend, Precision>::nextMeshId = 0;
+        Scene<Backend, Precision>::dirty = true; Scene<Backend, Precision>::environment = SceneEnvironment{};
+    };
+    auto setup = [&](Simulator<Backend, Precision, SystemT>& sim, bool clusterPipe) {
+        sim.pause = false;
+        sim.addCloth(particleNum1D, Precision(1.0), tinym::vec3(0, Precision(1.25), 0),
+                     Precision(1e5), Precision(1e5), Precision(2e5), Precision(0.01), Precision(0.1));
+        sim.addFloatMesh(ysim_paths::assetRoot(), "Human.obj",
+                         tinym::vec3(0, Precision(0.35), 0), Precision(0.04));
+        auto& hr = Scene<Backend, Precision>::requestsGeneralMeshes.back();
+        hr.isStatic = true; hr.applyGravity = false; hr.applyWind = false;
+        sim.initialize();
+        auto& bp = sim.collisionPipeline.broadPhase;
+        bp.twoMeshExperiment = true; bp.useSubObjectBVH = true; bp.subBvhSplitS = splitS;
+        bp.clusterNonGridBVH = true; bp.fusedRefitEnlarge = true; bp.clusterVFPipeline = clusterPipe;
+        if (bp.objTrees.size() > 1) bp.objTrees[1].builtForLifetimeId = -1;
+    };
+    auto med = [](std::vector<double> v){ if(v.empty())return 0.0; std::sort(v.begin(),v.end());
+        size_t n=v.size(); return (n&1)?v[n/2]:0.5*(v[n/2-1]+v[n/2]); };
+    auto clothMaxY = []() { auto& c = Scene<Backend, Precision>::meshes[0];
+        Index n=c.state.x.size/3; Precision mx=-1e30; for(Index i=0;i<n;++i) mx=std::max(mx,c.state.x[i*3+1]); return (double)mx; };
+
+    // (A) frozen-frame broad-set validation.
+    Precision h = Precision(1)/Precision(60);
+    { resetScene(); SystemT system(h,60); Simulator<Backend,Precision,SystemT> sim(system); setup(sim,true);
+      for (int f=0; f<std::max(1,frames); ++f) sim.update();
+      auto& bp = sim.collisionPipeline.broadPhase;
+      auto& pc = Scene<Backend, Precision>::packedCollisionData;
+      auto collect = [&](std::set<std::array<uint32_t,4>>& s){ uint32_t nb=pc.numBroadCollisions[0];
+          uint32_t n=std::min(nb,(uint32_t)pc.maxNumCollisions);
+          for(uint32_t i=0;i<n;++i){auto&b=pc.broadCollisions[i]; s.insert({b.objPair.query,b.indexPair.point,b.objPair.target,b.indexPair.triangle});} return nb; };
+      std::set<std::array<uint32_t,4>> cset, fset;
+      bp.detectCollisionsCluster(margin); uint32_t nbc = collect(cset);
+      bp.detectCollisionsTwoMesh(margin); uint32_t nbf = collect(fset);
+      size_t miss=0,extra=0; for(auto&t:fset)if(!cset.count(t))++miss; for(auto&t:cset)if(!fset.count(t))++extra;
+      printf("[cluster-live A] s=%d  cluster broad=%u(set %zu) full=%u(set %zu)  missing=%zu extra=%zu  %s\n",
+             splitS, nbc, cset.size(), nbf, fset.size(), miss, extra, (cset==fset)?"MATCH":"MISMATCH");
+    }
+
+    // (B) full-sim frame time + drape each way.
+    auto runSim = [&](bool clusterPipe, double& frameMs, double& maxY) {
+        resetScene(); SystemT system(h,60); Simulator<Backend,Precision,SystemT> sim(system); setup(sim,clusterPipe);
+        std::vector<double> ft; int warm=std::min(frames/2,5);
+        for (int f=0; f<frames; ++f) { auto a=Clock::now(); sim.update(); auto b=Clock::now();
+            if (f>=warm) ft.push_back(std::chrono::duration<double,std::milli>(b-a).count()); }
+        frameMs = med(ft); maxY = clothMaxY();
+    };
+    double fmC=0,myC=0,fmF=0,myF=0;
+    for (int r=0; r<std::max(1,reps); ++r) { double a,b,c,d; runSim(false,a,b); runSim(true,c,d); fmF=a;myF=b;fmC=c;myC=d; }
+    printf("[cluster-live B] s=%d frames=%d  full=%.2f ms (maxY %.3f)  cluster=%.2f ms (maxY %.3f)  speedup=%.2fx\n",
+           splitS, frames, fmF, myF, fmC, myC, fmC>0?fmF/fmC:0.0);
     return 0;
 }
 
@@ -19691,6 +19969,15 @@ int main(int argc, char** argv) {
         int Fr = (argc > 4) ? std::atoi(argv[4]) : 20;
         int R = (argc > 5) ? std::atoi(argv[5]) : 20;
         return runClusterVFBench(P, S, Fr, R);
+    }
+    if (argc > 1 && std::string(argv[1]) == "--bench-cluster-live") {
+        // GPU cluster VF pipeline live: validate broad set == full + frame time.
+        // Args: <particleNum1D=50> <splitS=3> <frames=30> <reps=3>.
+        int P = (argc > 2) ? std::atoi(argv[2]) : 50;
+        int S = (argc > 3) ? std::atoi(argv[3]) : 3;
+        int Fr = (argc > 4) ? std::atoi(argv[4]) : 30;
+        int R = (argc > 5) ? std::atoi(argv[5]) : 3;
+        return runClusterLive(P, S, Fr, R);
     }
     if (argc > 1 && std::string(argv[1]) == "--bench-twomesh") {
         // Two-mesh experiment: static Human + sub-object cloth, no scene TLAS,
