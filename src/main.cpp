@@ -5972,7 +5972,9 @@ struct BVH<BE, PR, BVHMODE::LINEAR, PRIMITIVE> {
             buildSweptLeafGPU(dt);
             bottomUpBoxesGPU(sceneBox);
         }
-        MetalGlobalContext::commitAndWait();
+        // None/PerFrame keep the refit dispatches in flight; the combined root
+        // boxes have no CPU consumer this substep (detect culls on the GPU).
+        if (syncEachPhase) MetalGlobalContext::commitAndWait();
     }
     // Multi-root combine. Mirrors bottomUpBoxesGPU (zero visit-counts +
     // dispatch) but the kernel stops each leaf walk at its group root.
@@ -7145,7 +7147,7 @@ struct BVH<BE, PR, BVHMODE::SCENE, BVHPRIMITIVE::OBJECT> {
             indices[ibase+1] = ibase+1;
         }
 
-        if (!twoMeshExperiment) {
+        if (!twoMeshExperiment && syncEachPhase) {
             tree.useAgglomerative = useAgglomerative;
             tree.build(-1, positions, indices);
         }
@@ -7296,6 +7298,7 @@ struct BVH<BE, PR, BVHMODE::SCENE, BVHPRIMITIVE::OBJECT> {
                 objTrees[i].useSubObjectBVH = useSubObjectBVH;
                 objTrees[i].subTopMode = subTopMode;
                 objTrees[i].subBvhSplitS = subBvhSplitS;
+                objTrees[i].syncEachPhase = syncEachPhase;   // gate the refit sync
                 if (objTrees[i].buildSweptLeafPSO) {
                     objTrees[i].refitSwept(dt);
                 } else {
@@ -7310,7 +7313,12 @@ struct BVH<BE, PR, BVHMODE::SCENE, BVHPRIMITIVE::OBJECT> {
                 objTrees[i].combineStaticOnce();   // one-time CPU correction (see refit())
                 objTrees[i].staticCombined = true;
             }
-            if (!twoMeshExperiment) {   // no scene-level TLAS in the experiment
+            // Skip the scene-level TLAS when it has no consumer this frame: the
+            // experiment never builds it, and None/PerFrame (!syncEachPhase)
+            // can't afford its objectRootAABB() CPU read (it's dead in the
+            // query path anyway — detect culls pairwise / GPU-brute). The
+            // frame%10 build() still constructs it for click-ray.
+            if (!twoMeshExperiment && syncEachPhase) {
             Index pbase = i*6;
             AABB4 objBox = objTrees[i].objectRootAABB();
             positions[pbase  ] = objBox.min.x;
@@ -7324,7 +7332,7 @@ struct BVH<BE, PR, BVHMODE::SCENE, BVHPRIMITIVE::OBJECT> {
             indices[ibase+1] = ibase+1;
             }
         }
-        if (!twoMeshExperiment) {
+        if (!twoMeshExperiment && syncEachPhase) {
             tree.useAgglomerative = useAgglomerative;
             tree.build(-1, positions, indices);
         }
@@ -7339,12 +7347,25 @@ struct BVH<BE, PR, BVHMODE::SCENE, BVHPRIMITIVE::OBJECT> {
     }
 
     void queryBegin() {
-        for(auto& tree : objTrees) {
-            tree.qFlag[0].stackOverflow = 0;
-            tree.qFlag[0].collisionOverflow = 0;
-            //Scene<METAL, PR>::findById(tree.objid)->constraints.numBroadCollisions[0] = 0;
+        if (syncEachPhase) {
+            for(auto& tree : objTrees) {
+                tree.qFlag[0].stackOverflow = 0;
+                tree.qFlag[0].collisionOverflow = 0;
+            }
+            Scene<METAL, PR>::packedCollisionData.numBroadCollisions[0] = 0;
+        } else {
+            // Async (None/PerFrame): the broad-pair counter MUST be reset on
+            // the GPU, encoded into the stream — a CPU write here would not
+            // order with the in-flight detect dispatches, so all 60 substeps'
+            // resets would land before the GPU runs any query and the pairs
+            // would accumulate across the whole frame. (qFlag is never read
+            // off InFrame, so its reset is skipped.)
+            static MTL::ComputePipelineState* resetPSO =
+                MetalKernelContext::getPSO("reset_counter");
+            MetalGlobalContext::setBuffer(
+                Scene<METAL, PR>::packedCollisionData.numBroadCollisions, 0);
+            MetalGlobalContext::dispatchThreads(resetPSO, 1);
         }
-        Scene<METAL, PR>::packedCollisionData.numBroadCollisions[0] = 0;
     }
     void detectCollisions(PR margin, bool enableSelfCollisions=true,
                           bool analyticEnabled=false) {
@@ -7523,12 +7544,11 @@ struct BVH<BE, PR, BVHMODE::SCENE, BVHPRIMITIVE::OBJECT> {
         queryEnd();
     }
     void queryEnd() {
-        MetalGlobalContext::commitAndWait();
-        // Overflow-flag reads are CPU reads of GPU-written flags — they need
-        // the sync above and are diagnostic only, so run them only in InFrame.
-        // None/PerFrame skip them (the GPU atomics self-clamp; the count stays
-        // accurate). P5 makes the commitAndWait above conditional too.
+        // None/PerFrame: leave the query dispatches in flight (narrow reads
+        // broadCollisions on the GPU) and skip the diagnostic flag reads — no
+        // sync at all. InFrame syncs so the CPU flag reads below are coherent.
         if (!syncEachPhase) return;
+        MetalGlobalContext::commitAndWait();
         for(auto& tree : objTrees) {
             if(tree.qFlag[0].stackOverflow) std::cout << "[Scene BVH detect collisions] " << tree.objid << "'s tree got query stack overflowed\n";
             if(tree.qFlag[0].collisionOverflow) {
