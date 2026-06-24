@@ -11032,6 +11032,29 @@ struct Simulator {
                         } else {
                             runDetect();
                         }
+                        // Temporal-coherence dump (YSIM_PAIR_DUMP=<path>): one line
+                        // per broad CHECK = "<checkIdx> <numPairs> a:b a:b ...". Only
+                        // the cluster-VF path has cluster pairs; pairs are coherent
+                        // here because queryEnd() commitAndWaits under InFrame.
+                        // Offline script computes pair-persistence ratio + run lengths.
+                        if (bp.clusterVFPipeline && bp.clusterPairCount.ptr) {
+                            static std::ofstream pairDump = []() {
+                                std::ofstream f;
+                                if (const char* p = std::getenv("YSIM_PAIR_DUMP")) f.open(p);
+                                return f;
+                            }();
+                            static uint64_t checkIdx = 0;
+                            if (pairDump.is_open()) {
+                                uint32_t np = bp.clusterPairCount[0];
+                                if (np > bp.clusterPairCap) np = bp.clusterPairCap;
+                                pairDump << checkIdx << ' ' << np;
+                                for (uint32_t pi = 0; pi < np; ++pi)
+                                    pairDump << ' ' << bp.clusterPairBuf.ptr[pi].a
+                                             << ':' << bp.clusterPairBuf.ptr[pi].b;
+                                pairDump << '\n';
+                                ++checkIdx;
+                            }
+                        }
                     }
                 }
 
@@ -14054,6 +14077,61 @@ static int runClusterCompare(int particleNum1D, int maxSplitS, int frames, int r
     }
     csv.close();
     std::cerr << "[cluster-compare DONE] wrote " << outPath << "\n";
+    return 0;
+}
+
+// Pair-persistence (temporal-coherence) probe: builds the SAME camel+cloth
+// cluster-VF scene as runClusterCompare's cluster variant, runs `frames` frames,
+// and (via YSIM_PAIR_DUMP) dumps the cluster-cluster candidate-pair set on every
+// broad check. Offline: how often a once-detected pair survives into the next
+// check, and the run-length stats of consecutive survival. One config, one run.
+static int runPairPersistence(int particleNum1D, int splitS, int frames) {
+    using Backend = METAL;
+    using SystemT = ExplicitSystem<Backend, Precision>;
+    if (!MetalGlobalContext::getDevice() || !MetalKernelContext::getLibrary()) {
+        std::cerr << "[pair-persistence SKIP] metal unavailable\n"; return 0;
+    }
+    // Scene reset (identical to runClusterCompare::resetScene).
+    for (auto& m : Scene<Backend, Precision>::meshes) m.initializer = nullptr;
+    Scene<Backend, Precision>::meshes.clear();
+    for (auto& r : Scene<Backend, Precision>::requestsGeneralMeshes) delete r.initializer;
+    Scene<Backend, Precision>::requestsGeneralMeshes.clear();
+    Scene<Backend, Precision>::numMeshes = 0; Scene<Backend, Precision>::nextMeshId = 0;
+    Scene<Backend, Precision>::dirty = true; Scene<Backend, Precision>::environment = SceneEnvironment{};
+    GlobalAutoAllocator<Backend>::hardReset();
+
+    Precision h = Precision(1)/Precision(60);
+    SystemT system(h, 60);
+    Simulator<Backend, Precision, SystemT> sim(system);
+    sim.pause = false;
+    sim.profileLevel = sim_config::ProfileLevel::InFrame;  // syncEachPhase ⇒ pairs coherent
+    sim.addCloth(particleNum1D, Precision(1.0), tinym::vec3(0, Precision(1.25), 0),
+                 Precision(1e5), Precision(1e5), Precision(2e5), Precision(0.01), Precision(0.1));
+    const char* obsObj    = std::getenv("YSIM_OBSTACLE_OBJ");
+    const char* obsScaleE = std::getenv("YSIM_OBSTACLE_SCALE");
+    const char* obsYE     = std::getenv("YSIM_OBSTACLE_Y");
+    Precision obsScale = obsScaleE ? (Precision)std::atof(obsScaleE) : Precision(0.04);
+    Precision obsY     = obsYE     ? (Precision)std::atof(obsYE)     : Precision(0.35);
+    sim.addFloatMesh(ysim_paths::assetRoot(), obsObj ? obsObj : "Human.obj",
+                     tinym::vec3(0, obsY, 0), obsScale);
+    { auto& hr = Scene<Backend, Precision>::requestsGeneralMeshes.back();
+      hr.isStatic = true; hr.applyGravity = false; hr.applyWind = false; }
+    sim.initialize();
+    auto& bp = sim.collisionPipeline.broadPhase;
+    bp.twoMeshExperiment = true;
+    bp.useSubObjectBVH   = true;
+    bp.subBvhSplitS      = splitS;
+    bp.subTopMode        = 1;
+    bp.clusterNonGridBVH = true;
+    bp.clusterVFPipeline = true;
+    bp.fusedRefitEnlarge = true;
+    if (bp.objTrees.size() > 1) bp.objTrees[1].builtForLifetimeId = -1;
+    int k = bp.objTrees.size() > 1 ? bp.objTrees[1].numGroups : 1;
+    std::cerr << "[pair-persistence] P=" << particleNum1D << " s=" << splitS
+              << " k=" << k << " frames=" << frames << " (60 substeps/frame ⇒ "
+              << frames*60 << " checks); dump=" << (std::getenv("YSIM_PAIR_DUMP") ? std::getenv("YSIM_PAIR_DUMP") : "(unset!)") << "\n";
+    for (int f = 0; f < frames; ++f) sim.update();
+    std::cerr << "[pair-persistence DONE]\n";
     return 0;
 }
 
@@ -20316,6 +20394,15 @@ int main(int argc, char** argv) {
         int Fr = (argc > 4) ? std::atoi(argv[4]) : 30;
         int R = (argc > 5) ? std::atoi(argv[5]) : 5;
         return runClusterCompare(P, S, Fr, R);
+    }
+    if (argc > 1 && std::string(argv[1]) == "--bench-pair-persistence") {
+        // Temporal-coherence probe on cluster-cluster candidate pairs. Same
+        // camel+cloth cluster-VF scene; dumps per-check pair sets to YSIM_PAIR_DUMP.
+        // Args: <P=50> <splitS=4> <frames=24>.
+        int P = (argc > 2) ? std::atoi(argv[2]) : 50;
+        int S = (argc > 3) ? std::atoi(argv[3]) : 4;
+        int F = (argc > 4) ? std::atoi(argv[4]) : 24;
+        return runPairPersistence(P, S, F);
     }
     if (argc > 1 && std::string(argv[1]) == "--bench-cluster-live") {
         // GPU cluster VF pipeline live: validate broad set == full + frame time.
