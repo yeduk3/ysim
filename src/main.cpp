@@ -7831,8 +7831,13 @@ struct BVH<BE, PR, BVHMODE::SCENE, BVHPRIMITIVE::OBJECT> {
         float bmin[3]={1e30f,1e30f,1e30f}, bmax[3]={-1e30f,-1e30f,-1e30f}, maxExt=0.0f;
         for (int g=0; g<ks; ++g) for (int c=0;c<3;++c){ bmin[c]=std::min(bmin[c],hA[6*g+c]); bmax[c]=std::max(bmax[c],hA[6*g+3+c]); maxExt=std::max(maxExt,hA[6*g+3+c]-hA[6*g+c]); }
         float cell = maxExt > 1e-6f ? maxExt : 1.0f;
-        int dims[3]; for (int c=0;c<3;++c) dims[c]=std::max(1,(int)std::ceil((bmax[c]-bmin[c])/cell));
-        size_t numCells = (size_t)dims[0]*dims[1]*dims[2];
+        // Floor the cell so the grid resolution stays sane: at very high s the
+        // clusters are ~single triangles, so cell→tiny would explode dims/numCells.
+        int dims[3]; size_t numCells = 0;
+        for (int it = 0; it < 64; ++it) {
+            size_t nc = 1; for (int c=0;c<3;++c){ dims[c]=std::max(1,(int)std::ceil((bmax[c]-bmin[c])/cell)); nc*=(size_t)dims[c]; }
+            numCells = nc; if (nc <= (size_t(1)<<20)) break; cell *= 1.6f;   // cap ~1M cells
+        }
         auto cellRange = [&](int g, int lo[3], int hi[3]) { for (int c=0;c<3;++c){
             lo[c]=std::min(std::max(0,(int)std::floor((hA[6*g+c]-bmin[c])/cell)),dims[c]-1);
             hi[c]=std::min(std::max(0,(int)std::floor((hA[6*g+3+c]-bmin[c])/cell)),dims[c]-1); } };
@@ -7877,8 +7882,10 @@ struct BVH<BE, PR, BVHMODE::SCENE, BVHPRIMITIVE::OBJECT> {
         cloth.computeClusterAABBGPU(clothClusterAABB);          // (1) cloth AABBs (GPU)
         if (!clusterGridBuilt) { MetalGlobalContext::commitAndWait(); buildHumanClusterGrid(human, margin); }
 
-        // (2) grid pair query (GPU). Reset count on GPU, dispatch over kc.
-        uint32_t maxPairs = (uint32_t)kc * (uint32_t)ks;
+        // (2) grid pair query (GPU). Reset count on GPU, dispatch over kc. Cap the
+        // pair buffer / over-dispatch: kc*ks explodes at very high s (s8 ~117M), but
+        // the actual overlaps are few thousand, so a 4M cap never clamps in practice.
+        uint32_t maxPairs = (uint32_t)std::min<uint64_t>((uint64_t)kc * (uint64_t)ks, 4u*1024u*1024u);
         if (clusterPairCap < maxPairs) { clusterPairCap = maxPairs; clusterPairBuf = VectorBase<METAL, ClusterPair>((Index)maxPairs); }
         if (!clusterPairCount.ptr) clusterPairCount = VectorBase<METAL, uint32_t>(1, 0u);
         MetalGlobalContext::setBuffer(clusterPairCount, 0); MetalGlobalContext::dispatchThreads(resetPSO, 1);
@@ -13716,6 +13723,119 @@ static int runClusterLive(int particleNum1D, int splitS, int frames, int reps) {
     for (int r=0; r<std::max(1,reps); ++r) { double a,b,c,d; runSim(false,a,b); runSim(true,c,d); fmF=a;myF=b;fmC=c;myC=d; }
     printf("[cluster-live B] s=%d frames=%d  full=%.2f ms (maxY %.3f)  cluster=%.2f ms (maxY %.3f)  speedup=%.2fx\n",
            splitS, frames, fmF, myF, fmC, myC, fmC>0?fmF/fmC:0.0);
+    return 0;
+}
+
+// Proper two-mesh comparison (PerFrame async, frame_ms — same methodology as the
+// twomesh sweep): general single-root BVH vs sub-object BVH, both the OLD path
+// (full detectCollisionsTwoMesh, which LOST in project_twomesh_experiment because
+// the per-point top phase blows up with k) and the NEW clustered cluster-VF
+// pipeline (Human connectivity-clustered + grid cluster-pair broad + bidirectional
+// VF). Variants: single(s=0) / subobj(s) full-detect / cluster(s) VF-pipeline.
+static int runClusterCompare(int particleNum1D, int maxSplitS, int frames, int repeats) {
+    using Backend = METAL;
+    using SystemT = ExplicitSystem<Backend, Precision>;
+    using Clock = std::chrono::steady_clock;
+    if (!MetalGlobalContext::getDevice() || !MetalKernelContext::getLibrary()) {
+        std::cerr << "[cluster-compare SKIP] metal unavailable\n"; return 0;
+    }
+    namespace fs = std::filesystem;
+    std::string outPath;
+#ifdef YSIM_PROJECT_ROOT
+    outPath = std::string(YSIM_PROJECT_ROOT) + "/profiles/experiment/cluster/cluster_compare.csv";
+#else
+    outPath = "profiles/experiment/cluster/cluster_compare.csv";
+#endif
+    if (const char* o = std::getenv("YSIM_BENCH_CSV")) outPath = o;
+    fs::path csvPath(outPath);
+    if (csvPath.has_parent_path()) { std::error_code ec; fs::create_directories(csvPath.parent_path(), ec); }
+    std::ofstream csv(csvPath);
+    csv << "variant,split_s,num_groups,repeat,refit_ms,detect_ms,narrow_ms,"
+           "sysupd_ms,frame_ms,broad,narrow,cloth_maxY\n";
+
+    auto resetScene = []() {
+        for (auto& m : Scene<Backend, Precision>::meshes) m.initializer = nullptr;
+        Scene<Backend, Precision>::meshes.clear();
+        for (auto& r : Scene<Backend, Precision>::requestsGeneralMeshes) delete r.initializer;
+        Scene<Backend, Precision>::requestsGeneralMeshes.clear();
+        Scene<Backend, Precision>::numMeshes = 0; Scene<Backend, Precision>::nextMeshId = 0;
+        Scene<Backend, Precision>::dirty = true; Scene<Backend, Precision>::environment = SceneEnvironment{};
+    };
+    auto median = [](std::vector<double> v) { if (v.empty()) return 0.0; std::sort(v.begin(),v.end());
+        size_t n=v.size(); return (n&1)?v[n/2]:0.5*(v[n/2-1]+v[n/2]); };
+
+    struct VR { double refit, detect, narrow, sysupd, frame, maxY; uint32_t broad, narrowN; int k; };
+    auto runVariant = [&](int splitS, bool sub, bool clusterVF) -> VR {
+        resetScene();
+        Precision h = Precision(1)/Precision(60);
+        SystemT system(h, 60);
+        Simulator<Backend, Precision, SystemT> sim(system);
+        sim.pause = false;
+        sim.profileLevel = sim_config::ProfileLevel::InFrame;   // per-section timers live
+        sim.addCloth(particleNum1D, Precision(1.0), tinym::vec3(0, Precision(1.25), 0),
+                     Precision(1e5), Precision(1e5), Precision(2e5), Precision(0.01), Precision(0.1));
+        sim.addFloatMesh(ysim_paths::assetRoot(), "Human.obj",
+                         tinym::vec3(0, Precision(0.35), 0), Precision(0.04));
+        { auto& hr = Scene<Backend, Precision>::requestsGeneralMeshes.back();
+          hr.isStatic = true; hr.applyGravity = false; hr.applyWind = false; }
+        sim.initialize();
+        auto& bp = sim.collisionPipeline.broadPhase;
+        bp.twoMeshExperiment = true;
+        bp.useSubObjectBVH   = sub;
+        bp.subBvhSplitS      = splitS;
+        bp.subTopMode        = 1;            // GPU brute top for the old sub-object path
+        bp.clusterNonGridBVH = clusterVF;    // Human cluster only for the VF pipeline
+        bp.clusterVFPipeline = clusterVF;
+        bp.fusedRefitEnlarge = true;
+        if (clusterVF && bp.objTrees.size() > 1) bp.objTrees[1].builtForLifetimeId = -1;
+
+        profiler::FrameProfiler prof((std::size_t)(frames + 4));
+        sim.profiler = &prof;
+        auto secMs = [&](const char* nm) -> double {
+            const auto* s = prof.history().latestFrame();
+            int i = prof.history().sectionIndex(nm);
+            if (s && i >= 0 && (std::size_t)i < s->section_ms.size()) return (double)s->section_ms[i];
+            return 0.0;
+        };
+        std::vector<double> fv, rv, dv, nv, sv; int warm = std::min(frames/2, 8);
+        for (int f = 0; f < frames; ++f) {
+            prof.beginFrame((uint64_t)f, (double)f*(double)h);
+            auto a = Clock::now(); sim.update(); auto b = Clock::now();
+            prof.endFrame();
+            if (f >= warm) { fv.push_back(std::chrono::duration<double,std::milli>(b-a).count());
+                rv.push_back(secMs("broad_refit_swept")); dv.push_back(secMs("broad_detect"));
+                nv.push_back(secMs("narrow_phase")); sv.push_back(secMs("system_update")); }
+        }
+        sim.profiler = nullptr;
+        auto& pc = Scene<Backend, Precision>::packedCollisionData;
+        auto& cloth = Scene<Backend, Precision>::meshes[0];
+        Index n = cloth.state.x.size/3; Precision mx=-1e30;
+        for (Index i=0;i<n;++i) mx=std::max(mx, cloth.state.x[i*3+1]);
+        int k = clusterVF && bp.objTrees.size()>1 ? bp.objTrees[1].numGroups
+              : (sub && !bp.objTrees.empty() ? bp.objTrees[0].numGroups : 1);
+        return { median(rv), median(dv), median(nv), median(sv), median(fv), (double)mx,
+                 (uint32_t)pc.numBroadCollisions[0], (uint32_t)pc.numNarrowCollisions[0], k };
+    };
+
+    std::vector<std::tuple<const char*,int,bool,bool>> variants = {{"single",0,false,false}};
+    for (int s=1; s<=maxSplitS; ++s) { variants.push_back({"subobj",s,true,false});
+                                       variants.push_back({"cluster",s,true,true}); }
+    std::cerr << "=== cluster-compare: P=" << particleNum1D << " s=0.." << maxSplitS
+              << " variants={single,subobj(full-detect),cluster(VF-pipeline)} InFrame frames="
+              << frames << " reps=" << repeats << " (interleaved, median, per-section) ===\n";
+    for (int r = 0; r < repeats; ++r) {
+        for (auto [name, s, sub, cl] : variants) {
+            VR v = runVariant(s, sub, cl);
+            csv << name << ',' << s << ',' << v.k << ',' << r << ',' << v.refit << ','
+                << v.detect << ',' << v.narrow << ',' << v.sysupd << ',' << v.frame << ','
+                << v.broad << ',' << v.narrowN << ',' << v.maxY << '\n'; csv.flush();
+            std::cerr << "[cluster-compare r=" << r << ' ' << name << " s=" << s << " k=" << v.k
+                      << "] refit=" << v.refit << " detect=" << v.detect << " narrow=" << v.narrow
+                      << " sysupd=" << v.sysupd << " frame=" << v.frame << "ms maxY=" << v.maxY << "\n";
+        }
+    }
+    csv.close();
+    std::cerr << "[cluster-compare DONE] wrote " << outPath << "\n";
     return 0;
 }
 
@@ -19969,6 +20089,15 @@ int main(int argc, char** argv) {
         int Fr = (argc > 4) ? std::atoi(argv[4]) : 20;
         int R = (argc > 5) ? std::atoi(argv[5]) : 20;
         return runClusterVFBench(P, S, Fr, R);
+    }
+    if (argc > 1 && std::string(argv[1]) == "--bench-cluster-compare") {
+        // Proper twomesh-style sweep: single-root vs sub-object (old full-detect)
+        // vs cluster-VF pipeline, PerFrame frame_ms. Args: <P=50> <maxS=6> <frames=30> <reps=5>.
+        int P = (argc > 2) ? std::atoi(argv[2]) : 50;
+        int S = (argc > 3) ? std::atoi(argv[3]) : 6;
+        int Fr = (argc > 4) ? std::atoi(argv[4]) : 30;
+        int R = (argc > 5) ? std::atoi(argv[5]) : 5;
+        return runClusterCompare(P, S, Fr, R);
     }
     if (argc > 1 && std::string(argv[1]) == "--bench-cluster-live") {
         // GPU cluster VF pipeline live: validate broad set == full + frame time.
