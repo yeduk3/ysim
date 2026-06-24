@@ -59,6 +59,7 @@ struct METAL : Backend {};
 
 #include <algorithm>
 #include <chrono>
+#include <thread>
 #include <cstring>
 #include <filesystem>
 #include <random>
@@ -553,6 +554,16 @@ struct GlobalAutoAllocator {
     // BroadPhase::build allocations reuse the existing backing buffers
     // instead of leaking forward. Call at the TOP of Simulator::initialize.
     static void reset() { globalPool.pool.resetMarkers(); }
+
+    // Hard reset: FREE every sub-pool (releasing the Metal buffers) and force
+    // the next globalInitialize to rebuild from scratch. reset() only rewinds
+    // markers, so when the allocation SEQUENCE changes between runs (e.g. a
+    // bench sweeping single-root vs clustered, which allocate different buffer
+    // sets) the pool fragments and appends fresh sub-pools every iteration —
+    // unbounded growth that eventually exceeds the GPU working set and faults.
+    // Bench harnesses call this between scene variants to cap the footprint at
+    // a single variant's true need.
+    static void hardReset() { globalPool.pool.clear(); globalInitialized = false; }
 
     template <typename PR>
     static MemoryBlock<BE, PR> alloc(size_t count) { return globalPool.template alloc<PR>(count); }
@@ -3475,6 +3486,15 @@ struct Scene {
         }
 
         // allocate collisions
+        // YSIM_COLS_PER_POINT raises the per-point broad-pair budget so a
+        // densely-draping cloth on a big obstacle (P200 + camel ≈ 6–12M
+        // pairs) does NOT overflow the buffer and silently drop pairs —
+        // dropped pairs are the source of non-reproducible detect times and
+        // patchy tunneling. Default 15 keeps normal-run memory small.
+        if (const char* e = std::getenv("YSIM_COLS_PER_POINT")) {
+            int v = std::atoi(e);
+            if (v > 0) packedCollisionData.approxColsPerPoints = (Index)v;
+        }
         packedCollisionData.maxNumCollisions = numPoints*packedCollisionData.approxColsPerPoints;
         packedCollisionData.broadCollisions = VectorBase<BE, BroadCollision>(packedCollisionData.maxNumCollisions);
         packedCollisionData.numBroadCollisions = VectorBase<BE, Index>(1, 0);
@@ -3489,7 +3509,12 @@ struct Scene {
         // fits: segMaxTGs uses TOTAL numPoints as an upper bound on any
         // single mesh's point count, segPerTGCap mirrors the global
         // per-point estimate scaled to one threadgroup.
-        packedCollisionData.segPerTGCap = packedCollisionData.approxColsPerPoints
+        // Decoupled from approxColsPerPoints: the segmented path's per-TG
+        // budget keeps its historical base (15) so raising the global broad
+        // budget (YSIM_COLS_PER_POINT) does not multiply this scratch by the
+        // same factor (would balloon to ~1GB at cols=256). Segmented query is
+        // off in the cluster bench anyway; this only sizes its idle scratch.
+        packedCollisionData.segPerTGCap = Index(15)
                                         * packedCollisionData.segTGSize
                                         * packedCollisionData.segPerTGCapFactor;
         packedCollisionData.segMaxTGs   = std::max<Index>(1,
@@ -8873,7 +8898,26 @@ struct Simulator {
         if (mesh.rigidBodyHandle != ysim::physics::kInvalidBodyHandle) return;
 
         ysim::physics::RigidInitial init{};
-        init.position = mesh.transformPosition;
+        // Spawn the body at the mesh's VERTEX CENTROID, not transformPosition.
+        // The per-step rigid sync (see update()) snaps the centroid onto the
+        // body origin; transformPosition == the initializer offset, which
+        // equals the centroid only for origin-authored shapes (sphere/cube).
+        // A file OBJ whose local centroid sits off-origin (camel: +0.30y)
+        // would otherwise jerk by -(localCentroid*scale) on the first step.
+        // Falls back to transformPosition when verts aren't packed yet.
+        tinym::vec3 spawn = mesh.transformPosition;
+        const Index nv = mesh.state.x.size / 3;
+        if (nv > 0 && mesh.state.x.ptr) {
+            tinym::vec3 c{0, 0, 0};
+            const PR* xp = mesh.state.x.ptr;
+            for (Index vi = 0; vi < nv; ++vi) {
+                c.x += (float)xp[vi*3+0];
+                c.y += (float)xp[vi*3+1];
+                c.z += (float)xp[vi*3+2];
+            }
+            spawn = tinym::vec3(c.x / nv, c.y / nv, c.z / nv);
+        }
+        init.position = spawn;
         init.rotation = mesh.rotationQuat;
         // Apply Gravity=false → Bullet static body (mass=0): it never
         // falls, never receives impulses, but still serves as a
@@ -13883,9 +13927,16 @@ static int runClusterCompare(int particleNum1D, int maxSplitS, int frames, int r
         Scene<Backend, Precision>::requestsGeneralMeshes.clear();
         Scene<Backend, Precision>::numMeshes = 0; Scene<Backend, Precision>::nextMeshId = 0;
         Scene<Backend, Precision>::dirty = true; Scene<Backend, Precision>::environment = SceneEnvironment{};
+        // Free the global pool between variants so its footprint never
+        // accumulates across the sweep (else big-P + high cols faults).
+        GlobalAutoAllocator<Backend>::hardReset();
     };
-    auto median = [](std::vector<double> v) { if (v.empty()) return 0.0; std::sort(v.begin(),v.end());
-        size_t n=v.size(); return (n&1)?v[n/2]:0.5*(v[n/2-1]+v[n/2]); };
+    // Mean (not median): with the broad buffer sized to never overflow
+    // (YSIM_COLS_PER_POINT), per-frame times are stable enough that the mean
+    // is the honest central estimate and exposes outliers the median hides.
+    auto avg = [](const std::vector<double>& v) -> double {
+        if (v.empty()) return 0.0;
+        double s = 0.0; for (double x : v) s += x; return s / (double)v.size(); };
 
     struct VR { double refit, detect, narrow, sysupd, frame, maxY; uint32_t broad, narrowN; int k; };
     auto runVariant = [&](int splitS, bool sub, bool clusterVF) -> VR {
@@ -13948,9 +13999,30 @@ static int runClusterCompare(int particleNum1D, int maxSplitS, int frames, int r
         auto& cloth = Scene<Backend, Precision>::meshes[0];
         Index n = cloth.state.x.size/3; Precision mx=-1e30;
         for (Index i=0;i<n;++i) mx=std::max(mx, cloth.state.x[i*3+1]);
+        // Viz dump: when YSIM_DUMP_VERTS=<path> is set and THIS variant is the
+        // cluster run at split YSIM_DUMP_S (default 4), write every mesh's
+        // final-frame vertices as "x y z mesh_index" so an offline plotter can
+        // show the cloth (mesh 1+) draped on the obstacle (mesh 0... here mesh
+        // 0 = cloth, mesh 1 = obstacle). Proves detection held (cloth rests on
+        // the camel, not through it).
+        if (const char* dp = std::getenv("YSIM_DUMP_VERTS")) {
+            int dumpS = std::getenv("YSIM_DUMP_S") ? std::atoi(std::getenv("YSIM_DUMP_S")) : 4;
+            if (clusterVF && splitS == dumpS) {
+                std::ofstream vf(dp);
+                vf << "# x y z mesh_index  (mesh0=cloth, mesh1=obstacle)\n";
+                auto& ms = Scene<Backend, Precision>::meshes;
+                for (size_t mi = 0; mi < ms.size(); ++mi) {
+                    Index nv = ms[mi].state.x.size / 3;
+                    for (Index v = 0; v < nv; ++v)
+                        vf << ms[mi].state.x[v*3+0] << ' ' << ms[mi].state.x[v*3+1] << ' '
+                           << ms[mi].state.x[v*3+2] << ' ' << mi << '\n';
+                }
+                std::cerr << "[dump] wrote " << dp << " (variant cluster s=" << splitS << ")\n";
+            }
+        }
         int k = clusterVF && bp.objTrees.size()>1 ? bp.objTrees[1].numGroups
               : (sub && !bp.objTrees.empty() ? bp.objTrees[0].numGroups : 1);
-        return { median(rv), median(dv), median(nv), median(sv), median(fv), (double)mx,
+        return { avg(rv), avg(dv), avg(nv), avg(sv), avg(fv), (double)mx,
                  (uint32_t)pc.numBroadCollisions[0], (uint32_t)pc.numNarrowCollisions[0], k };
     };
 
@@ -13963,8 +14035,14 @@ static int runClusterCompare(int particleNum1D, int maxSplitS, int frames, int r
     std::cerr << "=== cluster-compare: P=" << particleNum1D << " s=0.." << maxSplitS
               << " variants={single,subobj(full-detect),cluster(VF-pipeline)} InFrame frames="
               << frames << " reps=" << repeats << " (interleaved, median, per-section) ===\n";
+    // YSIM_COOLDOWN_MS sleeps between variants so the GPU returns toward a
+    // baseline temperature before each timed run — separates thermal drift
+    // from the (dominant) cloth-chaos variance. 0 = off.
+    int cooldownMs = std::getenv("YSIM_COOLDOWN_MS") ? std::atoi(std::getenv("YSIM_COOLDOWN_MS")) : 0;
     for (int r = 0; r < repeats; ++r) {
         for (auto [name, s, sub, cl] : variants) {
+            if (cooldownMs > 0)
+                std::this_thread::sleep_for(std::chrono::milliseconds(cooldownMs));
             VR v = runVariant(s, sub, cl);
             csv << name << ',' << s << ',' << v.k << ',' << r << ',' << v.refit << ','
                 << v.detect << ',' << v.narrow << ',' << v.sysupd << ',' << v.frame << ','
