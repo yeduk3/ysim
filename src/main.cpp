@@ -188,19 +188,44 @@ struct MetalGlobalContext {
         getComputeCommandEncoder()->setComputePipelineState(pso);
         getComputeCommandEncoder()->dispatchThreads(gridSize, groupSize);
     }
+    // Last command buffer flushed by commit() (no-wait) with no later encoder yet.
+    // commitAndWait() waits on it so a frame that ended on a per-substep commit
+    // still synchronizes at its boundary (else the CPU would read GPU-in-flight x).
+    inline static MTL::CommandBuffer* lastCommitted = nullptr;
     static void commitAndWait() {
-        // No pending encoder = nothing to commit. Used to crash on null
-        // dereference; D-030's hybrid bottom-up driver needs a no-op
-        // path when its prior dispatches already committed (e.g.,
-        // pure-CPU branch called between two GPU-dispatching paths).
+        if (computeCommandEncoder) {
+            computeCommandEncoder->endEncoding();
+            commandBuffer->commit();
+            commandBuffer->waitUntilCompleted();
+            commandBuffer = nullptr;
+            computeCommandEncoder = nullptr;
+            lastCommitted = nullptr;
+            ++syncCount;
+            return;
+        }
+        // No pending encoder. If the last work was flushed by commit() (no-wait),
+        // wait on it now — otherwise nothing to do (D-030: a no-op path is needed
+        // when prior dispatches already committed, e.g. a pure-CPU branch between
+        // two GPU-dispatching paths).
+        if (lastCommitted) {
+            lastCommitted->waitUntilCompleted();
+            lastCommitted = nullptr;
+            ++syncCount;
+        }
+    }
+    // Flush the current command buffer to the GPU WITHOUT blocking the CPU. The
+    // next dispatch opens a fresh command buffer; same-queue buffers run in order
+    // so correctness is preserved. Lets the GPU start a substep while the CPU
+    // encodes the next (pipelining) instead of one giant per-frame buffer. NOT a
+    // sync (no waitUntilCompleted, no syncCount++); the frame-boundary
+    // commitAndWait waits on `lastCommitted`.
+    static void commit() {
         if (!computeCommandEncoder) return;
         computeCommandEncoder->endEncoding();
         commandBuffer->commit();
-        commandBuffer->waitUntilCompleted();
-
+        lastCommitted = commandBuffer;
         commandBuffer = nullptr;
         computeCommandEncoder = nullptr;
-        ++syncCount;
     }
 
 };
@@ -8521,6 +8546,11 @@ struct Simulator {
     bool syncEachPhase() const {
         return profileLevel == sim_config::ProfileLevel::InFrame;
     }
+    // Experiment: in PerFrame mode, commit (NO wait) after each substep so the GPU
+    // pipelines substeps instead of running one giant per-frame command buffer.
+    // The frame-boundary commitAndWait still provides the single sync. Default OFF
+    // ⇒ PerFrame behaves as before (one buffer/frame).
+    bool perFrameSubstepCommit = false;
 
 
     PR margin = 0.015;
@@ -10945,6 +10975,15 @@ struct Simulator {
                 system.update(scene);
             } else {
                 system.update(scene);
+            }
+
+            // Experiment: PerFrame + perFrameSubstepCommit → flush this substep's
+            // command buffer to the GPU without waiting, so the GPU executes it
+            // while the CPU encodes the next substep (pipelining) instead of one
+            // giant per-frame buffer. The boundary commitAndWait below is the sync.
+            if (perFrameSubstepCommit
+                && profileLevel == sim_config::ProfileLevel::PerFrame) {
+                MetalGlobalContext::commit();
             }
         }
 
@@ -13776,6 +13815,8 @@ static int runClusterCompare(int particleNum1D, int maxSplitS, int frames, int r
         static const bool perFrame = std::getenv("YSIM_CLUSTER_PERFRAME") != nullptr;
         sim.profileLevel = perFrame ? sim_config::ProfileLevel::PerFrame
                                     : sim_config::ProfileLevel::InFrame;
+        // YSIM_PERFRAME_SUBSTEP_COMMIT=1: per-substep commit(no-wait) experiment.
+        sim.perFrameSubstepCommit = std::getenv("YSIM_PERFRAME_SUBSTEP_COMMIT") != nullptr;
         sim.addCloth(particleNum1D, Precision(1.0), tinym::vec3(0, Precision(1.25), 0),
                      Precision(1e5), Precision(1e5), Precision(2e5), Precision(0.01), Precision(0.1));
         sim.addFloatMesh(ysim_paths::assetRoot(), "Human.obj",
