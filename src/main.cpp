@@ -13771,7 +13771,11 @@ static int runClusterCompare(int particleNum1D, int maxSplitS, int frames, int r
         SystemT system(h, 60);
         Simulator<Backend, Precision, SystemT> sim(system);
         sim.pause = false;
-        sim.profileLevel = sim_config::ProfileLevel::InFrame;   // per-section timers live
+        // Default InFrame so per-section timers are live; YSIM_CLUSTER_PERFRAME=1
+        // switches to PerFrame async (sections dead, frame_ms = real cost).
+        static const bool perFrame = std::getenv("YSIM_CLUSTER_PERFRAME") != nullptr;
+        sim.profileLevel = perFrame ? sim_config::ProfileLevel::PerFrame
+                                    : sim_config::ProfileLevel::InFrame;
         sim.addCloth(particleNum1D, Precision(1.0), tinym::vec3(0, Precision(1.25), 0),
                      Precision(1e5), Precision(1e5), Precision(2e5), Precision(0.01), Precision(0.1));
         sim.addFloatMesh(ysim_paths::assetRoot(), "Human.obj",
@@ -13817,8 +13821,11 @@ static int runClusterCompare(int particleNum1D, int maxSplitS, int frames, int r
                  (uint32_t)pc.numBroadCollisions[0], (uint32_t)pc.numNarrowCollisions[0], k };
     };
 
+    // YSIM_CLUSTER_NOSUBOBJ=1 drops the old full-detect sub-object variant (it's
+    // catastrophic at high P/s — skip it to keep big-P sweeps tractable).
+    bool noSub = std::getenv("YSIM_CLUSTER_NOSUBOBJ") != nullptr;
     std::vector<std::tuple<const char*,int,bool,bool>> variants = {{"single",0,false,false}};
-    for (int s=1; s<=maxSplitS; ++s) { variants.push_back({"subobj",s,true,false});
+    for (int s=1; s<=maxSplitS; ++s) { if (!noSub) variants.push_back({"subobj",s,true,false});
                                        variants.push_back({"cluster",s,true,true}); }
     std::cerr << "=== cluster-compare: P=" << particleNum1D << " s=0.." << maxSplitS
               << " variants={single,subobj(full-detect),cluster(VF-pipeline)} InFrame frames="
