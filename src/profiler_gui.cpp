@@ -127,10 +127,10 @@ void drawProfilerWindow(
         ImGui::TextDisabled(*fused_refit_enlarge ? "[1 swept pass]" : "[2-pass legacy]");
     }
     if (use_subobject_bvh) {
-        ImGui::Checkbox("Sub-object BVH (B)", use_subobject_bvh);
+        ImGui::Checkbox("Cluster mode", use_subobject_bvh);
         ImGui::SameLine();
-        ImGui::TextDisabled(*use_subobject_bvh ? "[multi-root + mini-TLAS]"
-                                               : "[single-root]");
+        ImGui::TextDisabled(*use_subobject_bvh ? "[cluster sub-obj BVH — per-object s in 물체 panel]"
+                                               : "[off]");
         if (subbvh_split_s) {
             // SliderInt clamps to [1,16]; k = tiles² saturates at full split.
             ImGui::SliderInt("Split s (N)", subbvh_split_s, 1, 16, "s=%d");

@@ -671,6 +671,34 @@ void drawMeshInspectorWindow(MeshInspectorWindowState& st, const MeshInspectorTa
         }
     }
 
+    // ─── 서브오브젝트 BVH Sub-object BVH (per-object; master in profiler) ──
+    if(t.subobj_split_s&&t.subobj_render){
+        if(AccordionHeader("서브오브젝트 BVH","Sub-object BVH")){
+            ImGui::Dummy({0,kP});ImGui::Indent(kP);
+            // split s slider (integer 1..8, k = 4^s) — per object
+            {
+                float contentW=CW(),labelOff=60,valW=36,gap=8,sliderW=contentW-labelOff-gap-valW;
+                ImGui::PushStyleColor(ImGuiCol_Text,kG60);ImGui::TextUnformatted("분할 s");ImGui::PopStyleColor();
+                ImGui::SameLine(kP+labelOff);
+                ImGui::PushStyleColor(ImGuiCol_FrameBg,kG10);ImGui::PushStyleColor(ImGuiCol_FrameBgHovered,kG10);ImGui::PushStyleColor(ImGuiCol_FrameBgActive,kG10);
+                ImGui::PushStyleVar(ImGuiStyleVar_FramePadding,ImVec2(0,4));
+                ImGui::SetNextItemWidth(sliderW);
+                int si=*t.subobj_split_s;
+                bool ch=ImGui::SliderInt("##sob_s",&si,1,8,"");
+                ImGui::PopStyleVar();ImGui::PopStyleColor(3);
+                ImGui::SameLine(kP+contentW-valW);
+                ImGui::PushStyleColor(ImGuiCol_Text,kG60);ImGui::Text("%d",si);ImGui::PopStyleColor();
+                if(ch&&si!=*t.subobj_split_s){*t.subobj_split_s=si;if(t.on_subobj_split)t.on_subobj_split(t.mesh_id,si);}
+            }
+            ImGui::Dummy({0,12});
+            // color the selected mesh's triangles by cluster
+            ImGui::PushStyleColor(ImGuiCol_Text,kG60);ImGui::TextUnformatted("클러스터 렌더링");ImGui::PopStyleColor();
+            ImGui::SameLine(kP+CW()-42);
+            if(PillToggle("##sob_rn",t.subobj_render)){if(t.on_subobj_render)t.on_subobj_render(t.mesh_id,*t.subobj_render);}
+            ImGui::Unindent(kP);ImGui::Dummy({0,kP});
+        }
+    }
+
     ImGui::PopStyleVar(2);ImGui::End();
 }
 } // namespace mesh_inspector

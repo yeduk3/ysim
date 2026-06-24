@@ -15,8 +15,11 @@
 #include <GL/glew.h>
 #include <Eigen/Dense>
 
+#include <cmath>
 #include <cstddef>
+#include <cstdint>
 #include <iostream>
+#include <vector>
 
 #include "program.hpp"
 #include "tinym.hpp"
@@ -157,6 +160,73 @@ struct MeshGL<CPU> {
         glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, facetBuffer);
 
         glDrawElements(GL_TRIANGLES, facetNum*3, GL_UNSIGNED_INT, 0);
+    }
+
+    // ── Cluster visualization (debug) ─────────────────────────────────
+    // Multi-draw the mesh colored by sub-object BVH cluster: a cluster-
+    // sorted index buffer (built on demand, keyed by cluster count) + per-
+    // cluster (offset,count) ranges, each drawn with a hashed baseColor
+    // through the normal PBR shader. No shader/attribute changes — just one
+    // extra draw call per non-empty cluster.
+    // ponytail: O(#clusters) draw calls/frame while the toggle is on; fine
+    // for a debug viz, gate to low s if it ever bites perf.
+    GLuint clusterEBO = 0;
+    std::vector<uint32_t> clusterOffset, clusterCount, clusterId;  // parallel, per drawn cluster
+    int clusterVizKey = -1;
+
+    static tinym::vec3 clusterColor(uint32_t g) {
+        // golden-ratio hue hash → vivid, well-separated colors per cluster
+        float h = std::fmod((float)g * 0.61803398875f, 1.0f) * 6.0f;
+        float x = 1.0f - std::fabs(std::fmod(h, 2.0f) - 1.0f);
+        float r, gr, b;
+        if      (h < 1) { r=1; gr=x; b=0; } else if (h < 2) { r=x; gr=1; b=0; }
+        else if (h < 3) { r=0; gr=1; b=x; } else if (h < 4) { r=0; gr=x; b=1; }
+        else if (h < 5) { r=x; gr=0; b=1; } else            { r=1; gr=0; b=x; }
+        return tinym::vec3(0.15f + 0.85f*r, 0.15f + 0.85f*gr, 0.15f + 0.85f*b);
+    }
+
+    // Rebuild the cluster-sorted index buffer when `key` changes (key =
+    // cluster count, so it rebuilds on a split-s change). groupOfPrim[f] is
+    // the cluster of original facet f, aligned with facetPtr.
+    void buildClusters(const uint32_t* groupOfPrim, int numClusters, int key) {
+        if (key == clusterVizKey && clusterEBO) return;
+        clusterVizKey = key;
+        std::vector<uint32_t> idx(facetNum * 3);
+        std::vector<uint32_t> cnt(numClusters, 0), base(numClusters, 0);
+        for (size_t f = 0; f < facetNum; ++f) cnt[groupOfPrim[f]]++;
+        uint32_t acc = 0;
+        clusterOffset.clear(); clusterCount.clear(); clusterId.clear();
+        for (int g = 0; g < numClusters; ++g) {
+            base[g] = acc;
+            if (cnt[g]) { clusterOffset.push_back(acc * 3); clusterCount.push_back(cnt[g] * 3); clusterId.push_back((uint32_t)g); }
+            acc += cnt[g];
+        }
+        std::vector<uint32_t> cur = base;
+        for (size_t f = 0; f < facetNum; ++f) {
+            uint32_t g = groupOfPrim[f], p = cur[g]++;
+            idx[p*3+0] = facetPtr[f*3+0]; idx[p*3+1] = facetPtr[f*3+1]; idx[p*3+2] = facetPtr[f*3+2];
+        }
+        if (!clusterEBO) glGenBuffers(1, &clusterEBO);
+        glBindVertexArray(vao);
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, clusterEBO);
+        glBufferData(GL_ELEMENT_ARRAY_BUFFER, idx.size() * sizeof(uint32_t), idx.data(), GL_DYNAMIC_DRAW);
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, facetBuffer);  // restore the VAO's element binding
+    }
+
+    void drawClusters(Program& shader, float metallic, float roughness,
+                      float specularWeight, const tinym::vec3& emissionColor) {
+        shader.setUniform("metallic",       metallic);
+        shader.setUniform("roughness",      roughness);
+        shader.setUniform("specularWeight", specularWeight);
+        shader.setUniform("emissionColor",  emissionColor);
+        glBindVertexArray(vao);
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, clusterEBO);
+        for (size_t i = 0; i < clusterId.size(); ++i) {
+            shader.setUniform("baseColor", clusterColor(clusterId[i]));
+            glDrawElements(GL_TRIANGLES, (GLsizei)clusterCount[i], GL_UNSIGNED_INT,
+                           (const void*)(size_t)(clusterOffset[i] * sizeof(uint32_t)));
+        }
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, facetBuffer);
     }
 
     // ID-pass draw: writes `meshId` into the R32I color attachment of

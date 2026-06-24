@@ -2728,6 +2728,19 @@ struct GeneralMesh {
     // Mirrored on RequestGeneralMesh so it survives Scene::pack rebuilds.
     bool checkerboard = false;
 
+    // Sub-object / cluster BVH per-object settings (UI-driven). clusterSplitS
+    // = this mesh's split s (k=4^s clusters/tiles) — per-object so each mesh
+    // divides to suit its size (maximizes the grid cluster-pair effect). -1
+    // = inherit the global BroadPhase::subBvhSplitS (so headless benches that
+    // set the global keep working; the GUI writes a concrete 1..8 per object).
+    // clusterRender = color this mesh's triangles by cluster in the viewport.
+    // Both mirrored on RequestGeneralMesh so they survive Scene::pack (the
+    // '0' reset rebuilds BroadPhase from scratch; without the mirror these
+    // GUI edits would be lost). The master cluster-mode switch is global
+    // (Simulator::clusterModeOn / the profiler window), these are per-object.
+    int  clusterSplitS = -1;
+    bool clusterRender = false;
+
     // D-039: Rigid backend wiring. Set by Simulator::ensureRigidBackendBody
     // on Float→Rigid transition (changeBehavior) or initialize-time sweep.
     // kInvalidBodyHandle (-1) means "no backend body yet"; update() skips.
@@ -2761,7 +2774,9 @@ struct GeneralMesh {
           applyGravity(other.applyGravity),
           applyWind(other.applyWind),
           isStatic(other.isStatic),
-          checkerboard(other.checkerboard)
+          checkerboard(other.checkerboard),
+          clusterSplitS(other.clusterSplitS),
+          clusterRender(other.clusterRender)
     {
         other.initializer = nullptr;
     }
@@ -2860,6 +2875,12 @@ struct Scene {
         // copies this onto the realized mesh; the inspector callback writes
         // here in addition to the live mesh field. Default off.
         bool checkerboard = false;
+        // Mirror of GeneralMesh.clusterSplitS / clusterRender (per-object
+        // sub-object BVH split count + cluster-color render). The '0' reset
+        // wipes BroadPhase entirely, so these per-object GUI edits must ride
+        // the request through pack. Defaults: s=-1 (inherit global), render off.
+        int  clusterSplitS = -1;
+        bool clusterRender = false;
         // Mirror of GeneralMesh.rotationQuat kept on the request so the
         // user's orientation survives Scene::pack rebuilds (initialize /
         // reset / loadScene). Without this, pack rebuilds meshes from the
@@ -3209,6 +3230,9 @@ struct Scene {
             meshes[i].applyWind    = req.applyWind;
             meshes[i].isStatic     = req.isStatic;
             meshes[i].checkerboard = req.checkerboard;
+            // Per-object sub-object BVH settings survive reset via the request.
+            meshes[i].clusterSplitS = req.clusterSplitS;
+            meshes[i].clusterRender = req.clusterRender;
             // Carry the user's orientation through pack. The R-3 preview
             // memcpy below restores the rotated *geometry*; this restores
             // the stored *quaternion* so the inspector keeps showing the
@@ -7421,7 +7445,12 @@ struct BVH<BE, PR, BVHMODE::SCENE, BVHPRIMITIVE::OBJECT> {
             objTrees[i].useAgglomerative = useAgglomerative;
             objTrees[i].useSubObjectBVH = useSubObjectBVH;
             objTrees[i].subTopMode = subTopMode;
-            objTrees[i].subBvhSplitS = subBvhSplitS;
+            // Per-object split s: each mesh divides to suit its own size (the
+            // GUI sets GeneralMesh::clusterSplitS per object). -1 = inherit the
+            // global subBvhSplitS (headless benches set the global, leave the
+            // per-object sentinel, and keep their requested s).
+            objTrees[i].subBvhSplitS = scene.meshes[i].clusterSplitS >= 1
+                                     ? scene.meshes[i].clusterSplitS : subBvhSplitS;
             objTrees[i].useClusterBVH = clusterNonGridBVH;   // non-grid → connectivity cluster
             objTrees[i].build(scene.meshes[i]);
             objTrees[i].objIndex = (int)i;  // D-041 turn-3
@@ -8558,6 +8587,13 @@ struct Simulator {
 
     // object select
     int selectedObj = -1;
+    // Master cluster-mode switch (the profiler window's "Cluster mode"
+    // checkbox aliases this). When on, the two-mesh cluster-VF broad phase
+    // runs and the inspector exposes the per-object Sub-object BVH panel.
+    // Lives on the Simulator (NOT BroadPhase) so it survives the '0' reset,
+    // which reconstructs BroadPhase from scratch; applyClusterMode()
+    // re-imprints it onto the fresh BroadPhase after every rebuild.
+    bool clusterModeOn = false;
     // Camera-follow target: when >= 0, the render loop drives the viewport
     // orbit pivot (camera.look) to this mesh's live animated root every
     // frame. Toggled per kinematic body in the inspector. Cleared to -1
@@ -10341,6 +10377,34 @@ struct Simulator {
         initialize();
     }
 
+    // Imprint the master cluster-mode switch onto the BroadPhase: the same
+    // flag combo --bench-cluster-compare uses. Called after every BroadPhase
+    // (re)construction (initialize) and whenever the profiler toggle flips,
+    // so the '0' reset can't silently drop cluster mode. Clears each tree's
+    // build cache so the per-object split takes on the next build.
+    void applyClusterMode() {
+        auto& bp = collisionPipeline.broadPhase;
+        bool on = clusterModeOn;
+        bp.twoMeshExperiment = on;
+        bp.useSubObjectBVH   = on;
+        bp.clusterNonGridBVH = on;
+        bp.clusterVFPipeline = on;
+        if (on) {
+            bp.subTopMode = 1; bp.fusedRefitEnlarge = true;
+            if (bp.subBvhSplitS < 2) bp.subBvhSplitS = 3;  // sane global fallback for inherit (-1) meshes
+        }
+        for (auto& tr : bp.objTrees) tr.builtForLifetimeId = -1;
+    }
+
+    // Cheap per-frame check: re-imprint cluster mode only when the BroadPhase
+    // no longer matches the master switch (the profiler checkbox flipped it).
+    // No-op (no rebuild) when already consistent, so safe to call every frame.
+    void reconcileClusterMode() {
+        auto& bp = collisionPipeline.broadPhase;
+        bool cur = bp.twoMeshExperiment && bp.clusterVFPipeline;
+        if (cur != clusterModeOn) applyClusterMode();
+    }
+
     void initialize() {
         GlobalAutoAllocator<BE>::globalInitialize(1<<20);
         // D-041: rewind the global pool's bump markers BEFORE Scene::pack
@@ -10417,6 +10481,11 @@ struct Simulator {
             std::string v(st);
             collisionPipeline.broadPhase.subTopMode = (v == "gpu" || v == "1") ? 1 : 0;
         }
+
+        // Re-imprint the GUI master cluster-mode onto the freshly
+        // reconstructed BroadPhase (line ~10388 wiped it) BEFORE build, so
+        // the '0' reset preserves cluster mode + per-object splits.
+        applyClusterMode();
 
         collisionPipeline.broadPhase.build(scene);
         shBroadPhase.build(scene);
@@ -11116,12 +11185,27 @@ struct Simulator {
                     }
                 }
             }
-            renderState.getOrCreate(mesh).draw(shader,
-                drawColor,
-                mesh.material.metallic,
-                mesh.material.roughness,
-                mesh.material.specularWeight,
-                mesh.material.emissionColor);  // D-028
+            auto& gl = renderState.getOrCreate(mesh);
+            // Per-object cluster render: when this mesh's clusterRender pill is
+            // on and its sub-object BVH has built a per-prim cluster map,
+            // multi-draw it colored by cluster instead of the single PBR draw.
+            auto& vizTrees = collisionPipeline.broadPhase.objTrees;
+            size_t mi = (size_t)(&mesh - &scene.meshes[0]);
+            bool clusterViz = mesh.clusterRender && mi < vizTrees.size()
+                && vizTrees[mi].groupOfPrim.ptr && vizTrees[mi].numGroups > 0;
+            if (clusterViz) {
+                gl.buildClusters(vizTrees[mi].groupOfPrim.ptr,
+                                 vizTrees[mi].numGroups, vizTrees[mi].numGroups);
+                gl.drawClusters(shader, mesh.material.metallic, mesh.material.roughness,
+                                mesh.material.specularWeight, mesh.material.emissionColor);
+            } else {
+                gl.draw(shader,
+                    drawColor,
+                    mesh.material.metallic,
+                    mesh.material.roughness,
+                    mesh.material.specularWeight,
+                    mesh.material.emissionColor);  // D-028
+            }
         }
 
         // Translucent strobe of the two blend clips (opaque pass done first so
@@ -13819,8 +13903,16 @@ static int runClusterCompare(int particleNum1D, int maxSplitS, int frames, int r
         sim.perFrameSubstepCommit = std::getenv("YSIM_PERFRAME_SUBSTEP_COMMIT") != nullptr;
         sim.addCloth(particleNum1D, Precision(1.0), tinym::vec3(0, Precision(1.25), 0),
                      Precision(1e5), Precision(1e5), Precision(2e5), Precision(0.01), Precision(0.1));
-        sim.addFloatMesh(ysim_paths::assetRoot(), "Human.obj",
-                         tinym::vec3(0, Precision(0.35), 0), Precision(0.04));
+        // Obstacle is the Human by default; YSIM_OBSTACLE_OBJ/_SCALE/_Y swap it
+        // (e.g. camel-gallop-reference.obj scale 1 y 0.35 ⇒ top ~1.23, cloth from
+        // 1.25 contacts within ~4 frames) without disturbing the Human baseline.
+        static const char* obsObj    = std::getenv("YSIM_OBSTACLE_OBJ");
+        static const char* obsScaleE = std::getenv("YSIM_OBSTACLE_SCALE");
+        static const char* obsYE     = std::getenv("YSIM_OBSTACLE_Y");
+        Precision obsScale = obsScaleE ? (Precision)std::atof(obsScaleE) : Precision(0.04);
+        Precision obsY     = obsYE     ? (Precision)std::atof(obsYE)     : Precision(0.35);
+        sim.addFloatMesh(ysim_paths::assetRoot(), obsObj ? obsObj : "Human.obj",
+                         tinym::vec3(0, obsY, 0), obsScale);
         { auto& hr = Scene<Backend, Precision>::requestsGeneralMeshes.back();
           hr.isStatic = true; hr.applyGravity = false; hr.applyWind = false; }
         sim.initialize();
@@ -21398,6 +21490,40 @@ int main(int argc, char** argv) {
                         break;
                     }
                 };
+                // Sub-object BVH panel — shown ONLY when the profiler's
+                // master "Cluster mode" is on. Per-object controls (the
+                // pointers alias this mesh's own fields): split s (k=4^s) and
+                // cluster-color render, so each object divides to suit its
+                // size. Both writes mirror to the request (so the '0' reset
+                // preserves them) and the s change clears just THIS mesh's
+                // tree cache so the next update rebuilds it at the new split.
+                if (simulator.clusterModeOn) {
+                    // Lazily turn the inherit sentinel (-1) into a concrete
+                    // per-object value so the slider shows/edits a real s.
+                    if (selectedMesh->clusterSplitS < 1)
+                        selectedMesh->clusterSplitS = std::max(1,
+                            simulator.collisionPipeline.broadPhase.subBvhSplitS);
+                    target.subobj_split_s = &selectedMesh->clusterSplitS;
+                    target.subobj_render  = &selectedMesh->clusterRender;
+                    target.on_subobj_split = [&simulator](int id, int s) {
+                        for (auto& r : Scene<Backend, Precision>::requestsGeneralMeshes)
+                            if (r.id == id) { r.clusterSplitS = s; break; }
+                        auto& meshes = Scene<Backend, Precision>::meshes;
+                        auto& trees = simulator.collisionPipeline.broadPhase.objTrees;
+                        for (int idx = 0; idx < (int)meshes.size(); ++idx)
+                            if (meshes[idx].id == id) {
+                                meshes[idx].clusterSplitS = s;
+                                if (idx < (int)trees.size()) trees[idx].builtForLifetimeId = -1;
+                                break;
+                            }
+                    };
+                    target.on_subobj_render = [](int id, bool on) {
+                        for (auto& r : Scene<Backend, Precision>::requestsGeneralMeshes)
+                            if (r.id == id) { r.clusterRender = on; break; }
+                        for (auto& m : Scene<Backend, Precision>::meshes)
+                            if (m.id == id) { m.clusterRender = on; break; }
+                    };
+                }
                 // Kinematic body: playback panel. Snapshots are rebuilt
                 // each frame; commits go through the Simulator helpers /
                 // the request-owned initializer (pack-stable). The
@@ -22722,8 +22848,8 @@ int main(int argc, char** argv) {
                 &simulator.cdSubstepPeriod,
                 &profileLevelUi,
                 &simulator.collisionPipeline.broadPhase.fusedRefitEnlarge,
-                &simulator.collisionPipeline.broadPhase.useSubObjectBVH,
-                &simulator.collisionPipeline.broadPhase.subBvhSplitS,
+                &simulator.clusterModeOn,   // master cluster mode (per-object s in inspector)
+                nullptr,                    // split-s slider removed — now per-object
                 &simulator.useMultiLevelSH
             );
             scene_log::drawSceneActionLogWindow(sceneLogWindowState);
@@ -22748,14 +22874,17 @@ int main(int argc, char** argv) {
                 &simulator.cdSubstepPeriod,
                 &profileLevelUi,
                 &simulator.collisionPipeline.broadPhase.fusedRefitEnlarge,
-                &simulator.collisionPipeline.broadPhase.useSubObjectBVH,
-                &simulator.collisionPipeline.broadPhase.subBvhSplitS,
+                &simulator.clusterModeOn,   // master cluster mode (per-object s in inspector)
+                nullptr,                    // split-s slider removed — now per-object
                 &simulator.useMultiLevelSH
             );
             scene_log::drawSceneActionLogWindow(sceneLogWindowState);
             ImGui::Render();
             ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
         }
+        // Apply a just-toggled profiler "Cluster mode" checkbox to the
+        // BroadPhase (no-op when unchanged); the next update rebuilds.
+        simulator.reconcileClusterMode();
 
         // Close before the window-title read below — title reads
         // history().latestFrame() and needs endFrame() to have run.

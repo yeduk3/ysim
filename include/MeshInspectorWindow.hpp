@@ -261,6 +261,19 @@ struct MeshInspectorTarget {
     bool* is_static = nullptr;
     std::function<void(int /*meshId*/, bool /*isStatic*/)> on_static_change;
 
+    // ── Sub-object BVH (per-object; shown only in master cluster mode) ─
+    // Per-object controls for the cluster sub-object BVH. subobj_split_s
+    // aliases this mesh's split s (1..8, k=4^s); on_subobj_split commits +
+    // rebuilds this mesh's tree. subobj_render aliases "this mesh's
+    // triangles are color-coded by cluster"; on_subobj_render commits it.
+    // The master on/off lives in the profiler window (global) — production
+    // only sets these pointers when master cluster mode is on, so the
+    // section is hidden otherwise (null-pointer gating). Both must be set.
+    int*  subobj_split_s = nullptr;
+    bool* subobj_render  = nullptr;
+    std::function<void(int /*meshId*/, int  /*s*/)>      on_subobj_split;
+    std::function<void(int /*meshId*/, bool /*render*/)> on_subobj_render;
+
     // Checkerboard render option — non-null only for plane (grid) meshes.
     // The checkbox aliases GeneralMesh::checkerboard (renderer reads it each
     // frame); on_checkerboard mirrors the new value onto the request so
