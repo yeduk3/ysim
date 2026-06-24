@@ -510,6 +510,111 @@ kernel void ref_constraint_copy_force(
     v[q] = v[t];
 }
 
+// Start-of-substep snapshot: xprev := x over one mesh's contiguous global
+// vertex range [base, base+count). Replaces the per-substep CPU memcpy loop
+// in Simulator::update so the substep loop needs no CPU read of x (the
+// update() sync refactor — None/PerFrame run fully async). Dispatched once
+// per non-Float/non-Kinematic mesh; those are excluded on the host exactly
+// as the old CPU loop did (Float never moves so x==xprev anyway; Kinematic
+// keeps its per-frame xprev = previous pose for the swept narrow phase).
+kernel void snapshot_xprev_range(
+    device const packed_float3* x [[buffer(0)]],
+    device packed_float3* xprev [[buffer(1)]],
+    constant uint& base [[buffer(2)]],
+    constant uint& count [[buffer(3)]],
+    uint id [[thread_position_in_grid]]
+) {
+    if (id >= count) return;
+    xprev[base + id] = x[base + id];
+}
+
+// ========================================================
+// GPU narrow-phase bucketing (update() sync refactor, P4). Replaces the CPU
+// loops in narrowAndSortByVertices that built the per-vertex CSR
+// (vertColFacetsOffsets + vertColFacets the integrator reads) — those loops
+// read narrowCollisions on the CPU and forced a sync. Four kernels run in
+// ONE encoder, serially ordered (implicit barrier between dispatches), so no
+// commitAndWait is needed: zero -> count(histogram) -> scan(prefix) ->
+// scatter. Output layout is byte-identical to the old CPU result, so the
+// integrator (integrate_cloth) is untouched. ppid = statesOffsets[query] +
+// point; offsets[ppid+1] gets the count, the inclusive scan turns offsets[k]
+// into vertex k's start index. numNarrow is read on the GPU (never the CPU).
+// ========================================================
+
+// Reset a single uint counter on the GPU (numNarrowCollisions atomic base for
+// the async narrow path) — avoids the CPU write that would race the GPU.
+kernel void reset_counter(
+    device uint* counter [[buffer(0)]],
+    uint id [[thread_position_in_grid]]
+) {
+    if (id == 0u) counter[0] = 0u;
+}
+
+// Step 0: zero the histogram/CSR-offsets array (n = numPoints+1) and the
+// per-vertex running counter used by scatter (numPoints entries).
+kernel void narrow_bucket_zero(
+    device uint* offsets [[buffer(0)]],
+    device uint* counter [[buffer(1)]],
+    constant uint& nOffsets [[buffer(2)]],
+    uint id [[thread_position_in_grid]]
+) {
+    if (id >= nOffsets) return;
+    offsets[id] = 0u;
+    if (id + 1u < nOffsets) counter[id] = 0u;   // counter has nOffsets-1 = numPoints
+}
+
+// Step 1: histogram — each contact bumps offsets[ppid+1]. Dispatched over
+// maxN (== maxNumCollisions); the real bound numNarrow[0] is read on the GPU.
+kernel void narrow_bucket_count(
+    device const NarrowCollision* narrowCollisions [[buffer(0)]],
+    device const uint* numNarrow [[buffer(1)]],
+    device const uint* statesOffsets [[buffer(2)]],
+    device atomic_uint* offsets [[buffer(3)]],
+    constant uint& maxN [[buffer(4)]],
+    uint id [[thread_position_in_grid]]
+) {
+    if (id >= maxN || id >= numNarrow[0]) return;
+    NarrowCollision nc = narrowCollisions[id];
+    uint ppid = statesOffsets[nc.objPair.x] + nc.indexPair.x;   // query, point
+    atomic_fetch_add_explicit(&offsets[ppid + 1u], 1u, memory_order_relaxed);
+}
+
+// Step 2: inclusive prefix sum, in place, single thread. offsets[ppid] then
+// holds vertex ppid's start (contacts of all earlier vertices) and
+// offsets[ppid+1] its end. Serial is fine: numPoints is small relative to the
+// ~200us sync this whole pass removes (ponytail: serial scan; swap to a
+// Hillis-Steele log-pass scan only if a huge mesh ever makes it dominate).
+kernel void narrow_bucket_scan(
+    device uint* offsets [[buffer(0)]],
+    constant uint& n [[buffer(1)]],
+    uint id [[thread_position_in_grid]]
+) {
+    if (id != 0u) return;
+    uint acc = 0u;
+    for (uint i = 0u; i < n; ++i) { acc += offsets[i]; offsets[i] = acc; }
+}
+
+// Step 3: scatter each contact into its vertex bucket. local = running
+// per-vertex offset (atomic); slot = start + local. Within-bucket order is
+// nondeterministic vs the CPU, but the integrator dedups + sums normals
+// order-independently, so the response is identical.
+kernel void narrow_bucket_scatter(
+    device const NarrowCollision* narrowCollisions [[buffer(0)]],
+    device const uint* numNarrow [[buffer(1)]],
+    device const uint* statesOffsets [[buffer(2)]],
+    device const uint* offsets [[buffer(3)]],
+    device atomic_uint* counter [[buffer(4)]],
+    device NarrowCollision* vertColFacets [[buffer(5)]],
+    constant uint& maxN [[buffer(6)]],
+    uint id [[thread_position_in_grid]]
+) {
+    if (id >= maxN || id >= numNarrow[0]) return;
+    NarrowCollision nc = narrowCollisions[id];
+    uint ppid = statesOffsets[nc.objPair.x] + nc.indexPair.x;
+    uint local = atomic_fetch_add_explicit(&counter[ppid], 1u, memory_order_relaxed);
+    vertColFacets[offsets[ppid] + local] = nc;
+}
+
 //kernel void integrate_all(
 //    device packed_float3* x [[buffer(0)]],
 //    device packed_float3* v [[buffer(1)]],

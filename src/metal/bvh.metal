@@ -1467,6 +1467,162 @@ kernel void queryPointsPairs(
               broadCollisions, numBroadCollisions, qFlag, pr.pointId, pr.entryRoot);
 }
 
+// Async variant of queryPointsPairs: the pair count lives in a GPU buffer
+// (numPairsBuf), so the caller over-dispatches up to the pair-buffer capacity and
+// each thread bounds itself — no CPU readback of the count, hence no extra sync
+// in the live loop. Used by the cluster VF pipeline's bidirectional descent.
+kernel void queryPointsPairsBounded(
+    device const packed_float3* x [[buffer(0)]],
+    device const packed_uint3* facets [[buffer(1)]],
+    device const BVHNode* tree [[buffer(2)]],
+    constant QueryPointsParams& qParams [[buffer(3)]],
+    device BroadCollision* broadCollisions [[buffer(4)]],
+    device atomic_uint* numBroadCollisions [[buffer(5)]],
+    device QueryFlag* qFlag [[buffer(6)]],
+    device const SAPPair* pairs [[buffer(7)]],
+    device const uint* numPairsBuf [[buffer(8)]],
+    uint id [[thread_position_in_grid]]
+) {
+    if (id >= numPairsBuf[0]) return;
+    SAPPair pr = pairs[id];
+    float3 pos = x[pr.pointId];
+    float3 margin = float3(qParams.queryMargin);
+    queryAABB(pos-margin, pos+margin, facets, tree, qParams,
+              broadCollisions, numBroadCollisions, qFlag, pr.pointId, pr.entryRoot);
+}
+
+
+// ============================================================
+// Phase 3: cluster-pair broad phase via a uniform grid over cluster AABBs.
+//
+// One object's clusters (the static target, e.g. Human) are inserted into grid
+// cells on the CPU once (cellStart/cellClusters CSR). Here one thread per QUERY
+// cluster (e.g. a cloth sub-object) walks the cells its AABB covers, AABB-tests
+// the target clusters parked there, and emits each overlapping (query,target)
+// cluster pair EXACTLY ONCE via min-cell dedup: a pair is emitted only from the
+// cell that holds the minimum corner of the two AABBs' overlap box — that cell
+// is covered by both AABBs, so it is visited once and only once. The emitted
+// pairs are the bidirectional VF dispatch units for Phase 4.
+struct ClusterPair { uint a; uint b; };      // (query cluster, target cluster)
+struct ClusterGridParams {
+    float ox, oy, oz;     // grid origin (min corner)
+    float cellSize;       // uniform cell size (~ max cluster extent)
+    int   dx, dy, dz;     // grid dims (cells per axis)
+    uint  numQuery;       // # query clusters
+    uint  maxPairs;       // pair buffer capacity
+    float margin;         // inflate query AABBs (VF needs margin-expanded pairs)
+};
+
+kernel void clusterpair_query(
+    device const float* qAabb [[buffer(0)]],            // [6*numQuery] query cluster AABBs
+    device const float* tAabb [[buffer(1)]],            // [6*numTarget] target cluster AABBs
+    device const uint* cellStart [[buffer(2)]],         // [numCells+1] CSR offsets
+    device const uint* cellClusters [[buffer(3)]],      // CSR target cluster ids per cell
+    constant ClusterGridParams& gp [[buffer(4)]],
+    device ClusterPair* pairs [[buffer(5)]],
+    device atomic_uint* pairCount [[buffer(6)]],
+    uint id [[thread_position_in_grid]]
+) {
+    if (id >= gp.numQuery) return;
+    float3 origin = float3(gp.ox, gp.oy, gp.oz);
+    float inv = 1.0f / gp.cellSize;
+    int3 dims = int3(gp.dx, gp.dy, gp.dz);
+
+    float3 qmin = float3(qAabb[6*id+0], qAabb[6*id+1], qAabb[6*id+2]) - gp.margin;
+    float3 qmax = float3(qAabb[6*id+3], qAabb[6*id+4], qAabb[6*id+5]) + gp.margin;
+
+    int3 lo = clamp(int3(floor((qmin - origin) * inv)), int3(0), dims - 1);
+    int3 hi = clamp(int3(floor((qmax - origin) * inv)), int3(0), dims - 1);
+
+    for (int cz = lo.z; cz <= hi.z; ++cz)
+    for (int cy = lo.y; cy <= hi.y; ++cy)
+    for (int cx = lo.x; cx <= hi.x; ++cx) {
+        uint cell = (uint)((cz * dims.y + cy) * dims.x + cx);
+        for (uint p = cellStart[cell]; p < cellStart[cell+1]; ++p) {
+            uint j = cellClusters[p];
+            float3 tmin = float3(tAabb[6*j+0], tAabb[6*j+1], tAabb[6*j+2]);
+            float3 tmax = float3(tAabb[6*j+3], tAabb[6*j+4], tAabb[6*j+5]);
+            if (qmax.x < tmin.x || qmin.x > tmax.x ||
+                qmax.y < tmin.y || qmin.y > tmax.y ||
+                qmax.z < tmin.z || qmin.z > tmax.z) continue;
+            // min-cell dedup: emit only from the cell holding the overlap min.
+            float3 omin = max(qmin, tmin);
+            int3 mc = clamp(int3(floor((omin - origin) * inv)), int3(0), dims - 1);
+            if (mc.x != cx || mc.y != cy || mc.z != cz) continue;
+            uint slot = atomic_fetch_add_explicit(pairCount, 1u, memory_order_relaxed);
+            if (slot < gp.maxPairs) { pairs[slot].a = id; pairs[slot].b = j; }
+        }
+    }
+}
+
+// Per-cluster AABB = tight box over the cluster's current face vertices UNION the
+// swept tree group-root box. One thread per cluster walks its Morton-partitioned
+// prim slice (no atomics). Output flat float[6*numGroups] = (min xyz, max xyz).
+// (The static cluster mesh's cached group-root box doesn't reliably enclose its
+// verts, so the tight box is needed; the swept root covers a dynamic mesh's swept
+// leaves — see runClusterVFTest.)
+kernel void cluster_aabb(
+    device const packed_float3* x [[buffer(0)]],
+    device const packed_uint3* facets [[buffer(1)]],
+    device const MortonNode* mortons [[buffer(2)]],
+    device const uint* groupPrimBase [[buffer(3)]],
+    device const uint* groupSize [[buffer(4)]],
+    device const BVHNode* tree [[buffer(5)]],
+    device const uint* groupNodeBase [[buffer(6)]],
+    device float* clusterAABB [[buffer(7)]],
+    constant uint& numGroups [[buffer(8)]],
+    uint g [[thread_position_in_grid]]
+) {
+    if (g >= numGroups) return;
+    float3 mn = float3(INFINITY), mx = float3(-INFINITY);
+    uint base = groupPrimBase[g], M = groupSize[g];
+    for (uint i = 0; i < M; ++i) {
+        uint3 f = facets[mortons[base + i].index];
+        float3 a = x[f.x], b = x[f.y], c = x[f.z];
+        mn = min(mn, min(a, min(b, c)));
+        mx = max(mx, max(a, max(b, c)));
+    }
+    float3 rmn = (float3)tree[groupNodeBase[g]].min;
+    float3 rmx = (float3)tree[groupNodeBase[g]].max;
+    mn = min(mn, rmn); mx = max(mx, rmx);
+    clusterAABB[6*g+0]=mn.x; clusterAABB[6*g+1]=mn.y; clusterAABB[6*g+2]=mn.z;
+    clusterAABB[6*g+3]=mx.x; clusterAABB[6*g+4]=mx.y; clusterAABB[6*g+5]=mx.z;
+}
+
+// Expand cluster pairs → per-vertex point-query pairs (SAPPair{pointId,entryRoot})
+// in BOTH directions. One thread per ClusterPair (a=query cluster, b=target
+// cluster): emit each query-cluster vertex → target cluster root (dirA), and each
+// target-cluster vertex → query cluster root (dirB). Atomic append; bounded.
+kernel void clusterpair_expand(
+    device const ClusterPair* pairs [[buffer(0)]],
+    device const uint* numPairsBuf [[buffer(1)]],   // GPU pair count (async: over-dispatch + bound)
+    device const uint* aVertOff [[buffer(2)]],   // query (cloth) cluster vertex CSR
+    device const uint* aVerts [[buffer(3)]],
+    device const uint* aNodeBase [[buffer(4)]],  // query cluster subtree roots
+    device const uint* bVertOff [[buffer(5)]],   // target (human) cluster vertex CSR
+    device const uint* bVerts [[buffer(6)]],
+    device const uint* bNodeBase [[buffer(7)]],  // target cluster subtree roots
+    device SAPPair* dirA [[buffer(8)]],          // query vert → target root
+    device atomic_uint* dirACount [[buffer(9)]],
+    device SAPPair* dirB [[buffer(10)]],         // target vert → query root
+    device atomic_uint* dirBCount [[buffer(11)]],
+    constant uint& maxA [[buffer(12)]],
+    constant uint& maxB [[buffer(13)]],
+    uint id [[thread_position_in_grid]]
+) {
+    if (id >= numPairsBuf[0]) return;
+    ClusterPair p = pairs[id];
+    uint broot = bNodeBase[p.b], aroot = aNodeBase[p.a];
+    for (uint q = aVertOff[p.a]; q < aVertOff[p.a + 1]; ++q) {
+        uint slot = atomic_fetch_add_explicit(dirACount, 1u, memory_order_relaxed);
+        if (slot < maxA) { dirA[slot].pointId = aVerts[q]; dirA[slot].entryRoot = broot; }
+    }
+    for (uint q = bVertOff[p.b]; q < bVertOff[p.b + 1]; ++q) {
+        uint slot = atomic_fetch_add_explicit(dirBCount, 1u, memory_order_relaxed);
+        if (slot < maxB) { dirB[slot].pointId = bVerts[q]; dirB[slot].entryRoot = aroot; }
+    }
+}
+
 
 // ============================================================
 // Segmented (per-threadgroup) detect + reduce variant.

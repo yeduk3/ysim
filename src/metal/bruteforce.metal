@@ -59,9 +59,18 @@ kernel void narrow_pt_tri(
     // x_prev (start-of-prior-substep position; D-013).
     device const packed_float3* scenePackedXPrev [[buffer(10)]],
 
+    // numBroadCollisions counter (update() sync refactor, P4). The async
+    // narrow path (None/PerFrame) dispatches over maxNumCollisions and sets
+    // params.numBroadCollisions = maxNumCollisions, then bounds the real work
+    // with this GPU-side count — no CPU read of the broad count. InFrame
+    // dispatches over the tight count as before, so this check is redundant
+    // there (id is already < params.numBroadCollisions <= numBroadBuf[0]).
+    device const uint* numBroadBuf [[buffer(11)]],
+
     uint id [[thread_position_in_grid]]
 ) {
     if (id >= params.numBroadCollisions) return;
+    if (id >= numBroadBuf[0]) return;
 
     BroadCollision bc = broadCollisions[id];
 
