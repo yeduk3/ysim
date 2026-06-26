@@ -60,6 +60,9 @@ struct METAL : Backend {};
 #include <algorithm>
 #include <chrono>
 #include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <queue>
 #include <cstring>
 #include <filesystem>
 #include <random>
@@ -13916,6 +13919,229 @@ static int runClusterLive(int particleNum1D, int splitS, int frames, int reps) {
     return 0;
 }
 
+// Per-frame profiling with live OpenGL render and captured scene images at
+// selected frames. Captures the same single-root LBVH (or cluster) scene used
+// in runClusterCompare; per-section InFrame timings are logged to CSV and the
+// OpenGL window renders cloth+obstacle each frame. At capture frames a background
+// thread writes the framebuffer to PPM (minimizes main-thread stall).
+// Env: YSIM_FRAME_CSV, YSIM_CAPTURE_DIR, YSIM_CAPTURE_FRAMES (comma-sep or "all").
+// Obstacle selection: YSIM_OBSTACLE_OBJ / _SCALE / _Y (same as runClusterCompare).
+static int runFrameProfile(int P, int splitS, bool clusterVF, int totalFrames) {
+    using Backend = METAL;
+    using SystemT = ExplicitSystem<Backend, Precision>;
+    using Clock   = std::chrono::steady_clock;
+    if (!MetalGlobalContext::getDevice() || !MetalKernelContext::getLibrary()) {
+        std::cerr << "[frame-profile SKIP] metal unavailable\n"; return 0;
+    }
+
+    // --- Output paths ---
+    std::string outCsv = "frame_profile.csv";
+    if (const char* e = std::getenv("YSIM_FRAME_CSV")) outCsv = e;
+    std::string capDir = "captures";
+    if (const char* e = std::getenv("YSIM_CAPTURE_DIR")) capDir = e;
+    { std::error_code ec; std::filesystem::create_directories(capDir, ec); }
+
+    // --- Capture-frame set ---
+    std::set<int> captureSet;
+    bool captureAll = false;
+    if (const char* e = std::getenv("YSIM_CAPTURE_FRAMES")) {
+        if (std::string(e) == "all") { captureAll = true; }
+        else { const char* p = e; while (*p) {
+            captureSet.insert((int)std::strtol(p, (char**)&p, 10));
+            if (*p == ',') ++p; } }
+    } else {
+        // Default: ~6 spread frames + last
+        int step = std::max(1, totalFrames / 6);
+        for (int f = 0; f < totalFrames; f += step) captureSet.insert(f);
+        captureSet.insert(totalFrames - 1);
+    }
+
+    // --- ysim renderer: YGLWindow + shader + camera ---
+    const int WIN_W = 640, WIN_H = 480;
+    yglwindow = new YGLWindow(WIN_W, WIN_H, "ysim frame-profile");
+    glfwSwapInterval(0);  // no vsync
+    Program fpShader;
+    fpShader.loadShader("shader.vert", "shader.geom", "shader.frag");
+    if (!fpShader.programID) {
+        std::cerr << "[frame-profile] shader load failed\n";
+        delete yglwindow; yglwindow = nullptr; return 1;
+    }
+    // eye=(0.35,1.10,1.90) looking at (0,0.75,0): setPosition = eye - look
+    camera.look = tinym::vec3(0.0f, 0.75f, 0.0f);
+    camera.setPosition(tinym::vec3(0.35f, 0.35f, 1.90f));
+    camera.rotatePosition();
+
+    // --- Background PPM writer thread ---
+    struct CaptureJob { int frame; std::vector<uint8_t> pix; };
+    std::queue<CaptureJob> capQ;
+    std::mutex capMtx;
+    std::condition_variable capCV;
+    bool capDone = false;
+    std::thread capThread([&]() {
+        while (true) {
+            std::unique_lock<std::mutex> lk(capMtx);
+            capCV.wait(lk, [&]{ return !capQ.empty() || capDone; });
+            while (!capQ.empty()) {
+                auto job = std::move(capQ.front()); capQ.pop();
+                lk.unlock();
+                char path[512];
+                std::snprintf(path, sizeof(path), "%s/frame_%03d.ppm",
+                              capDir.c_str(), job.frame);
+                std::ofstream f(path, std::ios::binary);
+                f << "P6\n" << WIN_W << " " << WIN_H << "\n255\n";
+                int row = WIN_W * 3;
+                // Flip vertically: OpenGL origin is bottom-left
+                for (int y = WIN_H - 1; y >= 0; --y)
+                    f.write((char*)job.pix.data() + y * row, row);
+                lk.lock();
+            }
+            if (capDone && capQ.empty()) break;
+        }
+    });
+
+    // --- Scene setup (mirrors runClusterCompare) ---
+    for (auto& m : Scene<Backend, Precision>::meshes) m.initializer = nullptr;
+    Scene<Backend, Precision>::meshes.clear();
+    for (auto& r : Scene<Backend, Precision>::requestsGeneralMeshes) delete r.initializer;
+    Scene<Backend, Precision>::requestsGeneralMeshes.clear();
+    Scene<Backend, Precision>::numMeshes = 0; Scene<Backend, Precision>::nextMeshId = 0;
+    Scene<Backend, Precision>::dirty = true; Scene<Backend, Precision>::environment = SceneEnvironment{};
+    GlobalAutoAllocator<Backend>::hardReset();
+
+    Precision h = Precision(1) / Precision(60);
+    SystemT system(h, 60);
+    Simulator<Backend, Precision, SystemT> sim(system);
+    sim.pause = false;
+    sim.profileLevel = sim_config::ProfileLevel::InFrame;
+    sim.addCloth(P, Precision(1.0), tinym::vec3(0, Precision(1.25), 0),
+                 Precision(1e5), Precision(1e5), Precision(2e5), Precision(0.01), Precision(0.1));
+    const char* obsObj    = std::getenv("YSIM_OBSTACLE_OBJ");
+    const char* obsScaleE = std::getenv("YSIM_OBSTACLE_SCALE");
+    const char* obsYE     = std::getenv("YSIM_OBSTACLE_Y");
+    Precision obsScale = obsScaleE ? (Precision)std::atof(obsScaleE) : Precision(0.04);
+    Precision obsY     = obsYE     ? (Precision)std::atof(obsYE)     : Precision(0.35);
+    sim.addFloatMesh(ysim_paths::assetRoot(), obsObj ? obsObj : "Human.obj",
+                     tinym::vec3(0, obsY, 0), obsScale);
+    { auto& hr = Scene<Backend, Precision>::requestsGeneralMeshes.back();
+      hr.isStatic = true; hr.applyGravity = false; hr.applyWind = false; }
+    sim.initialize();
+
+    auto& bp = sim.collisionPipeline.broadPhase;
+    bp.twoMeshExperiment = true;
+    bp.fusedRefitEnlarge = true;
+    if (clusterVF) {
+        bp.useSubObjectBVH   = true;
+        bp.subBvhSplitS      = splitS;
+        bp.subTopMode        = 1;
+        bp.clusterNonGridBVH = true;
+        bp.clusterVFPipeline = true;
+        if (bp.objTrees.size() > 1) bp.objTrees[1].builtForLifetimeId = -1;
+    }
+
+    // --- Profiler ---
+    profiler::FrameProfiler prof((std::size_t)(totalFrames + 4));
+    sim.profiler = &prof;
+    auto secMs = [&](const char* nm) -> double {
+        const auto* s = prof.history().latestFrame();
+        int i = prof.history().sectionIndex(nm);
+        if (s && i >= 0 && (std::size_t)i < s->section_ms.size())
+            return (double)s->section_ms[i];
+        return 0.0;
+    };
+
+    // --- Per-frame loop ---
+    std::ofstream csv(outCsv);
+    csv << "frame,refit_ms,detect_ms,narrow_ms,sysupd_ms,frame_ms,"
+           "broad,narrow_n,cloth_maxY,captured\n";
+
+    for (int f = 0; f < totalFrames; ++f) {
+        // (A) Metal compute — timed
+        prof.beginFrame((uint64_t)f, (double)f * (double)h);
+        auto tA = Clock::now();
+        sim.update();
+        auto tB = Clock::now();
+        prof.endFrame();
+        double frameMs = std::chrono::duration<double, std::milli>(tB - tA).count();
+
+        // (B) Per-section timings + scene stats
+        double refit  = secMs("broad_refit_swept");
+        double detect = secMs("broad_detect");
+        double narrow = secMs("narrow_phase");
+        double sysupd = secMs("system_update");
+        auto& pc    = Scene<Backend, Precision>::packedCollisionData;
+        auto& cloth = Scene<Backend, Precision>::meshes[0];
+        Index nC = cloth.state.x.size / 3;
+        Precision clothMaxY = Precision(-1e30);
+        for (Index i = 0; i < nC; ++i)
+            clothMaxY = std::max(clothMaxY, cloth.state.x[i * 3 + 1]);
+        bool doCapture = captureAll || captureSet.count(f);
+
+        // (C) ysim render (after Metal timing — does NOT affect Metal times)
+        sim.uploadMeshes();
+        fpShader.use();
+        glViewport(0, 0, WIN_W, WIN_H);
+        {
+            const auto& bg = Scene<Backend, Precision>::environment.backgroundColor;
+            glClearColor(bg.x, bg.y, bg.z, 1.0f);
+        }
+        glEnable(GL_DEPTH_TEST);
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+        tinym::mat4 fpM(1);
+        tinym::mat4 fpV = camera.lookAt();
+        tinym::mat4 fpP = camera.perspective(float(WIN_W) / float(WIN_H), 0.1f, 1000.f);
+        float fpW = WIN_W * 0.5f, fpH = WIN_H * 0.5f;
+        tinym::mat4 fpVP(tinym::vec4(fpW, 0, 0, 0), tinym::vec4(0, fpH, 0, 0),
+                         tinym::vec4(0, 0, 1, 0),   tinym::vec4(fpW, fpH, 0, 1));
+        fpShader.setUniform("M", fpM);
+        fpShader.setUniform("V", fpV);
+        fpShader.setUniform("P", fpP);
+        fpShader.setUniform("ViewportMatrix", fpVP);
+        fpShader.setUniform("lightColor",
+            Scene<Backend, Precision>::environment.lightColor
+            * Scene<Backend, Precision>::environment.lightIntensity);
+        fpShader.setUniform("hoveredId",  -1);
+        fpShader.setUniform("selectedId", -1);
+        fpShader.setUniform("shadowMap", 2);
+        fpShader.setUniform("shadowsOn", 0);
+        sim.draw(fpShader);
+
+        // (D) Capture: glFinish → glReadPixels → push to background thread
+        if (doCapture) {
+            glFinish();
+            std::vector<uint8_t> pix(WIN_W * WIN_H * 3);
+            glReadPixels(0, 0, WIN_W, WIN_H, GL_RGB, GL_UNSIGNED_BYTE, pix.data());
+            { std::lock_guard<std::mutex> lk(capMtx);
+              capQ.push({f, std::move(pix)}); }
+            capCV.notify_one();
+        }
+
+        glfwSwapBuffers(yglwindow->getGLFWWindow());
+        glfwPollEvents();
+
+        // (E) Log
+        csv << f << ',' << refit << ',' << detect << ',' << narrow << ','
+            << sysupd << ',' << frameMs << ','
+            << pc.numBroadCollisions[0] << ',' << pc.numNarrowCollisions[0] << ','
+            << (double)clothMaxY << ',' << (doCapture ? 1 : 0) << '\n';
+        csv.flush();
+        std::cerr << "[fp f=" << f << "] refit=" << refit << " det=" << detect
+                  << " nar=" << narrow << " frame=" << frameMs
+                  << " maxY=" << (double)clothMaxY << '\n';
+    }
+
+    sim.profiler = nullptr;
+    csv.close();
+
+    // Drain capture queue then join
+    { std::lock_guard<std::mutex> lk(capMtx); capDone = true; }
+    capCV.notify_one();
+    capThread.join();
+
+    delete yglwindow; yglwindow = nullptr;
+    std::cerr << "[frame-profile DONE] csv=" << outCsv << " captures=" << capDir << '\n';
+    return 0;
+}
+
 // Proper two-mesh comparison (PerFrame async, frame_ms — same methodology as the
 // twomesh sweep): general single-root BVH vs sub-object BVH, both the OLD path
 // (full detectCollisionsTwoMesh, which LOST in project_twomesh_experiment because
@@ -13929,6 +14155,15 @@ static int runClusterCompare(int particleNum1D, int maxSplitS, int frames, int r
     if (!MetalGlobalContext::getDevice() || !MetalKernelContext::getLibrary()) {
         std::cerr << "[cluster-compare SKIP] metal unavailable\n"; return 0;
     }
+    // YGLWindow + per-frame render keeps the GPU in the same active state as the
+    // interactive GUI, so InFrame per-section times are directly comparable.
+    yglwindow = new YGLWindow(640, 480, "ysim cluster bench");
+    glfwSwapInterval(0);
+    Program ccShader;
+    ccShader.loadShader("shader.vert", "shader.geom", "shader.frag");
+    camera.look = tinym::vec3(0.0f, 0.75f, 0.0f);
+    camera.setPosition(tinym::vec3(0.35f, 0.35f, 1.90f));
+    camera.rotatePosition();
     namespace fs = std::filesystem;
     std::string outPath;
 #ifdef YSIM_PROJECT_ROOT
@@ -13939,9 +14174,11 @@ static int runClusterCompare(int particleNum1D, int maxSplitS, int frames, int r
     if (const char* o = std::getenv("YSIM_BENCH_CSV")) outPath = o;
     fs::path csvPath(outPath);
     if (csvPath.has_parent_path()) { std::error_code ec; fs::create_directories(csvPath.parent_path(), ec); }
-    std::ofstream csv(csvPath);
-    csv << "variant,split_s,num_groups,repeat,refit_ms,detect_ms,narrow_ms,"
-           "sysupd_ms,frame_ms,broad,narrow,cloth_maxY\n";
+    bool appendMode = std::getenv("YSIM_BENCH_APPEND") != nullptr;
+    std::ofstream csv(csvPath, appendMode ? std::ios::app : std::ios::out);
+    if (!appendMode)
+        csv << "variant,split_s,num_groups,repeat,refit_ms,detect_ms,narrow_ms,"
+               "sysupd_ms,frame_ms,broad,narrow,cloth_maxY\n";
 
     auto resetScene = []() {
         for (auto& m : Scene<Backend, Precision>::meshes) m.initializer = nullptr;
@@ -14013,6 +14250,32 @@ static int runClusterCompare(int particleNum1D, int maxSplitS, int frames, int r
             prof.beginFrame((uint64_t)f, (double)f*(double)h);
             auto a = Clock::now(); sim.update(); auto b = Clock::now();
             prof.endFrame();
+            // ysim render — keeps GPU active between Metal frames (matches GUI state)
+            if (yglwindow && ccShader.programID) {
+                sim.uploadMeshes();
+                ccShader.use();
+                constexpr int RW = 640, RH = 480;
+                glViewport(0, 0, RW, RH);
+                const auto& bg = Scene<Backend, Precision>::environment.backgroundColor;
+                glClearColor(bg.x, bg.y, bg.z, 1.0f);
+                glEnable(GL_DEPTH_TEST);
+                glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+                tinym::mat4 ccM(1), ccV = camera.lookAt();
+                tinym::mat4 ccP = camera.perspective(float(RW)/float(RH), 0.1f, 1000.f);
+                float vw=RW*0.5f, vh=RH*0.5f;
+                tinym::mat4 ccVP(tinym::vec4(vw,0,0,0), tinym::vec4(0,vh,0,0),
+                                 tinym::vec4(0,0,1,0),  tinym::vec4(vw,vh,0,1));
+                ccShader.setUniform("M", ccM); ccShader.setUniform("V", ccV);
+                ccShader.setUniform("P", ccP); ccShader.setUniform("ViewportMatrix", ccVP);
+                ccShader.setUniform("lightColor",
+                    Scene<Backend, Precision>::environment.lightColor
+                    * Scene<Backend, Precision>::environment.lightIntensity);
+                ccShader.setUniform("hoveredId", -1); ccShader.setUniform("selectedId", -1);
+                ccShader.setUniform("shadowMap", 2);  ccShader.setUniform("shadowsOn", 0);
+                sim.draw(ccShader);
+                glfwSwapBuffers(yglwindow->getGLFWWindow());
+                glfwPollEvents();
+            }
             if (f >= warm) { fv.push_back(std::chrono::duration<double,std::milli>(b-a).count());
                 rv.push_back(secMs("broad_refit_swept")); dv.push_back(secMs("broad_detect"));
                 nv.push_back(secMs("narrow_phase")); sv.push_back(secMs("system_update")); }
@@ -14051,10 +14314,15 @@ static int runClusterCompare(int particleNum1D, int maxSplitS, int frames, int r
 
     // YSIM_CLUSTER_NOSUBOBJ=1 drops the old full-detect sub-object variant (it's
     // catastrophic at high P/s — skip it to keep big-P sweeps tractable).
-    bool noSub = std::getenv("YSIM_CLUSTER_NOSUBOBJ") != nullptr;
-    std::vector<std::tuple<const char*,int,bool,bool>> variants = {{"single",0,false,false}};
-    for (int s=1; s<=maxSplitS; ++s) { if (!noSub) variants.push_back({"subobj",s,true,false});
-                                       variants.push_back({"cluster",s,true,true}); }
+    // YSIM_BENCH_MIN_S=N: skip cluster s < N (append-only extension of a prior run).
+    // YSIM_BENCH_SKIP_SINGLE=1: omit the single-root baseline (already in CSV).
+    bool noSub       = std::getenv("YSIM_CLUSTER_NOSUBOBJ") != nullptr;
+    int  minS        = std::getenv("YSIM_BENCH_MIN_S") ? std::atoi(std::getenv("YSIM_BENCH_MIN_S")) : 1;
+    bool skipSingle  = std::getenv("YSIM_BENCH_SKIP_SINGLE") != nullptr;
+    std::vector<std::tuple<const char*,int,bool,bool>> variants;
+    if (!skipSingle) variants.push_back({"single",0,false,false});
+    for (int s=minS; s<=maxSplitS; ++s) { if (!noSub) variants.push_back({"subobj",s,true,false});
+                                           variants.push_back({"cluster",s,true,true}); }
     std::cerr << "=== cluster-compare: P=" << particleNum1D << " s=0.." << maxSplitS
               << " variants={single,subobj(full-detect),cluster(VF-pipeline)} InFrame frames="
               << frames << " reps=" << repeats << " (interleaved, median, per-section) ===\n";
@@ -14064,8 +14332,10 @@ static int runClusterCompare(int particleNum1D, int maxSplitS, int frames, int r
     int cooldownMs = std::getenv("YSIM_COOLDOWN_MS") ? std::atoi(std::getenv("YSIM_COOLDOWN_MS")) : 0;
     for (int r = 0; r < repeats; ++r) {
         for (auto [name, s, sub, cl] : variants) {
-            if (cooldownMs > 0)
+            if (cooldownMs > 0) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(cooldownMs));
+                if (yglwindow) glfwPollEvents();
+            }
             VR v = runVariant(s, sub, cl);
             csv << name << ',' << s << ',' << v.k << ',' << r << ',' << v.refit << ','
                 << v.detect << ',' << v.narrow << ',' << v.sysupd << ',' << v.frame << ','
@@ -14077,6 +14347,7 @@ static int runClusterCompare(int particleNum1D, int maxSplitS, int frames, int r
     }
     csv.close();
     std::cerr << "[cluster-compare DONE] wrote " << outPath << "\n";
+    delete yglwindow; yglwindow = nullptr;
     return 0;
 }
 
@@ -20386,6 +20657,15 @@ int main(int argc, char** argv) {
         int R = (argc > 5) ? std::atoi(argv[5]) : 20;
         return runClusterVFBench(P, S, Fr, R);
     }
+    if (argc > 1 && std::string(argv[1]) == "--bench-frame-profile") {
+        // Per-frame profiling with live OpenGL render + background scene capture.
+        // Args: <P=50> <splitS=0 (0=single-root, N=cluster s=N)> <frames=30>.
+        // Env: YSIM_OBSTACLE_*, YSIM_FRAME_CSV, YSIM_CAPTURE_DIR, YSIM_CAPTURE_FRAMES.
+        int P  = (argc > 2) ? std::atoi(argv[2]) : 50;
+        int S  = (argc > 3) ? std::atoi(argv[3]) : 0;
+        int Fr = (argc > 4) ? std::atoi(argv[4]) : 30;
+        return runFrameProfile(P, S, S > 0, Fr);
+    }
     if (argc > 1 && std::string(argv[1]) == "--bench-cluster-compare") {
         // Proper twomesh-style sweep: single-root vs sub-object (old full-detect)
         // vs cluster-VF pipeline, PerFrame frame_ms. Args: <P=50> <maxS=6> <frames=30> <reps=5>.
@@ -20619,9 +20899,24 @@ int main(int argc, char** argv) {
         //simulator.addClothFile("src/assets", "teapot.obj", {0,0,0} 15, 1e4, 0, 2e4, thickness mass);
         //simulator.addClothFile("src/assets", "horse-gallop-01.obj", {0,0,0}, 80, 1e4, 0, 2e4, thickness mass);
         //simulator.addFloatMesh("src/assets", "horse-gallop-01.obj", {0, -1, 0}, 1.2);
-        //simulator.addFloatMesh("src/assets", "camel-gallop-reference.obj", {0, -1, 0}, 1.2);
-        simulator.addFloatMesh(ysim_paths::assetRoot(), "Human.obj", {0, 0.35, 0}, 0.04);
-        simulator.addGround(PlaneDirection::XZPlane, tinym::vec3(0, 0, 0), 50);
+        // Static Float obstacle. YSIM_OBSTACLE_OBJ/_SCALE/_Y swap it (default
+        // Human). YSIM_EXP_TWOMESH replicates the runFrameProfile collision
+        // environment in this REAL interactive loop: static obstacle + NO ground
+        // (so twoMeshExperiment sees exactly cloth+obstacle, no scene TLAS).
+        const bool expTwoMesh = std::getenv("YSIM_EXP_TWOMESH") != nullptr;
+        const char* obsObj   = std::getenv("YSIM_OBSTACLE_OBJ");
+        const char* obsScale = std::getenv("YSIM_OBSTACLE_SCALE");
+        const char* obsY     = std::getenv("YSIM_OBSTACLE_Y");
+        std::string obj = obsObj ? obsObj : "Human.obj";
+        Precision sc = obsScale ? (Precision)std::atof(obsScale) : Precision(0.04);
+        Precision oy = obsY ? (Precision)std::atof(obsY) : Precision(0.35);
+        simulator.addFloatMesh(ysim_paths::assetRoot(), obj, {0, oy, 0}, sc);
+        if (expTwoMesh) {
+            auto& hr = Scene<Backend, Precision>::requestsGeneralMeshes.back();
+            hr.isStatic = true; hr.applyGravity = false; hr.applyWind = false;
+        } else {
+            simulator.addGround(PlaneDirection::XZPlane, tinym::vec3(0, 0, 0), 50);
+        }
     }
 
     std::cout << "[Main] mesh added to scene" << std::endl;
@@ -21158,6 +21453,9 @@ int main(int argc, char** argv) {
             // because R-5 resync has been continuously writing sim state
             // back into preview.
             simulator->reset();
+            // Wipe the accumulated profiler log so each manual re-measure
+            // starts from an empty CSV. Section columns are preserved.
+            if(simulator->profiler) simulator->profiler->history().clearFrames();
         } else if(key == GLFW_KEY_9 && action == GLFW_PRESS) {
         } else if(key == GLFW_KEY_1 && action == GLFW_PRESS) {
             if(simulator->scene.meshes.size() > 0)
@@ -21248,7 +21546,8 @@ int main(int argc, char** argv) {
     const bool envProfile = std::getenv("YSIM_PROFILE_RUN") != nullptr;
     const bool cfgProfile = haveRunConfig && runConfig.profile.enabled;
     const bool profileActive = cfgProfile || envProfile;
-    const int  profileFrames = cfgProfile ? runConfig.profile.frames : 30;
+    const int  profileFrames = cfgProfile ? runConfig.profile.frames
+        : (std::getenv("YSIM_PROFILE_FRAMES") ? std::atoi(std::getenv("YSIM_PROFILE_FRAMES")) : 30);
     const bool profileRealtimeSync = cfgProfile ? runConfig.profile.realtimeSync : false;
     std::string profileCsvPath;
     if (cfgProfile && !runConfig.profile.outputPath.empty()) {
@@ -21314,6 +21613,33 @@ int main(int argc, char** argv) {
     // window's "Fused Refit+Enlarge" checkbox.
     if (std::getenv("YSIM_FUSED_REFIT") != nullptr)
         simulator.collisionPipeline.broadPhase.fusedRefitEnlarge = true;
+
+    // Sub-object-vs-regular BVH sweep, replicating runFrameProfile's collision
+    // environment INSIDE the real interactive renderer (req: same pipeline, real
+    // loop). YSIM_EXP_TWOMESH = master switch (also drops ground + statics the
+    // obstacle in the scene block above). YSIM_EXP_SUB_S:
+    //   0/unset → regular single-root LBVH (twoMeshExperiment, detectCollisionsTwoMesh)
+    //   1..6    → cluster-VF (grid cluster-pair) sub-object BVH, subBvhSplitS=s
+    //             applied to BOTH cloth+obstacle (global, per-mesh override -1).
+    // fusedRefitEnlarge = swept refit (→ broad_refit_swept section), as in the bench.
+    if (std::getenv("YSIM_EXP_TWOMESH")) {
+        auto& bp = simulator.collisionPipeline.broadPhase;
+        bp.twoMeshExperiment = true;
+        bp.fusedRefitEnlarge = true;
+        int sv = std::getenv("YSIM_EXP_SUB_S") ? std::atoi(std::getenv("YSIM_EXP_SUB_S")) : 0;
+        if (sv > 0) {
+            bp.useSubObjectBVH   = true;
+            bp.subBvhSplitS      = sv;
+            bp.subTopMode        = 1;       // GPU brute top (bench default)
+            bp.clusterNonGridBVH = true;
+            bp.clusterVFPipeline = true;
+            bp.validateSubObject = false;
+            if (bp.objTrees.size() > 1) bp.objTrees[1].builtForLifetimeId = -1;
+        }
+        std::cout << "[exp] twoMesh=1 fused=1 SUB_S=" << sv
+                  << " cluster=" << bp.clusterVFPipeline
+                  << " s=" << bp.subBvhSplitS << "\n";
+    }
 
     auto init = []() {
         glfwSwapInterval(1);

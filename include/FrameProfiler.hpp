@@ -64,6 +64,11 @@ public:
         return frames_.empty() ? nullptr : &frames_.back();
     }
 
+    // Drop all accumulated frames (the CSV export rows). Keeps section
+    // names/lookup so columns stay stable across re-records. Bound to the
+    // '0' reset so each manual measurement starts from an empty log.
+    void clearFrames() { frames_.clear(); }
+
     void push(FrameSnapshot frame) {
         if (frame.section_ms.size() < section_names_.size())
             frame.section_ms.resize(section_names_.size(), 0.0);
