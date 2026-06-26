@@ -355,7 +355,7 @@ void drawMeshInspectorWindow(MeshInspectorWindowState& st, const MeshInspectorTa
 
             static const char* kKinModes[4]={
                 "단일 클립 재생","랜덤 워크 · 모션 그래프","모션 전환 · 모션 그래프",
-                "모션 블렌드 · DTW"};
+                "모션 전환 · DTW"};
             const int mode=t.kin_mode<0?0:(t.kin_mode>3?3:t.kin_mode);
             ImGui::PushStyleColor(ImGuiCol_Text,kG60);ImGui::TextUnformatted("재생 모드");ImGui::PopStyleColor();ImGui::Dummy({0,4});
             ImGui::SetNextItemWidth(CW());
@@ -570,7 +570,7 @@ void drawMeshInspectorWindow(MeshInspectorWindowState& st, const MeshInspectorTa
                 ImGui::Dummy({0,12});
                 markerFracRow();
                 ImGui::Dummy({0,12});
-                if(ImGui::Button("블렌드 생성",{CW(),36})&&t.on_kin_blend_build)
+                if(ImGui::Button("전환 생성",{CW(),36})&&t.on_kin_blend_build)
                     t.on_kin_blend_build(t.mesh_id);
                 statusRow();
                 if(t.kin_graph_ready){

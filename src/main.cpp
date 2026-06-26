@@ -9416,7 +9416,7 @@ struct Simulator {
         {
             char buf[208];
             std::snprintf(buf, sizeof buf,
-                          "%s ~DTW~ %s · 블렌드 %d프레임 · 비용 %.3f · %.0fms",
+                          "%s ~DTW~ %s · 전환 %d프레임 · 비용 %.3f · %.0fms",
                           fileA.c_str(), fileB.c_str(),
                           kin->graphSession.trans.blendFrames,
                           kin->graphSession.trans.cost,
@@ -9426,7 +9426,7 @@ struct Simulator {
                 kin->graphStatus += " · 임계값 초과(최선값 사용)";
         }
         setKinematicTime(meshId, 0.0);
-        scene_log::logObject("모션 블렌드 생성 (id " + std::to_string(meshId) +
+        scene_log::logObject("모션 전환 생성 (id " + std::to_string(meshId) +
                              "): " + fileA + " ~ " + fileB);
         return true;
     }
