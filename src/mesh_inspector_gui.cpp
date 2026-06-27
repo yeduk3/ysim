@@ -68,6 +68,44 @@ static bool PillToggle(const char* id, bool* v) {
     ImGui::PopID(); return ch;
 }
 
+// ─── RangeSliderInt2 ────────────────────────────────────────────────
+// One track, two handles: the [*lo,*hi] span is filled (accent), the rest is a
+// gray background. Drag either handle (nearest to the press point); they can't
+// cross. Returns true the frame a handle moves. Integer domain [vmin,vmax].
+static bool RangeSliderInt2(const char* id, int* lo, int* hi, int vmin, int vmax) {
+    ImGui::PushID(id);
+    bool ch=false;
+    const float w=CW(), h=20, r=h*0.5f;
+    ImVec2 p=ImGui::GetCursorScreenPos();
+    ImDrawList* dl=ImGui::GetWindowDrawList();
+    ImGui::InvisibleButton("##rs",{w,h});
+    const bool active=ImGui::IsItemActive();
+    const float xL=p.x+r, xR=p.x+w-r, yc=p.y+h*0.5f;
+    auto v2x=[&](int v){ float t=vmax>vmin?float(v-vmin)/float(vmax-vmin):0.f; return xL+t*(xR-xL); };
+    auto x2v=[&](float x){ float t=(xR>xL)?(x-xL)/(xR-xL):0.f; t=t<0?0:(t>1?1:t); return vmin+int(t*float(vmax-vmin)+0.5f); };
+    ImGuiStorage* ss=ImGui::GetStateStorage();
+    ImGuiID wk=ImGui::GetID("##which");
+    if(ImGui::IsItemActivated()){  // pick the handle nearest the press
+        float mx=ImGui::GetIO().MousePos.x;
+        ss->SetInt(wk, std::fabs(mx-v2x(*lo))<=std::fabs(mx-v2x(*hi))?0:1);
+    }
+    if(active){
+        int which=ss->GetInt(wk,0);
+        int v=x2v(ImGui::GetIO().MousePos.x);
+        if(which==0){ if(v>*hi)v=*hi; if(v!=*lo){*lo=v;ch=true;} }
+        else        { if(v<*lo)v=*lo; if(v!=*hi){*hi=v;ch=true;} }
+    }
+    const ImU32 cTrack=ImGui::ColorConvertFloat4ToU32(kG20);
+    const ImU32 cFill=ImGui::ColorConvertFloat4ToU32(kG100);
+    dl->AddRectFilled({p.x,yc-3},{p.x+w,yc+3},cTrack,3.f);
+    const float xa=v2x(*lo), xb=v2x(*hi);
+    dl->AddRectFilled({xa,yc-3},{xb,yc+3},cFill,3.f);
+    dl->AddCircleFilled({xa,yc},r*0.85f,IM_COL32(255,255,255,255),16);
+    dl->AddCircleFilled({xb,yc},r*0.85f,IM_COL32(255,255,255,255),16);
+    ImGui::PopID();
+    return ch;
+}
+
 // ─── AccordionHeader ────────────────────────────────────────────────
 static std::unordered_map<ImGuiID,bool> sA;
 static bool AccordionHeader(const char* kr, const char* en) {
@@ -353,14 +391,14 @@ void drawMeshInspectorWindow(MeshInspectorWindowState& st, const MeshInspectorTa
                 ImGui::Dummy({0,16});
             }
 
-            static const char* kKinModes[4]={
+            static const char* kKinModes[5]={
                 "단일 클립 재생","랜덤 워크 · 모션 그래프","모션 전환 · 모션 그래프",
-                "모션 전환 · DTW"};
-            const int mode=t.kin_mode<0?0:(t.kin_mode>3?3:t.kin_mode);
+                "모션 전환 · DTW","모션 블렌드 스페이스"};
+            const int mode=t.kin_mode<0?0:(t.kin_mode>4?4:t.kin_mode);
             ImGui::PushStyleColor(ImGuiCol_Text,kG60);ImGui::TextUnformatted("재생 모드");ImGui::PopStyleColor();ImGui::Dummy({0,4});
             ImGui::SetNextItemWidth(CW());
             if(ImGui::BeginCombo("##kinmode",kKinModes[mode])){
-                for(int mi=0;mi<4;++mi){
+                for(int mi=0;mi<5;++mi){
                     bool sel=(mi==mode);
                     if(ImGui::Selectable(kKinModes[mi],sel)&&!sel&&t.on_kin_mode)
                         t.on_kin_mode(t.mesh_id,mi);
@@ -433,6 +471,58 @@ void drawMeshInspectorWindow(MeshInspectorWindowState& st, const MeshInspectorTa
                     ImGui::EndCombo();
                 }
             };
+            // ── Reusable motion-clip selector row ────────────────────────
+            // One uniform widget for picking a clip in ANY mode: label + file
+            // combo + preview-strobe toggle + in-place color swatch + one-shot
+            // play button. Drives t.kin_clip_slots[idx] via the slot callbacks.
+            // To change the selector everywhere, edit only this lambda; to add
+            // it to a new mode, call clipSlotRow(i) per slot.
+            auto clipSlotRow=[&](int idx){
+                if(idx<0||idx>=(int)t.kin_clip_slots.size())return;
+                auto& s=t.kin_clip_slots[idx];
+                if(!s.label.empty()){
+                    ImGui::PushStyleColor(ImGuiCol_Text,kG60);ImGui::TextUnformatted(s.label.c_str());ImGui::PopStyleColor();ImGui::Dummy({0,4});
+                }
+                char cid[24]; snprintf(cid,sizeof cid,"##slf%d",idx);
+                fileCombo(cid,s.file,[&,idx](const std::string& f){
+                    if(t.on_kin_slot_file)t.on_kin_slot_file(t.mesh_id,idx,f);
+                });
+                ImGui::Dummy({0,6});
+                ImGui::PushStyleColor(ImGuiCol_Text,kG60);ImGui::TextUnformatted("프리뷰");ImGui::PopStyleColor();
+                ImGui::SameLine(0,8);
+                bool pv=s.preview;
+                char tid[24]; snprintf(tid,sizeof tid,"##slpv%d",idx);
+                if(PillToggle(tid,&pv)&&t.on_kin_slot_preview)t.on_kin_slot_preview(t.mesh_id,idx,pv);
+                if(s.color){
+                    ImGui::SameLine(0,10);
+                    char colid[24]; snprintf(colid,sizeof colid,"##slc%d",idx);
+                    ImGui::ColorEdit3(colid,s.color,ImGuiColorEditFlags_NoInputs|ImGuiColorEditFlags_NoLabel);
+                }
+                ImGui::SameLine(0,10);
+                if(t.kin_preview_playing==idx+1){
+                    // This slot is playing → 중단 removes it.
+                    char sid[24]; snprintf(sid,sizeof sid,"중단##slpl%d",idx);
+                    if(ImGui::SmallButton(sid)&&t.on_kin_preview_stop)t.on_kin_preview_stop(t.mesh_id);
+                }else{
+                    char pid[24]; snprintf(pid,sizeof pid,"재생##slpl%d",idx);
+                    ImGui::BeginDisabled(!(s.preview&&t.kin_sim_paused));
+                    if(ImGui::SmallButton(pid)&&t.on_kin_slot_play)t.on_kin_slot_play(t.mesh_id,idx);
+                    ImGui::EndDisabled();
+                }
+                // Active-frame window — colored span = frames the effect+preview
+                // use; its first frame anchors the body. Known once the clip is
+                // cached (프리뷰 on), so the slider appears with the preview.
+                if(s.frame_count>1){
+                    ImGui::Dummy({0,8});
+                    ImGui::PushStyleColor(ImGuiCol_Text,kG60);ImGui::TextUnformatted("프레임 범위");ImGui::PopStyleColor();
+                    ImGui::SameLine(0,8);
+                    ImGui::Text("%d–%d / %d",s.range_start,s.range_end,s.frame_count-1);
+                    int lo=s.range_start, hi=s.range_end;
+                    char rid[24]; snprintf(rid,sizeof rid,"##slrg%d",idx);
+                    if(RangeSliderInt2(rid,&lo,&hi,0,s.frame_count-1)&&t.on_kin_slot_range)
+                        t.on_kin_slot_range(t.mesh_id,idx,lo,hi);
+                }
+            };
             auto statusRow=[&](){
                 if(t.kin_status.empty())return;
                 ImGui::Dummy({0,8});
@@ -500,16 +590,11 @@ void drawMeshInspectorWindow(MeshInspectorWindowState& st, const MeshInspectorTa
                     speedRow();
                 }
             }else if(mode==2){
-                // 모션 전환 — A → B composite → playback with scrub.
-                ImGui::PushStyleColor(ImGuiCol_Text,kG60);ImGui::TextUnformatted("모션 1 (시작)");ImGui::PopStyleColor();ImGui::Dummy({0,4});
-                fileCombo("##kintra",t.kin_trans_a,[&](const std::string& f){
-                    if(t.on_kin_trans_a)t.on_kin_trans_a(t.mesh_id,f);
-                });
+                // 모션 전환 — A → B composite → playback with scrub. Clip pick
+                // uses the shared selector (combo + preview + color + play).
+                clipSlotRow(0);
                 ImGui::Dummy({0,12});
-                ImGui::PushStyleColor(ImGuiCol_Text,kG60);ImGui::TextUnformatted("모션 2 (도착)");ImGui::PopStyleColor();ImGui::Dummy({0,4});
-                fileCombo("##kintrb",t.kin_trans_b,[&](const std::string& f){
-                    if(t.on_kin_trans_b)t.on_kin_trans_b(t.mesh_id,f);
-                });
+                clipSlotRow(1);
                 ImGui::Dummy({0,12});
                 thresholdRow();
                 ImGui::Dummy({0,8});
@@ -527,46 +612,13 @@ void drawMeshInspectorWindow(MeshInspectorWindowState& st, const MeshInspectorTa
                     ImGui::Dummy({0,12});
                     speedRow();
                 }
-            }else{
+            }else if(mode==3){
                 // 모션 블렌드 — DTW timewarp A→B → time-scaled crossfade track.
-                // A per-clip preview (strobe ghost + color) sits under each
-                // combo so each motion can be eyeballed as it is picked, before
-                // 블렌드 생성. Ghost root is placed at the object's transform.
-                ImGui::PushStyleColor(ImGuiCol_Text,kG60);ImGui::TextUnformatted("모션 1 (시작)");ImGui::PopStyleColor();ImGui::Dummy({0,4});
-                fileCombo("##kinbla",t.kin_trans_a,[&](const std::string& f){
-                    if(t.on_kin_trans_a)t.on_kin_trans_a(t.mesh_id,f);
-                });
-                ImGui::Dummy({0,6});
-                ImGui::PushStyleColor(ImGuiCol_Text,kG60);ImGui::TextUnformatted("프리뷰");ImGui::PopStyleColor();
-                ImGui::SameLine(0,8);
-                bool pa=t.kin_preview_a;
-                if(PillToggle("##kpva",&pa)&&t.on_kin_preview_a)t.on_kin_preview_a(t.mesh_id,pa);
-                if(t.kin_preview_col_a){
-                    ImGui::SameLine(0,10);
-                    ImGui::ColorEdit3("##kpca",t.kin_preview_col_a,ImGuiColorEditFlags_NoInputs|ImGuiColorEditFlags_NoLabel);
-                }
-                ImGui::SameLine(0,10);
-                ImGui::BeginDisabled(!(t.kin_preview_a&&t.kin_sim_paused));
-                if(ImGui::SmallButton("재생##pa")&&t.on_kin_preview_play_a)t.on_kin_preview_play_a(t.mesh_id);
-                ImGui::EndDisabled();
+                // Clip pick uses the shared selector — each motion's strobe
+                // ghost + color + play can be eyeballed before 블렌드 생성.
+                clipSlotRow(0);
                 ImGui::Dummy({0,12});
-                ImGui::PushStyleColor(ImGuiCol_Text,kG60);ImGui::TextUnformatted("모션 2 (도착)");ImGui::PopStyleColor();ImGui::Dummy({0,4});
-                fileCombo("##kinblb",t.kin_trans_b,[&](const std::string& f){
-                    if(t.on_kin_trans_b)t.on_kin_trans_b(t.mesh_id,f);
-                });
-                ImGui::Dummy({0,6});
-                ImGui::PushStyleColor(ImGuiCol_Text,kG60);ImGui::TextUnformatted("프리뷰");ImGui::PopStyleColor();
-                ImGui::SameLine(0,8);
-                bool pb=t.kin_preview_b;
-                if(PillToggle("##kpvb",&pb)&&t.on_kin_preview_b)t.on_kin_preview_b(t.mesh_id,pb);
-                if(t.kin_preview_col_b){
-                    ImGui::SameLine(0,10);
-                    ImGui::ColorEdit3("##kpcb",t.kin_preview_col_b,ImGuiColorEditFlags_NoInputs|ImGuiColorEditFlags_NoLabel);
-                }
-                ImGui::SameLine(0,10);
-                ImGui::BeginDisabled(!(t.kin_preview_b&&t.kin_sim_paused));
-                if(ImGui::SmallButton("재생##pb")&&t.on_kin_preview_play_b)t.on_kin_preview_play_b(t.mesh_id);
-                ImGui::EndDisabled();
+                clipSlotRow(1);
                 ImGui::Dummy({0,12});
                 markerFracRow();
                 ImGui::Dummy({0,12});
@@ -584,6 +636,143 @@ void drawMeshInspectorWindow(MeshInspectorWindowState& st, const MeshInspectorTa
                     playRow(true);
                     ImGui::Dummy({0,16});
                     scrubRow();
+                    ImGui::Dummy({0,12});
+                    speedRow();
+                }
+            }else{
+                // 모션 블렌드 스페이스 — N locomotion clips placed in a 2D pad,
+                // blended live by a draggable cursor. The mix drives the
+                // kinematic body, which in turn drives any attached cloth.
+                ImGui::PushTextWrapPos(ImGui::GetCursorPosX()+CW());
+                ImGui::PushStyleColor(ImGuiCol_Text,kG60);
+                ImGui::TextUnformatted("프리셋을 고르면 모션 4개가 채워짐. 각 모션은 아래에서 교체·프리뷰, 생성 후 패드로 실시간 혼합.");
+                ImGui::PopStyleColor();ImGui::PopTextWrapPos();
+                ImGui::Dummy({0,12});
+                // Preset dropdown — ABOVE the per-clip combos. "자율선택" = manual.
+                // Picking a preset fills the 4 clips; editing any clip reverts here.
+                ImGui::PushStyleColor(ImGuiCol_Text,kG60);ImGui::TextUnformatted("프리셋");ImGui::PopStyleColor();ImGui::Dummy({0,4});
+                const char* curPreset=(t.kin_blend_preset>=0&&t.kin_blend_preset<(int)t.kin_blend_presets.size())
+                    ? t.kin_blend_presets[t.kin_blend_preset].c_str() : "자율선택";
+                ImGui::SetNextItemWidth(CW());
+                if(ImGui::BeginCombo("##bspreset",curPreset)){
+                    bool selC=(t.kin_blend_preset<0);
+                    if(ImGui::Selectable("자율선택",selC)&&!selC&&t.on_kin_blend_preset)
+                        t.on_kin_blend_preset(t.mesh_id,-1);
+                    for(int i=0;i<(int)t.kin_blend_presets.size();++i){
+                        bool sel=(i==t.kin_blend_preset);
+                        if(ImGui::Selectable(t.kin_blend_presets[i].c_str(),sel)&&!sel&&t.on_kin_blend_preset)
+                            t.on_kin_blend_preset(t.mesh_id,i);
+                        if(sel)ImGui::SetItemDefaultFocus();
+                    }
+                    ImGui::EndCombo();
+                }
+                ImGui::Dummy({0,14});
+                // Same per-clip selector as the other modes, one row per corner.
+                for(int i=0;i<(int)t.kin_clip_slots.size();++i){
+                    clipSlotRow(i);
+                    ImGui::Dummy({0,10});
+                }
+                // Build-time root mode: 절대(absolute) blends real per-clip root
+                // motion; off = 상대(relative) pin+integrate. Toggling rebuilds.
+                ImGui::PushStyleColor(ImGuiCol_Text,kG60);ImGui::TextUnformatted("절대 루트");ImGui::PopStyleColor();
+                ImGui::SameLine(0,10);
+                bool ar=t.kin_blend_absroot;
+                if(PillToggle("##kbabs",&ar)&&t.on_kin_blend_absroot)t.on_kin_blend_absroot(t.mesh_id,ar);
+                ImGui::Dummy({0,12});
+                if(ImGui::Button("블렌드 스페이스 생성",{CW(),36})&&t.on_kin_blendspace_build)
+                    t.on_kin_blendspace_build(t.mesh_id);
+                statusRow();
+                if(t.kin_graph_ready&&!t.kin_blend_coords.empty()){
+                    ImGui::Dummy({0,16});
+                    // 2D pad: blend coords (in [-1,1]) → a square; drag the
+                    // cursor anywhere inside to set the live mix.
+                    const float pad=CW();
+                    const ImVec2 org=ImGui::GetCursorScreenPos();
+                    ImGui::InvisibleButton("##blendpad",{pad,pad});
+                    const bool active=ImGui::IsItemActive();
+                    ImDrawList* dl=ImGui::GetWindowDrawList();
+                    auto N2S=[&](float x,float y){
+                        return ImVec2(org.x+(x*0.5f+0.5f)*pad,
+                                      org.y+(-y*0.5f+0.5f)*pad);
+                    };
+                    dl->AddRectFilled(org,{org.x+pad,org.y+pad},IM_COL32(20,20,24,255),8.0f);
+                    dl->AddRect(org,{org.x+pad,org.y+pad},IM_COL32(80,80,90,255),8.0f);
+                    dl->AddLine(N2S(-1,0),N2S(1,0),IM_COL32(48,48,56,255));
+                    dl->AddLine(N2S(0,-1),N2S(0,1),IM_COL32(48,48,56,255));
+                    // Clip sample points sized/tinted by their current weight.
+                    for(size_t i=0;i<t.kin_blend_coords.size();++i){
+                        const ImVec2 pp=N2S(t.kin_blend_coords[i][0],t.kin_blend_coords[i][1]);
+                        const float w=i<t.kin_blend_weights.size()?t.kin_blend_weights[i]:0.0f;
+                        const ImU32 col=IM_COL32((int)(110+140*w),(int)(120+50*w),(int)(160-70*w),255);
+                        dl->AddCircleFilled(pp,4.0f+9.0f*w,col);
+                        const char* nm=i<t.kin_blend_labels.size()?t.kin_blend_labels[i].c_str():"";
+                        dl->AddText({pp.x+9,pp.y-7},IM_COL32(220,220,228,255),nm);
+                    }
+                    // Cursor: follow the mouse while the pad is held.
+                    ImVec2 cur=N2S(t.kin_blend_cursor[0],t.kin_blend_cursor[1]);
+                    if(active){
+                        const ImVec2 mp=ImGui::GetIO().MousePos;
+                        float nx=((mp.x-org.x)/pad)*2.0f-1.0f;
+                        float ny=-(((mp.y-org.y)/pad)*2.0f-1.0f);
+                        nx=nx<-1?-1:(nx>1?1:nx); ny=ny<-1?-1:(ny>1?1:ny);
+                        if(t.on_kin_blend_cursor)t.on_kin_blend_cursor(t.mesh_id,nx,ny);
+                        cur=N2S(nx,ny);
+                    }
+                    dl->AddCircle(cur,9.0f,IM_COL32(255,255,255,255),0,2.0f);
+                    dl->AddCircleFilled(cur,3.0f,IM_COL32(255,255,255,255));
+                    ImGui::Dummy({0,12});
+                    // 1D bars, one per axis. Each edits ONLY its own axis and
+                    // passes the other through unchanged (moving one bar never
+                    // disturbs the other or the pad). Labelled by the clip files
+                    // at the axis ends — no fixed role names. Grey frame bg to
+                    // match the material sliders (InlineSlider).
+                    auto nearestLabel=[&](float tx,float ty)->const char*{
+                        int best=-1; float bd=1e9f;
+                        for(size_t i=0;i<t.kin_blend_coords.size();++i){
+                            float dx=t.kin_blend_coords[i][0]-tx,dy=t.kin_blend_coords[i][1]-ty;
+                            float d=dx*dx+dy*dy;
+                            if(d<bd){bd=d;best=(int)i;}
+                        }
+                        return (best>=0&&best<(int)t.kin_blend_labels.size())?t.kin_blend_labels[best].c_str():"";
+                    };
+                    auto axisBar=[&](const char* id,const char* lbl,float val,
+                                     const std::function<void(float)>& onChange){
+                        ImGui::PushStyleColor(ImGuiCol_Text,kG60);ImGui::TextUnformatted(lbl);ImGui::PopStyleColor();ImGui::Dummy({0,4});
+                        ImGui::PushStyleColor(ImGuiCol_FrameBg,kG10);ImGui::PushStyleColor(ImGuiCol_FrameBgHovered,kG10);ImGui::PushStyleColor(ImGuiCol_FrameBgActive,kG10);
+                        ImGui::SetNextItemWidth(CW());
+                        if(ImGui::SliderFloat(id,&val,-1.0f,1.0f,""))onChange(val);
+                        ImGui::PopStyleColor(3);
+                    };
+                    char ylbl[128],xlbl[128];
+                    snprintf(ylbl,sizeof ylbl,"%s  ↔  %s",nearestLabel(0,-1),nearestLabel(0,1));
+                    snprintf(xlbl,sizeof xlbl,"%s  ↔  %s",nearestLabel(-1,0),nearestLabel(1,0));
+                    axisBar("##bswr",ylbl,t.kin_blend_cursor[1],[&](float v){
+                        if(t.on_kin_blend_cursor)t.on_kin_blend_cursor(t.mesh_id,t.kin_blend_cursor[0],v);
+                    });
+                    ImGui::Dummy({0,8});
+                    axisBar("##bssl",xlbl,t.kin_blend_cursor[0],[&](float v){
+                        if(t.on_kin_blend_cursor)t.on_kin_blend_cursor(t.mesh_id,v,t.kin_blend_cursor[1]);
+                    });
+                    ImGui::Dummy({0,12});
+                    // Blend-result preview: strobe ghost of the blended cycle
+                    // (toggle), plus a one-shot 재생 of the blend through one
+                    // cycle. Both morph live as the pad/slider moves; 재생 is
+                    // paused-only.
+                    ImGui::PushStyleColor(ImGuiCol_Text,kG60);ImGui::TextUnformatted("블렌드 프리뷰");ImGui::PopStyleColor();
+                    ImGui::SameLine(0,10);
+                    bool bp=t.kin_blend_preview;
+                    if(PillToggle("##kbpv",&bp)&&t.on_kin_blend_preview)t.on_kin_blend_preview(t.mesh_id,bp);
+                    ImGui::SameLine(0,12);
+                    if(t.kin_preview_playing==-1){
+                        if(ImGui::SmallButton("중단##kbplay")&&t.on_kin_preview_stop)t.on_kin_preview_stop(t.mesh_id);
+                    }else{
+                        ImGui::BeginDisabled(!t.kin_sim_paused);
+                        if(ImGui::SmallButton("재생##kbplay")&&t.on_kin_blend_play)t.on_kin_blend_play(t.mesh_id);
+                        ImGui::EndDisabled();
+                    }
+                    ImGui::Dummy({0,12});
+                    labelRow();
+                    playRow(false);
                     ImGui::Dummy({0,12});
                     speedRow();
                 }

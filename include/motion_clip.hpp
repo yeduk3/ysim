@@ -103,6 +103,26 @@ struct Quatf {
         }
         return q.normalized();
     }
+
+    // Unit-quaternion log → tangent 3-vector u (the half-angle rotation vector:
+    // |u| = half the rotation angle, û = axis). Assumes |q|=1; identity → 0.
+    // exp(log(q)) == q for w ≥ 0, so callers sign-flip to the w ≥ 0 hemisphere
+    // first (shortest arc) before taking the log.
+    std::array<float, 3> log() const {
+        const float vn = std::sqrt(x * x + y * y + z * z);
+        if (vn < 1e-8f) return {0.0f, 0.0f, 0.0f};
+        const float ww = w < -1.0f ? -1.0f : (w > 1.0f ? 1.0f : w);
+        const float k = std::atan2(vn, ww) / vn;  // θ/|v|, θ = half-angle
+        return {x * k, y * k, z * k};
+    }
+
+    // Exp of a tangent 3-vector u → unit quaternion (cos|u|, û sin|u|).
+    static Quatf exp(const std::array<float, 3>& u) {
+        const float th = std::sqrt(u[0] * u[0] + u[1] * u[1] + u[2] * u[2]);
+        if (th < 1e-8f) return identity();
+        const float s = std::sin(th) / th;
+        return Quatf{std::cos(th), u[0] * s, u[1] * s, u[2] * s};
+    }
 };
 
 // Shortest-arc spherical interpolation (nlerp fallback when nearly parallel).
@@ -190,6 +210,108 @@ inline void blendPose(const LocalPose& a, const LocalPose& b, float wa,
         out.rootPos[k] = a.rootPos[k] * wa + b.rootPos[k] * wb;
     for (size_t j = 0; j < a.rot.size(); ++j)
         out.rot[j] = slerp(a.rot[j], b.rot[j], wb);
+}
+
+// N-way weighted blend: out = Σ w_i · poses[i]. Roots take the weighted mean;
+// rotations are blended by INCREMENTAL sign-correct slerp in fixed index order
+// (acc = slerp(acc, q_i, w_i/(accW+w_i))). This is continuous in the weights —
+// crucially it has NO argmax / reference choice, so when the dominant clip
+// changes (e.g. dragging the cursor across the blend-space center) there is no
+// reference switch and therefore no pose pop. Each slerp flips internally on a
+// negative dot, so it is antipodal-safe (q ≡ -q). A weight ≤ 0 is skipped, and
+// as a weight → 0 its slerp step → identity, so coverage is continuous too.
+// Order-dependent (vs a true mean) but smooth, which is what matters here.
+inline void blendPoseN(const std::vector<LocalPose>& poses,
+                       const std::vector<float>& w, LocalPose& out) {
+    const size_t n = poses.size();
+    if (n == 0 || w.size() < n) { out = poses.empty() ? LocalPose{} : poses[0]; return; }
+    if (n == 1) { out = poses[0]; return; }
+    float wsum = 0.0f;
+    for (size_t i = 0; i < n; ++i) if (w[i] > 0.0f) wsum += w[i];
+    const float inv = wsum > 1e-8f ? 1.0f / wsum : 0.0f;
+    const size_t J = poses[0].rot.size();
+    out.rootPos = {0.0f, 0.0f, 0.0f};
+    out.rot.resize(J);
+    for (int k = 0; k < 3; ++k) {
+        float acc = 0.0f;
+        for (size_t i = 0; i < n; ++i) acc += poses[i].rootPos[k] * std::max(0.0f, w[i]);
+        out.rootPos[k] = inv > 0.0f ? acc * inv : poses[0].rootPos[k];
+    }
+    for (size_t j = 0; j < J; ++j) {
+        Quatf acc;
+        float accW = 0.0f;
+        bool started = false;
+        for (size_t i = 0; i < n; ++i) {
+            const float wi = w[i] > 0.0f ? w[i] : 0.0f;
+            if (wi <= 0.0f || j >= poses[i].rot.size()) continue;
+            if (!started) { acc = poses[i].rot[j]; accW = wi; started = true; }
+            else {
+                acc = slerp(acc, poses[i].rot[j], wi / (accW + wi));
+                accW += wi;
+            }
+        }
+        out.rot[j] = started ? acc.normalized() : poses[0].rot[j];
+    }
+}
+
+// N-way weighted blend using a true intrinsic (Karcher) mean for the joint
+// rotations: out.rot[j] = argmin_q Σ w_i · d(q, q_i)² on S³. The order-dependent
+// incremental slerp of blendPoseN() is the warm start (it is antipodal-safe and
+// already close to the mean), then a few Newton steps in the tangent space at
+// the running estimate refine it: m = Σ ŵ_i · log(ref⁻¹ q_i), ref ← ref·exp(m).
+// Unlike four-vector-sum + renormalize this introduces no spurious acceleration,
+// and unlike incremental slerp the result is independent of clip order. Two
+// iterations converge to float precision for typical (sub-π) blends. Root takes
+// the same weighted mean as blendPoseN. See AAT02 (log/exp) + AAT03 (why an
+// N-quaternion combination has no closed form).
+inline void blendPoseNMean(const std::vector<LocalPose>& poses,
+                           const std::vector<float>& w, LocalPose& out,
+                           int iters = 2) {
+    const size_t n = poses.size();
+    if (n == 0 || w.size() < n) { out = poses.empty() ? LocalPose{} : poses[0]; return; }
+    if (n == 1) { out = poses[0]; return; }
+    float wsum = 0.0f;
+    for (size_t i = 0; i < n; ++i) if (w[i] > 0.0f) wsum += w[i];
+    const float inv = wsum > 1e-8f ? 1.0f / wsum : 0.0f;
+    const size_t J = poses[0].rot.size();
+    out.rootPos = {0.0f, 0.0f, 0.0f};
+    out.rot.resize(J);
+    for (int k = 0; k < 3; ++k) {
+        float acc = 0.0f;
+        for (size_t i = 0; i < n; ++i) acc += poses[i].rootPos[k] * std::max(0.0f, w[i]);
+        out.rootPos[k] = inv > 0.0f ? acc * inv : poses[0].rootPos[k];
+    }
+    for (size_t j = 0; j < J; ++j) {
+        // Warm start: incremental sign-correct slerp (same as blendPoseN).
+        Quatf ref;
+        float accW = 0.0f;
+        bool started = false;
+        for (size_t i = 0; i < n; ++i) {
+            const float wi = w[i] > 0.0f ? w[i] : 0.0f;
+            if (wi <= 0.0f || j >= poses[i].rot.size()) continue;
+            if (!started) { ref = poses[i].rot[j]; accW = wi; started = true; }
+            else { ref = slerp(ref, poses[i].rot[j], wi / (accW + wi)); accW += wi; }
+        }
+        if (!started) { out.rot[j] = poses[0].rot[j]; continue; }
+        ref = ref.normalized();
+        // Karcher refinement in the tangent space at `ref`.
+        for (int it = 0; it < iters && inv > 0.0f; ++it) {
+            const Quatf refInv{ref.w, -ref.x, -ref.y, -ref.z};  // unit ⇒ inverse
+            float mx = 0.0f, my = 0.0f, mz = 0.0f;
+            for (size_t i = 0; i < n; ++i) {
+                const float wi = w[i] > 0.0f ? w[i] : 0.0f;
+                if (wi <= 0.0f || j >= poses[i].rot.size()) continue;
+                Quatf rel = refInv * poses[i].rot[j];
+                if (rel.w < 0.0f) { rel.w = -rel.w; rel.x = -rel.x; rel.y = -rel.y; rel.z = -rel.z; }
+                const auto d = rel.log();
+                const float wn = wi * inv;
+                mx += wn * d[0]; my += wn * d[1]; mz += wn * d[2];
+            }
+            if (mx * mx + my * my + mz * mz < 1e-12f) break;
+            ref = (ref * Quatf::exp({mx, my, mz})).normalized();
+        }
+        out.rot[j] = ref;
+    }
 }
 
 // Forward kinematics against the reference skeleton. Parent always precedes
@@ -340,6 +462,103 @@ inline bool sampleClip(const bvh::Motion& m, const Skeleton& ref, float refDt,
         }
     }
     return !out.frames.empty();
+}
+
+// Sample a clip at a normalized phase. loop=true (the default, live looping
+// body): phase wraps to [0,1) and the last frame blends back into the first,
+// so loop-authored clips ( *LoopA ) cycle seamlessly. loop=false (one-shot
+// playback): phase clamps to [0,1] over frames [0, nf-1] with NO wrap — the
+// last frame is held, so a non-looping clip (last≠first) ends on its true end
+// pose instead of morphing back toward frame 0 at the seam. Phase is shared
+// across clips of differing length to keep their gait cycles in sync.
+inline void sampleClipPhase(const Clip& c, float phase, LocalPose& out,
+                            bool loop = true) {
+    const int nf = int(c.frames.size());
+    if (nf == 0) { out = LocalPose{}; return; }
+    if (nf == 1) { out = c.frames[0]; return; }
+    if (loop) {
+        const float p = phase - std::floor(phase);     // wrap to [0,1)
+        const float ff = p * float(nf);                // [0, nf)
+        const int f0 = int(ff) % nf;
+        const int f1 = (f0 + 1) % nf;
+        blendPose(c.frames[f0], c.frames[f1], 1.0f - (ff - std::floor(ff)), out);
+    } else {
+        const float p = phase < 0.0f ? 0.0f : (phase > 1.0f ? 1.0f : phase);
+        const float ff = p * float(nf - 1);            // [0, nf-1]
+        int f0 = int(ff);
+        if (f0 > nf - 2) f0 = nf - 2;                  // clamp last cell
+        blendPose(c.frames[f0], c.frames[f0 + 1], 1.0f - (ff - float(f0)), out);
+    }
+}
+
+// Pin a clip "in place" for blend-space use: re-root every frame to the
+// canonical origin (root xz = 0, heading/yaw = 0), keeping vertical bob (Y) and
+// all joint motion. Raw locomotion clips translate and turn — jogCurve curves
+// ~187° and drifts ~30 units, DNCMODRNA drifts far — so on the shared looping
+// phase the root would teleport back at the seam (phase 1→0): a violent
+// position + heading pop, worst when clips travel/turn the most. Pinned, the
+// gait plays as an in-place "treadmill" (what a cloth-driving character wants)
+// and every clip co-aligns so the N-way blend stays clean. Joint rotations are
+// relative to the root, so the gait itself is untouched.
+inline void pinClipInPlace(Clip& c) {
+    for (LocalPose& p : c.frames) {
+        if (!p.rot.empty()) {
+            std::array<float, 9> R;
+            p.rot[0].toMat3(R);
+            const float yaw = std::atan2(R[2], R[0]);  // world heading about +Y
+            p.rot[0] = (Quatf::yaw(-yaw) * p.rot[0]).normalized();
+        }
+        p.rootPos[0] = 0.0f;  // keep Y (bob), pin xz
+        p.rootPos[2] = 0.0f;
+    }
+}
+
+// ---- clip style features (for "opposed pair" ranking) -----------------------
+
+// Height-normalized locomotion descriptors of a clip, so clips of different
+// scale compare fairly. Two clips are "clearly opposed" when they sit far
+// apart in this space — high speed gap (walk vs run), height gap (sneak vs
+// stand), bounce gap, or vigour gap. Used to rank blend-space axis endpoints.
+struct ClipFeatures {
+    float rootSpeed = 0.0f;   // mean root xz speed / height   (per second)
+    float rootHeight = 0.0f;  // mean root Y / height          (low = crouched)
+    float bob = 0.0f;         // (maxY-minY) of root / height  (vertical bounce)
+    float energy = 0.0f;      // mean Σ_joint geodesic angle / s (overall vigour)
+};
+
+inline ClipFeatures clipFeatures(const Skeleton& skel, const Clip& c) {
+    ClipFeatures f;
+    const int nf = int(c.frames.size());
+    if (nf == 0 || skel.height <= 1e-6f) return f;
+    const float invH = 1.0f / skel.height;
+    float yMin = 1e30f, yMax = -1e30f, ySum = 0.0f, spd = 0.0f, en = 0.0f;
+    for (int i = 0; i < nf; ++i) {
+        const LocalPose& p = c.frames[i];
+        const float y = p.rootPos[1] * invH;
+        ySum += y;
+        yMin = std::min(yMin, y);
+        yMax = std::max(yMax, y);
+        if (i > 0) {
+            const LocalPose& q = c.frames[i - 1];
+            const float dx = (p.rootPos[0] - q.rootPos[0]) * invH;
+            const float dz = (p.rootPos[2] - q.rootPos[2]) * invH;
+            spd += std::sqrt(dx * dx + dz * dz);
+            float a = 0.0f;
+            for (size_t j = 0; j < p.rot.size() && j < q.rot.size(); ++j) {
+                float d = std::fabs(p.rot[j].dot(q.rot[j]));
+                if (d > 1.0f) d = 1.0f;
+                a += 2.0f * std::acos(d);  // geodesic angle between frames
+            }
+            en += a;
+        }
+    }
+    const float dt = c.dt > 1e-6f ? c.dt : 1.0f;
+    const int steps = std::max(1, nf - 1);
+    f.rootSpeed = (spd / steps) / dt;
+    f.rootHeight = ySum / float(nf);
+    f.bob = yMax - yMin;
+    f.energy = (en / steps) / dt;
+    return f;
 }
 
 }  // namespace mograph

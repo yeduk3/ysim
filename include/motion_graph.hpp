@@ -906,12 +906,21 @@ struct SessionParams {
 // FK update consumes; future blend modes plug in as new build*()/sample
 // paths over the same Clip/LocalPose data.
 struct Session {
-    enum class Mode : uint8_t { Off = 0, Transition = 1, RandomWalk = 2, Blend = 3 };
+    enum class Mode : uint8_t {
+        Off = 0, Transition = 1, RandomWalk = 2, Blend = 3, BlendSpace = 4
+    };
+    // Blend-space root handling (AAT07 "absolute vs relative"). Relative (default)
+    // pins each clip + integrates blended heading-relative velocity → curving
+    // travel-in-place. Absolute rebases each clip to its own frame 0 and blends
+    // the absolute root position/orientation directly (no integrator); the body
+    // is then anchored frame-0→object by applyRootRebase. Chosen at build.
+    enum class RootMode : uint8_t { Relative = 0, Absolute = 1 };
 
     // Transition and Blend both bake one finite, scrubbable LocalPose track.
     bool trackMode() const { return mode == Mode::Transition || mode == Mode::Blend; }
 
     Mode mode = Mode::Off;
+    RootMode rootMode = RootMode::Relative;
     Skeleton skel;
     float dt = 1.0f / 30.0f;
     std::vector<Clip> clips;
@@ -930,29 +939,252 @@ struct Session {
     MotionGraph graph;
     WalkBaker walker;
 
+    // Interactive blend-space payload (Mode::BlendSpace): N looping clips, each
+    // placed at a 2D coordinate; a live cursor produces inverse-distance weights
+    // that blend the clips per frame. No baked track — samplePose blends live.
+    std::vector<std::array<float, 2>> clipCoords;  // parallel to clips
+    std::array<float, 2> cursor{0.0f, 0.0f};
+    // Fixed gait period (seconds), set once at build = mean clip duration. The
+    // live phase = fmod(t, blendCycleSec)/blendCycleSec is CURSOR-INDEPENDENT:
+    // a weight-dependent period would make fmod(large t, cycle) jump whenever
+    // the cursor moves (the modulus shifts under a large dividend) → a pose
+    // pop. Clips stay phase-synced on this common normalized timeline.
+    double blendCycleSec = 1.0;
+    // Joint-rotation blend method for the N-way mix. true = intrinsic (Karcher)
+    // mean (order-independent, no spurious acceleration); false = the legacy
+    // order-dependent incremental slerp. Default on; the toggle is the fallback.
+    bool useIntrinsicMean = true;
+    // Thin-plate RBF cursor→weight scheme (Rose "Verbs & Adverbs"). Built once
+    // from clipCoords: cardinal functions w_i(x)=Σ_j λ_ij·φ(|x-x_j|)+a_i+b_i·x+
+    // c_i·y with φ(r)=r²ln(r), so w_i(x_j)=δ_ij exactly and the affine poly term
+    // makes Σ_i w_i≡1. Empty (n<2 or a singular system from coincident samples)
+    // ⇒ blendWeights falls back to inverse-distance. Weights may go negative
+    // (extrapolation) — accepted, not clamped (matches the paper).
+    // ponytail: O(n²) per-frame eval; n = #blend clips is tiny so no hoist.
+    bool useRbf = true;
+    std::vector<float> rbfLambda;  // n*n, cardinal i basis j → rbfLambda[i*n+j]
+    std::vector<float> rbfPoly;    // n*3, cardinal i → {a_i,b_i,c_i}
+    // Root motion (velocity-integrated, with turning). The clips are pinned in
+    // place (no absolute root motion → no seam teleport); locomotion is added
+    // back by blending each clip's per-frame HEADING-RELATIVE root velocity
+    // {localVx, localVz, yawRate} and integrating it: blendYaw += Σ w_i·ω_i·dt,
+    // blendPos += R(blendYaw)·(Σ w_i·v_i)·dt. Integration (not v·t) keeps the
+    // position continuous when the mix changes mid-playback, and the heading
+    // term lets the body curve (e.g. blending toward jogCurve turns it).
+    std::vector<std::vector<std::array<float, 3>>> clipRootVel;  // [clip][frame]
+    double blendYaw = 0.0;          // integrated heading (rad)
+    double blendPosX = 0.0, blendPosZ = 0.0;  // integrated world root position
+    double blendTravelLastT = -1.0;  // last samplePose t (dt clock); <0 = uninit
+
     std::string note;      // build summary for the GUI status line
     double buildMs = 0.0;
 
     bool ready() const {
         if (trackMode()) return !track.empty();
         if (mode == Mode::RandomWalk) return !graph.nodes.empty() && !clips.empty();
+        if (mode == Mode::BlendSpace) return !clips.empty();
         return false;
     }
 
     void clear() {
         mode = Mode::Off;
+        rootMode = RootMode::Relative;
         clips.clear();
         track.clear();
         graph = MotionGraph{};
         walker = WalkBaker{};
+        clipCoords.clear();
+        clipRootVel.clear();
+        rbfLambda.clear();
+        rbfPoly.clear();
+        resetBlendTravel();
         note.clear();
     }
 
-    // Finite for transitions/blends; effectively unbounded for walks.
+    // Reset just the root-motion integrator (on seek / time set), keep the build.
+    void resetBlendTravel() {
+        blendYaw = 0.0;
+        blendPosX = 0.0;
+        blendPosZ = 0.0;
+        blendTravelLastT = -1.0;
+    }
+
+    // Blended heading-relative root velocity {vx, vz, yawRate} at normalized
+    // phase under weights `w` — per-frame lerp (looping), summed by weight.
+    std::array<double, 3> blendRootVel(float phase,
+                                       const std::vector<float>& w) const {
+        double bvx = 0.0, bvz = 0.0, bom = 0.0;
+        for (size_t i = 0; i < clips.size() && i < clipRootVel.size() &&
+                           i < w.size(); ++i) {
+            const auto& rv = clipRootVel[i];
+            const int nf = int(rv.size());
+            if (nf == 0) continue;
+            const float p = phase - std::floor(phase);
+            const float ff = p * float(nf);
+            const int f0 = int(ff) % nf;
+            const int f1 = (f0 + 1) % nf;
+            const float a = ff - std::floor(ff);
+            const float vx = rv[f0][0] * (1 - a) + rv[f1][0] * a;
+            const float vz = rv[f0][1] * (1 - a) + rv[f1][1] * a;
+            const float om = rv[f0][2] * (1 - a) + rv[f1][2] * a;
+            bvx += double(w[i]) * vx;
+            bvz += double(w[i]) * vz;
+            bom += double(w[i]) * om;
+        }
+        return {bvx, bvz, bom};
+    }
+
+    // Finite for transitions/blends; effectively unbounded for walks + the
+    // forever-looping blend space.
     double duration() const {
         if (trackMode()) return double(track.size()) * dt;
-        if (mode == Mode::RandomWalk) return 1e18;
+        if (mode == Mode::RandomWalk || mode == Mode::BlendSpace) return 1e18;
         return 0.0;
+    }
+
+    // ── Blend-space weighting (Mode::BlendSpace) ──────────────────────────
+    // Thin-plate radial basis φ(r)=r²ln(r), keyed on squared distance:
+    // r²ln(r) = ½·r²·ln(r²). φ(0)=0.
+    static double tpsPhi(double r2) {
+        return r2 < 1e-12 ? 0.0 : 0.5 * r2 * std::log(r2);
+    }
+
+    // In-place Gauss-Jordan solve of A·X=B (A is mxm row-major, B is m×rhs
+    // row-major; B holds X on return). Partial pivoting; false if singular.
+    static bool solveDense(std::vector<double>& A, std::vector<double>& B,
+                           int m, int rhs) {
+        auto a = [&](int r, int c) -> double& { return A[r * m + c]; };
+        auto b = [&](int r, int c) -> double& { return B[r * rhs + c]; };
+        for (int col = 0; col < m; ++col) {
+            int piv = col;
+            double best = std::fabs(a(col, col));
+            for (int r = col + 1; r < m; ++r) {
+                const double v = std::fabs(a(r, col));
+                if (v > best) { best = v; piv = r; }
+            }
+            if (best < 1e-12) return false;
+            if (piv != col) {
+                for (int c = 0; c < m; ++c) std::swap(a(col, c), a(piv, c));
+                for (int c = 0; c < rhs; ++c) std::swap(b(col, c), b(piv, c));
+            }
+            const double d = a(col, col);
+            for (int r = 0; r < m; ++r) {
+                if (r == col) continue;
+                const double f = a(r, col) / d;
+                if (f == 0.0) continue;
+                for (int c = col; c < m; ++c) a(r, c) -= f * a(col, c);
+                for (int c = 0; c < rhs; ++c) b(r, c) -= f * b(col, c);
+            }
+        }
+        for (int col = 0; col < m; ++col) {
+            const double d = a(col, col);
+            for (int c = 0; c < rhs; ++c) b(col, c) /= d;
+        }
+        return true;
+    }
+
+    // Solve the thin-plate cardinal-function coefficients once (at build).
+    // System: [[Φ P],[Pᵀ 0]]·[Λ;C] = [I;0]; P row i = [1,xᵢ,yᵢ]. Leaves
+    // rbfLambda/rbfPoly empty on n<2 or a singular system → IDW fallback.
+    void buildRbf() {
+        rbfLambda.clear();
+        rbfPoly.clear();
+        const int n = int(clipCoords.size());
+        if (n < 2) return;
+        const int m = n + 3;
+        std::vector<double> M(size_t(m) * m, 0.0), B(size_t(m) * n, 0.0);
+        auto AT = [&](int r, int c) -> double& { return M[size_t(r) * m + c]; };
+        for (int i = 0; i < n; ++i) {
+            for (int j = 0; j < n; ++j) {
+                const double dx = clipCoords[i][0] - clipCoords[j][0];
+                const double dy = clipCoords[i][1] - clipCoords[j][1];
+                AT(i, j) = tpsPhi(dx * dx + dy * dy);
+            }
+            AT(i, n + 0) = 1.0; AT(i, n + 1) = clipCoords[i][0]; AT(i, n + 2) = clipCoords[i][1];
+            AT(n + 0, i) = 1.0; AT(n + 1, i) = clipCoords[i][0]; AT(n + 2, i) = clipCoords[i][1];
+        }
+        for (int i = 0; i < n; ++i) B[size_t(i) * n + i] = 1.0;  // RHS = [I;0]
+        if (!solveDense(M, B, m, n)) return;
+        rbfLambda.assign(size_t(n) * n, 0.0f);
+        rbfPoly.assign(size_t(n) * 3, 0.0f);
+        for (int i = 0; i < n; ++i) {  // column i of X = cardinal i's coeffs
+            for (int j = 0; j < n; ++j) rbfLambda[size_t(i) * n + j] = float(B[size_t(j) * n + i]);
+            for (int k = 0; k < 3; ++k) rbfPoly[size_t(i) * 3 + k] = float(B[size_t(n + k) * n + i]);
+        }
+    }
+
+    // Blend weights for `cur` over clipCoords, normalized (Σ=1). Uses the
+    // thin-plate RBF cardinal functions when built (w_i(x_j)=δ_ij, smooth
+    // between samples); otherwise inverse-distance with an ε singularity guard
+    // (snaps onto a sample without divide-by-zero; uniform if all coincide).
+    void blendWeights(const std::array<float, 2>& cur,
+                      std::vector<float>& w) const {
+        const int n = int(clipCoords.size());
+        w.assign(size_t(n), 0.0f);
+        if (n == 0) return;
+        if (n == 1) { w[0] = 1.0f; return; }
+        if (useRbf && int(rbfLambda.size()) == n * n &&
+            int(rbfPoly.size()) == n * 3) {
+            float sum = 0.0f;
+            for (int i = 0; i < n; ++i) {
+                double acc = double(rbfPoly[size_t(i) * 3 + 0]) +
+                             double(rbfPoly[size_t(i) * 3 + 1]) * cur[0] +
+                             double(rbfPoly[size_t(i) * 3 + 2]) * cur[1];
+                for (int j = 0; j < n; ++j) {
+                    const double dx = cur[0] - clipCoords[j][0];
+                    const double dy = cur[1] - clipCoords[j][1];
+                    acc += double(rbfLambda[size_t(i) * n + j]) * tpsPhi(dx * dx + dy * dy);
+                }
+                w[i] = float(acc);
+                sum += w[i];
+            }
+            if (std::fabs(sum) > 1e-6f) for (auto& x : w) x /= sum;  // enforce Σ=1
+            return;
+        }
+        float sum = 0.0f;
+        for (int i = 0; i < n; ++i) {
+            const float dx = cur[0] - clipCoords[i][0];
+            const float dy = cur[1] - clipCoords[i][1];
+            const float wi = 1.0f / (dx * dx + dy * dy + 1e-4f);
+            w[i] = wi;
+            sum += wi;
+        }
+        if (sum > 1e-12f) for (auto& x : w) x /= sum;
+        else for (auto& x : w) x = 1.0f / float(n);
+    }
+
+    // Mean clip duration — the fixed gait period stored as blendCycleSec at
+    // build time. Cursor-independent (see blendCycleSec) so the live phase
+    // never jumps when the mix changes.
+    double meanClipDuration() const {
+        if (clips.empty()) return 1.0;
+        double c = 0.0;
+        for (const auto& cl : clips) c += cl.duration();
+        return c / double(clips.size());
+    }
+
+    // N-way pose blend at normalized phase under weights `w` (no fk, no travel).
+    void blendLocalPoseW(float phase01, bool loop, const std::vector<float>& w,
+                         LocalPose& mixed) const {
+        std::vector<LocalPose> poses(clips.size());
+        for (size_t i = 0; i < clips.size(); ++i)
+            sampleClipPhase(clips[i], phase01, poses[i], loop);
+        if (useIntrinsicMean) blendPoseNMean(poses, w, mixed);
+        else blendPoseN(poses, w, mixed);
+    }
+
+    // N-way blend at normalized phase `phase01` under the current cursor →
+    // world pose, IN PLACE (no root travel — travel lives in samplePose). loop=
+    // true wraps the gait cycle; loop=false clamps to the last frame (one-shot
+    // playback). Used by the preview ghosts.
+    bool sampleBlendPhase(float phase01, bool loop, bvh::Pose& out) {
+        if (mode != Mode::BlendSpace || clips.empty()) return false;
+        std::vector<float> w;
+        blendWeights(cursor, w);
+        LocalPose mixed;
+        blendLocalPoseW(phase01, loop, w, mixed);
+        fk(skel, mixed, out);
+        return true;
     }
 
     int windowFrames() const {
@@ -964,9 +1196,51 @@ struct Session {
     // A[0..i-1] + k blended frames + aligned B[j+1..]. When no local
     // minimum beats the threshold the global minimum is used and flagged,
     // so the user always gets a playable (if imperfect) result.
+    // Trim a sampled clip to its active window [start,end] (raw; end<0 = full).
+    // The window's first frame becomes frame 0, so a baked track / blend that
+    // consumes the clip starts there → it anchors to the kinematic object.
+    // Rigidly rebase a clip so its frame 0 sits at the canonical origin (xz=0,
+    // yaw=0), keeping the rest of the root trajectory relative to it (Y kept).
+    // For absolute-root blending: the clip then carries its real in-cycle travel
+    // and the blend averages absolute roots. Uses the file's local-frame
+    // convention (matches the velocity extractor's rotation).
+    static void rebaseClipToFrame0(Clip& c) {
+        if (c.frames.empty() || c.frames[0].rot.empty()) return;
+        std::array<float, 9> R0;
+        c.frames[0].rot[0].toMat3(R0);
+        const float th0 = std::atan2(R0[2], R0[0]);
+        const float x0 = c.frames[0].rootPos[0], z0 = c.frames[0].rootPos[2];
+        const float cs = std::cos(th0), sn = std::sin(th0);
+        for (auto& p : c.frames) {
+            const float dx = p.rootPos[0] - x0, dz = p.rootPos[2] - z0;
+            // Rigid: position AND orientation both rotate by yaw(-th0). Same
+            // form as applyRootRebase / rebaseXZYaw (main.cpp), keyed on the
+            // identical th0 = atan2(R[2],R[0]).
+            p.rootPos[0] = cs * dx - sn * dz;
+            p.rootPos[2] = sn * dx + cs * dz;
+            if (!p.rot.empty())
+                p.rot[0] = (Quatf::yaw(-th0) * p.rot[0]).normalized();
+        }
+    }
+
+    static void trimClip(Clip& c, const std::array<int, 2>& rg) {
+        const int nf = int(c.frames.size());
+        if (nf <= 0) return;
+        int a = rg[0];
+        int b = rg[1] < 0 ? nf - 1 : rg[1];
+        a = a < 0 ? 0 : (a > nf - 1 ? nf - 1 : a);
+        b = b < 0 ? 0 : (b > nf - 1 ? nf - 1 : b);
+        if (b < a) b = a;
+        if (a > 0 || b < nf - 1)
+            c.frames = std::vector<LocalPose>(c.frames.begin() + a,
+                                              c.frames.begin() + b + 1);
+    }
+
     bool buildTransition(const bvh::Motion& A, const std::string& nameA,
                          const bvh::Motion& B, const std::string& nameB,
-                         const SessionParams& p, std::string* err) {
+                         const SessionParams& p, std::string* err,
+                         std::array<int, 2> rangeA = {0, -1},
+                         std::array<int, 2> rangeB = {0, -1}) {
         clear();
         params = p;
         if (!A.valid() || !B.valid()) {
@@ -986,6 +1260,8 @@ struct Session {
             if (err) *err = "failed to sample clips";
             return false;
         }
+        trimClip(clips[0], rangeA);  // active windows → track starts at A's start
+        trimClip(clips[1], rangeB);
         const int k = windowFrames();
         if (int(clips[0].frames.size()) < k + 1 ||
             int(clips[1].frames.size()) < k + 1) {
@@ -1073,7 +1349,9 @@ struct Session {
     // the best-matching anchor + aligned B suffix.
     bool buildBlend(const bvh::Motion& A, const std::string& nameA,
                     const bvh::Motion& B, const std::string& nameB,
-                    const SessionParams& p, std::string* err) {
+                    const SessionParams& p, std::string* err,
+                    std::array<int, 2> rangeA = {0, -1},
+                    std::array<int, 2> rangeB = {0, -1}) {
         clear();
         params = p;
         if (!A.valid() || !B.valid()) {
@@ -1093,6 +1371,8 @@ struct Session {
             if (err) *err = "failed to sample clips";
             return false;
         }
+        trimClip(clips[0], rangeA);  // active windows → track starts at A's start
+        trimClip(clips[1], rangeB);
         const int k = windowFrames();
         if (int(clips[0].frames.size()) < k + 1 ||
             int(clips[1].frames.size()) < k + 1) {
@@ -1219,6 +1499,115 @@ struct Session {
         walker.start(graph, clips, seed);
     }
 
+    // Interactive blend space: retarget each compatible clip onto motions[0]'s
+    // skeleton and place it at coords[i]. No graph build, no baked track — the
+    // cursor's inverse-distance weights blend the clips live in samplePose.
+    // motions[0] is the reference skeleton (clips[0]); later clips are skeleton-
+    // gated (incompatible ones reported in `skipped`, dropped from the space).
+    // `ranges` (optional, parallel to motions) trims each clip to an active
+    // frame window [start,end] BEFORE velocity extraction + pinning, so the
+    // window's first frame becomes the clip's frame 0 (→ anchors to the object)
+    // and only those frames drive the blend. end<0 or start<0 ⇒ no trim.
+    bool buildBlendSpace(const std::vector<const bvh::Motion*>& motions,
+                         const std::vector<std::string>& names,
+                         const std::vector<std::array<float, 2>>& coords,
+                         const SessionParams& p, std::string* err,
+                         std::vector<std::string>* skipped = nullptr,
+                         const std::vector<std::array<int, 2>>* ranges = nullptr,
+                         RootMode rmode = RootMode::Relative) {
+        clear();
+        params = p;
+        if (motions.empty() || !motions[0]->valid()) {
+            if (err) *err = "no motions";
+            return false;
+        }
+        skel = Skeleton::extract(*motions[0]);
+        dt = motions[0]->frameTime;
+        for (size_t m = 0; m < motions.size(); ++m) {
+            if (m > 0 && !skel.compatible(Skeleton::extract(*motions[m]))) {
+                if (skipped) skipped->push_back(names[m]);
+                continue;
+            }
+            Clip c;
+            if (!sampleClip(*motions[m], skel, dt, names[m], c)) {
+                if (skipped) skipped->push_back(names[m]);
+                continue;
+            }
+            // Trim to the active window first → window start = clip frame 0.
+            if (ranges && m < ranges->size() && !c.frames.empty()) {
+                const int nf = int(c.frames.size());
+                int a = (*ranges)[m][0];
+                int b = (*ranges)[m][1] < 0 ? nf - 1 : (*ranges)[m][1];
+                a = a < 0 ? 0 : (a > nf - 1 ? nf - 1 : a);
+                b = b < 0 ? 0 : (b > nf - 1 ? nf - 1 : b);
+                if (b < a) b = a;
+                if (a > 0 || b < nf - 1)
+                    c.frames = std::vector<LocalPose>(c.frames.begin() + a,
+                                                      c.frames.begin() + b + 1);
+            }
+            if (rmode == RootMode::Absolute) {
+                // Absolute root: keep the clip's real orientation (frame 0 aligned
+                // to canonical, the rest relative), and carry travel as WORLD-frame
+                // per-frame velocity {dx/dt, dz/dt, 0} — integrated in samplePose
+                // with NO heading re-projection (the body faces its blended actual
+                // orientation, not an integrated yaw). Root xz is then zeroed so
+                // the per-cycle loop seam can't slide the body back to the origin.
+                rebaseClipToFrame0(c);
+                const float cdt = c.dt > 1e-6f ? c.dt : 1.0f;
+                std::vector<std::array<float, 3>> rv(c.frames.size(), {0.0f, 0.0f, 0.0f});
+                for (size_t f = 1; f < c.frames.size(); ++f) {
+                    rv[f][0] = (c.frames[f].rootPos[0] - c.frames[f - 1].rootPos[0]) / cdt;
+                    rv[f][1] = (c.frames[f].rootPos[2] - c.frames[f - 1].rootPos[2]) / cdt;
+                    rv[f][2] = 0.0f;  // no yaw integration (orientation kept)
+                }
+                if (rv.size() > 1) rv[0] = rv[1];
+                clipRootVel.push_back(std::move(rv));
+                for (auto& fp : c.frames) { fp.rootPos[0] = 0.0f; fp.rootPos[2] = 0.0f; }
+            } else {
+                // Per-frame HEADING-RELATIVE root velocity {localVx, localVz,
+                // yawRate} — read BEFORE pinning zeroes the root xz/heading.
+                // Stored so samplePose can blend + integrate it into curving
+                // travel.
+                const float cdt = c.dt > 1e-6f ? c.dt : 1.0f;
+                const float kTwoPi = 6.28318530718f;
+                std::vector<std::array<float, 3>> rv(c.frames.size(), {0.0f, 0.0f, 0.0f});
+                for (size_t f = 1; f < c.frames.size(); ++f) {
+                    const float dx = c.frames[f].rootPos[0] - c.frames[f - 1].rootPos[0];
+                    const float dz = c.frames[f].rootPos[2] - c.frames[f - 1].rootPos[2];
+                    std::array<float, 9> R0, R1;
+                    c.frames[f - 1].rot[0].toMat3(R0);
+                    c.frames[f].rot[0].toMat3(R1);
+                    const float yaw0 = std::atan2(R0[2], R0[0]);
+                    const float yaw1 = std::atan2(R1[2], R1[0]);
+                    const float dyaw = std::remainder(yaw1 - yaw0, kTwoPi);  // [-π,π]
+                    const float cs = std::cos(yaw0), sn = std::sin(yaw0);
+                    rv[f][0] = (cs * dx + sn * dz) / cdt;   // local forward/back
+                    rv[f][1] = (-sn * dx + cs * dz) / cdt;  // local lateral
+                    rv[f][2] = dyaw / cdt;                  // yaw rate
+                }
+                if (rv.size() > 1) rv[0] = rv[1];
+                clipRootVel.push_back(std::move(rv));
+                pinClipInPlace(c);  // remove root travel/turn → no seam teleport
+            }
+            clips.push_back(std::move(c));
+            clipCoords.push_back(m < coords.size()
+                                     ? coords[m]
+                                     : std::array<float, 2>{0.0f, 0.0f});
+        }
+        if (clips.empty()) {
+            if (err) *err = "no compatible clips";
+            return false;
+        }
+        blendCycleSec = meanClipDuration();  // fixed gait period (no pop on drag)
+        buildRbf();  // thin-plate cardinal coeffs (empty ⇒ IDW fallback)
+        resetBlendTravel();
+        cursor = {0.0f, 0.0f};
+        rootMode = rmode;
+        mode = Mode::BlendSpace;
+        note = std::to_string(clips.size()) + " clips in blend space";
+        return true;
+    }
+
     bool samplePose(double t, bvh::Pose& out) {
         if (!ready()) return false;
         if (trackMode()) {
@@ -1231,6 +1620,49 @@ struct Session {
             LocalPose mid;
             blendPose(track[f0], track[f0 + 1], 1.0f - float(ff - double(f0)), mid);
             fk(skel, mid, out);
+            return true;
+        }
+        if (mode == Mode::BlendSpace) {
+            const double cycle = blendCycleSec;  // fixed — cursor-independent
+            const double phase =
+                cycle > 1e-6 ? std::fmod(std::max(0.0, t), cycle) / cycle : 0.0;
+            std::vector<float> w;
+            blendWeights(cursor, w);
+            if (rootMode == RootMode::Absolute) {
+                // Integrate blended WORLD-frame root velocity (no heading re-
+                // projection) → continuous travel with no per-cycle loop pop.
+                // Orientation is the blended absolute orientation (kept in pose).
+                double dtA = blendTravelLastT < 0.0 ? 0.0 : (t - blendTravelLastT);
+                if (dtA < 0.0 || dtA > 0.5) dtA = 0.0;
+                blendTravelLastT = t;
+                const auto va = blendRootVel(float(phase), w);  // {dx,dz,0} world
+                blendPosX += va[0] * dtA;
+                blendPosZ += va[1] * dtA;
+                LocalPose mixed;
+                blendLocalPoseW(float(phase), true, w, mixed);
+                mixed.rootPos[0] += float(blendPosX);
+                mixed.rootPos[2] += float(blendPosZ);
+                fk(skel, mixed, out);
+                return true;
+            }
+            // Integrate the blended heading-relative root velocity into a world
+            // heading + position. A seek/scrub (dt < 0 or a big gap) is not
+            // integrated, so the body never lurches across a time jump.
+            double dtT = blendTravelLastT < 0.0 ? 0.0 : (t - blendTravelLastT);
+            if (dtT < 0.0 || dtT > 0.5) dtT = 0.0;
+            blendTravelLastT = t;
+            const auto v = blendRootVel(float(phase), w);  // {vx, vz, yawRate} local
+            blendYaw += v[2] * dtT;
+            const double cy = std::cos(blendYaw), sy = std::sin(blendYaw);
+            blendPosX += (cy * v[0] - sy * v[1]) * dtT;  // local→world
+            blendPosZ += (sy * v[0] + cy * v[1]) * dtT;
+            LocalPose mixed;
+            blendLocalPoseW(float(phase), true, w, mixed);
+            // Face the integrated heading, then place at the integrated position.
+            mixed.rot[0] = (Quatf::yaw(float(blendYaw)) * mixed.rot[0]).normalized();
+            mixed.rootPos[0] += float(blendPosX);
+            mixed.rootPos[2] += float(blendPosZ);
+            fk(skel, mixed, out);
             return true;
         }
         // Random walk: bake on demand, then lerp.
@@ -1259,6 +1691,16 @@ struct Session {
             if (f < double(trans.prefixFrames + trans.blendFrames))
                 return clips[0].name + arrow + clips[1].name;
             return clips[1].name;
+        }
+        if (mode == Mode::BlendSpace) {
+            if (clips.empty()) return "";
+            std::vector<float> w;
+            blendWeights(cursor, w);
+            size_t best = 0;
+            for (size_t i = 1; i < w.size(); ++i)
+                if (w[i] > w[best]) best = i;
+            return clips[best].name + " " +
+                   std::to_string(int(w[best] * 100.0f + 0.5f)) + "%";
         }
         if (mode == Mode::RandomWalk) {
             const long long f = (long long)(t / dt);

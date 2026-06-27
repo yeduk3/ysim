@@ -3,6 +3,7 @@
 add_executable(ysim_tests
     scene_io_test.cpp
     sim_config_test.cpp
+    motion_blend_test.cpp
 )
 
 target_link_libraries(ysim_tests PRIVATE ysim_core)

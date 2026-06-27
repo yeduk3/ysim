@@ -1892,6 +1892,34 @@ inline std::vector<std::string> listBVHFiles() {
     return out;
 }
 
+// Curated blend-space presets, distilled from the `--blend-spaces` ranking
+// (opposed axes that are also near-orthogonal). Each is 4 files in
+// blendSpaceCoords order {bottom(Y-), top(Y+), left(X-), right(X+)}; all four
+// share the WalkLoopA skeleton group. The blend-space mode's preset dropdown
+// offers these plus "자율선택" (manual). MBS-7 verifies each builds with all 4.
+struct BlendPreset {
+    const char* name;
+    std::array<const char*, 4> files;
+    // Per-clip active frame window {start,end}; end<0 = full. Default = all full
+    // (presets that omit it blend whole clips).
+    std::array<std::array<int, 2>, 4> ranges{{{0, -1}, {0, -1}, {0, -1}, {0, -1}}};
+};
+inline const std::vector<BlendPreset>& blendPresets() {
+    static const std::vector<BlendPreset> kPresets = {
+        {"정지 ↔ 질주 · 살금 ↔ 활보",
+         {"standReallyStill.bvh", "jogCurve.bvh", "SneakLoopA.bvh", "StrutLoopA.bvh"}},
+        {"걷기 ↔ 질주 · 살금 ↔ 활보",
+         {"WalkLoopA.bvh", "jogCurve.bvh", "SneakLoopA.bvh", "StrutLoopA.bvh"}},
+        {"걷기 변형 (미세 블렌드)",
+         {"smoothWalk.bvh", "walkStraightTwiceAsFast.bvh", "walkCurve.bvh",
+          "walkReallySmooth.bvh"},
+         {{{36, -1}, {0, -1}, {0, -1}, {35, -1}}}},  // trim the two long walks
+        {"댄스 ↔ 정지 · 살금 ↔ 질주",
+         {"standReallyStill.bvh", "DNCMODRNA.bvh", "SneakLoopA.bvh", "jogCurve.bvh"}},
+    };
+    return kPresets;
+}
+
 const char* shapeTypeName(ShapeType shapeType) {
     switch (shapeType) {
         case ShapeType::Mesh: return "Mesh";
@@ -2408,27 +2436,96 @@ struct MeshKinematicInitializer : GeneralMeshInitializer<BE, PR> {
     mograph::Session graphSession;
     std::vector<std::string> graphSelFiles;  // random-walk clip set (file names)
     std::string transFileA, transFileB;      // transition endpoints (file names)
+    // Interactive blend space (motionMode 4): N locomotion clips placed in a 2D
+    // pad, blended live by a draggable cursor. Default files sit at a diamond
+    // (bottom/top/left/right); all clips just mix — no fixed role names, they
+    // are shown by file. Files user-editable. The live cursor lives on graphSession.
+    std::vector<std::string> blendSpaceFiles{
+        "WalkLoopA.bvh", "jogCurve.bvh", "SneakLoopA.bvh", "StrutLoopA.bvh"};
+    std::vector<std::array<float, 2>> blendSpaceCoords{
+        {0.0f, -1.0f}, {0.0f, 1.0f}, {-1.0f, 0.0f}, {1.0f, 0.0f}};
+    // Active blend preset: -1 = 자율선택(manual), else index into blendPresets().
+    // Selecting a preset fills blendSpaceFiles; changing any file reverts to -1.
+    int blendPreset = -1;
+    // Blend-space root handling (build-time): false = relative (pin + integrate
+    // heading-relative velocity → curving travel-in-place); true = absolute
+    // (blend the real per-clip root pos/orientation, anchored frame-0→object).
+    bool blendAbsoluteRoot = false;
     float graphThreshold = 0.10f;            // cost threshold, fraction of height
     float graphMarkerFrac = 0.10f;           // joint-axis marker length / height
     uint32_t walkSeed = 12345;
     std::string graphStatus;                 // last build report for the GUI
 
-    // Blend-mode motion preview: independent per-clip strobe, available before
-    // 블렌드 생성 — samples the selected files directly (cached) rather than the
-    // built session's clips. Colors are user-pickable.
-    bool previewA = false, previewB = false;
-    std::array<float, 3> previewColA{0.95f, 0.25f, 0.25f};  // motion 1 (red)
-    std::array<float, 3> previewColB{0.30f, 0.45f, 0.95f};  // motion 2 (blue)
-    // Blend playback tint: when on (blend mode only), the live body is colored
-    // by mixing previewColA/B by the current blend source weight, so you see
-    // which source motion dominates as the crossfade plays.
+    // ── Per-clip motion-selection slots (backs the reusable selector) ──
+    // One slot per selectable clip. Modes that pick clips index into these:
+    // transition/DTW use 0,1; the blend space uses 0..N-1. The file a slot
+    // *shows* comes from the mode's own storage (slotFile) — transFileA/B for
+    // 2/3, blendSpaceFiles[i] for 4 — so there is one source of truth for the
+    // selected files; the slot owns only the preview toggle, color, and cache.
+    // Available before any build (samples the selected files directly), exactly
+    // like the old A/B preview.
+    struct MotionSlot {
+        bool preview = false;                          // strobe-ghost toggle
+        std::array<float, 3> color{0.6f, 0.6f, 0.65f};  // strobe / play / tint
+        mograph::Clip cachedClip;                      // sampled ghost cache
+        std::string cachedFile;                        // which file the cache holds
+        // Active-frame window [rangeStart, rangeEnd] over cachedClip: the only
+        // frames the effect + preview use, and whose FIRST frame anchors to the
+        // kinematic object. rangeEnd < 0 = clip end (resolved once cached); a
+        // file change resets the window to full (see on_kin_slot_file).
+        int rangeStart = 0;
+        int rangeEnd = -1;
+    };
+    std::vector<MotionSlot> motionSlots{
+        {false, {0.95f, 0.25f, 0.25f}, {}, ""},  // slot 0 — red
+        {false, {0.30f, 0.45f, 0.95f}, {}, ""},  // slot 1 — blue
+        {false, {0.30f, 0.85f, 0.40f}, {}, ""},  // slot 2 — green
+        {false, {0.95f, 0.78f, 0.25f}, {}, ""},  // slot 3 — amber
+    };
+    // Blend playback tint: when on (DTW mode only), the live body is colored by
+    // mixing slot 0/1 colors by the current blend source weight.
     bool blendColorize = false;
-    mograph::Clip previewClipA, previewClipB;
-    std::string previewFileA, previewFileB;  // which file each cache holds
-    // One-shot opaque playback (paused-only, render-loop driven): 0 none,
-    // 1 = motion A playing, 2 = motion B playing. Clears itself at clip end.
+    // Blend-result preview (blend-space mode only): a translucent strobe of the
+    // live N-way blended gait cycle, recomputed every frame from the session's
+    // current cursor — so dragging the pad morphs the ghost in real time.
+    bool blendPreview = false;
+    // One-shot opaque playback (paused-only, render-loop driven): 0 none, else
+    // (slot index + 1). Clears itself at clip end.
     int previewPlay = 0;
     double previewPlayTime = 0.0;
+
+    // Slots the current mode exposes, and the file each one selects (from the
+    // mode's own storage). The single place that knows the mode→slot mapping.
+    int numSlots() const {
+        if (motionMode == 4) return int(blendSpaceFiles.size());
+        if (motionMode == 2 || motionMode == 3) return 2;
+        return 0;
+    }
+    // Resolve slot i's active-frame window against its cached clip length.
+    // rangeEnd<0 / stale ⇒ full clip; clamped, start ≤ end. {0,0} if not cached.
+    std::array<int, 2> slotRange(int i) const {
+        if (i < 0 || i >= int(motionSlots.size())) return {0, 0};
+        const int nf = int(motionSlots[i].cachedClip.frames.size());
+        if (nf <= 0) return {0, 0};
+        int a = motionSlots[i].rangeStart;
+        int b = motionSlots[i].rangeEnd < 0 ? nf - 1 : motionSlots[i].rangeEnd;
+        a = a < 0 ? 0 : (a > nf - 1 ? nf - 1 : a);
+        b = b < 0 ? 0 : (b > nf - 1 ? nf - 1 : b);
+        if (b < a) b = a;
+        return {a, b};
+    }
+    std::string slotFile(int i) const {
+        if (motionMode == 4)
+            return i >= 0 && i < int(blendSpaceFiles.size()) ? blendSpaceFiles[i]
+                                                             : std::string();
+        if (motionMode == 2 || motionMode == 3) {
+            const std::string& f = (i == 0) ? transFileA
+                                            : (i == 1 ? transFileB : transFileA);
+            if (!f.empty()) return f;
+            return std::filesystem::path(params.filePath).filename().string();
+        }
+        return std::string();
+    }
 
     // Reference skeleton (the loaded motion's), cached for preview FK + clip
     // sampling. Invalidated on reloadMotion.
@@ -2450,6 +2547,8 @@ struct MeshKinematicInitializer : GeneralMeshInitializer<BE, PR> {
             return graphSession.mode == mograph::Session::Mode::Transition;
         if (motionMode == 3)
             return graphSession.mode == mograph::Session::Mode::Blend;
+        if (motionMode == 4)
+            return graphSession.mode == mograph::Session::Mode::BlendSpace;
         return false;
     }
 
@@ -2501,10 +2600,11 @@ struct MeshKinematicInitializer : GeneralMeshInitializer<BE, PR> {
         graphSession.clear();
         // Skeleton + preview caches reference the old motion — drop them.
         skelValid_ = false;
-        previewFileA.clear();
-        previewFileB.clear();
-        previewClipA.frames.clear();
-        previewClipB.frames.clear();
+        for (auto& s : motionSlots) {
+            s.cachedFile.clear();
+            s.cachedClip.frames.clear();
+        }
+        previewPlay = 0;
         invalidateRebase();
         return true;
     }
@@ -2569,6 +2669,10 @@ struct MeshKinematicInitializer : GeneralMeshInitializer<BE, PR> {
     // preserving — same family as the motion-graph XformXZ.
     void applyRootRebase(bvh::Pose& pose) {
         if (pose.world.empty()) return;
+        // Blend space (both root modes): clips are zeroed at the root and travel
+        // is integrated into samplePose, so there is nothing to re-root — and we
+        // must NOT sample at t=0 here, which would corrupt the travel dt clock.
+        if (motionMode == 4 && graphActive()) return;
         if (!rebaseValid_) {
             bvh::Pose p0;
             sampleWorldPose(0.0, p0);
@@ -2606,13 +2710,14 @@ struct MeshKinematicInitializer : GeneralMeshInitializer<BE, PR> {
     // the body transform — so it rests at the object's position, feet grounded.
     void writeGhost(const mograph::Clip& c, int f, tinym::vec3 userScale,
                     const Quat& rot, tinym::vec3 position,
-                    std::vector<float>& out) {
+                    std::vector<float>& out, int anchorFrame = 0) {
         if (c.frames.empty()) return;
         const int nf = int(c.frames.size());
         const int fi = f < 0 ? 0 : (f >= nf ? nf - 1 : f);
+        const int af = anchorFrame < 0 ? 0 : (anchorFrame >= nf ? nf - 1 : anchorFrame);
         bvh::Pose pose, pose0;
         mograph::fk(skel(), c.frames[fi], pose);
-        mograph::fk(skel(), c.frames[0], pose0);
+        mograph::fk(skel(), c.frames[af], pose0);  // anchor = range-start frame
         rebaseXZYaw(pose, pose0.world[0]);
         out.resize(size_t(proxy.numVerts) * 3);
         proxy.writeVertices(
@@ -2627,9 +2732,11 @@ struct MeshKinematicInitializer : GeneralMeshInitializer<BE, PR> {
     // frames) — for the smooth one-shot preview playback.
     void writeGhostAtTime(const mograph::Clip& c, double timeSec,
                           tinym::vec3 userScale, const Quat& rot,
-                          tinym::vec3 position, std::vector<float>& out) {
+                          tinym::vec3 position, std::vector<float>& out,
+                          int anchorFrame = 0) {
         if (c.frames.empty()) return;
         const int nf = int(c.frames.size());
+        const int af = anchorFrame < 0 ? 0 : (anchorFrame >= nf ? nf - 1 : anchorFrame);
         double ff = timeSec / (c.dt > 0 ? c.dt : 1.0);
         if (ff < 0) ff = 0;
         if (ff > nf - 1) ff = nf - 1;
@@ -2640,8 +2747,62 @@ struct MeshKinematicInitializer : GeneralMeshInitializer<BE, PR> {
         mograph::blendPose(c.frames[f0], c.frames[f1], 1.0f - frac, mid);
         bvh::Pose pose, pose0;
         mograph::fk(skel(), mid, pose);
-        mograph::fk(skel(), c.frames[0], pose0);
+        mograph::fk(skel(), c.frames[af], pose0);  // anchor = range-start frame
         rebaseXZYaw(pose, pose0.world[0]);
+        out.resize(size_t(proxy.numVerts) * 3);
+        proxy.writeVertices(
+            pose, normScale(),
+            {float(userScale.x), float(userScale.y), float(userScale.z)},
+            quatToMat3(rot),
+            {float(position.x), float(position.y), float(position.z)},
+            out.data());
+    }
+
+    // Strobe-frame of the live N-way blended result at normalized phase
+    // [0,1), re-rooted like the live body. Samples the session at the CURRENT
+    // cursor every call (samplePose reads graphSession.cursor), so the blend
+    // preview ghost morphs in real time as the pad is dragged. No-op unless a
+    // blend space is built.
+    void writeBlendGhost(double phase01, bool loop, tinym::vec3 userScale,
+                         const Quat& rot, tinym::vec3 position,
+                         std::vector<float>& out) {
+        out.clear();
+        if (!graphActive() ||
+            graphSession.mode != mograph::Session::Mode::BlendSpace)
+            return;
+        bvh::Pose pose, pose0;
+        // Rebase reference = phase-0 pose (always looped) so the ghost root
+        // sits at the object origin regardless of the play/clamp mode.
+        if (!graphSession.sampleBlendPhase(float(phase01), loop, pose)) return;
+        graphSession.sampleBlendPhase(0.0f, true, pose0);
+        if (pose.world.empty() || pose0.world.empty()) return;
+        rebaseXZYaw(pose, pose0.world[0]);
+        // Show the curving travel too, so the preview matches the live body:
+        // integrate the blended root velocity over ONE cycle from phase 0 to
+        // phase01, then rotate (heading) + translate the ghost. Strobe frames
+        // then spread along the curved path; the one-shot ghost follows it.
+        {
+            const auto& ses = graphSession;
+            std::vector<float> w;
+            ses.blendWeights(ses.cursor, w);
+            const int STEPS = 24;
+            const double subDt = (double(phase01) / STEPS) * ses.blendCycleSec;
+            double yaw = 0.0, px = 0.0, pz = 0.0;
+            for (int s = 0; s < STEPS; ++s) {
+                const float ph = float(double(phase01) * (s + 0.5) / STEPS);
+                const auto v = ses.blendRootVel(ph, w);
+                yaw += v[2] * subDt;
+                const double cy = std::cos(yaw), sy = std::sin(yaw);
+                px += (cy * v[0] - sy * v[1]) * subDt;
+                pz += (sy * v[0] + cy * v[1]) * subDt;
+            }
+            const float cyf = std::cos(float(yaw)), syf = std::sin(float(yaw));
+            for (auto& jx : pose.world) {
+                const float x = jx.t[0], z = jx.t[2];
+                jx.t[0] = cyf * x - syf * z + float(px);  // re-head + translate
+                jx.t[2] = syf * x + cyf * z + float(pz);
+            }
+        }
         out.resize(size_t(proxy.numVerts) * 3);
         proxy.writeVertices(
             pose, normScale(),
@@ -8683,12 +8844,9 @@ struct Simulator {
     // (only when stale). Sampled onto the body's own skeleton so the proxy
     // matches; a joint-count mismatch leaves the cache empty (preview skipped).
     void ensurePreviewClips(MeshKinematicInitializer<BE, PR>* kin) {
-        const std::string cur =
-            std::filesystem::path(kin->params.filePath).filename().string();
-        auto load = [&](bool want, const std::string& sel, std::string& cached,
+        auto load = [&](const std::string& file, std::string& cached,
                         mograph::Clip& clip) {
-            if (!want) return;
-            const std::string file = sel.empty() ? cur : sel;
+            if (file.empty()) return;
             if (cached == file && !clip.frames.empty()) return;  // hit
             cached = file;
             clip.frames.clear();
@@ -8697,8 +8855,12 @@ struct Simulator {
                 return;  // unreadable / incompatible with this proxy
             mograph::sampleClip(m, kin->skel(), kin->motion.frameTime, file, clip);
         };
-        load(kin->previewA, kin->transFileA, kin->previewFileA, kin->previewClipA);
-        load(kin->previewB, kin->transFileB, kin->previewFileB, kin->previewClipB);
+        const int n = kin->numSlots();
+        for (int i = 0; i < n && i < int(kin->motionSlots.size()); ++i) {
+            auto& s = kin->motionSlots[i];
+            if (!s.preview && kin->previewPlay != i + 1) continue;  // only needed
+            load(kin->slotFile(i), s.cachedFile, s.cachedClip);
+        }
     }
 
     // One-shot preview playback clock. Runs OUTSIDE the physics loop (driven by
@@ -8710,28 +8872,65 @@ struct Simulator {
             auto* kin =
                 dynamic_cast<MeshKinematicInitializer<BE, PR>*>(mesh.initializer);
             if (!kin || kin->previewPlay == 0) continue;
-            if (!pause || kin->motionMode != 3) { kin->previewPlay = 0; continue; }
-            const mograph::Clip& c =
-                kin->previewPlay == 1 ? kin->previewClipA : kin->previewClipB;
+            if (!pause) { kin->previewPlay = 0; continue; }
+            if (kin->previewPlay < 0) {  // -1 = blended-result one-shot
+                if (kin->motionMode != 4 || !kin->graphActive()) {
+                    kin->previewPlay = 0;
+                    continue;
+                }
+                const double cycle = kin->graphSession.blendCycleSec;
+                kin->previewPlayTime += dt;
+                if (cycle <= 1e-6 || kin->previewPlayTime >= cycle)
+                    kin->previewPlay = 0;  // played one cycle → vanish
+                continue;
+            }
+            const int si = kin->previewPlay - 1;
+            if (si >= kin->numSlots() || si >= int(kin->motionSlots.size())) {
+                kin->previewPlay = 0;
+                continue;
+            }
+            const mograph::Clip& c = kin->motionSlots[si].cachedClip;
+            const auto rg = kin->slotRange(si);  // active window only
+            // max(span,1): a 1-frame window still plays one frame (dur>0) instead
+            // of vanishing before it renders. span>=1 is bit-identical.
             const double dur =
-                c.frames.empty() ? 0.0 : double(c.frames.size() - 1) * c.dt;
+                c.frames.empty() ? 0.0 : double(std::max(rg[1] - rg[0], 1)) * c.dt;
             kin->previewPlayTime += dt;
             if (c.frames.empty() || kin->previewPlayTime >= dur)
-                kin->previewPlay = 0;  // played once → vanish
+                kin->previewPlay = 0;  // played the window once → vanish
         }
     }
 
-    // Begin a one-shot opaque playback of preview clip `which` (1=A, 2=B).
+    // Begin a one-shot opaque playback of the clip in slot `slotIdx` (0-based).
     // No-op unless paused (the feature is paused-only by design).
-    void startPreviewPlayback(int meshId, int which) {
+    void startPreviewPlayback(int meshId, int slotIdx) {
         auto* kin = kinematicOf(meshId);
-        if (!kin || !pause || kin->motionMode != 3) return;
+        if (!kin || !pause) return;
+        if (slotIdx < 0 || slotIdx >= kin->numSlots() ||
+            slotIdx >= int(kin->motionSlots.size()))
+            return;
         ensurePreviewClips(kin);
-        const mograph::Clip& c =
-            which == 1 ? kin->previewClipA : kin->previewClipB;
-        if (c.frames.empty()) return;
-        kin->previewPlay = which;
+        if (kin->motionSlots[slotIdx].cachedClip.frames.empty()) return;
+        kin->previewPlay = slotIdx + 1;
         kin->previewPlayTime = 0.0;
+    }
+
+    // Begin a one-shot opaque playback of the BLENDED result through one gait
+    // cycle (sampled live at the cursor, so dragging the pad morphs it as it
+    // plays). Paused-only; blend-space mode only.
+    void startBlendPlayback(int meshId) {
+        auto* kin = kinematicOf(meshId);
+        if (!kin || !pause || kin->motionMode != 4 || !kin->graphActive()) return;
+        kin->previewPlay = -1;
+        kin->previewPlayTime = 0.0;
+    }
+
+    // Stop + remove the in-progress one-shot preview (slot or blend).
+    void stopPreviewPlayback(int meshId) {
+        if (auto* kin = kinematicOf(meshId)) {
+            kin->previewPlay = 0;
+            kin->previewPlayTime = 0.0;
+        }
     }
 
     // Translucent strobe of the selected blend clips (motion 1 + motion 2,
@@ -8742,10 +8941,16 @@ struct Simulator {
         for (auto& mesh : scene.meshes) {
             auto* kin =
                 dynamic_cast<MeshKinematicInitializer<BE, PR>*>(mesh.initializer);
-            if (!kin || kin->motionMode != 3) continue;     // blend mode only
-            const bool wantStrobe = kin->previewA || kin->previewB;
+            if (!kin) continue;
+            const int n = kin->numSlots();
+            if (n <= 0) continue;          // slot-based modes only (transition/DTW/blend)
+            bool wantStrobe = false;
+            for (int i = 0; i < n && i < int(kin->motionSlots.size()); ++i)
+                if (kin->motionSlots[i].preview) wantStrobe = true;
             const bool wantPlay = kin->previewPlay != 0;
-            if (!wantStrobe && !wantPlay) continue;
+            const bool wantBlend = kin->blendPreview && kin->motionMode == 4 &&
+                                   kin->graphActive();
+            if (!wantStrobe && !wantPlay && !wantBlend) continue;
             ensurePreviewClips(kin);
             ensureGhostGL(kin->proxy);
 
@@ -8761,49 +8966,121 @@ struct Simulator {
                 glDepthMask(GL_FALSE);
                 shader.setUniform("opacity", 0.15f);
                 const int N = 7;
+                // Strobe spans ONLY the slot's active window [fs, fe]; the
+                // range-start frame fs anchors the body (writeGhost anchorFrame).
                 auto strobe = [&](const mograph::Clip& c,
-                                  const std::array<float, 3>& col) {
+                                  const std::array<float, 3>& col, int fs, int fe) {
                     const int nf = int(c.frames.size());
                     if (nf <= 0) return;
                     const tinym::vec3 base(col[0], col[1], col[2]);
                     const tinym::vec3 emis(col[0] * 0.5f, col[1] * 0.5f,
                                            col[2] * 0.5f);
+                    const int span = fe - fs;
                     for (int i = 0; i < N; ++i) {
-                        const int f = N <= 1 ? 0
-                                             : int(std::lround(double(i) /
-                                                               (N - 1) *
-                                                               (nf - 1)));
+                        const int f = N <= 1 || span <= 0
+                                          ? fs
+                                          : fs + int(std::lround(double(i) /
+                                                                 (N - 1) * span));
                         kin->writeGhost(c, f, mesh.scale, mesh.rotationQuat,
-                                        mesh.transformPosition, ghostVerts_);
+                                        mesh.transformPosition, ghostVerts_, fs);
                         ghostGL_.computeNormal();
                         ghostGL_.updateBuffer();
                         ghostGL_.draw(shader, base, 0.0f, 1.0f, 0.0f, emis);
                     }
                 };
-                if (kin->previewA)
-                    strobe(kin->previewClipA, kin->previewColA);
-                if (kin->previewB)
-                    strobe(kin->previewClipB, kin->previewColB);
+                for (int i = 0; i < n && i < int(kin->motionSlots.size()); ++i)
+                    if (kin->motionSlots[i].preview) {
+                        const auto rg = kin->slotRange(i);
+                        strobe(kin->motionSlots[i].cachedClip,
+                               kin->motionSlots[i].color, rg[0], rg[1]);
+                    }
             }
 
-            // One-shot opaque playback (full color, depth-writing).
-            if (wantPlay) {
+            // One-shot opaque playback (full color, depth-writing). previewPlay
+            // < 0 is the blended result (sampled live at the cursor through one
+            // cycle); > 0 is a single clip slot.
+            if (wantPlay && kin->previewPlay < 0) {
                 glDisable(GL_BLEND);
                 glDepthMask(GL_TRUE);
                 shader.setUniform("opacity", 1.0f);
-                const mograph::Clip& c = kin->previewPlay == 1
-                                             ? kin->previewClipA
-                                             : kin->previewClipB;
-                const auto& col =
-                    kin->previewPlay == 1 ? kin->previewColA : kin->previewColB;
+                std::vector<float> w;
+                kin->graphSession.blendWeights(kin->graphSession.cursor, w);
+                const double cycle = kin->graphSession.blendCycleSec;
+                tinym::vec3 col(0, 0, 0);
+                float sw = 0.0f;
+                for (int i = 0; i < int(w.size()) &&
+                                i < int(kin->motionSlots.size()); ++i) {
+                    const auto& cc = kin->motionSlots[i].color;
+                    col.x += cc[0] * w[i]; col.y += cc[1] * w[i]; col.z += cc[2] * w[i];
+                    sw += w[i];
+                }
+                if (sw > 1e-6f) { col.x /= sw; col.y /= sw; col.z /= sw; }
+                else col = tinym::vec3(0.85f, 0.85f, 0.9f);
+                const tinym::vec3 emis(col.x * 0.5f, col.y * 0.5f, col.z * 0.5f);
+                const double phase = cycle > 1e-6 ? kin->previewPlayTime / cycle : 0.0;
+                kin->writeBlendGhost(phase, /*loop=*/false, mesh.scale,
+                                     mesh.rotationQuat, mesh.transformPosition,
+                                     ghostVerts_);
+                if (!ghostVerts_.empty()) {
+                    ghostGL_.computeNormal();
+                    ghostGL_.updateBuffer();
+                    ghostGL_.draw(shader, col, 0.0f, 1.0f, 0.0f, emis);
+                }
+            } else if (wantPlay &&
+                       kin->previewPlay - 1 < int(kin->motionSlots.size())) {
+                glDisable(GL_BLEND);
+                glDepthMask(GL_TRUE);
+                shader.setUniform("opacity", 1.0f);
+                const int si = kin->previewPlay - 1;
+                const auto& slot = kin->motionSlots[si];
+                const mograph::Clip& c = slot.cachedClip;
+                const auto& col = slot.color;
                 const tinym::vec3 base(col[0], col[1], col[2]);
                 const tinym::vec3 emis(col[0] * 0.5f, col[1] * 0.5f, col[2] * 0.5f);
-                kin->writeGhostAtTime(c, kin->previewPlayTime, mesh.scale,
+                // Play inside the active window: clock starts at the range-start
+                // frame, which also anchors the body (anchorFrame = rg[0]).
+                const auto rg = kin->slotRange(si);
+                const double tOff = double(rg[0]) * (c.dt > 0 ? c.dt : 0.0);
+                kin->writeGhostAtTime(c, tOff + kin->previewPlayTime, mesh.scale,
                                       mesh.rotationQuat, mesh.transformPosition,
-                                      ghostVerts_);
+                                      ghostVerts_, rg[0]);
                 ghostGL_.computeNormal();
                 ghostGL_.updateBuffer();
                 ghostGL_.draw(shader, base, 0.0f, 1.0f, 0.0f, emis);
+            }
+
+            // Blend-result preview: translucent strobe of the live blended gait
+            // cycle. Color = slot colors mixed by the current weights, and the
+            // poses come from samplePose at the live cursor — so dragging the
+            // pad re-tints AND re-poses every ghost in real time.
+            if (wantBlend) {
+                glEnable(GL_BLEND);
+                glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+                glDepthMask(GL_FALSE);
+                shader.setUniform("opacity", 0.22f);
+                std::vector<float> w;
+                kin->graphSession.blendWeights(kin->graphSession.cursor, w);
+                tinym::vec3 col(0, 0, 0);
+                float sw = 0.0f;
+                for (int i = 0; i < int(w.size()) &&
+                                i < int(kin->motionSlots.size()); ++i) {
+                    const auto& c = kin->motionSlots[i].color;
+                    col.x += c[0] * w[i]; col.y += c[1] * w[i]; col.z += c[2] * w[i];
+                    sw += w[i];
+                }
+                if (sw > 1e-6f) { col.x /= sw; col.y /= sw; col.z /= sw; }
+                else col = tinym::vec3(0.85f, 0.85f, 0.9f);
+                const tinym::vec3 emis(col.x * 0.5f, col.y * 0.5f, col.z * 0.5f);
+                const int N = 7;
+                for (int i = 0; i < N; ++i) {
+                    kin->writeBlendGhost(double(i) / N, /*loop=*/true, mesh.scale,
+                                         mesh.rotationQuat, mesh.transformPosition,
+                                         ghostVerts_);
+                    if (ghostVerts_.empty()) continue;
+                    ghostGL_.computeNormal();
+                    ghostGL_.updateBuffer();
+                    ghostGL_.draw(shader, col, 0.0f, 1.0f, 0.0f, emis);
+                }
             }
 
             shader.setUniform("opacity", 1.0f);
@@ -9264,6 +9541,7 @@ struct Simulator {
         auto* kin = kinematicOf(meshId);
         if (!m || !kin || !m->state.x.ptr) return;
         kin->localTime = timeSec;
+        kin->graphSession.resetBlendTravel();  // seek → restart travel integrator
         // A pending re-pack (file swap marked dirty) can leave the live
         // buffer sized for the OLD proxy; writing the new pose would
         // overrun it. The pack realizes localTime anyway.
@@ -9324,6 +9602,16 @@ struct Simulator {
 
     // Best Kovar transition fileA → fileB baked into a finite, scrubbable
     // composite. Always leaves graphStatus describing the outcome.
+    // Raw active window {start,end} (end<0 = full) for a clip slot, fed to the
+    // session builders so the baked track starts at the window's first frame.
+    static std::array<int, 2> slotRawRange(MeshKinematicInitializer<BE, PR>* kin,
+                                           int slot) {
+        if (kin && slot >= 0 && slot < int(kin->motionSlots.size()))
+            return {kin->motionSlots[slot].rangeStart,
+                    kin->motionSlots[slot].rangeEnd};
+        return {0, -1};
+    }
+
     bool buildKinematicTransition(int meshId, const std::string& fileA,
                                   const std::string& fileB) {
         auto* kin = kinematicOf(meshId);
@@ -9338,9 +9626,11 @@ struct Simulator {
         p.markerScaleFrac = kin->graphMarkerFrac;
         std::string err;
         bool ok;
+        const auto rgA = slotRawRange(kin, 0), rgB = slotRawRange(kin, 1);
         if (fileB == fileA) {
             ok = kin->graphSession.buildTransition(kin->motion, fileA,
-                                                   kin->motion, fileB, p, &err);
+                                                   kin->motion, fileB, p, &err,
+                                                   rgA, rgB);
         } else {
             std::string lerr;
             bvh::Motion mb = bvh::load(dir + "/" + fileB, &lerr);
@@ -9349,7 +9639,7 @@ struct Simulator {
                 return false;
             }
             ok = kin->graphSession.buildTransition(kin->motion, fileA, mb,
-                                                   fileB, p, &err);
+                                                   fileB, p, &err, rgA, rgB);
         }
         if (!ok) {
             kin->graphStatus = "실패: " + err;
@@ -9392,9 +9682,10 @@ struct Simulator {
         p.markerScaleFrac = kin->graphMarkerFrac;
         std::string err;
         bool ok;
+        const auto rgA = slotRawRange(kin, 0), rgB = slotRawRange(kin, 1);
         if (fileB == fileA) {
             ok = kin->graphSession.buildBlend(kin->motion, fileA, kin->motion,
-                                              fileB, p, &err);
+                                              fileB, p, &err, rgA, rgB);
         } else {
             std::string lerr;
             bvh::Motion mb = bvh::load(dir + "/" + fileB, &lerr);
@@ -9403,7 +9694,7 @@ struct Simulator {
                 return false;
             }
             ok = kin->graphSession.buildBlend(kin->motion, fileA, mb, fileB, p,
-                                              &err);
+                                              &err, rgA, rgB);
         }
         if (!ok) {
             kin->graphStatus = "실패: " + err;
@@ -9512,6 +9803,129 @@ struct Simulator {
         kin->graphSession.reseed(kin->walkSeed);
         kin->invalidateRebase();
         setKinematicTime(meshId, 0.0);
+    }
+
+    // ── Interactive blend space (motionMode 4) ────────────────────────────
+    // Build an N-clip blend space from the initializer's presets. Reference =
+    // first file (becomes the proxy skeleton). Skeleton-incompatible/unreadable
+    // clips are dropped and reported, mirroring buildKinematicWalk.
+    bool buildKinematicBlendSpace(int meshId) {
+        auto* kin = kinematicOf(meshId);
+        if (!kin) return false;
+        if (kin->blendSpaceFiles.empty()) {
+            kin->graphStatus = "실패: 블렌드 클립이 없습니다";
+            return false;
+        }
+        const std::string dir = bvhAssetDir();
+        const std::string ref = kin->blendSpaceFiles.front();
+        if (!ensureKinematicRefFile(meshId, dir + "/" + ref)) {
+            kin->graphStatus = "실패: " + ref + " 로드 불가";
+            return false;
+        }
+        // Pass 1: load every non-ref clip into stable storage (pointer-stable
+        // for buildBlendSpace, which takes addresses).
+        struct Loaded { bvh::Motion m; std::string name; std::array<float, 2> co; int slot; };
+        std::vector<Loaded> loaded;
+        std::vector<std::string> unreadable;
+        for (size_t i = 0; i < kin->blendSpaceFiles.size(); ++i) {
+            const std::string& f = kin->blendSpaceFiles[i];
+            if (f == ref) continue;
+            const std::array<float, 2> co =
+                i < kin->blendSpaceCoords.size() ? kin->blendSpaceCoords[i]
+                                                 : std::array<float, 2>{0.0f, 0.0f};
+            std::string lerr;
+            bvh::Motion m = bvh::load(dir + "/" + f, &lerr);
+            if (!m.valid()) { unreadable.push_back(f); continue; }
+            loaded.push_back({std::move(m), f, co, int(i)});
+        }
+        // Pass 2: ref first (skeleton source), then the rest in file order so
+        // coords stay parallel.
+        std::vector<const bvh::Motion*> ms{&kin->motion};
+        std::vector<std::string> names{ref};
+        std::vector<std::array<float, 2>> coords{
+            kin->blendSpaceCoords.empty() ? std::array<float, 2>{0.0f, 0.0f}
+                                          : kin->blendSpaceCoords.front()};
+        for (auto& lm : loaded) {
+            ms.push_back(&lm.m);
+            names.push_back(lm.name);
+            coords.push_back(lm.co);
+        }
+        // Per-clip active windows in SESSION order (ref/slot-0 first, then the
+        // loaded clips). Raw {start,end}; end<0 = full. buildBlendSpace clamps
+        // against each clip's own length and trims before pin/velocity.
+        auto rawRange = [&](int slotIdx) -> std::array<int, 2> {
+            if (slotIdx >= 0 && slotIdx < int(kin->motionSlots.size()))
+                return {kin->motionSlots[slotIdx].rangeStart,
+                        kin->motionSlots[slotIdx].rangeEnd};
+            return {0, -1};
+        };
+        std::vector<std::array<int, 2>> ranges{rawRange(0)};
+        for (auto& lm : loaded) ranges.push_back(rawRange(lm.slot));
+        mograph::SessionParams p;
+        p.thresholdFrac = kin->graphThreshold;
+        p.markerScaleFrac = kin->graphMarkerFrac;
+        std::string err;
+        std::vector<std::string> incompatible;
+        const auto rmode = kin->blendAbsoluteRoot
+                               ? mograph::Session::RootMode::Absolute
+                               : mograph::Session::RootMode::Relative;
+        if (!kin->graphSession.buildBlendSpace(ms, names, coords, p, &err,
+                                               &incompatible, &ranges, rmode)) {
+            kin->graphStatus = "실패: " + err;
+            return false;
+        }
+        kin->motionMode = 4;
+        kin->invalidateRebase();
+        {
+            char buf[160];
+            std::snprintf(buf, sizeof buf, "블렌드 스페이스 · 클립 %d개",
+                          (int)kin->graphSession.clips.size());
+            kin->graphStatus = buf;
+        }
+        std::string dropped;
+        for (const auto& f : incompatible)
+            dropped += (dropped.empty() ? "" : ", ") + f + "(스켈레톤 불일치)";
+        for (const auto& f : unreadable)
+            dropped += (dropped.empty() ? "" : ", ") + f + "(로드 실패)";
+        if (!dropped.empty()) kin->graphStatus += " · 제외: " + dropped;
+        setKinematicTime(meshId, 0.0);
+        scene_log::logObject("블렌드 스페이스 빌드 (id " + std::to_string(meshId) +
+                             "): " + std::to_string(names.size()) + "개 클립");
+        return true;
+    }
+
+    // Live cursor for the blend space (GUI pad drag / 1D slider). Re-roots so
+    // the body stays at the object origin as the frame-0 pose shifts with the
+    // mix.
+    void setKinematicBlendCursor(int meshId, float x, float y) {
+        auto* kin = kinematicOf(meshId);
+        if (!kin || kin->motionMode != 4) return;
+        kin->graphSession.cursor = {x, y};
+        kin->invalidateRebase();
+    }
+
+    // Apply a curated blend preset: fill blendSpaceFiles with its 4 clips and,
+    // when a space is already built, rebuild so the change is live. presetIdx
+    // < 0 = 자율선택 (manual) — just marks the body custom, keeps current files.
+    void setKinematicBlendPreset(int meshId, int presetIdx) {
+        auto* kin = kinematicOf(meshId);
+        if (!kin) return;
+        if (presetIdx < 0) { kin->blendPreset = -1; return; }
+        if (presetIdx >= int(blendPresets().size())) return;
+        const auto& p = blendPresets()[presetIdx];
+        kin->blendSpaceFiles.assign(p.files.begin(), p.files.end());
+        kin->blendPreset = presetIdx;
+        for (size_t i = 0; i < kin->motionSlots.size(); ++i) {
+            auto& s = kin->motionSlots[i];
+            s.cachedFile.clear();   // re-cache previews
+            // Apply the preset's per-clip window (default {0,-1} = full).
+            const auto rg = i < p.ranges.size() ? p.ranges[i]
+                                                : std::array<int, 2>{0, -1};
+            s.rangeStart = rg[0];
+            s.rangeEnd = rg[1];
+        }
+        if (kin->motionMode == 4 && kin->graphActive())
+            buildKinematicBlendSpace(meshId);  // rebuild live (re-asserts mode 4)
     }
 
     void addGround(PlaneDirection dir, tinym::vec3 center, PR size1D, PR mass=0.1) {
@@ -11243,11 +11657,12 @@ struct Simulator {
             tinym::vec3 drawColor = mesh.material.baseColor;
             if (auto* kin =
                     dynamic_cast<MeshKinematicInitializer<BE, PR>*>(mesh.initializer)) {
-                if (kin->blendColorize && kin->motionMode == 3 && kin->graphActive()) {
+                if (kin->blendColorize && kin->motionMode == 3 &&
+                    kin->graphActive() && kin->motionSlots.size() >= 2) {
                     const float wa = kin->graphSession.blendWeightA(kin->localTime);
                     if (wa >= 0.0f) {
-                        const auto& a = kin->previewColA;
-                        const auto& b = kin->previewColB;
+                        const auto& a = kin->motionSlots[0].color;
+                        const auto& b = kin->motionSlots[1].color;
                         const float wb = 1.0f - wa;
                         drawColor = tinym::vec3(a[0]*wa + b[0]*wb,
                                                 a[1]*wa + b[1]*wb,
@@ -19978,6 +20393,287 @@ static int runSelfTest() {
         }
     }
 
+    // ---- Block MBS: interactive motion blend space — preset skeleton ----
+    //                 compatibility, inverse-distance weighting, and the
+    //                 N-way pose blend (corner ≈ pure clip, center = mix).
+    {
+        const std::string dir = bvhAssetDir();
+        const std::vector<std::string> presets{
+            "WalkLoopA.bvh", "jogCurve.bvh", "SneakLoopA.bvh", "StrutLoopA.bvh"};
+        bool haveAll = true;
+        for (const auto& f : presets)
+            if (!std::filesystem::exists(dir + "/" + f)) haveAll = false;
+        if (!haveAll) {
+            skip("MBS", "blend-space preset assets missing under " + dir);
+        } else {
+            resetScene();
+            sim.pause = false;
+            if (!sim.addKinematicBody(dir + "/WalkLoopA.bvh",
+                                      tinym::vec3(0, 0, 0), 1.8f)) {
+                fail("MBS-1 / kinematic body for blend space", "load failed");
+            } else {
+                sim.initialize();
+                auto* kin = sim.kinematicOf(0);
+                const bool built = sim.buildKinematicBlendSpace(0);
+                // MBS-1: all four presets are skeleton-compatible + retained.
+                if (built && kin && kin->graphActive() && kin->motionMode == 4 &&
+                    kin->graphSession.clips.size() == presets.size())
+                    pass("MBS-1 / 4 presets build a blend space (skeletons compatible)");
+                else
+                    fail("MBS-1 / 4 presets build a blend space (skeletons compatible)",
+                         "clips=" +
+                             std::to_string(kin ? kin->graphSession.clips.size() : 0) +
+                             " status=" + (kin ? kin->graphStatus : "no kin"));
+
+                if (built && kin) {
+                    auto& ses = kin->graphSession;
+                    // Locate the clip placed at the Run corner (0,1).
+                    int runIdx = -1;
+                    for (size_t i = 0; i < ses.clipCoords.size(); ++i)
+                        if (std::fabs(ses.clipCoords[i][0]) < 1e-3f &&
+                            std::fabs(ses.clipCoords[i][1] - 1.0f) < 1e-3f)
+                            runIdx = int(i);
+                    // MBS-2: cursor on a sample point ⇒ that clip's weight → 1,
+                    // and the weights are a normalized partition (Σ=1).
+                    std::vector<float> w;
+                    ses.blendWeights({0.0f, 1.0f}, w);
+                    float sum = 0.0f;
+                    for (float x : w) sum += x;
+                    const bool peak = runIdx >= 0 && w[size_t(runIdx)] > 0.9f;
+                    if (peak && std::fabs(sum - 1.0f) < 1e-4f)
+                        pass("MBS-2 / cursor on a sample snaps to that clip (w>0.9, Σw=1)");
+                    else
+                        fail("MBS-2 / cursor on a sample snaps to that clip (w>0.9, Σw=1)",
+                             "wRun=" + std::to_string(runIdx >= 0 ? w[size_t(runIdx)] : -1.0f) +
+                                 " sum=" + std::to_string(sum));
+
+                    // MBS-3: the diamond center is a near-uniform 4-way mix.
+                    std::vector<float> wc;
+                    ses.blendWeights({0.0f, 0.0f}, wc);
+                    float spread = 0.0f;
+                    for (float x : wc) spread = std::max(spread, std::fabs(x - 0.25f));
+                    if (spread < 0.05f)
+                        pass("MBS-3 / blend-space center is near-uniform (4 clips ≈ 0.25)");
+                    else
+                        fail("MBS-3 / blend-space center is near-uniform (4 clips ≈ 0.25)",
+                             "max|w-0.25|=" + std::to_string(spread));
+
+                    // MBS-4: N-way blend — at a pure corner the live pose
+                    // matches that clip alone; at center it differs (real mix).
+                    const int ri = runIdx >= 0 ? runIdx : 0;
+                    ses.cursor = {0.0f, 1.0f};  // pure Run
+                    bvh::Pose pRun;
+                    ses.samplePose(0.0, pRun);
+                    bvh::Pose pRunRef;
+                    mograph::fk(ses.skel, ses.clips[size_t(ri)].frames[0], pRunRef);
+                    float dCorner = 0.0f;
+                    for (size_t j = 0; j < pRun.world.size(); ++j)
+                        for (int c = 0; c < 3; ++c)
+                            dCorner = std::max(dCorner,
+                                               std::fabs(pRun.world[j].t[c] -
+                                                         pRunRef.world[j].t[c]));
+                    ses.cursor = {0.0f, 0.0f};  // center mix
+                    bvh::Pose pMix;
+                    ses.samplePose(0.0, pMix);
+                    float dMix = 0.0f;
+                    for (size_t j = 0; j < pMix.world.size(); ++j)
+                        for (int c = 0; c < 3; ++c)
+                            dMix = std::max(dMix,
+                                            std::fabs(pMix.world[j].t[c] -
+                                                      pRunRef.world[j].t[c]));
+                    if (dCorner < 0.05f * ses.skel.height && dMix > dCorner)
+                        pass("MBS-4 / N-way blend: corner≈pure clip, center is a real mix");
+                    else
+                        fail("MBS-4 / N-way blend: corner≈pure clip, center is a real mix",
+                             "dCorner=" + std::to_string(dCorner) + " dMix=" +
+                                 std::to_string(dMix) + " h=" +
+                                 std::to_string(ses.skel.height));
+
+                    // MBS-5: blend-result preview reflects the cursor — the
+                    // ghost geometry is finite, body-sized, and differs between
+                    // two cursor positions (the live real-time-reflection claim,
+                    // GL aside).
+                    std::vector<float> gA, gB;
+                    ses.cursor = {0.0f, 1.0f};  // Run corner
+                    kin->writeBlendGhost(0.25, true, tinym::vec3(1, 1, 1), Quat{},
+                                         tinym::vec3(0, 0, 0), gA);
+                    ses.cursor = {0.0f, -1.0f};  // Walk corner
+                    kin->writeBlendGhost(0.25, true, tinym::vec3(1, 1, 1), Quat{},
+                                         tinym::vec3(0, 0, 0), gB);
+                    bool finite = !gA.empty() &&
+                                  gA.size() == size_t(kin->proxy.numVerts) * 3 &&
+                                  gA.size() == gB.size();
+                    for (float v : gA) finite = finite && std::isfinite(v);
+                    for (float v : gB) finite = finite && std::isfinite(v);
+                    float gd = 0.0f;
+                    for (size_t i = 0; finite && i < gA.size(); ++i)
+                        gd = std::max(gd, std::fabs(gA[i] - gB[i]));
+                    if (finite && gd > 1e-4f)
+                        pass("MBS-5 / blend preview ghost reflects cursor (Run≠Walk, finite)");
+                    else
+                        fail("MBS-5 / blend preview ghost reflects cursor (Run≠Walk, finite)",
+                             "finite=" + std::to_string(int(finite)) +
+                                 " maxDiff=" + std::to_string(gd));
+                    ses.cursor = {0.0f, 0.0f};
+
+                    // MBS-6: the "opposition" metric — clip features separate a
+                    // still pose from active locomotion (vigour + translation).
+                    std::string e1, e2;
+                    bvh::Motion mStand = bvh::load(dir + "/standStill.bvh", &e1);
+                    bvh::Motion mWalk2 = bvh::load(dir + "/WalkLoopA.bvh", &e2);
+                    if (mStand.valid() && mWalk2.valid()) {
+                        mograph::Skeleton skS = mograph::Skeleton::extract(mStand);
+                        mograph::Skeleton skW = mograph::Skeleton::extract(mWalk2);
+                        mograph::Clip cS, cW;
+                        mograph::sampleClip(mStand, skS, mStand.frameTime, "stand", cS);
+                        mograph::sampleClip(mWalk2, skW, mWalk2.frameTime, "walk", cW);
+                        mograph::ClipFeatures fS = mograph::clipFeatures(skS, cS);
+                        mograph::ClipFeatures fW = mograph::clipFeatures(skW, cW);
+                        if (fW.energy > fS.energy && fW.rootSpeed >= fS.rootSpeed)
+                            pass("MBS-6 / clip features separate still from active locomotion");
+                        else
+                            fail("MBS-6 / clip features separate still from active locomotion",
+                                 "standE=" + std::to_string(fS.energy) + " walkE=" +
+                                     std::to_string(fW.energy) + " standSpd=" +
+                                     std::to_string(fS.rootSpeed) + " walkSpd=" +
+                                     std::to_string(fW.rootSpeed));
+                    } else {
+                        skip("MBS-6", "standStill/WalkLoopA missing");
+                    }
+
+                    // MBS-7: every curated preset builds with all 4 clips
+                    // retained (verifies the bundled file names + compatibility).
+                    bool allOk = true;
+                    std::string bad;
+                    for (size_t pi = 0; pi < blendPresets().size(); ++pi) {
+                        auto* k = sim.kinematicOf(0);
+                        if (!k) { allOk = false; bad += "no-kin "; break; }
+                        k->blendSpaceFiles.assign(blendPresets()[pi].files.begin(),
+                                                  blendPresets()[pi].files.end());
+                        const bool b = sim.buildKinematicBlendSpace(0);
+                        auto* k2 = sim.kinematicOf(0);
+                        const size_t nc = k2 ? k2->graphSession.clips.size() : 0;
+                        if (!b || nc != 4) {
+                            allOk = false;
+                            bad += std::string(blendPresets()[pi].name) + "(" +
+                                   std::to_string(nc) + ") ";
+                        }
+                    }
+                    if (allOk)
+                        pass("MBS-7 / all curated presets build with 4 compatible clips");
+                    else
+                        fail("MBS-7 / all curated presets build with 4 compatible clips",
+                             "bad: " + bad);
+
+                    // MBS-8: the one-shot preview (clamp) removes the end-of-
+                    // cycle seam. loop wraps phase 1→0 (a jump back toward the
+                    // start for non-looping clips); clamp holds the last frame,
+                    // so its end discontinuity is never worse than loop's.
+                    if (auto* k = sim.kinematicOf(0)) {
+                        if (k->graphActive() && k->motionMode == 4) {
+                            auto& s = k->graphSession;
+                            s.cursor = {0.0f, 1.0f};
+                            auto endJump = [&](bool loop) {
+                                bvh::Pose pa, pb;
+                                s.sampleBlendPhase(0.96f, loop, pa);
+                                s.sampleBlendPhase(1.0f, loop, pb);
+                                float d = 0.0f;
+                                for (size_t j = 0; j < pa.world.size(); ++j)
+                                    for (int c = 0; c < 3; ++c)
+                                        d = std::max(d, std::fabs(pa.world[j].t[c] -
+                                                                  pb.world[j].t[c]));
+                                return d;
+                            };
+                            const float jLoop = endJump(true);
+                            const float jClamp = endJump(false);
+                            if (jClamp <= jLoop + 1e-4f)
+                                pass("MBS-8 / one-shot clamp end-jump ≤ loop wrap (seam removed)");
+                            else
+                                fail("MBS-8 / one-shot clamp end-jump ≤ loop wrap (seam removed)",
+                                     "jLoop=" + std::to_string(jLoop) + " jClamp=" +
+                                         std::to_string(jClamp));
+                            s.cursor = {0.0f, 0.0f};
+
+                            // MBS-9: the blended pose is CONTINUOUS in the cursor
+                            // at large t — no pop. A step discontinuity (fmod-
+                            // modulus jump from a weight-dependent cycle, or the
+                            // old argmax reference switch in blendPoseN) would
+                            // fire on ANY nonzero nudge → dSmall ≈ dBig. A
+                            // continuous blend scales with the nudge → dBig ≫
+                            // dSmall. Sampled on the most disparate preset so the
+                            // gradient is steep but must still be proportional.
+                            const double tBig = 50.0;
+                            auto poseAt = [&](float cx) {
+                                s.cursor = {cx, 0.0f};
+                                bvh::Pose p;
+                                s.samplePose(tBig, p);
+                                return p;
+                            };
+                            auto poseDiff = [](const bvh::Pose& a, const bvh::Pose& b) {
+                                float d = 0.0f;
+                                for (size_t j = 0; j < a.world.size() &&
+                                                   j < b.world.size(); ++j)
+                                    for (int c = 0; c < 3; ++c)
+                                        d = std::max(d, std::fabs(a.world[j].t[c] -
+                                                                  b.world[j].t[c]));
+                                return d;
+                            };
+                            const bvh::Pose p0 = poseAt(0.0f);
+                            const bvh::Pose pSmall = poseAt(0.01f);
+                            const bvh::Pose pBig = poseAt(0.10f);
+                            const float dSmall = poseDiff(p0, pSmall);
+                            const float dBig = poseDiff(p0, pBig);
+                            // 10× the nudge must move the pose markedly more than
+                            // 1× — i.e. no flat step. (A pop gives dBig ≈ dSmall.)
+                            if (dBig >= 3.0f * dSmall - 1e-3f)
+                                pass("MBS-9 / blended pose continuous in cursor at large t (no pop)");
+                            else
+                                fail("MBS-9 / blended pose continuous in cursor at large t (no pop)",
+                                     "dSmall=" + std::to_string(dSmall) + " dBig=" +
+                                         std::to_string(dBig) + " (step-like)");
+
+                            // MBS-10: the blended root TRAVELS forward (velocity-
+                            // integrated) yet never teleports — net travel grows
+                            // over time while every consecutive-frame root step
+                            // stays small (raw jogCurve would teleport ~30 at the
+                            // seam). Driven via samplePose at 60 fps over 8 s.
+                            s.cursor = {0.0f, 0.0f};
+                            s.resetBlendTravel();
+                            float maxStep = 0.0f, pathLen = 0.0f;
+                            bvh::Pose prev, cur;
+                            const double fdt = 1.0 / 60.0;
+                            for (int q = 0; q <= 480; ++q) {
+                                s.samplePose(q * fdt, cur);
+                                if (cur.world.empty()) continue;
+                                if (q > 0 && !prev.world.empty()) {
+                                    const float dx = cur.world[0].t[0] - prev.world[0].t[0];
+                                    const float dz = cur.world[0].t[2] - prev.world[0].t[2];
+                                    const float step = std::sqrt(dx * dx + dz * dz);
+                                    pathLen += step;
+                                    maxStep = std::max(maxStep, step);
+                                }
+                                prev = cur;
+                            }
+                            // moves a meaningful distance (path, robust to curving)
+                            // yet no single-frame teleport.
+                            if (pathLen > 0.5f * s.skel.height &&
+                                maxStep < 0.05f * s.skel.height)
+                                pass("MBS-10 / blend-space root travels (curving) without seam teleport");
+                            else
+                                fail("MBS-10 / blend-space root travels (curving) without seam teleport",
+                                     "pathLen=" + std::to_string(pathLen) +
+                                         " maxStep=" + std::to_string(maxStep) +
+                                         " h=" + std::to_string(s.skel.height));
+                            s.cursor = {0.0f, 0.0f};
+                            s.resetBlendTravel();
+                        }
+                    }
+                }
+                sim.setKinematicMode(0, 0);
+            }
+        }
+    }
+
     // ---- Block RIG: rigid mesh stays glued to its Bullet body even when ----
     // the narrow-phase response shoves its verts (kinematic walker overlap).
     {
@@ -20473,7 +21169,209 @@ static int runMlDriveDiag(int frames, int cdPeriod, const std::string& method,
     return 0;
 }
 
+// ── Shared loaders for the opposed-pair / blend-space extractors ──────────
+struct ClipFeatEntry {
+    std::string name;
+    mograph::Skeleton skel;
+    mograph::ClipFeatures f;
+};
+static float clipFeatK(const mograph::ClipFeatures& f, int k) {
+    return k == 0 ? f.rootSpeed : k == 1 ? f.rootHeight : k == 2 ? f.bob : f.energy;
+}
+static std::vector<ClipFeatEntry> loadClipFeatEntries() {
+    std::vector<ClipFeatEntry> entries;
+    const std::string dir = bvhAssetDir();
+    for (const auto& fn : listBVHFiles()) {
+        std::string err;
+        bvh::Motion m = bvh::load(dir + "/" + fn, &err);
+        if (!m.valid()) continue;
+        mograph::Skeleton sk = mograph::Skeleton::extract(m);
+        mograph::Clip c;
+        if (!mograph::sampleClip(m, sk, m.frameTime, fn, c)) continue;
+        entries.push_back({fn, std::move(sk), mograph::clipFeatures(sk, c)});
+    }
+    return entries;
+}
+// Skeleton-compatible groups (indices into entries).
+static std::vector<std::vector<int>> compatibleGroups(
+    const std::vector<ClipFeatEntry>& e) {
+    std::vector<std::vector<int>> groups;
+    std::vector<char> used(e.size(), 0);
+    for (size_t i = 0; i < e.size(); ++i) {
+        if (used[i]) continue;
+        std::vector<int> g{int(i)};
+        used[i] = 1;
+        for (size_t j = i + 1; j < e.size(); ++j)
+            if (!used[j] && e[i].skel.compatible(e[j].skel)) {
+                used[j] = 1;
+                g.push_back(int(j));
+            }
+        groups.push_back(std::move(g));
+    }
+    return groups;
+}
+// z-score the 4 features across group `g` → z[localIdx][k] (parallel to g).
+static std::vector<std::array<float, 4>> zscoreGroup(
+    const std::vector<ClipFeatEntry>& e, const std::vector<int>& g) {
+    float mean[4] = {0, 0, 0, 0}, sd[4] = {0, 0, 0, 0};
+    for (int k = 0; k < 4; ++k) {
+        for (int idx : g) mean[k] += clipFeatK(e[idx].f, k);
+        mean[k] /= float(g.size());
+        for (int idx : g) {
+            const float d = clipFeatK(e[idx].f, k) - mean[k];
+            sd[k] += d * d;
+        }
+        sd[k] = std::sqrt(sd[k] / float(g.size()));
+        if (sd[k] < 1e-6f) sd[k] = 1.0f;  // dead feature → no contribution
+    }
+    std::vector<std::array<float, 4>> z(g.size());
+    for (size_t x = 0; x < g.size(); ++x)
+        for (int k = 0; k < 4; ++k)
+            z[x][k] = (clipFeatK(e[g[x]].f, k) - mean[k]) / sd[k];
+    return z;
+}
+
+// Rank "clearly opposed" clip pairs: group by skeleton, z-score each group's
+// style features, sort pairs by L2 contrast. Prints the top `topN` per group —
+// a shortlist of blend-space axis endpoints.
+static int runBlendPairs(int topN) {
+    auto entries = loadClipFeatEntries();
+    if (entries.empty()) {
+        std::fprintf(stderr, "[blend-pairs] no BVH under %s\n",
+                     bvhAssetDir().c_str());
+        return 1;
+    }
+    std::printf("# clearly-opposed clip pairs (skeleton-compatible groups)\n");
+    std::printf("# feature contrast = L2 over z-scored {speed,height,bob,energy}\n");
+    int groupId = 0;
+    for (const auto& g : compatibleGroups(entries)) {
+        if (g.size() < 2) continue;
+        const auto z = zscoreGroup(entries, g);
+        struct Pair { int a, b; float score; };
+        std::vector<Pair> pairs;
+        for (size_t x = 0; x < g.size(); ++x)
+            for (size_t y = x + 1; y < g.size(); ++y) {
+                float s = 0.0f;
+                for (int k = 0; k < 4; ++k) {
+                    const float d = z[x][k] - z[y][k];
+                    s += d * d;
+                }
+                pairs.push_back({g[x], g[y], std::sqrt(s)});
+            }
+        std::sort(pairs.begin(), pairs.end(),
+                  [](const Pair& a, const Pair& b) { return a.score > b.score; });
+        std::printf("\n## group %d  (%zu clips, ref %s)\n", groupId++, g.size(),
+                    entries[g[0]].name.c_str());
+        const int lim = topN > 0 ? std::min(topN, int(pairs.size())) : int(pairs.size());
+        for (int p = 0; p < lim; ++p) {
+            const auto& pr = pairs[p];
+            const auto& fa = entries[pr.a].f;
+            const auto& fb = entries[pr.b].f;
+            std::printf("  %6.2f  %-28s <> %-28s  | dSpd %+.2f dHt %+.2f dBob %+.2f dErg %+.2f\n",
+                        pr.score, entries[pr.a].name.c_str(),
+                        entries[pr.b].name.c_str(),
+                        fb.rootSpeed - fa.rootSpeed, fb.rootHeight - fa.rootHeight,
+                        fb.bob - fa.bob, fb.energy - fa.energy);
+        }
+    }
+    return 0;
+}
+
+// Build candidate 2D blend spaces: pick two disjoint opposed pairs (4 distinct
+// clips) whose axis directions are near-orthogonal in feature space — so the
+// pad spans two genuinely different contrasts, not the same one twice. Ranks
+// by sqrt(contrastX*contrastY)*orthogonality and de-dups so each printed
+// candidate is a distinct clip set (≤2 clips shared with any shown one). Output
+// gives the 4 files in blendSpaceFiles order {bottom,top,left,right}.
+static int runBlendSpaces(int topN) {
+    auto entries = loadClipFeatEntries();
+    if (entries.empty()) {
+        std::fprintf(stderr, "[blend-spaces] no BVH under %s\n",
+                     bvhAssetDir().c_str());
+        return 1;
+    }
+    std::printf("# candidate blend spaces (2 orthogonal opposed axes, 4 clips)\n");
+    std::printf("# score = sqrt(contrastX*contrastY) * orthogonality(0..1)\n");
+    int groupId = 0;
+    for (const auto& g : compatibleGroups(entries)) {
+        if (g.size() < 4) continue;
+        const auto z = zscoreGroup(entries, g);
+        // Every pair as an oriented axis (lower rootSpeed = '-' end).
+        struct Axis { int a, b; std::array<float, 4> dir; float len; };
+        std::vector<Axis> axes;
+        for (size_t x = 0; x < g.size(); ++x)
+            for (size_t y = x + 1; y < g.size(); ++y) {
+                int a = g[x], b = g[y];
+                std::array<float, 4> d{};
+                float L = 0.0f;
+                for (int k = 0; k < 4; ++k) { d[k] = z[y][k] - z[x][k]; L += d[k] * d[k]; }
+                L = std::sqrt(L);
+                if (entries[a].f.rootSpeed > entries[b].f.rootSpeed) {
+                    std::swap(a, b);
+                    for (int k = 0; k < 4; ++k) d[k] = -d[k];
+                }
+                axes.push_back({a, b, d, L});
+            }
+        struct Cand { int ax, ay; float score, cX, cY, ortho; };
+        std::vector<Cand> cands;
+        for (size_t p = 0; p < axes.size(); ++p)
+            for (size_t q = p + 1; q < axes.size(); ++q) {
+                const Axis& A = axes[p];
+                const Axis& B = axes[q];
+                if (A.a == B.a || A.a == B.b || A.b == B.a || A.b == B.b) continue;
+                if (A.len < 1e-4f || B.len < 1e-4f) continue;
+                float dot = 0.0f;
+                for (int k = 0; k < 4; ++k) dot += A.dir[k] * B.dir[k];
+                const float ortho = 1.0f - std::fabs(dot) / (A.len * B.len);
+                // Bigger-contrast axis = Y (primary/vertical).
+                int ay = int(p), ax = int(q);
+                float cY = A.len, cX = B.len;
+                if (B.len > A.len) { ay = int(q); ax = int(p); cY = B.len; cX = A.len; }
+                cands.push_back({ax, ay, std::sqrt(cX * cY) * ortho, cX, cY, ortho});
+            }
+        std::sort(cands.begin(), cands.end(),
+                  [](const Cand& a, const Cand& b) { return a.score > b.score; });
+        std::printf("\n## group %d (%zu clips)\n", groupId++, g.size());
+        std::vector<std::array<int, 4>> shownSets;
+        int shown = 0;
+        const int lim = topN > 0 ? topN : int(cands.size());
+        for (size_t c = 0; c < cands.size() && shown < lim; ++c) {
+            const Axis& X = axes[cands[c].ax];
+            const Axis& Y = axes[cands[c].ay];
+            std::array<int, 4> key{X.a, X.b, Y.a, Y.b};
+            std::sort(key.begin(), key.end());
+            bool tooClose = false;  // share ≥3 clips with an already-shown set → skip
+            for (const auto& s : shownSets) {
+                int overlap = 0;
+                for (int u : key)
+                    for (int v : s)
+                        if (u == v) ++overlap;
+                if (overlap >= 3) { tooClose = true; break; }
+            }
+            if (tooClose) continue;
+            shownSets.push_back(key);
+            ++shown;
+            std::printf("  [%d] score %5.2f  (cX %.2f, cY %.2f, ortho %.2f)\n",
+                        shown, cands[c].score, cands[c].cX, cands[c].cY, cands[c].ortho);
+            std::printf("       Y  %-26s <> %-26s\n",
+                        entries[Y.a].name.c_str(), entries[Y.b].name.c_str());
+            std::printf("       X  %-26s <> %-26s\n",
+                        entries[X.a].name.c_str(), entries[X.b].name.c_str());
+            std::printf("       files = { \"%s\", \"%s\", \"%s\", \"%s\" }\n",
+                        entries[Y.a].name.c_str(), entries[Y.b].name.c_str(),
+                        entries[X.a].name.c_str(), entries[X.b].name.c_str());
+        }
+    }
+    return 0;
+}
+
 int main(int argc, char** argv) {
+    if (argc > 1 && std::string(argv[1]) == "--blend-pairs") {
+        return runBlendPairs(argc > 2 ? std::atoi(argv[2]) : 8);
+    }
+    if (argc > 1 && std::string(argv[1]) == "--blend-spaces") {
+        return runBlendSpaces(argc > 2 ? std::atoi(argv[2]) : 8);
+    }
     if (argc > 1 && std::string(argv[1]) == "--drive-ml") {
         int frames   = (argc > 2) ? std::atoi(argv[2]) : 30;
         int cdPeriod = (argc > 3) ? std::atoi(argv[3]) : 1;
@@ -20844,7 +21742,7 @@ int main(int argc, char** argv) {
 
     //ByteMemoryPool<METAL> pool(50*1024*1024*sizeof(Precision));
     Precision h = 1/Precision(60);
-    Index subSteps = 60;
+    Index subSteps = 1;
     ExplicitSystem<Backend, Precision> system(h, subSteps);
     Simulator<Backend, Precision, ExplicitSystem<Backend, Precision>> simulator(system);
     std::cout << "[Main] simulator created" << std::endl;
@@ -20895,28 +21793,9 @@ int main(int argc, char** argv) {
         simulator.addCloth(20, 1, tinym::vec3(0, 0.6, 0), kstretch, kshear, kbend, thickness, mass);
         simulator.mlBroadPhase.floorExcludeDiag = 1e9f;   // exclude NOTHING
     } else {
-        simulator.addCloth(50, 1, tinym::vec3(0, 1.25, 0), kstretch, kshear, kbend, thickness, mass);
-        //simulator.addClothFile("src/assets", "teapot.obj", {0,0,0} 15, 1e4, 0, 2e4, thickness mass);
-        //simulator.addClothFile("src/assets", "horse-gallop-01.obj", {0,0,0}, 80, 1e4, 0, 2e4, thickness mass);
-        //simulator.addFloatMesh("src/assets", "horse-gallop-01.obj", {0, -1, 0}, 1.2);
-        // Static Float obstacle. YSIM_OBSTACLE_OBJ/_SCALE/_Y swap it (default
-        // Human). YSIM_EXP_TWOMESH replicates the runFrameProfile collision
-        // environment in this REAL interactive loop: static obstacle + NO ground
-        // (so twoMeshExperiment sees exactly cloth+obstacle, no scene TLAS).
-        const bool expTwoMesh = std::getenv("YSIM_EXP_TWOMESH") != nullptr;
-        const char* obsObj   = std::getenv("YSIM_OBSTACLE_OBJ");
-        const char* obsScale = std::getenv("YSIM_OBSTACLE_SCALE");
-        const char* obsY     = std::getenv("YSIM_OBSTACLE_Y");
-        std::string obj = obsObj ? obsObj : "Human.obj";
-        Precision sc = obsScale ? (Precision)std::atof(obsScale) : Precision(0.04);
-        Precision oy = obsY ? (Precision)std::atof(obsY) : Precision(0.35);
-        simulator.addFloatMesh(ysim_paths::assetRoot(), obj, {0, oy, 0}, sc);
-        if (expTwoMesh) {
-            auto& hr = Scene<Backend, Precision>::requestsGeneralMeshes.back();
-            hr.isStatic = true; hr.applyGravity = false; hr.applyWind = false;
-        } else {
-            simulator.addGround(PlaneDirection::XZPlane, tinym::vec3(0, 0, 0), 50);
-        }
+        // Default scene: just a checkerboard floor (no cloth, no obstacle).
+        simulator.addGround(PlaneDirection::XZPlane, tinym::vec3(0, 0, 0), 50);
+        Scene<Backend, Precision>::requestsGeneralMeshes.back().checkerboard = true;
     }
 
     std::cout << "[Main] mesh added to scene" << std::endl;
@@ -22046,16 +22925,83 @@ int main(int argc, char** argv) {
                     target.kin_graph_ready = kin->graphActive();
                     target.kin_threshold = kin->graphThreshold;
                     target.kin_marker_frac = kin->graphMarkerFrac;
-                    target.kin_preview_a = kin->previewA;
-                    target.kin_preview_b = kin->previewB;
-                    target.kin_preview_col_a = kin->previewColA.data();
-                    target.kin_preview_col_b = kin->previewColB.data();
                     target.kin_blend_colorize = kin->blendColorize;
+                    target.kin_blend_preview = kin->blendPreview;
+                    target.kin_blend_absroot = kin->blendAbsoluteRoot;
+                    target.kin_preview_playing = kin->previewPlay;  // 0 none, slot+1, -1 blend
+                    target.kin_blend_preset = kin->blendPreset;
+                    if (target.kin_blend_presets.empty())
+                        for (const auto& p : blendPresets())
+                            target.kin_blend_presets.push_back(p.name);
+                    // Reusable clip-selector slots for the active mode: one row
+                    // per selectable clip (file + preview toggle + color + play),
+                    // identical across transition / DTW / blend-space modes.
+                    {
+                        const std::string cur = target.kin_file;
+                        auto pushSlot = [&](const std::string& label,
+                                            const std::string& file, int idx) {
+                            mesh_inspector::MeshInspectorTarget::MotionClipSlot s;
+                            s.label = label;
+                            s.file = file;
+                            if (idx < int(kin->motionSlots.size())) {
+                                s.preview = kin->motionSlots[idx].preview;
+                                s.color = kin->motionSlots[idx].color.data();
+                                // Frame window: known only once the clip is
+                                // cached (preview/play loads it) → slider shows
+                                // then. Resolved against the cached length.
+                                const int fc = int(
+                                    kin->motionSlots[idx].cachedClip.frames.size());
+                                s.frame_count = fc;
+                                if (fc > 0) {
+                                    const auto rg = kin->slotRange(idx);
+                                    s.range_start = rg[0];
+                                    s.range_end = rg[1];
+                                }
+                            }
+                            target.kin_clip_slots.push_back(std::move(s));
+                        };
+                        if (kin->motionMode == 2 || kin->motionMode == 3) {
+                            pushSlot("모션 1 (시작)",
+                                     kin->transFileA.empty() ? cur : kin->transFileA, 0);
+                            pushSlot("모션 2 (도착)",
+                                     kin->transFileB.empty() ? cur : kin->transFileB, 1);
+                        } else if (kin->motionMode == 4) {
+                            // No fixed corner names — the file combo already
+                            // shows each clip; rows are identified by file.
+                            for (size_t i = 0; i < kin->blendSpaceFiles.size(); ++i)
+                                pushSlot("", kin->blendSpaceFiles[i], int(i));
+                        }
+                    }
                     target.kin_sim_paused = simulator.pause;
                     target.kin_status = kin->graphStatus;
                     if (kin->graphActive())
                         target.kin_label =
                             kin->graphSession.currentLabel(kin->localTime);
+                    // Blend-space pad snapshot (mode 4, after a build): the
+                    // session's clips + coords are authoritative; pad/bar labels
+                    // are the clip file names (stem, no .bvh) — no fixed naming.
+                    if (kin->motionMode == 4 && kin->graphActive()) {
+                        const auto& ses = kin->graphSession;
+                        target.kin_blend_cursor[0] = ses.cursor[0];
+                        target.kin_blend_cursor[1] = ses.cursor[1];
+                        for (size_t i = 0; i < ses.clips.size(); ++i) {
+                            target.kin_blend_coords.push_back(ses.clipCoords[i]);
+                            target.kin_blend_labels.push_back(
+                                std::filesystem::path(ses.clips[i].name)
+                                    .stem()
+                                    .string());
+                        }
+                        ses.blendWeights(ses.cursor, target.kin_blend_weights);
+                        // Show the EFFECTIVE mix the pose uses: blendPoseNMean
+                        // drops negative (extrapolation) weights and renormalizes
+                        // over the positives, so mirror that for the pad display.
+                        {
+                            auto& bw = target.kin_blend_weights;
+                            float sp = 0.0f;
+                            for (auto& x : bw) { if (x < 0.0f) x = 0.0f; sp += x; }
+                            if (sp > 1e-6f) for (auto& x : bw) x /= sp;
+                        }
+                    }
                     target.kin_graph_selected.assign(
                         target.kin_file_list.size(), 0);
                     for (size_t fi = 0; fi < target.kin_file_list.size(); ++fi)
@@ -22064,12 +23010,6 @@ int main(int argc, char** argv) {
                                 target.kin_graph_selected[fi] = 1;
                                 break;
                             }
-                    target.kin_trans_a = kin->transFileA.empty()
-                                             ? target.kin_file
-                                             : kin->transFileA;
-                    target.kin_trans_b = kin->transFileB.empty()
-                                             ? target.kin_file
-                                             : kin->transFileB;
                     target.on_kin_play = [&simulator](int id, bool playing) {
                         if (auto* k = simulator.kinematicOf(id)) k->playing = playing;
                     };
@@ -22117,16 +23057,6 @@ int main(int argc, char** argv) {
                     target.on_kin_walk_reseed = [&simulator](int id) {
                         simulator.reseedKinematicWalk(id);
                     };
-                    target.on_kin_trans_a =
-                        [&simulator](int id, const std::string& f) {
-                            if (auto* k = simulator.kinematicOf(id))
-                                k->transFileA = f;
-                        };
-                    target.on_kin_trans_b =
-                        [&simulator](int id, const std::string& f) {
-                            if (auto* k = simulator.kinematicOf(id))
-                                k->transFileB = f;
-                        };
                     target.on_kin_trans_build = [&simulator](int id) {
                         auto* k = simulator.kinematicOf(id);
                         if (!k) return;
@@ -22145,21 +23075,76 @@ int main(int argc, char** argv) {
                             id, k->transFileA.empty() ? cur : k->transFileA,
                             k->transFileB.empty() ? cur : k->transFileB);
                     };
-                    target.on_kin_preview_a = [&simulator](int id, bool on) {
-                        if (auto* k = simulator.kinematicOf(id)) k->previewA = on;
+                    // Reusable slot callbacks (mode-aware file routing): the
+                    // common selector component fires these for any clip-picking
+                    // mode; the slot index says which clip.
+                    target.on_kin_slot_file =
+                        [&simulator](int id, int slot, const std::string& f) {
+                            auto* k = simulator.kinematicOf(id);
+                            if (!k) return;
+                            if (k->motionMode == 4) {
+                                if (slot >= 0 &&
+                                    slot < int(k->blendSpaceFiles.size())) {
+                                    k->blendSpaceFiles[slot] = f;
+                                    k->blendPreset = -1;  // manual edit → 자율선택
+                                }
+                            } else {  // transition / DTW
+                                if (slot == 0) k->transFileA = f;
+                                else if (slot == 1) k->transFileB = f;
+                            }
+                            if (slot >= 0 && slot < int(k->motionSlots.size())) {
+                                k->motionSlots[slot].cachedFile.clear();  // re-cache
+                                k->motionSlots[slot].rangeStart = 0;      // reset
+                                k->motionSlots[slot].rangeEnd = -1;       // window
+                            }
+                        };
+                    target.on_kin_slot_preview =
+                        [&simulator](int id, int slot, bool on) {
+                            auto* k = simulator.kinematicOf(id);
+                            if (k && slot >= 0 && slot < int(k->motionSlots.size()))
+                                k->motionSlots[slot].preview = on;
+                        };
+                    target.on_kin_slot_play = [&simulator](int id, int slot) {
+                        simulator.startPreviewPlayback(id, slot);  // 0-based
                     };
-                    target.on_kin_preview_b = [&simulator](int id, bool on) {
-                        if (auto* k = simulator.kinematicOf(id)) k->previewB = on;
-                    };
-                    target.on_kin_preview_play_a = [&simulator](int id) {
-                        simulator.startPreviewPlayback(id, 1);
-                    };
-                    target.on_kin_preview_play_b = [&simulator](int id) {
-                        simulator.startPreviewPlayback(id, 2);
+                    target.on_kin_slot_range =
+                        [&simulator](int id, int slot, int start, int end) {
+                            auto* k = simulator.kinematicOf(id);
+                            if (!k || slot < 0 || slot >= int(k->motionSlots.size()))
+                                return;
+                            if (end < start) end = start;
+                            k->motionSlots[slot].rangeStart = start;
+                            k->motionSlots[slot].rangeEnd = end;
+                        };
+                    target.on_kin_preview_stop = [&simulator](int id) {
+                        simulator.stopPreviewPlayback(id);
                     };
                     target.on_kin_blend_colorize = [&simulator](int id, bool on) {
                         if (auto* k = simulator.kinematicOf(id)) k->blendColorize = on;
                     };
+                    target.on_kin_blendspace_build = [&simulator](int id) {
+                        simulator.buildKinematicBlendSpace(id);
+                    };
+                    target.on_kin_blend_preview = [&simulator](int id, bool on) {
+                        if (auto* k = simulator.kinematicOf(id)) k->blendPreview = on;
+                    };
+                    target.on_kin_blend_absroot = [&simulator](int id, bool on) {
+                        auto* k = simulator.kinematicOf(id);
+                        if (!k) return;
+                        k->blendAbsoluteRoot = on;
+                        if (k->motionMode == 4 && k->graphActive())
+                            simulator.buildKinematicBlendSpace(id);  // build-time
+                    };
+                    target.on_kin_blend_play = [&simulator](int id) {
+                        simulator.startBlendPlayback(id);
+                    };
+                    target.on_kin_blend_preset = [&simulator](int id, int idx) {
+                        simulator.setKinematicBlendPreset(id, idx);
+                    };
+                    target.on_kin_blend_cursor =
+                        [&simulator](int id, float x, float y) {
+                            simulator.setKinematicBlendCursor(id, x, y);
+                        };
                 }
             }
             // Add-Object callbacks are wired regardless of selection — they

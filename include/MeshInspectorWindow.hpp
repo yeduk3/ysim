@@ -2,6 +2,7 @@
 
 #include "tinym.hpp"
 
+#include <array>
 #include <cmath>
 #include <functional>
 #include <string>
@@ -330,7 +331,6 @@ struct MeshInspectorTarget {
     std::string kin_status;
     std::string kin_label;
     std::vector<unsigned char> kin_graph_selected;
-    std::string kin_trans_a, kin_trans_b;
     std::function<void(int /*meshId*/, int /*mode*/)> on_kin_mode;
     std::function<void(int /*meshId*/, float /*threshold*/)> on_kin_threshold;
     std::function<void(int /*meshId*/, float /*markerFrac*/)> on_kin_marker_frac;
@@ -339,29 +339,77 @@ struct MeshInspectorTarget {
     std::function<void(int /*meshId*/, bool /*selectAll*/)> on_kin_graph_all;
     std::function<void(int /*meshId*/)> on_kin_walk_build;
     std::function<void(int /*meshId*/)> on_kin_walk_reseed;
-    std::function<void(int /*meshId*/, const std::string& /*file*/)> on_kin_trans_a;
-    std::function<void(int /*meshId*/, const std::string& /*file*/)> on_kin_trans_b;
     std::function<void(int /*meshId*/)> on_kin_trans_build;
-    // 모션 블렌드 (DTW): reuses kin_trans_a/b for the A/B clip pair.
     std::function<void(int /*meshId*/)> on_kin_blend_build;
-    // Motion preview: independent per-clip strobe ghosts (1=red, 2=blue) with
-    // user-pickable colors, shown at file-selection time (before build). The
-    // color pointers alias the initializer's rgb arrays (edited in place by
-    // ColorEdit3, same convention as base_color); null when not a kinematic.
-    bool kin_preview_a = false, kin_preview_b = false;
-    float* kin_preview_col_a = nullptr;
-    float* kin_preview_col_b = nullptr;
-    std::function<void(int /*meshId*/, bool /*on*/)> on_kin_preview_a;
-    std::function<void(int /*meshId*/, bool /*on*/)> on_kin_preview_b;
-    // One-shot opaque playback of a preview clip. Paused-only — the button is
-    // disabled while the sim runs (kin_sim_paused mirrors simulator.pause).
+
+    // ── Reusable motion-clip selector (common to every clip-picking mode) ──
+    // Each kin_clip_slots entry is one selectable clip: a file combo, a preview
+    // strobe toggle, an in-place color swatch, and a one-shot play button. The
+    // GUI renders a single uniform row per slot (clipSlotRow), so transition,
+    // DTW, and blend-space modes all pick clips with identical widgets. Modes
+    // index slots 0,1,…; the slot callbacks carry the slot index so one
+    // component drives them all. Per-frame snapshot like the other kin_* fields.
+    struct MotionClipSlot {
+        std::string label;       // row heading (모션 1, Walk, …); blank = none
+        std::string file;        // currently selected file name
+        bool preview = false;    // strobe-ghost toggle state
+        float* color = nullptr;  // 3 floats aliasing the body (ColorEdit3), or null
+        // Active-frame window [range_start, range_end] over a clip of frame_count
+        // frames. The 2-handle slider edits it; preview + the object anchor use
+        // only this window. frame_count 0 = not cached yet (slider hidden).
+        int range_start = 0;
+        int range_end = 0;
+        int frame_count = 0;
+    };
+    std::vector<MotionClipSlot> kin_clip_slots;
+    std::function<void(int /*meshId*/, int /*slot*/, const std::string& /*file*/)>
+        on_kin_slot_file;
+    std::function<void(int /*meshId*/, int /*slot*/, bool /*on*/)> on_kin_slot_preview;
+    std::function<void(int /*meshId*/, int /*slot*/)> on_kin_slot_play;
+    std::function<void(int /*meshId*/, int /*slot*/, int /*start*/, int /*end*/)>
+        on_kin_slot_range;
+    // Which one-shot preview is currently playing: 0 none, slotIdx+1 a clip
+    // slot, -1 the blended result. Lets the play button flip to "중단" + stop.
+    int kin_preview_playing = 0;
+    std::function<void(int /*meshId*/)> on_kin_preview_stop;
+    // Play buttons are paused-only — disabled while the sim runs (kin_sim_paused
+    // mirrors simulator.pause).
     bool kin_sim_paused = false;
-    std::function<void(int /*meshId*/)> on_kin_preview_play_a;
-    std::function<void(int /*meshId*/)> on_kin_preview_play_b;
     // Blend playback: tint the live body by the current blend source weight
-    // (mixes the two preview colors). Blend mode only; per-frame snapshot.
+    // (mixes slot 0/1 colors). DTW mode only; per-frame snapshot.
     bool kin_blend_colorize = false;
     std::function<void(int /*meshId*/, bool /*on*/)> on_kin_blend_colorize;
+    // Blend-result preview: translucent strobe of the live blended cycle
+    // (blend-space mode); morphs as the pad cursor moves. Per-frame snapshot.
+    bool kin_blend_preview = false;
+    std::function<void(int /*meshId*/, bool /*on*/)> on_kin_blend_preview;
+    // Absolute vs relative root for the blend space (build-time). On = blend the
+    // real per-clip root motion (anchored frame-0→object); off = pin + integrate
+    // heading-relative velocity. Toggling rebuilds. Per-frame snapshot.
+    bool kin_blend_absroot = false;
+    std::function<void(int /*meshId*/, bool /*on*/)> on_kin_blend_absroot;
+    // One-shot opaque playback of the blended result through one gait cycle
+    // (paused-only). Honors the live cursor as it plays.
+    std::function<void(int /*meshId*/)> on_kin_blend_play;
+
+    // ── Interactive blend space (kin_mode 4) ──────────────────────────────
+    // A 2D pad blends N locomotion clips placed at kin_blend_coords (in
+    // [-1,1]²); dragging the cursor sets inverse-distance weights live.
+    // Populated only after a blend space is built (kin_graph_ready).
+    float kin_blend_cursor[2] = {0.0f, 0.0f};
+    std::vector<std::array<float, 2>> kin_blend_coords;  // clip sample points
+    std::vector<std::string> kin_blend_labels;           // short clip labels
+    std::vector<float> kin_blend_weights;                // current mix (Σ=1)
+    std::function<void(int /*meshId*/)> on_kin_blendspace_build;
+    std::function<void(int /*meshId*/, float /*x*/, float /*y*/)>
+        on_kin_blend_cursor;
+    // Preset dropdown (above the per-clip combos): pick a curated 4-clip set or
+    // 자율선택(manual). kin_blend_preset = -1 manual, else index into
+    // kin_blend_presets. Choosing one fills the 4 clips; editing any clip reverts.
+    std::vector<std::string> kin_blend_presets;
+    int kin_blend_preset = -1;
+    std::function<void(int /*meshId*/, int /*presetIdx, -1=manual*/)>
+        on_kin_blend_preset;
 
     // No-selection branch: when mesh_id < 0 the right panel renders these
     // Add-Object buttons instead of the per-mesh editors. Callbacks
