@@ -2479,6 +2479,11 @@ struct MeshKinematicInitializer : GeneralMeshInitializer<BE, PR> {
     // the adverb slider past a motion exaggerates it; off = convex (clamped to
     // the two motions). Mirrors verbBlend.convexWeights (= !verbExtrapolate).
     bool verbExtrapolate = true;
+    // Root motion mode: false = absolute (blend the real root trajectories,
+    // default); true = relative velocity (integrate blended heading-relative
+    // velocity — for clips that face/curve differently). Mirrors
+    // verbBlend.rootMode; rebuild applies it.
+    bool verbRootRelative = false;
     bool verbActive() const { return motionMode == 5 && verbBlend.ready(); }
 
     // ── Per-clip motion-selection slots (backs the reusable selector) ──
@@ -9668,6 +9673,7 @@ struct Simulator {
         if (!m || !kin || !m->state.x.ptr) return;
         kin->localTime = timeSec;
         kin->graphSession.resetBlendTravel();  // seek → restart travel integrator
+        kin->verbBlend.resetTravel();          // same for the 2-motion blend
         // A pending re-pack (file swap marked dirty) can leave the live
         // buffer sized for the OLD proxy; writing the new pose would
         // overrun it. The pack realizes localTime anyway.
@@ -10093,6 +10099,9 @@ struct Simulator {
         vb.skel = skel;
         vb.dt = refDt;
         vb.convexWeights = !kin->verbExtrapolate;  // signed weights ⇒ extrapolation
+        vb.rootMode = kin->verbRootRelative
+                          ? mograph::VerbBlend::Root::Relative
+                          : mograph::VerbBlend::Root::Absolute;
         vb.tags = kin->verbTags;
         vb.query.assign(size_t(nt), 0.0f);
         for (int t = 0; t < nt && t < 2; ++t) vb.query[t] = kin->verbQuery[t];
@@ -10106,7 +10115,8 @@ struct Simulator {
             const auto rg = kin->slotRange(i);  // preview window, or {0,0}
             int a = rg[0], b = rg[1];
             if (b <= a) { a = 0; b = int(c.frames.size()) - 1; }  // whole clip
-            mograph::pinClipInPlace(c);
+            // NOT pinned: the root motion travels (blended absolute/relative).
+            // Foot Y (detection) is invariant under the old pin anyway.
             mograph::VerbExample e;
             bool ok = false;
             e.key = mograph::detectKeytimes(skel, c, a, b, &ok);
@@ -10237,6 +10247,17 @@ struct Simulator {
         if (!kin) return;
         kin->verbExtrapolate = on;
         kin->verbBlend.convexWeights = !on;  // live (only read at eval time)
+        kin->invalidateRebase();
+    }
+
+    void verbSetRootRelative(int meshId, bool on) {
+        auto* kin = kinematicOf(meshId);
+        if (!kin) return;
+        kin->verbRootRelative = on;
+        kin->verbBlend.rootMode = on ? mograph::VerbBlend::Root::Relative
+                                     : mograph::VerbBlend::Root::Absolute;
+        kin->verbBlend.resetTravel();  // switching frames ⇒ restart from origin
+        setKinematicTime(meshId, 0.0);
         kin->invalidateRebase();
     }
 
@@ -11598,7 +11619,11 @@ struct Simulator {
                 // Random walks run open-ended (the baker streams frames on
                 // demand); single clips and transition composites wrap or
                 // clamp over their finite duration as before.
-                const bool walking = kin->motionMode == 1 && kin->graphActive();
+                // Mode 5 (2-motion blend) travels open-ended like a random walk:
+                // NOT wrapped, so the absolute per-cycle root accumulate and the
+                // relative integrator see a monotone clock.
+                const bool walking =
+                    (kin->motionMode == 1 && kin->graphActive()) || kin->verbActive();
                 const double dur = kin->activeDuration();
                 if (!walking) {
                     if (!kin->loop)
@@ -21335,6 +21360,48 @@ static int runSelfTest() {
                         fail("VAB-8 / blend-preview ghost is finite and re-poses with the adverb query",
                              "ghostOk=" + std::to_string(int(ghostOk)) + " gd=" +
                                  std::to_string(gd));
+
+                    // VAB-10/11: the blended root TRAVELS (no treadmill) — net
+                    // path grows over ~10 s of open-ended play while every
+                    // consecutive-frame root step stays small (no seam teleport).
+                    // Checked for both absolute and relative-velocity root modes.
+                    auto travelProbe = [&](mograph::VerbBlend::Root rm) {
+                        k->verbBlend.rootMode = rm;
+                        k->verbBlend.resetTravel();
+                        k->verbBlend.query = {50.0f};
+                        float maxStep = 0.0f, pathLen = 0.0f;
+                        bvh::Pose prev, cur;
+                        const double fdt = 1.0 / 60.0;
+                        for (int q = 0; q <= 600; ++q) {
+                            k->sampleWorldPose(q * fdt, cur);
+                            if (cur.world.empty()) continue;
+                            if (q > 0 && !prev.world.empty()) {
+                                const float dx = cur.world[0].t[0] - prev.world[0].t[0];
+                                const float dz = cur.world[0].t[2] - prev.world[0].t[2];
+                                const float step = std::sqrt(dx * dx + dz * dz);
+                                pathLen += step;
+                                maxStep = std::max(maxStep, step);
+                            }
+                            prev = cur;
+                        }
+                        return std::array<float, 2>{pathLen, maxStep};
+                    };
+                    const float h = k->verbBlend.skel.height;
+                    const auto absT = travelProbe(mograph::VerbBlend::Root::Absolute);
+                    if (absT[0] > 0.5f * h && absT[1] < 0.05f * h)
+                        pass("VAB-10 / absolute root travels across cycles without seam teleport");
+                    else
+                        fail("VAB-10 / absolute root travels across cycles without seam teleport",
+                             "pathLen=" + std::to_string(absT[0]) + " maxStep=" +
+                                 std::to_string(absT[1]) + " h=" + std::to_string(h));
+                    const auto relT = travelProbe(mograph::VerbBlend::Root::Relative);
+                    if (relT[0] > 0.3f * h && relT[1] < 0.05f * h)
+                        pass("VAB-11 / relative-velocity root travels (integrated) without teleport");
+                    else
+                        fail("VAB-11 / relative-velocity root travels (integrated) without teleport",
+                             "pathLen=" + std::to_string(relT[0]) + " maxStep=" +
+                                 std::to_string(relT[1]) + " h=" + std::to_string(h));
+
                     k->verbBlend = mograph::VerbBlend{};  // restore for later blocks
                 }
                 sim.setKinematicMode(0, 0);
@@ -23681,6 +23748,7 @@ int main(int argc, char** argv) {
                     target.kin_verb_ready = kin->verbActive();
                     target.kin_verb_preview = kin->verbPreview;
                     target.kin_verb_extrapolate = kin->verbExtrapolate;
+                    target.kin_verb_root_relative = kin->verbRootRelative;
                     if (kin->motionMode == 5) {
                         target.kin_status = kin->verbStatus;
                         target.kin_verb_tags = kin->verbTags;
@@ -23879,6 +23947,10 @@ int main(int argc, char** argv) {
                     target.on_kin_verb_extrapolate =
                         [&simulator](int id, bool on) {
                             simulator.verbSetExtrapolate(id, on);
+                        };
+                    target.on_kin_verb_root_relative =
+                        [&simulator](int id, bool on) {
+                            simulator.verbSetRootRelative(id, on);
                         };
                 }
             }

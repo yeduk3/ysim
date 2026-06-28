@@ -919,10 +919,21 @@ void drawMeshInspectorWindow(MeshInspectorWindowState& st, const MeshInspectorTa
                         if(ImGui::SmallButton("재생##kvplay")&&t.on_kin_verb_play)t.on_kin_verb_play(t.mesh_id);
                         ImGui::EndDisabled();
                     }
+                    // 루트 모션: 기본=절대(두 모션의 실제 이동을 블렌드해 전진).
+                    // 켜면 상대 속도(헤딩-상대 속도 적분 — 두 모션의 방향/곡률이
+                    // 다를 때 유용). 둘 다 트레드밀(제자리걸음) 아님.
+                    ImGui::Dummy({0,14});
+                    ImGui::PushStyleColor(ImGuiCol_Text,kG60);ImGui::TextUnformatted("상대 속도 루트");ImGui::PopStyleColor();
+                    ImGui::SameLine(0,10);
+                    bool vr=t.kin_verb_root_relative;
+                    if(PillToggle("##kvroot",&vr)&&t.on_kin_verb_root_relative)t.on_kin_verb_root_relative(t.mesh_id,vr);
                     ImGui::Dummy({0,16});
                     playRow(true);
                     ImGui::Dummy({0,16});
-                    scrubRow();
+                    // 개방형 재생(이동) — 스크럽 대신 경과 시간 + 처음으로.
+                    ImGui::PushStyleColor(ImGuiCol_Text,kG60);ImGui::Text("시간  %.1fs",t.kin_time);ImGui::PopStyleColor();
+                    ImGui::SameLine(0,12);
+                    if(ImGui::SmallButton("처음으로")&&t.on_kin_scrub)t.on_kin_scrub(t.mesh_id,0.0f);
                     ImGui::Dummy({0,12});
                     speedRow();
                 }

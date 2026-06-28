@@ -158,6 +158,13 @@ inline float verbWarpFrame(const std::array<int, 5>& key,
     return float(key[s]) + u * float(key[s + 1] - key[s]);
 }
 
+// World heading (yaw about +Y) of a root quaternion — matches pinClipInPlace.
+inline float verbHeading(const Quatf& q) {
+    std::array<float, 9> R;
+    q.toMat3(R);
+    return std::atan2(R[2], R[0]);
+}
+
 // Sample a clip at a fractional frame index (lerp f0→f1, clamped to [0,nf-1]).
 inline void sampleClipFrameF(const Clip& c, float ff, LocalPose& out) {
     const int nf = int(c.frames.size());
@@ -238,6 +245,22 @@ struct VerbBlend {
     std::vector<float> rbfLambda;     // n*n  radial coeffs (cardinal i, basis j)
     std::vector<float> rbfPoly;       // n*(dim+1)  poly coeffs {a_i, b_i…}
 
+    // Root motion (neither is a treadmill — the body travels). Absolute (default)
+    // blends the clips' real root trajectories, anchored per cycle so it loops
+    // forward along the blended path. Relative pins + integrates the blended
+    // heading-relative velocity (curving travel; robust when the two clips
+    // face/curve differently). Built per clip in rebuild() from the UNPINNED
+    // clips + keytimes.
+    enum class Root { Absolute = 0, Relative = 1 };
+    Root rootMode = Root::Absolute;
+    std::vector<std::array<float, 2>> exRoot0;  // [clip] XZ at key[0] (cycle start)
+    std::vector<std::array<float, 2>> exDelta;  // [clip] XZ key[0]→key[4] (1 cycle)
+    std::vector<std::vector<std::array<float, 3>>> exVel;  // [clip][f] {lvx,lvz,ω}
+    // Relative-mode integrator (world). Reset on seek / mode switch, NOT on a
+    // weight/keytime edit (that must not teleport a body mid-travel).
+    double travYaw = 0.0, travX = 0.0, travZ = 0.0, travLastT = -1.0;
+    void resetTravel() { travYaw = 0.0; travX = 0.0; travZ = 0.0; travLastT = -1.0; }
+
     bool ready() const {
         return ex.size() >= 2 && !skel.joints.empty() &&
                !ex[0].clip.frames.empty() && !ex[1].clip.frames.empty();
@@ -291,6 +314,61 @@ struct VerbBlend {
         }
         cycleSec = (n > 0 && cs > 1e-6) ? cs / n : 1.0;
         buildRbf();
+        buildRootData();
+    }
+
+    // Per-clip root trajectory data from the (unpinned) clips: cycle-start XZ,
+    // one-cycle XZ travel, and per-frame heading-relative velocity {lvx,lvz,ω}.
+    void buildRootData() {
+        exRoot0.assign(ex.size(), {0.0f, 0.0f});
+        exDelta.assign(ex.size(), {0.0f, 0.0f});
+        exVel.assign(ex.size(), {});
+        for (size_t i = 0; i < ex.size(); ++i) {
+            const auto& fr = ex[i].clip.frames;
+            const int nf = int(fr.size());
+            if (nf == 0) continue;
+            auto cl = [&](int f) { return f < 0 ? 0 : (f > nf - 1 ? nf - 1 : f); };
+            const int k0 = cl(ex[i].key[0]), k4 = cl(ex[i].key[4]);
+            exRoot0[i] = {fr[k0].rootPos[0], fr[k0].rootPos[2]};
+            exDelta[i] = {fr[k4].rootPos[0] - exRoot0[i][0],
+                          fr[k4].rootPos[2] - exRoot0[i][1]};
+            const float dt = ex[i].clip.dt > 1e-6f ? ex[i].clip.dt : 1.0f / 30.0f;
+            std::vector<std::array<float, 3>> vel(size_t(nf), {0, 0, 0});
+            for (int f = 0; f < nf; ++f) {
+                const int g = f + 1 < nf ? f + 1 : f;
+                const float wvx = (fr[g].rootPos[0] - fr[f].rootPos[0]) / dt;
+                const float wvz = (fr[g].rootPos[2] - fr[f].rootPos[2]) / dt;
+                const float h0 = fr[f].rot.empty() ? 0.0f : verbHeading(fr[f].rot[0]);
+                const float h1 = fr[g].rot.empty() ? 0.0f : verbHeading(fr[g].rot[0]);
+                float dh = h1 - h0;
+                const float kPi = 3.14159265358979323846f;
+                while (dh > kPi) dh -= 2.0f * kPi;
+                while (dh < -kPi) dh += 2.0f * kPi;
+                const float c = std::cos(-h0), s = std::sin(-h0);  // world→local
+                vel[size_t(f)] = {c * wvx - s * wvz, s * wvx + c * wvz, dh / dt};
+            }
+            exVel[i] = std::move(vel);
+        }
+    }
+
+    // Blended heading-relative root velocity {lvx, lvz, ω} at a normalized phase.
+    std::array<double, 3> blendVel(float phase, const std::vector<float>& w) const {
+        double vx = 0, vz = 0, om = 0;
+        for (size_t i = 0; i < ex.size() && i < exVel.size() && i < w.size(); ++i) {
+            const auto& vel = exVel[i];
+            const int nf = int(vel.size());
+            if (nf == 0) continue;
+            const float ff = verbWarpFrame(ex[i].key, canon, phase);
+            int f0 = int(ff);
+            if (f0 < 0) f0 = 0;
+            if (f0 > nf - 1) f0 = nf - 1;
+            const int f1 = f0 + 1 < nf ? f0 + 1 : f0;
+            const float a = ff - std::floor(ff);
+            vx += double(w[i]) * (vel[f0][0] * (1 - a) + vel[f1][0] * a);
+            vz += double(w[i]) * (vel[f0][1] * (1 - a) + vel[f1][1] * a);
+            om += double(w[i]) * (vel[f0][2] * (1 - a) + vel[f1][2] * a);
+        }
+        return {vx, vz, om};
     }
 
     // Solve the thin-plate cardinal coefficients over adverb space once.
@@ -410,13 +488,61 @@ struct VerbBlend {
     }
 
     // World pose at time `tSec` (the per-frame entry). Phase = fmod over the
-    // fixed cycle clock; pinned, so the body walks in place.
-    bool sample(double tSec, bvh::Pose& out) const {
+    // fixed cycle clock; the root TRAVELS (absolute per-cycle accumulate, or
+    // relative velocity integration) — no treadmill. Non-const: relative mode
+    // advances the integrator. `tSec` is the open-ended play clock (NOT wrapped
+    // by the caller for this mode), so the cycle counter / dt are monotone.
+    bool sample(double tSec, bvh::Pose& out) {
         if (!ready()) return false;
         const double cyc = cycleSec > 1e-6 ? cycleSec : 1.0;
-        const float phase = float(std::fmod(std::max(0.0, tSec), cyc) / cyc);
+        const double tt = std::max(0.0, tSec);
+        const float phase = float(std::fmod(tt, cyc) / cyc);
+        std::vector<float> w;
+        weights(query, w);
+        std::vector<LocalPose> poses(ex.size());
+        for (size_t i = 0; i < ex.size(); ++i) {
+            const float ff = verbWarpFrame(ex[i].key, canon, phase);
+            sampleClipFrameF(ex[i].clip, ff, poses[i]);
+        }
         LocalPose mixed;
-        sampleMixed(phase, mixed);
+        if (poses.size() == 2 && w.size() == 2)
+            blendPose(poses[0], poses[1], w[0], mixed);
+        else if (useIntrinsicMean)
+            blendPoseNMean(poses, w, mixed);
+        else
+            blendPoseN(poses, w, mixed);
+
+        if (rootMode == Root::Relative) {
+            double dt = travLastT < 0.0 ? 0.0 : (tSec - travLastT);
+            if (dt < 0.0 || dt > 0.5) dt = 0.0;  // seek / first frame ⇒ no step
+            travLastT = tSec;
+            const auto v = blendVel(phase, w);
+            travYaw += v[2] * dt;
+            const double cy = std::cos(travYaw), sy = std::sin(travYaw);
+            travX += (cy * v[0] - sy * v[1]) * dt;  // local → world
+            travZ += (sy * v[0] + cy * v[1]) * dt;
+            if (!mixed.rot.empty()) {  // strip the blended heading, face travYaw
+                const float h0 = verbHeading(mixed.rot[0]);
+                mixed.rot[0] =
+                    (Quatf::yaw(float(travYaw) - h0) * mixed.rot[0]).normalized();
+            }
+            mixed.rootPos[0] = float(travX);
+            mixed.rootPos[2] = float(travZ);  // keep blended Y (bob)
+        } else {
+            // Absolute: per-cycle accumulate XZ so the loop travels forward with
+            // no seam; Y + heading stay as blended above.
+            const double cycleIdx = std::floor(tt / cyc);
+            double dx = 0, dz = 0, gx = 0, gz = 0;
+            for (size_t i = 0; i < ex.size() && i < exRoot0.size() &&
+                               i < w.size(); ++i) {
+                dx += double(w[i]) * (poses[i].rootPos[0] - exRoot0[i][0]);
+                dz += double(w[i]) * (poses[i].rootPos[2] - exRoot0[i][1]);
+                gx += double(w[i]) * exDelta[i][0];
+                gz += double(w[i]) * exDelta[i][1];
+            }
+            mixed.rootPos[0] = float(cycleIdx * gx + dx);
+            mixed.rootPos[2] = float(cycleIdx * gz + dz);
+        }
         fk(skel, mixed, out);
         return !out.world.empty();
     }
