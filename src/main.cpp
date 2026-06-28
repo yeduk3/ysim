@@ -21497,6 +21497,44 @@ static int runSelfTest() {
                                      std::to_string(cosX1));
                     }
 
+                    // VAB-13 (real-asset endpoint travel, the user's exact case):
+                    // Walk(0%) + Sneak(100%) where SneakLoopA travels world −Z and
+                    // faces ~143° while Walk faces ~12°. After re-root BOTH pure
+                    // endpoints must travel FORWARD (net dz>0) and face the forward
+                    // hemisphere (|heading|<90°) on the live sampleWorldPose path —
+                    // i.e. the kinematic forward, not the clip's raw world heading.
+                    // The pre-d9c1f85 world-frame blend left Sneak going raw −Z
+                    // (the "perfectly flipped 100%" the user reported); the
+                    // synthetic VAB-11/12 clips travel along their facing so they
+                    // miss it. This guards the real off-axis clip on the live path.
+                    {
+                        auto endpoint = [&](float q) {
+                            k->verbBlend.query = {q};
+                            bvh::Pose pa, pb;
+                            k->sampleWorldPose(0.5, pa);
+                            k->sampleWorldPose(5.0, pb);  // ~4.5 s of travel
+                            float dx = 0.0f, dz = 0.0f, hd = 0.0f;
+                            if (!pa.world.empty() && !pb.world.empty()) {
+                                dx = pb.world[0].t[0] - pa.world[0].t[0];
+                                dz = pb.world[0].t[2] - pa.world[0].t[2];
+                                hd = std::atan2(pb.world[0].R[2], pb.world[0].R[0]);
+                            }
+                            return std::array<float, 3>{dx, dz, hd};
+                        };
+                        const auto e0 = endpoint(0.0f), e1 = endpoint(100.0f);
+                        const float half = 1.5708f;  // 90°
+                        const bool fwd0 = e0[1] > 0.0f && std::fabs(e0[2]) < half;
+                        const bool fwd1 = e1[1] > 0.0f && std::fabs(e1[2]) < half;
+                        if (fwd0 && fwd1)
+                            pass("VAB-13 / real Walk+Sneak: both pure endpoints travel forward after re-root (off-axis clip not flipped)");
+                        else
+                            fail("VAB-13 / real Walk+Sneak: both pure endpoints travel forward after re-root (off-axis clip not flipped)",
+                                 "walk dz=" + std::to_string(e0[1]) + " head=" +
+                                     std::to_string(e0[2]) + " | sneak dz=" +
+                                     std::to_string(e1[1]) + " head=" +
+                                     std::to_string(e1[2]));
+                    }
+
                     k->verbBlend = mograph::VerbBlend{};  // restore for later blocks
                 }
                 sim.setKinematicMode(0, 0);
