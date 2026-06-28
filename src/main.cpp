@@ -22,6 +22,7 @@
 #include "bvh_motion.hpp"
 #include "kinematic_body.hpp"
 #include "motion_graph.hpp"
+#include "motion_verb.hpp"
 
 #include "imgui.h"
 #include "imgui_impl_glfw.h"
@@ -2456,6 +2457,30 @@ struct MeshKinematicInitializer : GeneralMeshInitializer<BE, PR> {
     uint32_t walkSeed = 12345;
     std::string graphStatus;                 // last build report for the GUI
 
+    // ── Two-motion keytime blend (motionMode 5; Verbs & Adverbs) ──
+    // A simpler sibling of the blend space (include/motion_verb.hpp): exactly
+    // two clips, registered by EXPLICIT foot keytimes (auto-detected, then
+    // editable) instead of DTW, and mixed by named "adverb" tags through an
+    // RBF. The staging below survives re-packs; buildKinematicVerb copies it
+    // into verbBlend, and the per-edit setters keep verbBlend live. Keytimes
+    // live in verbBlend.ex[i].key (editable post-build); the two files reuse
+    // motionSlots 0/1 for the file combo + preview + active-frame window.
+    mograph::VerbBlend verbBlend;
+    std::vector<std::string> verbFiles{"WalkLoopA.bvh", "SneakLoopA.bvh"};
+    std::vector<std::string> verbTags{"슬픔"};                  // 1..2 adverb names
+    std::vector<std::array<float, 2>> verbAdverb{{0, 0}, {100, 0}};  // [clip][tag]%
+    std::array<float, 2> verbQuery{50.0f, 0.0f};               // live adverb query %
+    std::string verbStatus;                  // last build report for the GUI
+    // Blended-result preview: translucent strobe of the live 2-motion blend
+    // cycle (morphs as the adverb slider / keytimes change). One-shot opaque
+    // playback reuses previewPlay = -1 (shared with the blend space).
+    bool verbPreview = false;
+    // Allow extrapolation past an example (signed RBF weights). On = over-driving
+    // the adverb slider past a motion exaggerates it; off = convex (clamped to
+    // the two motions). Mirrors verbBlend.convexWeights (= !verbExtrapolate).
+    bool verbExtrapolate = true;
+    bool verbActive() const { return motionMode == 5 && verbBlend.ready(); }
+
     // ── Per-clip motion-selection slots (backs the reusable selector) ──
     // One slot per selectable clip. Modes that pick clips index into these:
     // transition/DTW use 0,1; the blend space uses 0..N-1. The file a slot
@@ -2498,7 +2523,7 @@ struct MeshKinematicInitializer : GeneralMeshInitializer<BE, PR> {
     // mode's own storage). The single place that knows the mode→slot mapping.
     int numSlots() const {
         if (motionMode == 4) return int(blendSpaceFiles.size());
-        if (motionMode == 2 || motionMode == 3) return 2;
+        if (motionMode == 2 || motionMode == 3 || motionMode == 5) return 2;
         return 0;
     }
     // Resolve slot i's active-frame window against its cached clip length.
@@ -2515,6 +2540,9 @@ struct MeshKinematicInitializer : GeneralMeshInitializer<BE, PR> {
         return {a, b};
     }
     std::string slotFile(int i) const {
+        if (motionMode == 5)
+            return i >= 0 && i < int(verbFiles.size()) ? verbFiles[i]
+                                                       : std::string();
         if (motionMode == 4)
             return i >= 0 && i < int(blendSpaceFiles.size()) ? blendSpaceFiles[i]
                                                              : std::string();
@@ -2555,6 +2583,7 @@ struct MeshKinematicInitializer : GeneralMeshInitializer<BE, PR> {
     // Playback length of whatever the current mode plays (walks are
     // effectively unbounded).
     double activeDuration() const {
+        if (verbActive()) return verbBlend.cycleSec;  // loops one gait cycle
         return graphActive() ? graphSession.duration()
                              : (double)motion.duration();
     }
@@ -2598,6 +2627,8 @@ struct MeshKinematicInitializer : GeneralMeshInitializer<BE, PR> {
         // keep it from driving the new proxy. Builders reload first, then
         // rebuild the session, so this only ever drops stale state.
         graphSession.clear();
+        verbBlend = mograph::VerbBlend{};  // 2-blend references old skeleton too
+        verbStatus.clear();
         // Skeleton + preview caches reference the old motion — drop them.
         skelValid_ = false;
         for (auto& s : motionSlots) {
@@ -2643,6 +2674,15 @@ struct MeshKinematicInitializer : GeneralMeshInitializer<BE, PR> {
     // Sample the active source (graph session when built, else the raw clip)
     // into a world-space pose. Shared by playback and the frame-0 rebase.
     void sampleWorldPose(double timeSec, bvh::Pose& pose) {
+        if (verbActive()) {
+            verbBlend.sample(timeSec, pose);
+            // Skeleton mismatch ⇒ a blend built against a different file than
+            // the proxy — fall back rather than feed writeVertices a wrong-size
+            // pose (the builder gates on compatible(); belt + braces).
+            if (pose.world.size() != motion.joints.size())
+                motion.evaluate(float(timeSec), loop, pose);
+            return;
+        }
         if (graphActive()) {
             graphSession.samplePose(timeSec, pose);
             // Joint-count mismatch would mean a session built against a
@@ -2673,6 +2713,9 @@ struct MeshKinematicInitializer : GeneralMeshInitializer<BE, PR> {
         // is integrated into samplePose, so there is nothing to re-root — and we
         // must NOT sample at t=0 here, which would corrupt the travel dt clock.
         if (motionMode == 4 && graphActive()) return;
+        // 2-motion keytime blend: clips are pinned in place (root xz=0, yaw=0),
+        // so there is nothing to re-root — the object transform alone places it.
+        if (verbActive()) return;
         if (!rebaseValid_) {
             bvh::Pose p0;
             sampleWorldPose(0.0, p0);
@@ -2803,6 +2846,31 @@ struct MeshKinematicInitializer : GeneralMeshInitializer<BE, PR> {
                 jx.t[2] = syf * x + cyf * z + float(pz);
             }
         }
+        out.resize(size_t(proxy.numVerts) * 3);
+        proxy.writeVertices(
+            pose, normScale(),
+            {float(userScale.x), float(userScale.y), float(userScale.z)},
+            quatToMat3(rot),
+            {float(position.x), float(position.y), float(position.z)},
+            out.data());
+    }
+
+    // Strobe-frame of the live 2-motion keytime blend at normalized phase
+    // [0,1), pinned in place exactly like the live body (mode 5). Samples
+    // verbBlend at the CURRENT adverb query + keytimes every call, so the
+    // preview morphs in real time as the slider/keytimes change. No travel and
+    // no rebase — the clips are pinned, so the ghost sits at the object origin.
+    // No-op unless a 2-motion blend is built.
+    void writeVerbGhost(double phase01, tinym::vec3 userScale, const Quat& rot,
+                        tinym::vec3 position, std::vector<float>& out) {
+        out.clear();
+        if (!verbActive()) return;
+        mograph::LocalPose lp;
+        verbBlend.sampleMixed(float(phase01), lp);
+        bvh::Pose pose;
+        mograph::fk(verbBlend.skel, lp, pose);
+        if (pose.world.empty() || pose.world.size() != motion.joints.size())
+            return;
         out.resize(size_t(proxy.numVerts) * 3);
         proxy.writeVertices(
             pose, normScale(),
@@ -8873,12 +8941,15 @@ struct Simulator {
                 dynamic_cast<MeshKinematicInitializer<BE, PR>*>(mesh.initializer);
             if (!kin || kin->previewPlay == 0) continue;
             if (!pause) { kin->previewPlay = 0; continue; }
-            if (kin->previewPlay < 0) {  // -1 = blended-result one-shot
-                if (kin->motionMode != 4 || !kin->graphActive()) {
+            if (kin->previewPlay < 0) {  // -1 = blended one-shot (blend space OR 2-blend)
+                const bool blendOk = kin->motionMode == 4 && kin->graphActive();
+                const bool verbOk = kin->verbActive();
+                if (!blendOk && !verbOk) {
                     kin->previewPlay = 0;
                     continue;
                 }
-                const double cycle = kin->graphSession.blendCycleSec;
+                const double cycle = verbOk ? kin->verbBlend.cycleSec
+                                            : kin->graphSession.blendCycleSec;
                 kin->previewPlayTime += dt;
                 if (cycle <= 1e-6 || kin->previewPlayTime >= cycle)
                     kin->previewPlay = 0;  // played one cycle → vanish
@@ -8925,6 +8996,15 @@ struct Simulator {
         kin->previewPlayTime = 0.0;
     }
 
+    // Begin a one-shot opaque playback of the 2-motion blended result through
+    // one gait cycle (sampled live at the adverb query). Paused-only; mode 5.
+    void startVerbPlayback(int meshId) {
+        auto* kin = kinematicOf(meshId);
+        if (!kin || !pause || !kin->verbActive()) return;
+        kin->previewPlay = -1;
+        kin->previewPlayTime = 0.0;
+    }
+
     // Stop + remove the in-progress one-shot preview (slot or blend).
     void stopPreviewPlayback(int meshId) {
         if (auto* kin = kinematicOf(meshId)) {
@@ -8950,7 +9030,8 @@ struct Simulator {
             const bool wantPlay = kin->previewPlay != 0;
             const bool wantBlend = kin->blendPreview && kin->motionMode == 4 &&
                                    kin->graphActive();
-            if (!wantStrobe && !wantPlay && !wantBlend) continue;
+            const bool wantVerb = kin->verbPreview && kin->verbActive();
+            if (!wantStrobe && !wantPlay && !wantBlend && !wantVerb) continue;
             ensurePreviewClips(kin);
             ensureGhostGL(kin->proxy);
 
@@ -9003,9 +9084,16 @@ struct Simulator {
                 glDisable(GL_BLEND);
                 glDepthMask(GL_TRUE);
                 shader.setUniform("opacity", 1.0f);
+                const bool isVerb = kin->verbActive();  // mode 5 vs blend space
                 std::vector<float> w;
-                kin->graphSession.blendWeights(kin->graphSession.cursor, w);
-                const double cycle = kin->graphSession.blendCycleSec;
+                double cycle;
+                if (isVerb) {
+                    kin->verbBlend.weights(kin->verbBlend.query, w);
+                    cycle = kin->verbBlend.cycleSec;
+                } else {
+                    kin->graphSession.blendWeights(kin->graphSession.cursor, w);
+                    cycle = kin->graphSession.blendCycleSec;
+                }
                 tinym::vec3 col(0, 0, 0);
                 float sw = 0.0f;
                 for (int i = 0; i < int(w.size()) &&
@@ -9018,9 +9106,13 @@ struct Simulator {
                 else col = tinym::vec3(0.85f, 0.85f, 0.9f);
                 const tinym::vec3 emis(col.x * 0.5f, col.y * 0.5f, col.z * 0.5f);
                 const double phase = cycle > 1e-6 ? kin->previewPlayTime / cycle : 0.0;
-                kin->writeBlendGhost(phase, /*loop=*/false, mesh.scale,
-                                     mesh.rotationQuat, mesh.transformPosition,
-                                     ghostVerts_);
+                if (isVerb)
+                    kin->writeVerbGhost(phase, mesh.scale, mesh.rotationQuat,
+                                        mesh.transformPosition, ghostVerts_);
+                else
+                    kin->writeBlendGhost(phase, /*loop=*/false, mesh.scale,
+                                         mesh.rotationQuat, mesh.transformPosition,
+                                         ghostVerts_);
                 if (!ghostVerts_.empty()) {
                     ghostGL_.computeNormal();
                     ghostGL_.updateBuffer();
@@ -9076,6 +9168,40 @@ struct Simulator {
                     kin->writeBlendGhost(double(i) / N, /*loop=*/true, mesh.scale,
                                          mesh.rotationQuat, mesh.transformPosition,
                                          ghostVerts_);
+                    if (ghostVerts_.empty()) continue;
+                    ghostGL_.computeNormal();
+                    ghostGL_.updateBuffer();
+                    ghostGL_.draw(shader, col, 0.0f, 1.0f, 0.0f, emis);
+                }
+            }
+
+            // 2-motion keytime blend preview (mode 5): translucent strobe of the
+            // live blended cycle. Color = slot colors mixed by the adverb
+            // weights; poses come from verbBlend at the live query — so moving
+            // the slider re-tints AND re-poses every ghost in real time.
+            if (wantVerb) {
+                glEnable(GL_BLEND);
+                glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+                glDepthMask(GL_FALSE);
+                shader.setUniform("opacity", 0.22f);
+                std::vector<float> w;
+                kin->verbBlend.weights(kin->verbBlend.query, w);
+                tinym::vec3 col(0, 0, 0);
+                float sw = 0.0f;
+                for (int i = 0; i < int(w.size()) &&
+                                i < int(kin->motionSlots.size()); ++i) {
+                    const auto& c = kin->motionSlots[i].color;
+                    col.x += c[0] * w[i]; col.y += c[1] * w[i]; col.z += c[2] * w[i];
+                    sw += w[i];
+                }
+                if (sw > 1e-6f) { col.x /= sw; col.y /= sw; col.z /= sw; }
+                else col = tinym::vec3(0.85f, 0.85f, 0.9f);
+                const tinym::vec3 emis(col.x * 0.5f, col.y * 0.5f, col.z * 0.5f);
+                const int N = 7;
+                for (int i = 0; i < N; ++i) {
+                    kin->writeVerbGhost(double(i) / N, mesh.scale,
+                                        mesh.rotationQuat, mesh.transformPosition,
+                                        ghostVerts_);
                     if (ghostVerts_.empty()) continue;
                     ghostGL_.computeNormal();
                     ghostGL_.updateBuffer();
@@ -9926,6 +10052,192 @@ struct Simulator {
         }
         if (kin->motionMode == 4 && kin->graphActive())
             buildKinematicBlendSpace(meshId);  // rebuild live (re-asserts mode 4)
+    }
+
+    // ── Two-motion keytime blend (motionMode 5; Verbs & Adverbs) ──────────
+    // Load the two files, retarget both onto the proxy skeleton, pin in place,
+    // auto-detect foot keytimes inside each clip's active-frame window, and
+    // assemble verbBlend from the initializer's tag/adverb staging. Reference =
+    // verbFiles[0] (becomes the proxy skeleton); the other must be skeleton-
+    // compatible. Keytimes/tags/adverbs are editable afterwards (live).
+    bool buildKinematicVerb(int meshId) {
+        auto* kin = kinematicOf(meshId);
+        if (!kin) return false;
+        if (kin->verbFiles.size() < 2) {
+            kin->verbStatus = "실패: 모션 2개가 필요합니다";
+            return false;
+        }
+        const std::string dir = bvhAssetDir();
+        const std::string ref = kin->verbFiles[0];
+        if (!ensureKinematicRefFile(meshId, dir + "/" + ref)) {
+            kin->verbStatus = "실패: " + ref + " 로드 불가";
+            return false;
+        }
+        const mograph::Skeleton& skel = kin->skel();  // proxy reference skeleton
+        const float refDt =
+            kin->motion.frameTime > 1e-6f ? kin->motion.frameTime : 1.0f / 30.0f;
+        auto loadClip = [&](const std::string& f, mograph::Clip& out,
+                            std::string& err) -> bool {
+            if (f == ref)
+                return mograph::sampleClip(kin->motion, skel, refDt, f, out);
+            bvh::Motion m = bvh::load(dir + "/" + f, &err);
+            if (!m.valid()) return false;
+            if (!skel.compatible(mograph::Skeleton::extract(m))) {
+                err = f + " 스켈레톤 불일치";
+                return false;
+            }
+            return mograph::sampleClip(m, skel, refDt, f, out);
+        };
+        const int nt = std::max(1, int(kin->verbTags.size()));
+        mograph::VerbBlend vb;
+        vb.skel = skel;
+        vb.dt = refDt;
+        vb.convexWeights = !kin->verbExtrapolate;  // signed weights ⇒ extrapolation
+        vb.tags = kin->verbTags;
+        vb.query.assign(size_t(nt), 0.0f);
+        for (int t = 0; t < nt && t < 2; ++t) vb.query[t] = kin->verbQuery[t];
+        for (int i = 0; i < 2; ++i) {
+            mograph::Clip c;
+            std::string lerr;
+            if (!loadClip(kin->verbFiles[i], c, lerr)) {
+                kin->verbStatus = "실패: " + lerr;
+                return false;
+            }
+            const auto rg = kin->slotRange(i);  // preview window, or {0,0}
+            int a = rg[0], b = rg[1];
+            if (b <= a) { a = 0; b = int(c.frames.size()) - 1; }  // whole clip
+            mograph::pinClipInPlace(c);
+            mograph::VerbExample e;
+            bool ok = false;
+            e.key = mograph::detectKeytimes(skel, c, a, b, &ok);
+            e.range = {a, b};
+            e.name = kin->verbFiles[i];
+            e.clip = std::move(c);
+            e.adverb.assign(size_t(nt), 0.0f);
+            for (int t = 0; t < nt && t < 2 && i < int(kin->verbAdverb.size());
+                 ++t)
+                e.adverb[t] = kin->verbAdverb[i][t];
+            vb.ex.push_back(std::move(e));
+        }
+        vb.rebuild();
+        if (!vb.ready()) {
+            kin->verbStatus = "실패: 블렌드를 만들 수 없습니다";
+            return false;
+        }
+        const bool detA = vb.ex[0].key[0] < vb.ex[0].key[4];
+        kin->verbBlend = std::move(vb);
+        kin->motionMode = 5;
+        kin->invalidateRebase();
+        {
+            char buf[208];
+            std::snprintf(buf, sizeof buf,
+                          "2-모션 블렌드 · 주기 %.2fs · 태그 %d개%s",
+                          kin->verbBlend.cycleSec, nt,
+                          detA ? "" : " · 키타임 자동검출 실패(균등분할)");
+            kin->verbStatus = buf;
+        }
+        setKinematicTime(meshId, 0.0);
+        scene_log::logObject("2-모션 블렌드 생성 (id " + std::to_string(meshId) +
+                             "): " + kin->verbFiles[0] + " + " + kin->verbFiles[1]);
+        return true;
+    }
+
+    // Push the initializer's tag/adverb/query staging into a built verbBlend and
+    // rebuild its RBF (cheap). No-op until built.
+    void syncVerbBlend(MeshKinematicInitializer<BE, PR>* kin) {
+        if (!kin || !kin->verbBlend.ready()) return;
+        const int nt = std::max(1, int(kin->verbTags.size()));
+        kin->verbBlend.convexWeights = !kin->verbExtrapolate;
+        kin->verbBlend.tags = kin->verbTags;
+        kin->verbBlend.query.assign(size_t(nt), 0.0f);
+        for (int t = 0; t < nt && t < 2; ++t)
+            kin->verbBlend.query[t] = kin->verbQuery[t];
+        for (size_t i = 0; i < kin->verbBlend.ex.size(); ++i) {
+            kin->verbBlend.ex[i].adverb.assign(size_t(nt), 0.0f);
+            for (int t = 0; t < nt && t < 2 && i < kin->verbAdverb.size(); ++t)
+                kin->verbBlend.ex[i].adverb[t] = kin->verbAdverb[i][t];
+        }
+        kin->verbBlend.rebuild();
+        kin->invalidateRebase();
+    }
+
+    // Edit one keytime handle (which: 0=LFD 1=RFU 2=RFD 3=LFU 4=cycleEnd) and
+    // keep the five strictly increasing within the clip; rebuilds the warp/clock.
+    void verbSetKeytime(int meshId, int exIdx, int which, int frame) {
+        auto* kin = kinematicOf(meshId);
+        if (!kin || !kin->verbBlend.ready()) return;
+        if (exIdx < 0 || exIdx >= int(kin->verbBlend.ex.size())) return;
+        if (which < 0 || which > 4) return;
+        auto& key = kin->verbBlend.ex[exIdx].key;
+        const int nf = int(kin->verbBlend.ex[exIdx].clip.frames.size());
+        key[which] = frame < 0 ? 0 : (frame > nf - 1 ? nf - 1 : frame);
+        for (int s = 1; s < 5; ++s)  // forward sweep from the edited handle
+            if (key[s] <= key[s - 1]) key[s] = std::min(nf - 1, key[s - 1] + 1);
+        for (int s = 3; s >= 0; --s)  // backward sweep fixes any pile-up at nf-1
+            if (key[s] >= key[s + 1]) key[s] = std::max(0, key[s + 1] - 1);
+        kin->verbBlend.rebuild();
+        kin->invalidateRebase();
+    }
+
+    void verbAddTag(int meshId, const std::string& name) {
+        auto* kin = kinematicOf(meshId);
+        if (!kin || kin->verbTags.size() >= 2) return;
+        kin->verbTags.push_back(
+            name.empty() ? ("태그 " + std::to_string(kin->verbTags.size() + 1))
+                         : name);
+        syncVerbBlend(kin);
+    }
+
+    void verbRemoveTag(int meshId, int idx) {
+        auto* kin = kinematicOf(meshId);
+        if (!kin || idx < 0 || idx >= int(kin->verbTags.size()) ||
+            kin->verbTags.size() <= 1)
+            return;
+        kin->verbTags.erase(kin->verbTags.begin() + idx);
+        for (auto& a : kin->verbAdverb) {  // shift the removed column out
+            if (idx == 0) a[0] = a[1];
+            a[1] = 0.0f;
+        }
+        if (idx == 0) kin->verbQuery[0] = kin->verbQuery[1];
+        kin->verbQuery[1] = 0.0f;
+        syncVerbBlend(kin);
+    }
+
+    void verbSetTagName(int meshId, int idx, const std::string& name) {
+        auto* kin = kinematicOf(meshId);
+        if (!kin || idx < 0 || idx >= int(kin->verbTags.size())) return;
+        kin->verbTags[idx] = name;
+        if (kin->verbBlend.ready() && idx < int(kin->verbBlend.tags.size()))
+            kin->verbBlend.tags[idx] = name;
+    }
+
+    void verbSetAdverb(int meshId, int exIdx, int tagIdx, float val) {
+        auto* kin = kinematicOf(meshId);
+        if (!kin || exIdx < 0 || exIdx >= int(kin->verbAdverb.size()) ||
+            tagIdx < 0 || tagIdx > 1)
+            return;
+        kin->verbAdverb[exIdx][tagIdx] = val;
+        syncVerbBlend(kin);
+    }
+
+    void verbSetQuery(int meshId, int tagIdx, float val) {
+        auto* kin = kinematicOf(meshId);
+        if (!kin || tagIdx < 0 || tagIdx > 1) return;
+        kin->verbQuery[tagIdx] = val;
+        if (kin->verbBlend.ready()) {
+            const int nt = std::max(1, int(kin->verbTags.size()));
+            kin->verbBlend.query.resize(size_t(nt), 0.0f);
+            if (tagIdx < nt) kin->verbBlend.query[tagIdx] = val;
+        }
+        kin->invalidateRebase();
+    }
+
+    void verbSetExtrapolate(int meshId, bool on) {
+        auto* kin = kinematicOf(meshId);
+        if (!kin) return;
+        kin->verbExtrapolate = on;
+        kin->verbBlend.convexWeights = !on;  // live (only read at eval time)
+        kin->invalidateRebase();
     }
 
     void addGround(PlaneDirection dir, tinym::vec3 center, PR size1D, PR mass=0.1) {
@@ -20464,8 +20776,19 @@ static int runSelfTest() {
                     ses.cursor = {0.0f, 1.0f};  // pure Run
                     bvh::Pose pRun;
                     ses.samplePose(0.0, pRun);
+                    // Reference = that clip ALONE at phase 0. Under phase
+                    // registration its phase-0 is the gait-aligned frame (a warp
+                    // LUT lookup), not raw frame 0, so sample through the LUT.
                     bvh::Pose pRunRef;
-                    mograph::fk(ses.skel, ses.clips[size_t(ri)].frames[0], pRunRef);
+                    mograph::LocalPose runRef0;
+                    const std::vector<float> emptyLut;
+                    const std::vector<float>& runLut =
+                        (ses.registerPhase && size_t(ri) < ses.clipPhaseLUT.size())
+                            ? ses.clipPhaseLUT[size_t(ri)]
+                            : emptyLut;
+                    mograph::sampleClipPhaseLUT(ses.clips[size_t(ri)], runLut, 0.0f,
+                                                runRef0, true);
+                    mograph::fk(ses.skel, runRef0, pRunRef);
                     float dCorner = 0.0f;
                     for (size_t j = 0; j < pRun.world.size(); ++j)
                         for (int c = 0; c < 3; ++c)
@@ -20668,6 +20991,351 @@ static int runSelfTest() {
                             s.resetBlendTravel();
                         }
                     }
+
+                    // MBS-11: convex weights keep the blend inside the sample
+                    // hull even when extrapolating past a corner — all weights
+                    // ≥0 and Σ=1 (no overshoot). P0.
+                    {
+                        const bool savedCW = ses.convexWeights;
+                        ses.convexWeights = true;
+                        std::vector<float> wEx;
+                        ses.blendWeights({0.0f, 2.0f}, wEx);  // beyond the Run corner
+                        float mn = 1e9f, sm = 0.0f;
+                        for (float x : wEx) { mn = std::min(mn, x); sm += x; }
+                        ses.convexWeights = savedCW;
+                        if (mn >= -1e-6f && std::fabs(sm - 1.0f) < 1e-4f)
+                            pass("MBS-11 / convex weights stay ≥0 and Σ=1 under extrapolation");
+                        else
+                            fail("MBS-11 / convex weights stay ≥0 and Σ=1 under extrapolation",
+                                 "min=" + std::to_string(mn) + " sum=" + std::to_string(sm));
+                    }
+
+                    // MBS-12: phase registration (P1) built a per-clip cyclic
+                    // warp LUT — one entry per clip, correct length, frames in
+                    // range, at least one populated; plus a pure check of the
+                    // path→LUT resampler on a synthetic half-rate diagonal.
+                    {
+                        bool ok = ses.clipPhaseLUT.size() == ses.clips.size();
+                        int nonEmpty = 0;
+                        for (size_t i = 0; ok && i < ses.clipPhaseLUT.size(); ++i) {
+                            const auto& lut = ses.clipPhaseLUT[i];
+                            if (lut.empty()) continue;  // linear fallback allowed
+                            ++nonEmpty;
+                            const int nf = int(ses.clips[i].frames.size());
+                            if (int(lut.size()) != mograph::Session::kPhaseLUTRes) { ok = false; break; }
+                            for (float v : lut)
+                                if (v < 0.0f || v >= float(nf)) { ok = false; break; }
+                        }
+                        if (nonEmpty == 0) ok = false;  // registration must run
+                        mograph::WarpPath synth;
+                        for (int a = 0; a < 16; ++a) synth.cells.push_back({a, a / 2});
+                        auto slut = mograph::Session::buildPhaseLUTFromPath(synth, 20, 10, 4, 64);
+                        bool sok = slut.size() == 64;
+                        for (float v : slut) if (v < 0.0f || v >= 10.0f) sok = false;
+                        if (ok && sok)
+                            pass("MBS-12 / phase-registration LUTs built, in-range; resampler sane");
+                        else
+                            fail("MBS-12 / phase-registration LUTs built, in-range; resampler sane",
+                                 "lutOk=" + std::to_string(int(ok)) + " nonEmpty=" +
+                                     std::to_string(nonEmpty) + " synthOk=" + std::to_string(int(sok)));
+                    }
+                }
+
+                // ── Verbs & Adverbs two-motion keytime blend (motion_verb.hpp) ─
+                // Fully synthetic (no asset / no Metal): a 6-joint skeleton with
+                // named feet + two stepped foot-bob clips of DIFFERENT length but
+                // the SAME gait structure, plus a constant chest lean that
+                // differs between them so the adverb blend is observable.
+                {
+                    mograph::Skeleton sk;
+                    sk.height = 1.0f;
+                    auto addJ = [&](const char* nm, int par, float ox, float oy,
+                                    float oz) {
+                        mograph::Skeleton::J j;
+                        j.name = nm;
+                        j.parent = par;
+                        j.offset = {ox, oy, oz};
+                        j.isEndSite = false;
+                        sk.joints.push_back(j);
+                    };
+                    addJ("Center", -1, 0, 0, 0);       // 0 root
+                    addJ("LeftHip", 0, -0.2f, 0, 0);   // 1
+                    addJ("LeftToes", 1, 0, -1, 0);     // 2 foot L
+                    addJ("RightHip", 0, 0.2f, 0, 0);   // 3
+                    addJ("RightToes", 3, 0, -1, 0);    // 4 foot R
+                    addJ("Chest", 0, 0, 0.5f, 0);      // 5 style channel
+                    // Stepped gait: left planted φ<0.6, right swing φ∈[0.1,0.5).
+                    // Pitching a hip about +X lifts its toe (Y: -1 planted → 0 up).
+                    auto authorBob = [](int N, float leanZ) {
+                        mograph::Clip c;
+                        c.dt = 1.0f / 30.0f;
+                        c.frames.resize(size_t(N));
+                        const float H = 1.5707963f;  // π/2 lift
+                        for (int f = 0; f < N; ++f) {
+                            const float ph = float(f) / float(N);
+                            mograph::LocalPose& p = c.frames[size_t(f)];
+                            p.rootPos = {0, 0, 0};
+                            p.rot.assign(6, mograph::Quatf::identity());
+                            const float thL = (ph < 0.6f) ? 0.0f : H;
+                            const float thR =
+                                (ph >= 0.1f && ph < 0.5f) ? H : 0.0f;
+                            p.rot[1] = mograph::Quatf::axisAngle(1, 0, 0, thL);
+                            p.rot[3] = mograph::Quatf::axisAngle(1, 0, 0, thR);
+                            p.rot[5] = mograph::Quatf::axisAngle(0, 0, 1, leanZ);
+                        }
+                        return c;
+                    };
+                    mograph::Clip cA = authorBob(40, 0.0f);
+                    mograph::Clip cB = authorBob(30, 0.6f);  // shorter + leaned
+
+                    // VAB-1: feet located by name (LeftToes / RightToes).
+                    {
+                        const auto ft = mograph::findFeet(sk);
+                        if (ft[0] == 2 && ft[1] == 4)
+                            pass("VAB-1 / findFeet locates left/right foot joints by name");
+                        else
+                            fail("VAB-1 / findFeet locates left/right foot joints by name",
+                                 "got {" + std::to_string(ft[0]) + "," +
+                                     std::to_string(ft[1]) + "}");
+                    }
+
+                    // VAB-2: detection finds a full ordered cycle (ok=true),
+                    // monotone, in-range, starting at the planted-at-start frame.
+                    bool okA = false, okB = false;
+                    const auto kA = mograph::detectKeytimes(sk, cA, 0, 39, &okA);
+                    const auto kB = mograph::detectKeytimes(sk, cB, 0, 29, &okB);
+                    {
+                        auto mono = [](const std::array<int, 5>& k, int hi) {
+                            return k[0] >= 0 && k[0] < k[1] && k[1] < k[2] &&
+                                   k[2] < k[3] && k[3] < k[4] && k[4] <= hi;
+                        };
+                        const bool shapeA = okA && mono(kA, 39) && kA[0] == 0 &&
+                                            kA[1] >= 2 && kA[1] <= 6 &&
+                                            kA[2] >= 18 && kA[2] <= 22 &&
+                                            kA[3] >= 22 && kA[3] <= 26;
+                        const bool shapeB = okB && mono(kB, 29) && kB[0] == 0 &&
+                                            kB[1] >= 1 && kB[1] <= 5 &&
+                                            kB[2] >= 13 && kB[2] <= 17 &&
+                                            kB[3] >= 16 && kB[3] <= 20;
+                        if (shapeA && shapeB)
+                            pass("VAB-2 / keytime detection: ordered in-range cycle for both clips");
+                        else
+                            fail("VAB-2 / keytime detection: ordered in-range cycle for both clips",
+                                 "A ok=" + std::to_string(int(okA)) + " {" +
+                                     std::to_string(kA[0]) + "," + std::to_string(kA[1]) +
+                                     "," + std::to_string(kA[2]) + "," + std::to_string(kA[3]) +
+                                     "," + std::to_string(kA[4]) + "} B ok=" +
+                                     std::to_string(int(okB)) + " {" + std::to_string(kB[0]) +
+                                     "," + std::to_string(kB[1]) + "," + std::to_string(kB[2]) +
+                                     "," + std::to_string(kB[3]) + "," + std::to_string(kB[4]) + "}");
+                    }
+
+                    // Build the blend: 1 tag, A at 0% / B at 100%.
+                    mograph::VerbBlend vb;
+                    vb.skel = sk;
+                    vb.dt = cA.dt;
+                    vb.tags = {"sad"};
+                    vb.query = {50.0f};
+                    {
+                        mograph::VerbExample eA, eB;
+                        eA.clip = cA; eA.key = kA; eA.adverb = {0.0f}; eA.name = "A";
+                        eB.clip = cB; eB.key = kB; eB.adverb = {100.0f}; eB.name = "B";
+                        mograph::pinClipInPlace(eA.clip);
+                        mograph::pinClipInPlace(eB.clip);
+                        vb.ex = {eA, eB};
+                        vb.rebuild();
+                    }
+
+                    // VAB-3: canonical breakpoints monotone 0→1, and each event
+                    // canon[k] warps to that example's own key[k] frame (k=0..3) —
+                    // for BOTH examples sharing the one canon: A's RFD aligns with
+                    // B's RFD, etc. (the structural-registration guarantee).
+                    {
+                        bool canonOk = vb.canon[0] == 0.0f &&
+                                       std::fabs(vb.canon[4] - 1.0f) < 1e-5f;
+                        for (int s = 0; s < 4; ++s)
+                            if (vb.canon[s] >= vb.canon[s + 1]) canonOk = false;
+                        bool alignOk = true;
+                        for (int k = 0; k < 4 && alignOk; ++k) {
+                            const float fa = mograph::verbWarpFrame(
+                                vb.ex[0].key, vb.canon, vb.canon[k]);
+                            const float fb = mograph::verbWarpFrame(
+                                vb.ex[1].key, vb.canon, vb.canon[k]);
+                            if (std::fabs(fa - float(vb.ex[0].key[k])) > 1e-2f ||
+                                std::fabs(fb - float(vb.ex[1].key[k])) > 1e-2f)
+                                alignOk = false;
+                        }
+                        if (canonOk && alignOk)
+                            pass("VAB-3 / shared phase aligns same-event frames across both clips");
+                        else
+                            fail("VAB-3 / shared phase aligns same-event frames across both clips",
+                                 "canonOk=" + std::to_string(int(canonOk)) +
+                                     " alignOk=" + std::to_string(int(alignOk)));
+                    }
+
+                    // VAB-4: adverb RBF cardinals — query at an example's tag value
+                    // returns that example, midpoint splits 50/50 (1-tag exact lerp).
+                    {
+                        std::vector<float> w0, w1, wm;
+                        vb.weights({0.0f}, w0);
+                        vb.weights({100.0f}, w1);
+                        vb.weights({50.0f}, wm);
+                        const bool ok = w0.size() == 2 && w1.size() == 2 &&
+                                        std::fabs(w0[0] - 1.0f) < 1e-3f &&
+                                        std::fabs(w0[1]) < 1e-3f &&
+                                        std::fabs(w1[0]) < 1e-3f &&
+                                        std::fabs(w1[1] - 1.0f) < 1e-3f &&
+                                        std::fabs(wm[0] - 0.5f) < 1e-3f &&
+                                        std::fabs(wm[1] - 0.5f) < 1e-3f;
+                        if (ok)
+                            pass("VAB-4 / adverb RBF: cardinal at samples, 50/50 at the midpoint");
+                        else
+                            fail("VAB-4 / adverb RBF: cardinal at samples, 50/50 at the midpoint",
+                                 "wm={" + std::to_string(wm.empty() ? -9.0f : wm[0]) + "," +
+                                     std::to_string(wm.size() < 2 ? -9.0f : wm[1]) + "}");
+                    }
+
+                    // VAB-5: the blended pose actually mixes the two — the chest
+                    // lean (0 in A, 0.6 in B) lands halfway at the 50% query, and
+                    // strictly between the pure-A and pure-B poses.
+                    {
+                        auto chestAngle = [&](const std::vector<float>& q) {
+                            const auto saved = vb.query;
+                            vb.query = q;
+                            mograph::LocalPose lp;
+                            vb.sampleMixed(0.3f, lp);
+                            vb.query = saved;
+                            float wq = lp.rot.size() > 5 ? std::fabs(lp.rot[5].w) : 1.0f;
+                            if (wq > 1.0f) wq = 1.0f;
+                            return 2.0f * std::acos(wq);  // angle from identity
+                        };
+                        const float a0 = chestAngle({0.0f});
+                        const float a1 = chestAngle({100.0f});
+                        const float am = chestAngle({50.0f});
+                        if (a0 < 0.05f && std::fabs(a1 - 0.6f) < 0.05f &&
+                            a0 < am && am < a1 && std::fabs(am - 0.3f) < 0.05f)
+                            pass("VAB-5 / blended pose interpolates the style channel by adverb");
+                        else
+                            fail("VAB-5 / blended pose interpolates the style channel by adverb",
+                                 "a0=" + std::to_string(a0) + " am=" + std::to_string(am) +
+                                     " a1=" + std::to_string(a1));
+                    }
+
+                    // VAB-6: the phase clock is the mean cycle duration and the
+                    // world-pose sampler runs (non-empty, right joint count).
+                    {
+                        const double expect =
+                            0.5 * (double(kA[4] - kA[0]) + double(kB[4] - kB[0])) *
+                            double(cA.dt);
+                        bvh::Pose wp;
+                        const bool sok = vb.sample(0.0, wp);
+                        if (std::fabs(vb.cycleSec - expect) < 1e-4 && sok &&
+                            wp.world.size() == sk.joints.size())
+                            pass("VAB-6 / cycle clock = mean cycle, world sampler runs");
+                        else
+                            fail("VAB-6 / cycle clock = mean cycle, world sampler runs",
+                                 "cycleSec=" + std::to_string(vb.cycleSec) + " expect=" +
+                                     std::to_string(expect) + " sampleOk=" +
+                                     std::to_string(int(sok)));
+                    }
+
+                    // VAB-9: signed weights (convexWeights off) EXTRAPOLATE past
+                    // an endpoint — querying 150% drives the chest lean beyond
+                    // pure B (100%); convex clamps it back at B. Confirms the
+                    // negative-weight path actually reaches the pose (not dropped
+                    // by an internal w≤0 skip).
+                    {
+                        auto chestAt = [&](float qv, bool convex) {
+                            const auto sq = vb.query;
+                            const bool sc = vb.convexWeights;
+                            vb.query = {qv};
+                            vb.convexWeights = convex;
+                            mograph::LocalPose lp;
+                            vb.sampleMixed(0.3f, lp);
+                            vb.query = sq;
+                            vb.convexWeights = sc;
+                            float w = lp.rot.size() > 5 ? std::fabs(lp.rot[5].w) : 1.0f;
+                            if (w > 1.0f) w = 1.0f;
+                            return 2.0f * std::acos(w);
+                        };
+                        const float pureB = chestAt(100.0f, false);  // ≈0.6
+                        const float ext = chestAt(150.0f, false);    // extrapolate
+                        const float clamp = chestAt(150.0f, true);   // convex clamp
+                        if (ext > pureB + 0.1f && std::fabs(clamp - pureB) < 0.05f)
+                            pass("VAB-9 / signed weights extrapolate past an endpoint; convex clamps");
+                        else
+                            fail("VAB-9 / signed weights extrapolate past an endpoint; convex clamps",
+                                 "pureB=" + std::to_string(pureB) + " ext=" +
+                                     std::to_string(ext) + " clamp=" +
+                                     std::to_string(clamp));
+                    }
+                }
+
+                // VAB-7: full Simulator path on real assets — build a 2-motion
+                // blend from WalkLoopA + SneakLoopA and sample through the normal
+                // pose pipeline. Asserts the build succeeds, every sampled frame
+                // is finite with the proxy joint count, and the adverb query
+                // actually drives the pose (0% ≠ 100%).
+                if (auto* k = sim.kinematicOf(0)) {
+                    k->verbFiles = {"WalkLoopA.bvh", "SneakLoopA.bvh"};
+                    const bool built = sim.buildKinematicVerb(0);
+                    bool finite = built && k->verbActive();
+                    bvh::Pose p0, p1;
+                    if (finite) {
+                        for (int q = 0; q <= 30 && finite; ++q) {
+                            bvh::Pose p;
+                            k->sampleWorldPose(q * 0.05, p);
+                            if (p.world.size() != k->motion.joints.size()) {
+                                finite = false;
+                                break;
+                            }
+                            for (const auto& jx : p.world)
+                                for (int c = 0; c < 3; ++c)
+                                    if (!std::isfinite(jx.t[c])) finite = false;
+                        }
+                        k->verbBlend.query = {0.0f};
+                        k->sampleWorldPose(0.4, p0);
+                        k->verbBlend.query = {100.0f};
+                        k->sampleWorldPose(0.4, p1);
+                    }
+                    float dmax = 0.0f;
+                    for (size_t j = 0; finite && j < p0.world.size() &&
+                                       j < p1.world.size(); ++j)
+                        for (int c = 0; c < 3; ++c)
+                            dmax = std::max(dmax, std::fabs(p0.world[j].t[c] -
+                                                            p1.world[j].t[c]));
+                    if (finite && dmax > 1e-3f)
+                        pass("VAB-7 / Simulator builds 2-motion blend from real assets; adverb drives a finite pose");
+                    else
+                        fail("VAB-7 / Simulator builds 2-motion blend from real assets; adverb drives a finite pose",
+                             "built=" + std::to_string(int(built)) + " finite=" +
+                                 std::to_string(int(finite)) + " dmax=" +
+                                 std::to_string(dmax));
+
+                    // VAB-8: the blend-preview ghost (writeVerbGhost) yields
+                    // finite proxy verts that change with the adverb query — so
+                    // the strobe re-poses live as the slider moves.
+                    std::vector<float> g0, g1;
+                    k->verbBlend.query = {0.0f};
+                    k->writeVerbGhost(0.3, tinym::vec3(1, 1, 1), Quat{},
+                                      k->params.center, g0);
+                    k->verbBlend.query = {100.0f};
+                    k->writeVerbGhost(0.3, tinym::vec3(1, 1, 1), Quat{},
+                                      k->params.center, g1);
+                    bool ghostOk = built && !g0.empty() && g0.size() == g1.size();
+                    float gd = 0.0f;
+                    for (size_t i = 0; ghostOk && i < g0.size(); ++i) {
+                        if (!std::isfinite(g0[i]) || !std::isfinite(g1[i]))
+                            ghostOk = false;
+                        gd = std::max(gd, std::fabs(g0[i] - g1[i]));
+                    }
+                    if (ghostOk && gd > 1e-4f)
+                        pass("VAB-8 / blend-preview ghost is finite and re-poses with the adverb query");
+                    else
+                        fail("VAB-8 / blend-preview ghost is finite and re-poses with the adverb query",
+                             "ghostOk=" + std::to_string(int(ghostOk)) + " gd=" +
+                                 std::to_string(gd));
+                    k->verbBlend = mograph::VerbBlend{};  // restore for later blocks
                 }
                 sim.setKinematicMode(0, 0);
             }
@@ -22970,6 +23638,11 @@ int main(int argc, char** argv) {
                             // shows each clip; rows are identified by file.
                             for (size_t i = 0; i < kin->blendSpaceFiles.size(); ++i)
                                 pushSlot("", kin->blendSpaceFiles[i], int(i));
+                        } else if (kin->motionMode == 5) {
+                            if (kin->verbFiles.size() >= 2) {
+                                pushSlot("모션 1", kin->verbFiles[0], 0);
+                                pushSlot("모션 2", kin->verbFiles[1], 1);
+                            }
                         }
                     }
                     target.kin_sim_paused = simulator.pause;
@@ -23000,6 +23673,28 @@ int main(int argc, char** argv) {
                             float sp = 0.0f;
                             for (auto& x : bw) { if (x < 0.0f) x = 0.0f; sp += x; }
                             if (sp > 1e-6f) for (auto& x : bw) x /= sp;
+                        }
+                    }
+                    // 2-motion keytime blend (mode 5): editable keytimes +
+                    // tags + adverbs + the live mix. Status reuses kin_status;
+                    // `target` is rebuilt fresh each frame so push_back is safe.
+                    target.kin_verb_ready = kin->verbActive();
+                    target.kin_verb_preview = kin->verbPreview;
+                    target.kin_verb_extrapolate = kin->verbExtrapolate;
+                    if (kin->motionMode == 5) {
+                        target.kin_status = kin->verbStatus;
+                        target.kin_verb_tags = kin->verbTags;
+                        target.kin_verb_adverb = kin->verbAdverb;
+                        target.kin_verb_query[0] = kin->verbQuery[0];
+                        target.kin_verb_query[1] = kin->verbQuery[1];
+                        if (kin->verbActive()) {
+                            for (const auto& e : kin->verbBlend.ex) {
+                                target.kin_verb_keys.push_back(e.key);
+                                target.kin_verb_frame_count.push_back(
+                                    int(e.clip.frames.size()));
+                            }
+                            kin->verbBlend.weights(kin->verbBlend.query,
+                                                   target.kin_verb_weights);
                         }
                     }
                     target.kin_graph_selected.assign(
@@ -23082,7 +23777,10 @@ int main(int argc, char** argv) {
                         [&simulator](int id, int slot, const std::string& f) {
                             auto* k = simulator.kinematicOf(id);
                             if (!k) return;
-                            if (k->motionMode == 4) {
+                            if (k->motionMode == 5) {
+                                if (slot >= 0 && slot < int(k->verbFiles.size()))
+                                    k->verbFiles[slot] = f;
+                            } else if (k->motionMode == 4) {
                                 if (slot >= 0 &&
                                     slot < int(k->blendSpaceFiles.size())) {
                                     k->blendSpaceFiles[slot] = f;
@@ -23144,6 +23842,43 @@ int main(int argc, char** argv) {
                     target.on_kin_blend_cursor =
                         [&simulator](int id, float x, float y) {
                             simulator.setKinematicBlendCursor(id, x, y);
+                        };
+                    // 2-motion keytime blend (mode 5).
+                    target.on_kin_verb_build = [&simulator](int id) {
+                        simulator.buildKinematicVerb(id);
+                    };
+                    target.on_kin_verb_keytime =
+                        [&simulator](int id, int ex, int which, int frame) {
+                            simulator.verbSetKeytime(id, ex, which, frame);
+                        };
+                    target.on_kin_verb_add_tag =
+                        [&simulator](int id, const std::string& name) {
+                            simulator.verbAddTag(id, name);
+                        };
+                    target.on_kin_verb_remove_tag = [&simulator](int id, int i) {
+                        simulator.verbRemoveTag(id, i);
+                    };
+                    target.on_kin_verb_tag_name =
+                        [&simulator](int id, int i, const std::string& name) {
+                            simulator.verbSetTagName(id, i, name);
+                        };
+                    target.on_kin_verb_adverb =
+                        [&simulator](int id, int ex, int tag, float v) {
+                            simulator.verbSetAdverb(id, ex, tag, v);
+                        };
+                    target.on_kin_verb_query =
+                        [&simulator](int id, int tag, float v) {
+                            simulator.verbSetQuery(id, tag, v);
+                        };
+                    target.on_kin_verb_preview = [&simulator](int id, bool on) {
+                        if (auto* k = simulator.kinematicOf(id)) k->verbPreview = on;
+                    };
+                    target.on_kin_verb_play = [&simulator](int id) {
+                        simulator.startVerbPlayback(id);
+                    };
+                    target.on_kin_verb_extrapolate =
+                        [&simulator](int id, bool on) {
+                            simulator.verbSetExtrapolate(id, on);
                         };
                 }
             }

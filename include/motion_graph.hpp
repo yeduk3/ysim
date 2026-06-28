@@ -962,6 +962,11 @@ struct Session {
     // (extrapolation) — accepted, not clamped (matches the paper).
     // ponytail: O(n²) per-frame eval; n = #blend clips is tiny so no hoist.
     bool useRbf = true;
+    // Convex weights: clamp the RBF cardinals to ≥0 then renormalise to Σ=1, so
+    // the blended pose stays inside the convex hull of the sample poses (no
+    // extrapolation overshoot — a blend-space instability source). Off ⇒ the raw
+    // signed partition (paper-exact, may overshoot). IDW is already non-negative.
+    bool convexWeights = true;
     std::vector<float> rbfLambda;  // n*n, cardinal i basis j → rbfLambda[i*n+j]
     std::vector<float> rbfPoly;    // n*3, cardinal i → {a_i,b_i,c_i}
     // Root motion (velocity-integrated, with turning). The clips are pinned in
@@ -972,6 +977,17 @@ struct Session {
     // position continuous when the mix changes mid-playback, and the heading
     // term lets the body curve (e.g. blending toward jogCurve turns it).
     std::vector<std::vector<std::array<float, 3>>> clipRootVel;  // [clip][frame]
+    // Phase registration (Kovar & Gleicher "Registration Curves" 2003): per-clip
+    // cyclic warp LUT mapping the shared phase → that clip's frame, so a common
+    // phase hits the SAME gait event in every clip. Without it the shared
+    // phase·nf map assumes uniform phase correspondence — false across
+    // walk/run/sneak/limp (different stance/swing ratios + arbitrary loop seams)
+    // → stance-vs-swing poses get averaged → jitter. Built once vs a reference
+    // clip in buildPhaseRegistration(); an empty LUT for a clip ⇒ linear
+    // phase·nf fallback. Parallel to clips. registerPhase off ⇒ all linear.
+    bool registerPhase = true;
+    std::vector<std::vector<float>> clipPhaseLUT;   // parallel to clips; [clip][R]
+    static constexpr int kPhaseLUTRes = 256;        // LUT samples over one cycle
     double blendYaw = 0.0;          // integrated heading (rad)
     double blendPosX = 0.0, blendPosZ = 0.0;  // integrated world root position
     double blendTravelLastT = -1.0;  // last samplePose t (dt clock); <0 = uninit
@@ -995,6 +1011,7 @@ struct Session {
         walker = WalkBaker{};
         clipCoords.clear();
         clipRootVel.clear();
+        clipPhaseLUT.clear();
         rbfLambda.clear();
         rbfPoly.clear();
         resetBlendTravel();
@@ -1019,8 +1036,12 @@ struct Session {
             const auto& rv = clipRootVel[i];
             const int nf = int(rv.size());
             if (nf == 0) continue;
-            const float p = phase - std::floor(phase);
-            const float ff = p * float(nf);
+            // Warp the velocity phase by the SAME LUT as the pose, else travel
+            // desyncs from the gait-aligned pose.
+            const bool reg = registerPhase && i < clipPhaseLUT.size() &&
+                             !clipPhaseLUT[i].empty();
+            const float ff = reg ? warpedFrame(clipPhaseLUT[i], phase, nf)
+                                 : (phase - std::floor(phase)) * float(nf);
             const int f0 = int(ff) % nf;
             const int f1 = (f0 + 1) % nf;
             const float a = ff - std::floor(ff);
@@ -1138,7 +1159,17 @@ struct Session {
                 w[i] = float(acc);
                 sum += w[i];
             }
-            if (std::fabs(sum) > 1e-6f) for (auto& x : w) x /= sum;  // enforce Σ=1
+            if (convexWeights) {
+                // Clamp negatives then renormalise ⇒ a convex combination
+                // (Σ=1, all ≥0): the blended pose stays in the convex hull of
+                // the samples, so no extrapolation overshoot.
+                float s2 = 0.0f;
+                for (auto& x : w) { if (x < 0.0f) x = 0.0f; s2 += x; }
+                if (s2 > 1e-6f) for (auto& x : w) x /= s2;
+                else for (auto& x : w) x = 1.0f / float(n);
+            } else if (std::fabs(sum) > 1e-6f) {
+                for (auto& x : w) x /= sum;  // raw signed partition (Σ=1)
+            }
             return;
         }
         float sum = 0.0f;
@@ -1167,8 +1198,12 @@ struct Session {
     void blendLocalPoseW(float phase01, bool loop, const std::vector<float>& w,
                          LocalPose& mixed) const {
         std::vector<LocalPose> poses(clips.size());
-        for (size_t i = 0; i < clips.size(); ++i)
-            sampleClipPhase(clips[i], phase01, poses[i], loop);
+        for (size_t i = 0; i < clips.size(); ++i) {
+            if (registerPhase && i < clipPhaseLUT.size() && !clipPhaseLUT[i].empty())
+                sampleClipPhaseLUT(clips[i], clipPhaseLUT[i], phase01, poses[i], loop);
+            else
+                sampleClipPhase(clips[i], phase01, poses[i], loop);
+        }
         if (useIntrinsicMean) blendPoseNMean(poses, w, mixed);
         else blendPoseN(poses, w, mixed);
     }
@@ -1499,6 +1534,108 @@ struct Session {
         walker.start(graph, clips, seed);
     }
 
+    // Convert a DTW warp path (ref window-start a × DOUBLED-clip window-start b)
+    // into a cyclic warp LUT: lut[s] = fractional clip frame at the shared phase
+    // s/R. A window [start, start+k-1] is represented by its centre start+(k-1)/2.
+    // Runs where the ref holds (a constant, clip advances) are collapsed to a
+    // mean clip frame → a single-valued monotone v(refPhase). The clip is
+    // periodic (period nfClip ⇔ refPhase period 1), so samples are extended ±1
+    // cycle to interpolate cleanly across the seam, then folded to [0,nfClip).
+    // Pure (FK-free) → unit-testable. Returns empty on a degenerate path.
+    static std::vector<float> buildPhaseLUTFromPath(const WarpPath& path,
+                                                    int nfRef, int nfClip,
+                                                    int k, int R) {
+        if (nfRef <= 0 || nfClip <= 0 || R < 2) return {};
+        const float half = 0.5f * float(k - 1);
+        std::vector<float> xs, ys;  // refPhase (non-decreasing), clipFrame (raw)
+        double accY = 0.0; int accN = 0; int curA = -1;
+        auto flush = [&]() {
+            if (accN == 0) return;
+            xs.push_back((float(curA) + half) / float(nfRef));
+            ys.push_back(float(accY / accN));
+            accY = 0.0; accN = 0;
+        };
+        for (const auto& cell : path.cells) {
+            if (cell.first != curA && curA >= 0) flush();
+            curA = cell.first;
+            accY += double(cell.second) + half;  // clip frame in [0, 2·nfClip)
+            ++accN;
+        }
+        flush();
+        if (xs.size() < 2) return {};
+        // Periodic extension ±1 cycle (refPhase ±1 ⇔ clip frame ±nfClip). xs ⊂
+        // [0,1) so the three blocks stay globally increasing.
+        std::vector<float> ex, ey;
+        ex.reserve(xs.size() * 3); ey.reserve(ys.size() * 3);
+        for (int rep = -1; rep <= 1; ++rep)
+            for (size_t j = 0; j < xs.size(); ++j) {
+                ex.push_back(xs[j] + float(rep));
+                ey.push_back(ys[j] + float(rep) * float(nfClip));
+            }
+        std::vector<float> lut(R, 0.0f);
+        size_t seg = 0;
+        for (int s = 0; s < R; ++s) {
+            const float u = float(s) / float(R);
+            while (seg + 1 < ex.size() && ex[seg + 1] < u) ++seg;
+            const size_t s1 = seg + 1 < ex.size() ? seg + 1 : seg;
+            const float x0 = ex[seg], x1 = ex[s1];
+            const float y0 = ey[seg], y1 = ey[s1];
+            float t = (x1 > x0 + 1e-9f) ? (u - x0) / (x1 - x0) : 0.0f;
+            if (t < 0.0f) t = 0.0f; else if (t > 1.0f) t = 1.0f;
+            float ff = std::fmod(y0 + (y1 - y0) * t, float(nfClip));
+            if (ff < 0.0f) ff += float(nfClip);
+            lut[s] = ff;
+        }
+        return lut;
+    }
+
+    // Build per-clip phase-registration LUTs vs a reference clip so the shared
+    // phase is gait-aligned across clips (Kovar & Gleicher 2003). Reference =
+    // the clip nearest the blend-space centroid (most representative gait). Each
+    // other clip is DOUBLED so the free-boundary DTW recovers its cyclic phase
+    // offset; the warp path → LUT. An empty LUT for a clip ⇒ linear fallback.
+    // Called at the end of buildBlendSpace. Clips are already pinned in place.
+    void buildPhaseRegistration() {
+        clipPhaseLUT.assign(clips.size(), {});
+        const int n = int(clips.size());
+        if (!registerPhase || n < 2 || skel.height <= 0.0f) return;
+        std::array<float, 2> ctr{0.0f, 0.0f};
+        for (const auto& c : clipCoords) { ctr[0] += c[0]; ctr[1] += c[1]; }
+        ctr[0] /= float(n); ctr[1] /= float(n);
+        int ref = 0; float bestD = std::numeric_limits<float>::max();
+        for (int i = 0; i < n && i < int(clipCoords.size()); ++i) {
+            const float dx = clipCoords[i][0] - ctr[0];
+            const float dy = clipCoords[i][1] - ctr[1];
+            const float d = dx * dx + dy * dy;
+            if (d < bestD) { bestD = d; ref = i; }
+        }
+        const int nfRef = int(clips[ref].frames.size());
+        if (nfRef < 4) return;  // ref too short to register against
+        const float markerScale = params.markerScaleFrac * skel.height;
+        // Reference identity LUT (shared phase ↦ ref frame, linear).
+        clipPhaseLUT[ref].resize(kPhaseLUTRes);
+        for (int s = 0; s < kPhaseLUTRes; ++s)
+            clipPhaseLUT[ref][s] = (float(s) / float(kPhaseLUTRes)) * float(nfRef);
+        FrameCloud cref; cref.build(skel, clips[ref], markerScale);
+        for (int i = 0; i < n; ++i) {
+            if (i == ref) continue;
+            const int nfi = int(clips[i].frames.size());
+            if (nfi < 4) continue;  // leave empty ⇒ linear
+            Clip dbl; dbl.dt = clips[i].dt;
+            dbl.frames = clips[i].frames;
+            dbl.frames.insert(dbl.frames.end(), clips[i].frames.begin(),
+                              clips[i].frames.end());
+            int k = std::min({windowFrames(), nfRef - 1, 2 * nfi - 1});
+            k = std::max(2, k);
+            FrameCloud ci; ci.build(skel, dbl, markerScale);
+            CostMatrix D;
+            computeCostMatrix(cref, ci, k, skel.height, D);
+            WarpPath path;
+            if (D.empty() || !dtwPath(D, params.slopeLimit, path)) continue;
+            clipPhaseLUT[i] = buildPhaseLUTFromPath(path, nfRef, nfi, k, kPhaseLUTRes);
+        }
+    }
+
     // Interactive blend space: retarget each compatible clip onto motions[0]'s
     // skeleton and place it at coords[i]. No graph build, no baked track — the
     // cursor's inverse-distance weights blend the clips live in samplePose.
@@ -1600,6 +1737,7 @@ struct Session {
         }
         blendCycleSec = meanClipDuration();  // fixed gait period (no pop on drag)
         buildRbf();  // thin-plate cardinal coeffs (empty ⇒ IDW fallback)
+        buildPhaseRegistration();  // gait-align the shared phase across clips
         resetBlendTravel();
         cursor = {0.0f, 0.0f};
         rootMode = rmode;

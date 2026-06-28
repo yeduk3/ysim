@@ -491,6 +491,44 @@ inline void sampleClipPhase(const Clip& c, float phase, LocalPose& out,
     }
 }
 
+// Evaluate an optional warp LUT (length R; lut[s] = fractional source frame in
+// [0,nf) for the shared phase s/R) at a normalized phase, returning a fractional
+// frame in [0,nf). Empty lut ⇒ the identity map phase·nf (current behaviour).
+// The LUT is cyclic: when the bracketing samples straddle the loop seam (the
+// second is a smaller frame than the first) the second is lifted by nf so the
+// interpolation crosses the seam forward instead of running backwards.
+inline float warpedFrame(const std::vector<float>& lut, float phase, int nf) {
+    const float p = phase - std::floor(phase);          // [0,1)
+    if (lut.empty() || nf <= 0) return p * float(nf);
+    const int R = int(lut.size());
+    const float fs = p * float(R);
+    const int s0 = int(fs) % R;
+    const int s1 = (s0 + 1) % R;
+    const float a = fs - std::floor(fs);
+    float v0 = lut[s0], v1 = lut[s1];
+    if (v1 < v0 - 0.5f * float(nf)) v1 += float(nf);    // crossed the loop seam
+    float ff = v0 * (1.0f - a) + v1 * a;
+    if (ff >= float(nf)) ff -= float(nf);
+    if (ff < 0.0f) ff += float(nf);
+    return ff;
+}
+
+// sampleClipPhase variant that maps the shared phase through a per-clip warp LUT
+// (registration curve, Kovar & Gleicher 2003) so a common phase hits the SAME
+// gait event in every clip. Empty lut ⇒ identical to sampleClipPhase. The LUT
+// path is cyclic (always loops); `loop` only matters on the empty-lut fallback.
+inline void sampleClipPhaseLUT(const Clip& c, const std::vector<float>& lut,
+                               float phase, LocalPose& out, bool loop = true) {
+    const int nf = int(c.frames.size());
+    if (nf == 0) { out = LocalPose{}; return; }
+    if (nf == 1) { out = c.frames[0]; return; }
+    if (lut.empty()) { sampleClipPhase(c, phase, out, loop); return; }
+    const float ff = warpedFrame(lut, phase, nf);       // [0,nf)
+    const int f0 = int(ff) % nf;
+    const int f1 = (f0 + 1) % nf;
+    blendPose(c.frames[f0], c.frames[f1], 1.0f - (ff - std::floor(ff)), out);
+}
+
 // Pin a clip "in place" for blend-space use: re-root every frame to the
 // canonical origin (root xz = 0, heading/yaw = 0), keeping vertical bob (Y) and
 // all joint motion. Raw locomotion clips translate and turn — jogCurve curves

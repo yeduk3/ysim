@@ -411,6 +411,42 @@ struct MeshInspectorTarget {
     std::function<void(int /*meshId*/, int /*presetIdx, -1=manual*/)>
         on_kin_blend_preset;
 
+    // ── Two-motion keytime blend (kin_mode 5; Verbs & Adverbs) ────────────
+    // Two clips registered by editable foot keytimes and mixed by named adverb
+    // "tags" (1..2), each with a per-motion percentage; a query slider (1 tag)
+    // or pad (2 tags) sets the live mix. The kin_verb_* snapshots are populated
+    // after a build (kin_verb_ready); keytimes are LFD,RFU,RFD,LFU,cycleEnd in
+    // clip-frame coordinates, frame_count[i] is clip i's length (slider max).
+    // The two files reuse kin_clip_slots 0/1 (combo + preview + frame window).
+    bool kin_verb_ready = false;
+    std::vector<std::array<int, 5>> kin_verb_keys;      // per motion (2)
+    std::vector<int> kin_verb_frame_count;              // clip length per motion
+    std::vector<std::string> kin_verb_tags;             // 1..2 adverb names
+    std::vector<std::array<float, 2>> kin_verb_adverb;  // [motion][tag] percent
+    float kin_verb_query[2] = {50.0f, 0.0f};            // adverb query percent
+    std::vector<float> kin_verb_weights;                // current mix (2), display
+    std::function<void(int /*meshId*/)> on_kin_verb_build;
+    std::function<void(int /*meshId*/, int /*ex*/, int /*which*/, int /*frame*/)>
+        on_kin_verb_keytime;
+    std::function<void(int /*meshId*/, const std::string& /*name*/)>
+        on_kin_verb_add_tag;
+    std::function<void(int /*meshId*/, int /*tagIdx*/)> on_kin_verb_remove_tag;
+    std::function<void(int /*meshId*/, int /*tagIdx*/, const std::string& /*name*/)>
+        on_kin_verb_tag_name;
+    std::function<void(int /*meshId*/, int /*ex*/, int /*tag*/, float /*pct*/)>
+        on_kin_verb_adverb;
+    std::function<void(int /*meshId*/, int /*tag*/, float /*pct*/)> on_kin_verb_query;
+    // Blended-result preview: translucent strobe of the live 2-motion blend
+    // cycle (toggle), plus a one-shot 재생 through one cycle (paused-only; reuses
+    // kin_preview_playing == -1). Both morph as the adverb slider moves.
+    bool kin_verb_preview = false;
+    std::function<void(int /*meshId*/, bool /*on*/)> on_kin_verb_preview;
+    std::function<void(int /*meshId*/)> on_kin_verb_play;
+    // Extrapolation toggle: on = signed RBF weights (over-driving the adverb past
+    // a motion exaggerates it); off = convex (clamped between the two motions).
+    bool kin_verb_extrapolate = true;
+    std::function<void(int /*meshId*/, bool /*on*/)> on_kin_verb_extrapolate;
+
     // No-selection branch: when mesh_id < 0 the right panel renders these
     // Add-Object buttons instead of the per-mesh editors. Callbacks
     // are owned by main.cpp; they open the same Sphere / Cube / Import

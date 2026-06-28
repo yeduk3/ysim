@@ -391,14 +391,14 @@ void drawMeshInspectorWindow(MeshInspectorWindowState& st, const MeshInspectorTa
                 ImGui::Dummy({0,16});
             }
 
-            static const char* kKinModes[5]={
+            static const char* kKinModes[6]={
                 "단일 클립 재생","랜덤 워크 · 모션 그래프","모션 전환 · 모션 그래프",
-                "모션 전환 · DTW","모션 블렌드 스페이스"};
-            const int mode=t.kin_mode<0?0:(t.kin_mode>4?4:t.kin_mode);
+                "모션 전환 · DTW","모션 블렌드 스페이스","모션 2-블렌드 · 키타임"};
+            const int mode=t.kin_mode<0?0:(t.kin_mode>5?5:t.kin_mode);
             ImGui::PushStyleColor(ImGuiCol_Text,kG60);ImGui::TextUnformatted("재생 모드");ImGui::PopStyleColor();ImGui::Dummy({0,4});
             ImGui::SetNextItemWidth(CW());
             if(ImGui::BeginCombo("##kinmode",kKinModes[mode])){
-                for(int mi=0;mi<5;++mi){
+                for(int mi=0;mi<6;++mi){
                     bool sel=(mi==mode);
                     if(ImGui::Selectable(kKinModes[mi],sel)&&!sel&&t.on_kin_mode)
                         t.on_kin_mode(t.mesh_id,mi);
@@ -639,7 +639,7 @@ void drawMeshInspectorWindow(MeshInspectorWindowState& st, const MeshInspectorTa
                     ImGui::Dummy({0,12});
                     speedRow();
                 }
-            }else{
+            }else if(mode==4){
                 // 모션 블렌드 스페이스 — N locomotion clips placed in a 2D pad,
                 // blended live by a draggable cursor. The mix drives the
                 // kinematic body, which in turn drives any attached cloth.
@@ -773,6 +773,156 @@ void drawMeshInspectorWindow(MeshInspectorWindowState& st, const MeshInspectorTa
                     ImGui::Dummy({0,12});
                     labelRow();
                     playRow(false);
+                    ImGui::Dummy({0,12});
+                    speedRow();
+                }
+            }else if(mode==5){
+                // 모션 2-블렌드 · 키타임 (Verbs & Adverbs) — 두 모션을 발
+                // 키타임(L/R 착지·이륙)으로 같은 phase에 맞춘 뒤, 태그(부사)
+                // 값으로 RBF 블렌드. 발 키타임은 자동 검출 후 수정 가능.
+                ImGui::PushTextWrapPos(ImGui::GetCursorPosX()+CW());
+                ImGui::PushStyleColor(ImGuiCol_Text,kG60);
+                ImGui::TextUnformatted("두 모션을 발 키타임으로 정렬해 같은 동작 순간끼리 블렌드. 각 모션을 프리뷰로 켜 프레임 범위를 정한 뒤 생성하면 키타임이 자동 검출됨(이후 수정 가능).");
+                ImGui::PopStyleColor();ImGui::PopTextWrapPos();
+                ImGui::Dummy({0,12});
+                clipSlotRow(0);
+                ImGui::Dummy({0,10});
+                clipSlotRow(1);
+                ImGui::Dummy({0,12});
+                if(ImGui::Button("키타임 검출 · 블렌드 생성",{CW(),36})&&t.on_kin_verb_build)
+                    t.on_kin_verb_build(t.mesh_id);
+                statusRow();
+                if(t.kin_verb_ready){
+                    // ── Editable keytimes, one block per motion ──
+                    static const char* kKT[5]={
+                        "왼발 착지","오른발 이륙","오른발 착지","왼발 이륙","주기 끝"};
+                    ImGui::Dummy({0,16});
+                    for(int e=0;e<(int)t.kin_verb_keys.size();++e){
+                        char hdr[40]; snprintf(hdr,sizeof hdr,"모션 %d · 키타임(프레임)",e+1);
+                        ImGui::PushStyleColor(ImGuiCol_Text,kG60);ImGui::TextUnformatted(hdr);ImGui::PopStyleColor();
+                        ImGui::Dummy({0,4});
+                        const int fc=e<(int)t.kin_verb_frame_count.size()?t.kin_verb_frame_count[e]:1;
+                        for(int wkt=0;wkt<5;++wkt){
+                            ImGui::PushStyleColor(ImGuiCol_Text,kG60);ImGui::TextUnformatted(kKT[wkt]);ImGui::PopStyleColor();
+                            ImGui::SameLine(kP+108);
+                            int v=t.kin_verb_keys[e][wkt];
+                            char id[24]; snprintf(id,sizeof id,"##vkt%d_%d",e,wkt);
+                            ImGui::SetNextItemWidth(CW()-108);
+                            if(ImGui::DragInt(id,&v,0.5f,0,fc>1?fc-1:1,"%d")&&t.on_kin_verb_keytime)
+                                t.on_kin_verb_keytime(t.mesh_id,e,wkt,v);
+                            if(wkt<4)ImGui::Dummy({0,4});
+                        }
+                        ImGui::Dummy({0,12});
+                    }
+                    // ── Tags (adverbs): 1~2개. 추가하면 모션별 % 필드가 생김 ──
+                    ImGui::PushStyleColor(ImGuiCol_Text,kG60);ImGui::TextUnformatted("태그 (부사)");ImGui::PopStyleColor();
+                    if((int)t.kin_verb_tags.size()<2){
+                        ImGui::SameLine(0,10);
+                        if(ImGui::SmallButton("+ 태그 추가")&&t.on_kin_verb_add_tag)
+                            t.on_kin_verb_add_tag(t.mesh_id,"");
+                    }
+                    ImGui::Dummy({0,8});
+                    for(int tg=0;tg<(int)t.kin_verb_tags.size();++tg){
+                        char nm[64]={0};
+                        snprintf(nm,sizeof nm,"%s",t.kin_verb_tags[tg].c_str());
+                        ImGui::SetNextItemWidth((int)t.kin_verb_tags.size()>1?CW()-64:CW());
+                        char nid[16]; snprintf(nid,sizeof nid,"##vtn%d",tg);
+                        if(ImGui::InputText(nid,nm,sizeof nm)&&t.on_kin_verb_tag_name)
+                            t.on_kin_verb_tag_name(t.mesh_id,tg,nm);
+                        if((int)t.kin_verb_tags.size()>1){
+                            ImGui::SameLine(0,6);
+                            char rid[20]; snprintf(rid,sizeof rid,"삭제##vtr%d",tg);
+                            if(ImGui::SmallButton(rid)&&t.on_kin_verb_remove_tag)
+                                t.on_kin_verb_remove_tag(t.mesh_id,tg);
+                        }
+                        ImGui::Dummy({0,4});
+                        for(int e=0;e<2;++e){
+                            char vl[24]; snprintf(vl,sizeof vl,"모션 %d",e+1);
+                            ImGui::PushStyleColor(ImGuiCol_Text,kG60);ImGui::TextUnformatted(vl);ImGui::PopStyleColor();
+                            ImGui::SameLine(kP+72);
+                            float val=(e<(int)t.kin_verb_adverb.size())?t.kin_verb_adverb[e][tg]:0.0f;
+                            ImGui::SetNextItemWidth(CW()-72);
+                            char vid[24]; snprintf(vid,sizeof vid,"##vadv%d_%d",e,tg);
+                            if(ImGui::SliderFloat(vid,&val,0.0f,100.0f,"%.0f%%")&&t.on_kin_verb_adverb)
+                                t.on_kin_verb_adverb(t.mesh_id,e,tg,val);
+                            if(e==0)ImGui::Dummy({0,4});
+                        }
+                        ImGui::Dummy({0,12});
+                    }
+                    // 외삽 허용: 끄면 두 모션 사이로 제한(convex), 켜면 모션을
+                    // 지나 과장(extrapolation, 부호 있는 RBF 가중치). 1태그 슬라이더
+                    // 범위가 -50~150%로 넓어져 외삽 지점에 도달 가능.
+                    ImGui::PushStyleColor(ImGuiCol_Text,kG60);ImGui::TextUnformatted("외삽 허용");ImGui::PopStyleColor();
+                    ImGui::SameLine(0,10);
+                    bool ve=t.kin_verb_extrapolate;
+                    if(PillToggle("##kvext",&ve)&&t.on_kin_verb_extrapolate)t.on_kin_verb_extrapolate(t.mesh_id,ve);
+                    ImGui::Dummy({0,12});
+                    // ── Blend query: 1태그=슬라이더, 2태그=평면 패드 ──
+                    ImGui::PushStyleColor(ImGuiCol_Text,kG60);ImGui::TextUnformatted("블렌드 위치");ImGui::PopStyleColor();ImGui::Dummy({0,6});
+                    if((int)t.kin_verb_tags.size()<=1){
+                        const char* tn=t.kin_verb_tags.empty()?"":t.kin_verb_tags[0].c_str();
+                        ImGui::PushStyleColor(ImGuiCol_Text,kG60);ImGui::TextUnformatted(tn);ImGui::PopStyleColor();ImGui::Dummy({0,2});
+                        float q=t.kin_verb_query[0];
+                        const float qlo=t.kin_verb_extrapolate?-50.0f:0.0f;
+                        const float qhi=t.kin_verb_extrapolate?150.0f:100.0f;
+                        ImGui::SetNextItemWidth(CW());
+                        if(ImGui::SliderFloat("##vq0",&q,qlo,qhi,"%.0f%%")&&t.on_kin_verb_query)
+                            t.on_kin_verb_query(t.mesh_id,0,q);
+                    }else{
+                        // x = 태그1, y = 태그2, 0~100%.
+                        const float pad=CW();
+                        const ImVec2 org=ImGui::GetCursorScreenPos();
+                        ImGui::InvisibleButton("##vpad",{pad,pad});
+                        const bool actv=ImGui::IsItemActive();
+                        ImDrawList* dl=ImGui::GetWindowDrawList();
+                        auto P2S=[&](float x,float y){return ImVec2(org.x+(x/100.f)*pad,org.y+(1.f-y/100.f)*pad);};
+                        dl->AddRectFilled(org,{org.x+pad,org.y+pad},IM_COL32(20,20,24,255),8.f);
+                        dl->AddRect(org,{org.x+pad,org.y+pad},IM_COL32(80,80,90,255),8.f);
+                        for(int e=0;e<(int)t.kin_verb_adverb.size();++e){
+                            ImVec2 pp=P2S(t.kin_verb_adverb[e][0],t.kin_verb_adverb[e][1]);
+                            float w=e<(int)t.kin_verb_weights.size()?t.kin_verb_weights[e]:0.f;
+                            dl->AddCircleFilled(pp,4.f+9.f*w,IM_COL32(120,140,200,255));
+                            char nb[8]; snprintf(nb,sizeof nb,"%d",e+1);
+                            dl->AddText({pp.x+8,pp.y-7},IM_COL32(220,220,228,255),nb);
+                        }
+                        ImVec2 cu=P2S(t.kin_verb_query[0],t.kin_verb_query[1]);
+                        if(actv){
+                            ImVec2 mp=ImGui::GetIO().MousePos;
+                            float nx=((mp.x-org.x)/pad)*100.f, ny=(1.f-(mp.y-org.y)/pad)*100.f;
+                            nx=nx<0?0:(nx>100?100:nx); ny=ny<0?0:(ny>100?100:ny);
+                            if(t.on_kin_verb_query){t.on_kin_verb_query(t.mesh_id,0,nx);t.on_kin_verb_query(t.mesh_id,1,ny);}
+                            cu=P2S(nx,ny);
+                        }
+                        dl->AddCircle(cu,9.f,IM_COL32(255,255,255,255),0,2.f);
+                        dl->AddCircleFilled(cu,3.f,IM_COL32(255,255,255,255));
+                    }
+                    if(t.kin_verb_weights.size()==2){
+                        ImGui::Dummy({0,8});
+                        ImGui::PushStyleColor(ImGuiCol_Text,kG60);
+                        ImGui::Text("혼합  모션1 %.0f%%  ·  모션2 %.0f%%",
+                                    t.kin_verb_weights[0]*100.f,t.kin_verb_weights[1]*100.f);
+                        ImGui::PopStyleColor();
+                    }
+                    // 블렌드 결과 프리뷰: 라이브 블렌드 사이클 스트로브(토글) +
+                    // 한 사이클 1회 재생(일시정지 상태에서만). 슬라이더를 움직이면
+                    // 고스트가 실시간으로 다시 칠해지고 다시 포즈됨.
+                    ImGui::Dummy({0,14});
+                    ImGui::PushStyleColor(ImGuiCol_Text,kG60);ImGui::TextUnformatted("블렌드 프리뷰");ImGui::PopStyleColor();
+                    ImGui::SameLine(0,10);
+                    bool vp=t.kin_verb_preview;
+                    if(PillToggle("##kvpv",&vp)&&t.on_kin_verb_preview)t.on_kin_verb_preview(t.mesh_id,vp);
+                    ImGui::SameLine(0,12);
+                    if(t.kin_preview_playing==-1){
+                        if(ImGui::SmallButton("중단##kvplay")&&t.on_kin_preview_stop)t.on_kin_preview_stop(t.mesh_id);
+                    }else{
+                        ImGui::BeginDisabled(!t.kin_sim_paused);
+                        if(ImGui::SmallButton("재생##kvplay")&&t.on_kin_verb_play)t.on_kin_verb_play(t.mesh_id);
+                        ImGui::EndDisabled();
+                    }
+                    ImGui::Dummy({0,16});
+                    playRow(true);
+                    ImGui::Dummy({0,16});
+                    scrubRow();
                     ImGui::Dummy({0,12});
                     speedRow();
                 }
