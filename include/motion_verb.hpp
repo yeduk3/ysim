@@ -437,8 +437,13 @@ struct VerbBlend {
         else for (auto& x : w) x = 1.0f / float(n);
     }
 
-    // Blended LOCAL pose at a normalized phase (no fk) — each example keytime-
-    // warped to the common phase, then Karcher-mean-mixed by the adverb weights.
+    // Blended LOCAL pose at a normalized phase (no fk), IN PLACE (no per-cycle
+    // travel) — each example keytime-warped to the common phase, re-rooted into
+    // its key[0]-aligned frame (xz + yaw removed), then Karcher-mean-mixed by the
+    // adverb weights. This is exactly the live body's pose minus the travel
+    // accumulate, so the preview ghost (writeVerbGhost) faces the kinematic
+    // forward like the body — without the re-root the ghost showed each clip's
+    // RAW world heading (an off-axis clip like SneakLoopA looked flipped).
     void sampleMixed(float phase01, LocalPose& mixed) const {
         std::vector<float> w;
         weights(query, w);
@@ -446,6 +451,15 @@ struct VerbBlend {
         for (size_t i = 0; i < ex.size(); ++i) {
             const float ff = verbWarpFrame(ex[i].key, canon, phase01);
             sampleClipFrameF(ex[i].clip, ff, poses[i]);
+            if (i < exYaw0.size()) {
+                const auto a = alignXZ(exYaw0[i], poses[i].rootPos[0] - exP0[i][0],
+                                       poses[i].rootPos[2] - exP0[i][1]);
+                poses[i].rootPos[0] = a[0];
+                poses[i].rootPos[2] = a[1];
+                if (!poses[i].rot.empty())
+                    poses[i].rot[0] =
+                        (Quatf::yaw(-exYaw0[i]) * poses[i].rot[0]).normalized();
+            }
         }
         // Exactly two motions (the target case): a direct signed two-pose blend
         // so a weight outside [0,1] EXTRAPOLATES — slerp extends along the joint
@@ -476,35 +490,16 @@ struct VerbBlend {
         const double tt = std::max(0.0, tSec);
         const float phase = float(std::fmod(tt, cyc) / cyc);
         const double cycleIdx = std::floor(tt / cyc);
-        std::vector<float> w;
-        weights(query, w);
 
-        // Per clip: sample the warped pose, then re-root it into the clip's
-        // key[0]-aligned frame (xz + yaw removed) before blending.
-        std::vector<LocalPose> poses(ex.size());
-        for (size_t i = 0; i < ex.size(); ++i) {
-            const float ff = verbWarpFrame(ex[i].key, canon, phase);
-            sampleClipFrameF(ex[i].clip, ff, poses[i]);
-            if (i < exYaw0.size()) {
-                const auto a = alignXZ(exYaw0[i], poses[i].rootPos[0] - exP0[i][0],
-                                       poses[i].rootPos[2] - exP0[i][1]);
-                poses[i].rootPos[0] = a[0];
-                poses[i].rootPos[2] = a[1];
-                if (!poses[i].rot.empty())
-                    poses[i].rot[0] =
-                        (Quatf::yaw(-exYaw0[i]) * poses[i].rot[0]).normalized();
-            }
-        }
-
+        // In-place re-rooted blend (the preview ghost samples this exact pose),
+        // then add the per-cycle travel below — the only thing that differs
+        // between the live body and the in-place preview.
         LocalPose mixed;
-        if (poses.size() == 2 && w.size() == 2)
-            blendPose(poses[0], poses[1], w[0], mixed);  // aligned root + joints
-        else if (useIntrinsicMean)
-            blendPoseNMean(poses, w, mixed);
-        else
-            blendPoseN(poses, w, mixed);
+        sampleMixed(phase, mixed);
 
         // Unwrap: add the blended aligned per-cycle travel for the cycles done.
+        std::vector<float> w;
+        weights(query, w);
         double gx = 0, gz = 0;
         for (size_t i = 0; i < ex.size() && i < exDeltaL.size() && i < w.size(); ++i) {
             gx += double(w[i]) * exDeltaL[i][0];

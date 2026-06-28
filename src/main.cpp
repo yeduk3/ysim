@@ -2856,10 +2856,11 @@ struct MeshKinematicInitializer : GeneralMeshInitializer<BE, PR> {
     }
 
     // Strobe-frame of the live 2-motion keytime blend at normalized phase
-    // [0,1), pinned in place exactly like the live body (mode 5). Samples
-    // verbBlend at the CURRENT adverb query + keytimes every call, so the
-    // preview morphs in real time as the slider/keytimes change. No travel and
-    // no rebase — the clips are pinned, so the ghost sits at the object origin.
+    // [0,1). Samples verbBlend.sampleMixed at the CURRENT adverb query +
+    // keytimes every call, so the preview morphs in real time as the
+    // slider/keytimes change. sampleMixed re-roots each clip exactly like the
+    // live body (xz + yaw removed) but omits the per-cycle travel, so the ghost
+    // faces the kinematic forward and sits at the object origin (in place).
     // No-op unless a 2-motion blend is built.
     void writeVerbGhost(double phase01, tinym::vec3 userScale, const Quat& rot,
                         tinym::vec3 position, std::vector<float>& out) {
@@ -21533,6 +21534,43 @@ static int runSelfTest() {
                                      std::to_string(e0[2]) + " | sneak dz=" +
                                      std::to_string(e1[1]) + " head=" +
                                      std::to_string(e1[2]));
+                    }
+
+                    // VAB-14 (preview matches the body): the blend-preview ghost
+                    // samples sampleMixed, which must re-root each clip like the
+                    // live body (xz+yaw removed) — only the per-cycle travel may
+                    // differ. At q=100 (Sneak-dominant, raw heading ~143°) the
+                    // ghost root must face FORWARD (|heading|<90°), same hemisphere
+                    // as the body. Without the re-root sampleMixed returned the raw
+                    // ~143° heading → the "preview renders flipped motion" the user
+                    // saw. Also asserts the in-place ghost root and the body root
+                    // share the same heading at the same phase (preview == body
+                    // pose, modulo travel).
+                    {
+                        k->verbBlend.query = {100.0f};
+                        const float ph = 0.3f;
+                        mograph::LocalPose lp;
+                        k->verbBlend.sampleMixed(ph, lp);
+                        bvh::Pose ghost;
+                        mograph::fk(k->verbBlend.skel, lp, ghost);
+                        bvh::Pose body;
+                        k->verbBlend.sample(double(ph) * k->verbBlend.cycleSec,
+                                            body);
+                        float gh = 9.0f, bh = 9.0f;
+                        if (!ghost.world.empty())
+                            gh = std::atan2(ghost.world[0].R[2],
+                                            ghost.world[0].R[0]);
+                        if (!body.world.empty())
+                            bh = std::atan2(body.world[0].R[2],
+                                            body.world[0].R[0]);
+                        const float half = 1.5708f;
+                        if (std::fabs(gh) < half && std::fabs(bh) < half &&
+                            std::fabs(gh - bh) < 1e-3f)
+                            pass("VAB-14 / blend preview re-roots like the body (faces forward, not the clip's raw heading)");
+                        else
+                            fail("VAB-14 / blend preview re-roots like the body (faces forward, not the clip's raw heading)",
+                                 "ghostHeading=" + std::to_string(gh) +
+                                     " bodyHeading=" + std::to_string(bh));
                     }
 
                     k->verbBlend = mograph::VerbBlend{};  // restore for later blocks
