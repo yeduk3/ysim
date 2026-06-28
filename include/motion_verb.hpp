@@ -257,9 +257,14 @@ struct VerbBlend {
     std::vector<std::array<float, 2>> exP0;     // [clip] XZ at key[0]
     std::vector<std::array<float, 2>> exDeltaL; // [clip] aligned XZ travel / cycle
 
-    // Rotate a world XZ vector into the clip's key[0]-aligned frame (by -yaw0).
+    // Rotate a world XZ vector into the clip's key[0]-aligned frame. This MUST
+    // match applyRootRebase / rebaseXZYaw (the per-clip preview the user reads
+    // as ground truth): they apply R_Y(-yaw0) to the XZ as {c·x - s·z, s·x + c·z}
+    // with c=cos(yaw0), s=sin(yaw0). Using cos(-yaw0)/sin(-yaw0) here applied the
+    // INVERSE rotation, so the blended root travelled OPPOSITE the (correctly
+    // aligned) heading — a moonwalk that worsened with the off-axis clip.
     static std::array<float, 2> alignXZ(float yaw0, float x, float z) {
-        const float c = std::cos(-yaw0), s = std::sin(-yaw0);
+        const float c = std::cos(yaw0), s = std::sin(yaw0);
         return {c * x - s * z, s * x + c * z};
     }
 

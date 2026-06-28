@@ -21370,63 +21370,64 @@ static int runSelfTest() {
                                      std::to_string(maxStep) + " h=" + std::to_string(h));
                     }
 
-                    // VAB-11 (flip regression): two clips travel OPPOSITE world
-                    // directions but are both forward in their own frame (heading
-                    // aligned with travel). The yaw-aligned root blend must still
-                    // travel (≠0) and keep ONE direction across the adverb sweep —
-                    // the old world-frame blend cancelled to ~0 at the midpoint and
-                    // flipped sign. Built on the real reference skeleton.
+                    // VAB-11 (root sign regression): the SAME forward motion
+                    // captured at two different WORLD yaws must re-root to the SAME
+                    // travel direction (re-rooting removes world yaw). If the
+                    // position alignment is the inverse rotation of the heading
+                    // alignment, the off-yaw clip travels OPPOSITE the on-yaw one —
+                    // the moonwalk the user saw. Clip walks its own +local forward
+                    // placed at world yaw `yaw`; built on the real skeleton.
                     {
                         const mograph::Skeleton rs = k->skel();
-                        auto moveClip = [&](float dirX, float yaw) {
+                        auto fwdClip = [&](float yaw) {
                             mograph::Clip c;
                             c.dt = 1.0f / 30.0f;
                             c.frames.resize(40);
+                            const float cy = std::cos(yaw), sy = std::sin(yaw);
                             for (int f = 0; f < 40; ++f) {
                                 auto& p = c.frames[size_t(f)];
                                 p.rot.assign(rs.joints.size(), mograph::Quatf::identity());
                                 if (!p.rot.empty()) p.rot[0] = mograph::Quatf::yaw(yaw);
-                                p.rootPos = {dirX * 0.05f * float(f), 0.9f, 0.0f};
+                                const float d = 0.05f * float(f);    // forward distance
+                                p.rootPos = {d * sy, 0.9f, d * cy};  // R_Y(yaw)·(0,0,d)
                             }
                             return c;
                         };
                         mograph::VerbBlend mv;
                         mv.skel = rs;
                         mv.tags = {"t"};
-                        mv.query = {50.0f};
                         mv.convexWeights = false;
                         mograph::VerbExample ea, eb;
-                        ea.clip = moveClip(+1.0f, 1.5708f);   // +X, faces +X
+                        ea.clip = fwdClip(0.0f);     // forward = +Z, yaw0 = 0
                         ea.key = {0, 10, 20, 30, 39};
                         ea.adverb = {0.0f};
-                        eb.clip = moveClip(-1.0f, -1.5708f);  // -X, faces -X
+                        eb.clip = fwdClip(1.5708f);  // forward = +X, yaw0 = 90°
                         eb.key = {0, 10, 20, 30, 39};
                         eb.adverb = {100.0f};
                         mv.ex = {ea, eb};
                         mv.rebuild();
-                        auto netTravel = [&](float q) {
+                        auto dir = [&](float q) {
                             mv.query = {q};
                             bvh::Pose s0, s1;
                             mv.sample(0.0, s0);
                             mv.sample(2.0 * mv.cycleSec, s1);
-                            return std::array<float, 2>{
-                                s1.world[0].t[0] - s0.world[0].t[0],
-                                s1.world[0].t[2] - s0.world[0].t[2]};
+                            const float dx = s1.world[0].t[0] - s0.world[0].t[0];
+                            const float dz = s1.world[0].t[2] - s0.world[0].t[2];
+                            return std::array<float, 3>{dx, dz,
+                                                        std::sqrt(dx * dx + dz * dz)};
                         };
-                        const auto mid = netTravel(50.0f);
-                        const float midDist = std::sqrt(mid[0] * mid[0] + mid[1] * mid[1]);
-                        bool consistent = true;
-                        std::array<float, 2> ref = netTravel(0.0f);
-                        for (int qi = 1; qi <= 4 && consistent; ++qi) {
-                            const auto d = netTravel(float(qi) * 25.0f);
-                            if (ref[0] * d[0] + ref[1] * d[1] <= 0.0f) consistent = false;
-                        }
-                        if (midDist > 0.5f && consistent)
-                            pass("VAB-11 / yaw-aligned root blend: opposite-heading clips travel, no direction flip");
+                        const auto da = dir(0.0f), db = dir(100.0f);
+                        const float cosang =
+                            (da[2] > 1e-4f && db[2] > 1e-4f)
+                                ? (da[0] * db[0] + da[1] * db[1]) / (da[2] * db[2])
+                                : 0.0f;
+                        if (da[2] > 0.3f && db[2] > 0.3f && cosang > 0.9f)
+                            pass("VAB-11 / re-rooted travel is world-yaw invariant (root sign matches heading)");
                         else
-                            fail("VAB-11 / yaw-aligned root blend: opposite-heading clips travel, no direction flip",
-                                 "midDist=" + std::to_string(midDist) + " consistent=" +
-                                     std::to_string(int(consistent)));
+                            fail("VAB-11 / re-rooted travel is world-yaw invariant (root sign matches heading)",
+                                 "|a|=" + std::to_string(da[2]) + " |b|=" +
+                                     std::to_string(db[2]) + " cos=" +
+                                     std::to_string(cosang));
                     }
 
                     k->verbBlend = mograph::VerbBlend{};  // restore for later blocks
