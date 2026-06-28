@@ -21913,8 +21913,14 @@ static int runSelfTest() {
                         const bool active = k->verbActive() && k->motionMode == 6;
                         bvh::Pose pa, pb;
                         k->verbBlend.query = {50.0f};
-                        k->sampleWorldPose(0.5, pa);
-                        k->sampleWorldPose(5.0, pb);
+                        // Probe forward travel WITHIN cycle 0 — the middle motion
+                        // (jogCurve) curves, so over many loops the (correct)
+                        // heading accumulation turns the path and straight-Z is no
+                        // longer "forward". One cycle has no loop rotation yet, so
+                        // dz>0 still means forward. (No-moonwalk is VAB-23's job.)
+                        const double cyc16 = k->verbBlend.cycleSec;
+                        k->sampleWorldPose(0.05 * cyc16, pa);
+                        k->sampleWorldPose(0.85 * cyc16, pb);
                         float dz = 0.0f;
                         bool finite = !pa.world.empty() && !pb.world.empty();
                         if (finite) {
@@ -22218,6 +22224,67 @@ static int runSelfTest() {
                                          std::to_string(noClamp) + " loop=" +
                                          std::to_string(loopOk));
                         }
+                    }
+
+                    // VAB-23 (loop preserves root rotation): a turning blend keeps
+                    // turning across loops — heading accumulates per cycle instead
+                    // of resetting. A synthetic clip whose root heading advances
+                    // ~0.57 rad/cycle → after 3 loops the body heading ≈ 3×0.57,
+                    // not 0. (The old code accumulated only position.)
+                    {
+                        const mograph::Skeleton rs = k->skel();
+                        mograph::Clip c;
+                        c.dt = 1.0f / 30.0f;
+                        c.frames.resize(20);
+                        for (int f = 0; f < 20; ++f) {
+                            auto& p = c.frames[size_t(f)];
+                            p.rot.assign(rs.joints.size(), mograph::Quatf::identity());
+                            p.rot[0] = mograph::Quatf::yaw(0.03f * float(f));
+                            p.rootPos = {0.0f, 0.9f, 0.04f * float(f)};
+                        }
+                        mograph::VerbBlend mv;
+                        mv.skel = rs;
+                        mv.tags = {"t"};
+                        mograph::VerbExample e;
+                        e.clip = c;
+                        e.key = {0, 5, 10, 14, 19};
+                        e.adverb = {0};
+                        mograph::VerbExample e2 = e;
+                        e2.adverb = {100};
+                        mv.ex.push_back(e);
+                        mv.ex.push_back(e2);  // ready() needs ≥2
+                        mv.rebuild();
+                        mv.query = {0};
+                        auto headAt = [&](double t) {
+                            bvh::Pose o;
+                            mv.sample(t, o);
+                            return o.world.empty()
+                                       ? 99.0f
+                                       : std::atan2(o.world[0].R[2], o.world[0].R[0]);
+                        };
+                        const double cyc = mv.cycleSec;
+                        const float h0 = headAt(0.0);          // cycle 0 → ≈0
+                        const float h3 = headAt(3.0 * cyc);    // cycle 3 → ≈3·dYaw
+                        const float dYaw = 0.03f * 19.0f;      // key[4]=19 heading
+                        const float expect = 3.0f * dYaw;
+                        // Translation must follow the heading (NOT moonwalk): the
+                        // forward (+Z) travel curves the SAME way the heading
+                        // turns. heading turns +, so forward tilts toward +x → the
+                        // looped path's x is positive at cycle 2. A position
+                        // rotation opposite the heading (the moonwalk bug) gives
+                        // x<0.
+                        bvh::Pose p2;
+                        mv.sample(2.0 * cyc, p2);
+                        const float x2 = p2.world.empty() ? 0.0f : p2.world[0].t[0];
+                        if (std::fabs(h0) < 0.05f && std::fabs(h3 - expect) < 0.15f &&
+                            x2 > 0.1f)
+                            pass("VAB-23 / looped blend preserves root rotation; translation follows heading (no moonwalk)");
+                        else
+                            fail("VAB-23 / looped blend preserves root rotation; translation follows heading (no moonwalk)",
+                                 "h0=" + std::to_string(h0) + " h3=" +
+                                     std::to_string(h3) + " expect=" +
+                                     std::to_string(expect) + " x2=" +
+                                     std::to_string(x2));
                     }
 
                     k->verbBlend = mograph::VerbBlend{};  // restore for later blocks

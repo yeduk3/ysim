@@ -332,6 +332,7 @@ struct VerbBlend {
     std::vector<float> exYaw0;                  // [clip] heading at key[0]
     std::vector<std::array<float, 2>> exP0;     // [clip] XZ at key[0]
     std::vector<std::array<float, 2>> exDeltaL; // [clip] aligned XZ travel / cycle
+    std::vector<float> exDeltaYaw;              // [clip] heading turned / cycle
 
     // Rotate a world XZ vector into the clip's key[0]-aligned frame. This MUST
     // match applyRootRebase / rebaseXZYaw (the per-clip preview the user reads
@@ -407,6 +408,8 @@ struct VerbBlend {
         exYaw0.assign(ex.size(), 0.0f);
         exP0.assign(ex.size(), {0.0f, 0.0f});
         exDeltaL.assign(ex.size(), {0.0f, 0.0f});
+        exDeltaYaw.assign(ex.size(), 0.0f);
+        const float kPi = 3.14159265358979f;
         for (size_t i = 0; i < ex.size(); ++i) {
             const auto& fr = ex[i].clip.frames;
             const int nf = int(fr.size());
@@ -418,6 +421,14 @@ struct VerbBlend {
             // One-cycle world travel → aligned frame.
             exDeltaL[i] = alignXZ(exYaw0[i], fr[k4].rootPos[0] - exP0[i][0],
                                   fr[k4].rootPos[2] - exP0[i][1]);
+            // One-cycle heading turned (key[4] vs key[0]), wrapped to (−π,π]. The
+            // root TURNS each cycle, not just translates, so a curved walk keeps
+            // curving across loops instead of resetting its heading.
+            const float yaw4 = fr[k4].rot.empty() ? exYaw0[i]
+                                                  : verbHeading(fr[k4].rot[0]);
+            float dy = yaw4 - exYaw0[i];
+            dy -= 2.0f * kPi * std::round(dy / (2.0f * kPi));
+            exDeltaYaw[i] = dy;
         }
     }
 
@@ -579,16 +590,49 @@ struct VerbBlend {
         LocalPose mixed;
         sampleMixed(phase, mixed);
 
-        // Unwrap: add the blended aligned per-cycle travel for the cycles done.
+        // Unwrap: add the blended per-cycle travel for the cycles done — both the
+        // aligned XZ displacement AND the heading turned, so a curved blend keeps
+        // turning across loops (rotation preserved, not just position).
         std::vector<float> w;
         weights(query, w);
-        double gx = 0, gz = 0;
+        double gx = 0, gz = 0, dYaw = 0;
         for (size_t i = 0; i < ex.size() && i < exDeltaL.size() && i < w.size(); ++i) {
             gx += double(w[i]) * exDeltaL[i][0];
             gz += double(w[i]) * exDeltaL[i][1];
+            if (i < exDeltaYaw.size()) dYaw += double(w[i]) * exDeltaYaw[i];
         }
-        mixed.rootPos[0] += float(cycleIdx * gx);
-        mixed.rootPos[2] += float(cycleIdx * gz);
+        // Position from the cycles done = Σ_{c<N} R(c·dYaw)·(gx,gz). With heading
+        // turning each cycle the path curves; the rotation sum has a closed form
+        // (complex geometric series). dYaw≈0 → the old straight-line N·(gx,gz).
+        // Rotating an XZ vector by heading φ is R_Y(φ), which in the complex XZ
+        // (x+iz) plane is e^{-iφ} — the SAME direction the heading quaternion
+        // Quatf::yaw(φ) turns. (Using e^{+iφ} rotated the translation OPPOSITE the
+        // facing → the next loop moon-walked.) So the cycle-c travel is
+        // e^{-i·c·dYaw}·(gx+i·gz); P = Σ_{c<N} of that = the series with θ=−dYaw.
+        double px, pz;
+        if (std::fabs(dYaw) < 1e-6) {
+            px = cycleIdx * gx;
+            pz = cycleIdx * gz;
+        } else {
+            const double th = -dYaw, N = cycleIdx;  // R_Y(φ) ↔ e^{-iφ}
+            const double nx = std::cos(N * th) - 1.0, ny = std::sin(N * th);
+            const double bx = std::cos(th) - 1.0, by = std::sin(th);
+            const double den = bx * bx + by * by;  // S = (e^{iNθ}−1)/(e^{iθ}−1)
+            const double sx = (nx * bx + ny * by) / den;
+            const double sy = (ny * bx - nx * by) / den;
+            px = gx * sx - gz * sy;  // (gx + i·gz)·S
+            pz = gx * sy + gz * sx;
+        }
+        // Rotate the in-place root XZ by the accumulated heading H = R_Y(H)
+        // (e^{-iH}: x'=cH·x+sH·z, z'=cH·z−sH·x), then add the curved travel. The
+        // heading quaternion turns the SAME way (Quatf::yaw(H)).
+        const double H = cycleIdx * dYaw;
+        const double cH = std::cos(H), sH = std::sin(H);
+        const double ix = mixed.rootPos[0], iz = mixed.rootPos[2];
+        mixed.rootPos[0] = float(cH * ix + sH * iz + px);
+        mixed.rootPos[2] = float(cH * iz - sH * ix + pz);
+        if (!mixed.rot.empty())
+            mixed.rot[0] = (Quatf::yaw(float(H)) * mixed.rot[0]).normalized();
 
         fk(skel, mixed, out);
         return !out.world.empty();
