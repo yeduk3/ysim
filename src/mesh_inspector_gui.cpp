@@ -391,14 +391,15 @@ void drawMeshInspectorWindow(MeshInspectorWindowState& st, const MeshInspectorTa
                 ImGui::Dummy({0,16});
             }
 
-            static const char* kKinModes[6]={
+            static const char* kKinModes[7]={
                 "단일 클립 재생","랜덤 워크 · 모션 그래프","모션 전환 · 모션 그래프",
-                "모션 전환 · DTW","모션 블렌드 스페이스","모션 2-블렌드 · 키타임"};
-            const int mode=t.kin_mode<0?0:(t.kin_mode>5?5:t.kin_mode);
+                "모션 전환 · DTW","모션 블렌드 스페이스","모션 2-블렌드 · 키타임",
+                "모션 N-블렌드 · 키타임"};
+            const int mode=t.kin_mode<0?0:(t.kin_mode>6?6:t.kin_mode);
             ImGui::PushStyleColor(ImGuiCol_Text,kG60);ImGui::TextUnformatted("재생 모드");ImGui::PopStyleColor();ImGui::Dummy({0,4});
             ImGui::SetNextItemWidth(CW());
             if(ImGui::BeginCombo("##kinmode",kKinModes[mode])){
-                for(int mi=0;mi<6;++mi){
+                for(int mi=0;mi<7;++mi){
                     bool sel=(mi==mode);
                     if(ImGui::Selectable(kKinModes[mi],sel)&&!sel&&t.on_kin_mode)
                         t.on_kin_mode(t.mesh_id,mi);
@@ -521,6 +522,17 @@ void drawMeshInspectorWindow(MeshInspectorWindowState& st, const MeshInspectorTa
                     char rid[24]; snprintf(rid,sizeof rid,"##slrg%d",idx);
                     if(RangeSliderInt2(rid,&lo,&hi,0,s.frame_count-1)&&t.on_kin_slot_range)
                         t.on_kin_slot_range(t.mesh_id,idx,lo,hi);
+                }
+                // 루프 연장 (verb modes only): append a copy of the clip so the
+                // frame range AND the keytimes span two loops (place a keytime
+                // past the original end, into the 2nd loop). Re-detects live.
+                if((mode==5||mode==6)&&t.on_kin_slot_loop){
+                    ImGui::Dummy({0,6});
+                    ImGui::PushStyleColor(ImGuiCol_Text,kG60);ImGui::TextUnformatted("루프 연장 (프레임 2배)");ImGui::PopStyleColor();
+                    ImGui::SameLine(0,8);
+                    bool lp=(s.loop_sel>0);
+                    char lid[24]; snprintf(lid,sizeof lid,"##sllp%d",idx);
+                    if(PillToggle(lid,&lp))t.on_kin_slot_loop(t.mesh_id,idx,lp?1:0);
                 }
             };
             auto statusRow=[&](){
@@ -776,30 +788,91 @@ void drawMeshInspectorWindow(MeshInspectorWindowState& st, const MeshInspectorTa
                     ImGui::Dummy({0,12});
                     speedRow();
                 }
-            }else if(mode==5){
-                // 모션 2-블렌드 · 키타임 (Verbs & Adverbs) — 두 모션을 발
+            }else if(mode==5||mode==6){
+                // 모션 키타임 블렌드 (Verbs & Adverbs) — N개 모션을 발
                 // 키타임(L/R 착지·이륙)으로 같은 phase에 맞춘 뒤, 태그(부사)
                 // 값으로 RBF 블렌드. 발 키타임은 자동 검출 후 수정 가능.
+                // mode 5 = 정확히 두 모션, mode 6 = 모션 추가/삭제(2..N).
+                const bool nMode=(mode==6);
                 ImGui::PushTextWrapPos(ImGui::GetCursorPosX()+CW());
                 ImGui::PushStyleColor(ImGuiCol_Text,kG60);
-                ImGui::TextUnformatted("두 모션을 발 키타임으로 정렬해 같은 동작 순간끼리 블렌드. 각 모션을 프리뷰로 켜 프레임 범위를 정한 뒤 생성하면 키타임이 자동 검출됨(이후 수정 가능).");
+                ImGui::TextUnformatted(nMode
+                    ?"N개 모션을 발 키타임으로 정렬해 같은 동작 순간끼리 블렌드. 모션을 추가/삭제하고 각 모션을 프리뷰로 켜 프레임 범위를 정한 뒤 생성하면 키타임이 자동 검출됨."
+                    :"두 모션을 발 키타임으로 정렬해 같은 동작 순간끼리 블렌드. 각 모션을 프리뷰로 켜 프레임 범위를 정한 뒤 생성하면 키타임이 자동 검출됨(이후 수정 가능).");
                 ImGui::PopStyleColor();ImGui::PopTextWrapPos();
                 ImGui::Dummy({0,12});
-                clipSlotRow(0);
-                ImGui::Dummy({0,10});
-                clipSlotRow(1);
-                ImGui::Dummy({0,12});
+                // Preset combo (mode 6 only): picking one fills the motions +
+                // colors + loop + keytimes + tag + adverbs and builds. 자율선택
+                // = manual; a file/motion edit reverts here.
+                if(nMode&&!t.kin_verb_presets.empty()){
+                    ImGui::PushStyleColor(ImGuiCol_Text,kG60);ImGui::TextUnformatted("프리셋");ImGui::PopStyleColor();ImGui::Dummy({0,4});
+                    const char* curP=(t.kin_verb_preset>=0&&t.kin_verb_preset<(int)t.kin_verb_presets.size())
+                        ? t.kin_verb_presets[t.kin_verb_preset].c_str() : "자율선택";
+                    ImGui::SetNextItemWidth(CW());
+                    if(ImGui::BeginCombo("##vbpreset",curP)){
+                        bool selC=(t.kin_verb_preset<0);
+                        if(ImGui::Selectable("자율선택",selC)&&!selC&&t.on_kin_verb_preset)
+                            t.on_kin_verb_preset(t.mesh_id,-1);
+                        for(int i=0;i<(int)t.kin_verb_presets.size();++i){
+                            bool sel=(i==t.kin_verb_preset);
+                            if(ImGui::Selectable(t.kin_verb_presets[i].c_str(),sel)&&!sel&&t.on_kin_verb_preset)
+                                t.on_kin_verb_preset(t.mesh_id,i);
+                            if(sel)ImGui::SetItemDefaultFocus();
+                        }
+                        ImGui::EndCombo();
+                    }
+                    ImGui::Dummy({0,14});
+                }
+                // File rows. mode 5 = fixed 2; mode 6 = one row per motion with a
+                // 삭제 button (when >2) plus a + 모션 추가 button below.
+                const int nFiles=nMode?(int)t.kin_clip_slots.size():2;
+                for(int i=0;i<nFiles;++i){
+                    clipSlotRow(i);
+                    // Own line (not SameLine) — clipSlotRow's last widget is a
+                    // full-width range slider once the preview caches, which a
+                    // trailing SameLine would overrun.
+                    if(nMode&&nFiles>2){
+                        ImGui::Dummy({0,4});
+                        char rid[32]; snprintf(rid,sizeof rid,"모션 %d 삭제##vrm%d",i+1,i);
+                        if(ImGui::SmallButton(rid)&&t.on_kin_verb_remove_motion)
+                            t.on_kin_verb_remove_motion(t.mesh_id,i);
+                    }
+                    ImGui::Dummy({0,10});
+                }
+                if(nMode&&nFiles<4){  // ponytail: 4 = motionSlots preview pool
+                    if(ImGui::Button("+ 모션 추가",{CW(),28})&&t.on_kin_verb_add_motion)
+                        t.on_kin_verb_add_motion(t.mesh_id,"");
+                    ImGui::Dummy({0,8});
+                }
                 if(ImGui::Button("키타임 검출 · 블렌드 생성",{CW(),36})&&t.on_kin_verb_build)
                     t.on_kin_verb_build(t.mesh_id);
                 statusRow();
                 if(t.kin_verb_ready){
+                    // Motion display name (file stem) by index; falls back to
+                    // "모션 N" if the name snapshot is short. Used everywhere a
+                    // motion is referenced so the user sees WHICH clip.
+                    auto vname=[&](int e)->std::string{
+                        if(e>=0&&e<(int)t.kin_verb_names.size()&&!t.kin_verb_names[e].empty())
+                            return t.kin_verb_names[e];
+                        return "모션 "+std::to_string(e+1);
+                    };
                     // ── Editable keytimes, one block per motion ──
                     static const char* kKT[5]={
                         "왼발 착지","오른발 이륙","오른발 착지","왼발 이륙","주기 끝"};
                     ImGui::Dummy({0,16});
                     for(int e=0;e<(int)t.kin_verb_keys.size();++e){
-                        char hdr[40]; snprintf(hdr,sizeof hdr,"모션 %d · 키타임(프레임)",e+1);
-                        ImGui::PushStyleColor(ImGuiCol_Text,kG60);ImGui::TextUnformatted(hdr);ImGui::PopStyleColor();
+                        std::string hdr=vname(e)+" · 키타임(프레임)";
+                        ImGui::PushStyleColor(ImGuiCol_Text,kG60);ImGui::TextUnformatted(hdr.c_str());ImGui::PopStyleColor();
+                        // Per-section keytime preview toggle (common to every
+                        // motion): ghosts this clip at its 5 keytime frames so you
+                        // slide a handle and watch the pose. One section at a time.
+                        ImGui::SameLine(0,10);
+                        ImGui::PushStyleColor(ImGuiCol_Text,kG60);ImGui::TextUnformatted("프리뷰");ImGui::PopStyleColor();
+                        ImGui::SameLine(0,6);
+                        bool kp=(t.kin_verb_kt_preview==e);
+                        char kpid[20]; snprintf(kpid,sizeof kpid,"##vktpv%d",e);
+                        if(PillToggle(kpid,&kp)&&t.on_kin_verb_kt_preview)
+                            t.on_kin_verb_kt_preview(t.mesh_id,e,kp);
                         ImGui::Dummy({0,4});
                         const int fc=e<(int)t.kin_verb_frame_count.size()?t.kin_verb_frame_count[e]:1;
                         for(int wkt=0;wkt<5;++wkt){
@@ -812,6 +885,12 @@ void drawMeshInspectorWindow(MeshInspectorWindowState& st, const MeshInspectorTa
                                 t.on_kin_verb_keytime(t.mesh_id,e,wkt,v);
                             if(wkt<4)ImGui::Dummy({0,4});
                         }
+                        // 주기끝 = 왼발착지 + 한 모션(루프) 길이. 루프 연장과 함께
+                        // 쓰면 2번째 루프에 착지와 같은 포즈로 떨어져 이음매가 깔끔.
+                        ImGui::Dummy({0,6});
+                        char ceid[48]; snprintf(ceid,sizeof ceid,"주기끝 = 착지 + 모션 길이##vce%d",e);
+                        if(ImGui::SmallButton(ceid)&&t.on_kin_verb_cycle_end)
+                            t.on_kin_verb_cycle_end(t.mesh_id,e);
                         ImGui::Dummy({0,12});
                     }
                     // ── Tags (adverbs): 1~2개. 추가하면 모션별 % 필드가 생김 ──
@@ -836,16 +915,17 @@ void drawMeshInspectorWindow(MeshInspectorWindowState& st, const MeshInspectorTa
                                 t.on_kin_verb_remove_tag(t.mesh_id,tg);
                         }
                         ImGui::Dummy({0,4});
-                        for(int e=0;e<2;++e){
-                            char vl[24]; snprintf(vl,sizeof vl,"모션 %d",e+1);
-                            ImGui::PushStyleColor(ImGuiCol_Text,kG60);ImGui::TextUnformatted(vl);ImGui::PopStyleColor();
-                            ImGui::SameLine(kP+72);
-                            float val=(e<(int)t.kin_verb_adverb.size())?t.kin_verb_adverb[e][tg]:0.0f;
-                            ImGui::SetNextItemWidth(CW()-72);
+                        const int nA=(int)t.kin_verb_adverb.size();
+                        for(int e=0;e<nA;++e){
+                            // Motion name on its own line (variable-width file
+                            // stems overflow a fixed inline column), slider below.
+                            ImGui::PushStyleColor(ImGuiCol_Text,kG60);ImGui::TextUnformatted(vname(e).c_str());ImGui::PopStyleColor();
+                            float val=t.kin_verb_adverb[e][tg];
+                            ImGui::SetNextItemWidth(CW());
                             char vid[24]; snprintf(vid,sizeof vid,"##vadv%d_%d",e,tg);
                             if(ImGui::SliderFloat(vid,&val,0.0f,100.0f,"%.0f%%")&&t.on_kin_verb_adverb)
                                 t.on_kin_verb_adverb(t.mesh_id,e,tg,val);
-                            if(e==0)ImGui::Dummy({0,4});
+                            if(e+1<nA)ImGui::Dummy({0,6});
                         }
                         ImGui::Dummy({0,12});
                     }
@@ -869,7 +949,17 @@ void drawMeshInspectorWindow(MeshInspectorWindowState& st, const MeshInspectorTa
                         if(ImGui::SliderFloat("##vq0",&q,qlo,qhi,"%.0f%%")&&t.on_kin_verb_query)
                             t.on_kin_verb_query(t.mesh_id,0,q);
                     }else{
-                        // x = 태그1, y = 태그2, 0~100%.
+                        // 2-tag plane: generator axes are the TAG values, 0~100%.
+                        // Horizontal (X) = tag[0], vertical (Y) = tag[1]; dragging
+                        // the cursor sets both at once. Spell it out by tag name so
+                        // the user knows what each axis adjusts.
+                        const std::string t0=t.kin_verb_tags[0], t1=t.kin_verb_tags[1];
+                        ImGui::PushTextWrapPos(ImGui::GetCursorPosX()+CW());
+                        ImGui::PushStyleColor(ImGuiCol_Text,kG60);
+                        std::string cap="가로(X) = "+t0+"  ·  세로(Y) = "+t1+"   (각 0~100%, 오른쪽·위로 갈수록 값↑)";
+                        ImGui::TextUnformatted(cap.c_str());
+                        ImGui::PopStyleColor();ImGui::PopTextWrapPos();
+                        ImGui::Dummy({0,6});
                         const float pad=CW();
                         const ImVec2 org=ImGui::GetCursorScreenPos();
                         ImGui::InvisibleButton("##vpad",{pad,pad});
@@ -878,12 +968,17 @@ void drawMeshInspectorWindow(MeshInspectorWindowState& st, const MeshInspectorTa
                         auto P2S=[&](float x,float y){return ImVec2(org.x+(x/100.f)*pad,org.y+(1.f-y/100.f)*pad);};
                         dl->AddRectFilled(org,{org.x+pad,org.y+pad},IM_COL32(20,20,24,255),8.f);
                         dl->AddRect(org,{org.x+pad,org.y+pad},IM_COL32(80,80,90,255),8.f);
+                        // Axis name labels: tag[1] up the left edge (Y), tag[0]
+                        // along the bottom-right (X).
+                        const ImU32 axc=IM_COL32(150,150,160,255);
+                        dl->AddText({org.x+6,org.y+5},axc,("↑ "+t1).c_str());
+                        const ImVec2 xs=ImGui::CalcTextSize(("→ "+t0).c_str());
+                        dl->AddText({org.x+pad-xs.x-6,org.y+pad-xs.y-5},axc,("→ "+t0).c_str());
                         for(int e=0;e<(int)t.kin_verb_adverb.size();++e){
                             ImVec2 pp=P2S(t.kin_verb_adverb[e][0],t.kin_verb_adverb[e][1]);
                             float w=e<(int)t.kin_verb_weights.size()?t.kin_verb_weights[e]:0.f;
                             dl->AddCircleFilled(pp,4.f+9.f*w,IM_COL32(120,140,200,255));
-                            char nb[8]; snprintf(nb,sizeof nb,"%d",e+1);
-                            dl->AddText({pp.x+8,pp.y-7},IM_COL32(220,220,228,255),nb);
+                            dl->AddText({pp.x+8,pp.y-7},IM_COL32(220,220,228,255),vname(e).c_str());
                         }
                         ImVec2 cu=P2S(t.kin_verb_query[0],t.kin_verb_query[1]);
                         if(actv){
@@ -895,12 +990,22 @@ void drawMeshInspectorWindow(MeshInspectorWindowState& st, const MeshInspectorTa
                         }
                         dl->AddCircle(cu,9.f,IM_COL32(255,255,255,255),0,2.f);
                         dl->AddCircleFilled(cu,3.f,IM_COL32(255,255,255,255));
+                        // Live query values, named by tag.
+                        ImGui::Dummy({0,6});
+                        char qv[160]; snprintf(qv,sizeof qv,"현재  %s %.0f%%   ·   %s %.0f%%",
+                                               t0.c_str(),t.kin_verb_query[0],t1.c_str(),t.kin_verb_query[1]);
+                        ImGui::PushStyleColor(ImGuiCol_Text,kG60);ImGui::TextUnformatted(qv);ImGui::PopStyleColor();
                     }
-                    if(t.kin_verb_weights.size()==2){
+                    if(t.kin_verb_weights.size()>=2){
                         ImGui::Dummy({0,8});
+                        std::string mix="혼합  ";
+                        for(size_t i=0;i<t.kin_verb_weights.size();++i){
+                            if(i)mix+="   ·   ";
+                            char b[16]; snprintf(b,sizeof b," %.0f%%",t.kin_verb_weights[i]*100.f);
+                            mix+=vname((int)i)+b;
+                        }
                         ImGui::PushStyleColor(ImGuiCol_Text,kG60);
-                        ImGui::Text("혼합  모션1 %.0f%%  ·  모션2 %.0f%%",
-                                    t.kin_verb_weights[0]*100.f,t.kin_verb_weights[1]*100.f);
+                        ImGui::TextWrapped("%s",mix.c_str());
                         ImGui::PopStyleColor();
                     }
                     // 블렌드 결과 프리뷰: 라이브 블렌드 사이클 스트로브(토글) +

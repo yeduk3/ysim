@@ -360,6 +360,11 @@ struct MeshInspectorTarget {
         int range_start = 0;
         int range_end = 0;
         int frame_count = 0;
+        // Keytime source loop (verb modes 5/6): 0 = first detected gait cycle in
+        // the window, 1 = the next loop. For clips holding >1 cycle, lets the
+        // footstep keytimes come from a different loop (retime vs the other
+        // motion). Ignored by non-keytime modes.
+        int loop_sel = 0;
     };
     std::vector<MotionClipSlot> kin_clip_slots;
     std::function<void(int /*meshId*/, int /*slot*/, const std::string& /*file*/)>
@@ -368,6 +373,10 @@ struct MeshInspectorTarget {
     std::function<void(int /*meshId*/, int /*slot*/)> on_kin_slot_play;
     std::function<void(int /*meshId*/, int /*slot*/, int /*start*/, int /*end*/)>
         on_kin_slot_range;
+    // Keytime source loop toggle (verb modes only): pick the gait cycle the
+    // footstep keytimes are detected from. Re-detects that motion live.
+    std::function<void(int /*meshId*/, int /*slot*/, int /*loopSel*/)>
+        on_kin_slot_loop;
     // Which one-shot preview is currently playing: 0 none, slotIdx+1 a clip
     // slot, -1 the blended result. Lets the play button flip to "중단" + stop.
     int kin_preview_playing = 0;
@@ -425,9 +434,13 @@ struct MeshInspectorTarget {
     std::vector<std::array<float, 2>> kin_verb_adverb;  // [motion][tag] percent
     float kin_verb_query[2] = {50.0f, 0.0f};            // adverb query percent
     std::vector<float> kin_verb_weights;                // current mix (2), display
+    std::vector<std::string> kin_verb_names;            // per-motion display name
     std::function<void(int /*meshId*/)> on_kin_verb_build;
     std::function<void(int /*meshId*/, int /*ex*/, int /*which*/, int /*frame*/)>
         on_kin_verb_keytime;
+    // Set 주기끝(cycleEnd) = 왼발착지(LFD) + one motion-loop length, so the cycle
+    // spans exactly one loop from the landing (pairs with 루프 연장).
+    std::function<void(int /*meshId*/, int /*ex*/)> on_kin_verb_cycle_end;
     std::function<void(int /*meshId*/, const std::string& /*name*/)>
         on_kin_verb_add_tag;
     std::function<void(int /*meshId*/, int /*tagIdx*/)> on_kin_verb_remove_tag;
@@ -442,10 +455,29 @@ struct MeshInspectorTarget {
     bool kin_verb_preview = false;
     std::function<void(int /*meshId*/, bool /*on*/)> on_kin_verb_preview;
     std::function<void(int /*meshId*/)> on_kin_verb_play;
+    // Keytime-tuning preview: which motion's keytime filmstrip is shown (-1 off).
+    // Per keytime section a toggle drives this; the renderer ghosts that motion's
+    // clip at each of its 5 keytime frames so the user retimes by watching poses.
+    int kin_verb_kt_preview = -1;
+    std::function<void(int /*meshId*/, int /*motionIdx*/, bool /*on*/)>
+        on_kin_verb_kt_preview;
+    // N-blend presets (mode 6): a curated full setup (files + colors + loop +
+    // keytimes + tag + adverbs). Picking one fills + builds everything; a manual
+    // edit reverts to 자율선택 (-1). Mirrors the blend-space preset combo.
+    std::vector<std::string> kin_verb_presets;
+    int kin_verb_preset = -1;
+    std::function<void(int /*meshId*/, int /*presetIdx*/)> on_kin_verb_preset;
     // Extrapolation toggle: on = signed RBF weights (over-driving the adverb past
     // a motion exaggerates it); off = convex (clamped between the two motions).
     bool kin_verb_extrapolate = true;
     std::function<void(int /*meshId*/, bool /*on*/)> on_kin_verb_extrapolate;
+    // N-motion variant (kin_mode 6): same keytime blend, but the motion list
+    // grows/shrinks (2..N). add_motion appends a default clip + adverb row;
+    // remove_motion drops one (min 2). Both edit staging → need a rebuild. The
+    // mode-5 path keeps exactly two motions and never shows these.
+    std::function<void(int /*meshId*/, const std::string& /*file*/)>
+        on_kin_verb_add_motion;
+    std::function<void(int /*meshId*/, int /*motionIdx*/)> on_kin_verb_remove_motion;
 
     // No-selection branch: when mesh_id < 0 the right panel renders these
     // Add-Object buttons instead of the per-mesh editors. Callbacks

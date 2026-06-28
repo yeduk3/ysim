@@ -142,6 +142,33 @@ inline std::array<int, 5> detectKeytimes(const Skeleton& skel, const Clip& c,
     return {lfd, rfu, rfd, lfu, end};
 }
 
+// Extend a looping clip to TWICE its length by appending a copy of its frames,
+// so footstep keytimes (and the active-frame window) can span two loops — a
+// gait event that wraps past the loop seam becomes a plain monotonic frame in
+// [0, 2N) instead of wrapping. Joint rotations are copied verbatim (the two
+// halves pose identically — "the same half twice"); the copy's ROOT continues
+// forward by one cycle's travel (last − first) so a cycle placed in the second
+// half still moves the body instead of standing still.
+// ponytail: 1-frame seam stall (copy[0] coincides with the last original
+// frame); negligible for keytime tuning. Exact continuation would need the
+// wrapped next-frame step. Idempotency is the caller's job (toggle 0↔1 only).
+inline void doubleClipFrames(Clip& c) {
+    const int n = int(c.frames.size());
+    if (n < 2) return;
+    const std::array<float, 3> d{
+        c.frames[n - 1].rootPos[0] - c.frames[0].rootPos[0],
+        c.frames[n - 1].rootPos[1] - c.frames[0].rootPos[1],
+        c.frames[n - 1].rootPos[2] - c.frames[0].rootPos[2]};
+    c.frames.reserve(size_t(2 * n));
+    for (int f = 0; f < n; ++f) {
+        LocalPose p = c.frames[f];  // copy first (push_back may relocate)
+        p.rootPos[0] += d[0];
+        p.rootPos[1] += d[1];
+        p.rootPos[2] += d[2];
+        c.frames.push_back(std::move(p));
+    }
+}
+
 // Map a normalized phase to a fractional frame through the keytime warp:
 // canonical breakpoints `canon` (phase) ↔ `key` (frame), piecewise-linear.
 // canon[k] is where event k lands on the phase axis; key[k] its frame. At
@@ -174,6 +201,55 @@ inline void sampleClipFrameF(const Clip& c, float ff, LocalPose& out) {
     const int f0 = int(ff);
     const int f1 = std::min(f0 + 1, nf - 1);
     blendPose(c.frames[f0], c.frames[f1], 1.0f - (ff - float(f0)), out);
+}
+
+// SIGNED N-way pose blend — like blendPoseN/blendPoseNMean but it does NOT drop
+// negative weights, so an EXTRAPOLATING query (Σw=1 with some w<0, e.g. driving
+// the adverb past an example) actually moves the pose. The shared blendPoseN*
+// clamp w≤0 to stay inside the convex hull (right for the blend space, mode 4),
+// which is why the 2-motion path uses the signed `blendPose`; this is its N>2
+// analogue. Root = signed affine sum (Σw=1 ⇒ linear extrapolation). Rotations =
+// a single tangent-space combination at the largest-|weight| pose: add every
+// other pose's SIGNED log and exp back, so w<0 pushes AWAY from that pose along
+// the geodesic. At a pure example it reduces to that example (m=0). No Karcher
+// iteration — extrapolation is already a stretch, and one step matches the
+// 2-pose slerp's behaviour past [0,1].
+inline void blendPoseNSigned(const std::vector<LocalPose>& poses,
+                             const std::vector<float>& w, LocalPose& out) {
+    const size_t n = poses.size();
+    if (n == 0 || w.size() < n) {
+        out = poses.empty() ? LocalPose{} : poses[0];
+        return;
+    }
+    if (n == 1) { out = poses[0]; return; }
+    const size_t J = poses[0].rot.size();
+    out.rootPos = {0.0f, 0.0f, 0.0f};
+    out.rot.resize(J);
+    for (int k = 0; k < 3; ++k) {
+        float acc = 0.0f;
+        for (size_t i = 0; i < n; ++i) acc += poses[i].rootPos[k] * w[i];
+        out.rootPos[k] = acc;
+    }
+    int refI = 0;
+    float best = -1.0f;
+    for (size_t i = 0; i < n; ++i) {
+        const float a = std::fabs(w[i]);
+        if (a > best) { best = a; refI = int(i); }
+    }
+    for (size_t j = 0; j < J; ++j) {
+        if (j >= poses[refI].rot.size()) { out.rot[j] = poses[0].rot[j]; continue; }
+        const Quatf r = poses[refI].rot[j].normalized();
+        const Quatf refInv{r.w, -r.x, -r.y, -r.z};  // unit ⇒ inverse
+        float mx = 0.0f, my = 0.0f, mz = 0.0f;
+        for (size_t i = 0; i < n; ++i) {
+            if (int(i) == refI || j >= poses[i].rot.size()) continue;
+            Quatf rel = refInv * poses[i].rot[j];
+            if (rel.w < 0.0f) { rel.w = -rel.w; rel.x = -rel.x; rel.y = -rel.y; rel.z = -rel.z; }
+            const auto d = rel.log();
+            mx += w[i] * d[0]; my += w[i] * d[1]; mz += w[i] * d[2];
+        }
+        out.rot[j] = (r * Quatf::exp({mx, my, mz})).normalized();
+    }
 }
 
 // One example motion in the blend (exactly two are used).
@@ -471,7 +547,13 @@ struct VerbBlend {
             blendPose(poses[0], poses[1], w[0], mixed);  // wb = 1-w0 = w1
             return;
         }
-        if (useIntrinsicMean) blendPoseNMean(poses, w, mixed);
+        // Any negative weight ⇒ the query EXTRAPOLATES past the examples; the
+        // convex blendPoseN* would drop it (no pose effect, the reported bug), so
+        // use the signed N-way blend. Convex queries keep the polished mean.
+        bool anyNeg = false;
+        for (float x : w) if (x < 0.0f) { anyNeg = true; break; }
+        if (anyNeg) blendPoseNSigned(poses, w, mixed);
+        else if (useIntrinsicMean) blendPoseNMean(poses, w, mixed);
         else blendPoseN(poses, w, mixed);
     }
 
