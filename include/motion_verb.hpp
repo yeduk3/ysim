@@ -245,21 +245,23 @@ struct VerbBlend {
     std::vector<float> rbfLambda;     // n*n  radial coeffs (cardinal i, basis j)
     std::vector<float> rbfPoly;       // n*(dim+1)  poly coeffs {a_i, b_i…}
 
-    // Root motion (neither is a treadmill — the body travels). Absolute (default)
-    // blends the clips' real root trajectories, anchored per cycle so it loops
-    // forward along the blended path. Relative pins + integrates the blended
-    // heading-relative velocity (curving travel; robust when the two clips
-    // face/curve differently). Built per clip in rebuild() from the UNPINNED
-    // clips + keytimes.
-    enum class Root { Absolute = 0, Relative = 1 };
-    Root rootMode = Root::Absolute;
-    std::vector<std::array<float, 2>> exRoot0;  // [clip] XZ at key[0] (cycle start)
-    std::vector<std::array<float, 2>> exDelta;  // [clip] XZ key[0]→key[4] (1 cycle)
-    std::vector<std::vector<std::array<float, 3>>> exVel;  // [clip][f] {lvx,lvz,ω}
-    // Relative-mode integrator (world). Reset on seek / mode switch, NOT on a
-    // weight/keytime edit (that must not teleport a body mid-travel).
-    double travYaw = 0.0, travX = 0.0, travZ = 0.0, travLastT = -1.0;
-    void resetTravel() { travYaw = 0.0; travX = 0.0; travZ = 0.0; travLastT = -1.0; }
+    // Root motion (NOT a treadmill — the body travels). Each clip is re-rooted
+    // to its cycle start (key[0]) with both the xz offset AND the heading (yaw)
+    // removed — exactly what the per-clip preview shows — so both clips start at
+    // the kinematic root facing the same way. The blend then happens in that
+    // common aligned frame, so two clips that travel different WORLD directions
+    // never cancel or flip the travel direction; the per-cycle delta accumulates
+    // so the loop advances with no seam. Built per clip in rebuild() from the
+    // (unpinned) clips + keytimes.
+    std::vector<float> exYaw0;                  // [clip] heading at key[0]
+    std::vector<std::array<float, 2>> exP0;     // [clip] XZ at key[0]
+    std::vector<std::array<float, 2>> exDeltaL; // [clip] aligned XZ travel / cycle
+
+    // Rotate a world XZ vector into the clip's key[0]-aligned frame (by -yaw0).
+    static std::array<float, 2> alignXZ(float yaw0, float x, float z) {
+        const float c = std::cos(-yaw0), s = std::sin(-yaw0);
+        return {c * x - s * z, s * x + c * z};
+    }
 
     bool ready() const {
         return ex.size() >= 2 && !skel.joints.empty() &&
@@ -317,58 +319,25 @@ struct VerbBlend {
         buildRootData();
     }
 
-    // Per-clip root trajectory data from the (unpinned) clips: cycle-start XZ,
-    // one-cycle XZ travel, and per-frame heading-relative velocity {lvx,lvz,ω}.
+    // Per-clip root data from the (unpinned) clips: the key[0] heading + xz that
+    // align every clip to the kinematic root, and the one-cycle travel expressed
+    // in that aligned frame (so the per-cycle accumulate is direction-stable).
     void buildRootData() {
-        exRoot0.assign(ex.size(), {0.0f, 0.0f});
-        exDelta.assign(ex.size(), {0.0f, 0.0f});
-        exVel.assign(ex.size(), {});
+        exYaw0.assign(ex.size(), 0.0f);
+        exP0.assign(ex.size(), {0.0f, 0.0f});
+        exDeltaL.assign(ex.size(), {0.0f, 0.0f});
         for (size_t i = 0; i < ex.size(); ++i) {
             const auto& fr = ex[i].clip.frames;
             const int nf = int(fr.size());
             if (nf == 0) continue;
             auto cl = [&](int f) { return f < 0 ? 0 : (f > nf - 1 ? nf - 1 : f); };
             const int k0 = cl(ex[i].key[0]), k4 = cl(ex[i].key[4]);
-            exRoot0[i] = {fr[k0].rootPos[0], fr[k0].rootPos[2]};
-            exDelta[i] = {fr[k4].rootPos[0] - exRoot0[i][0],
-                          fr[k4].rootPos[2] - exRoot0[i][1]};
-            const float dt = ex[i].clip.dt > 1e-6f ? ex[i].clip.dt : 1.0f / 30.0f;
-            std::vector<std::array<float, 3>> vel(size_t(nf), {0, 0, 0});
-            for (int f = 0; f < nf; ++f) {
-                const int g = f + 1 < nf ? f + 1 : f;
-                const float wvx = (fr[g].rootPos[0] - fr[f].rootPos[0]) / dt;
-                const float wvz = (fr[g].rootPos[2] - fr[f].rootPos[2]) / dt;
-                const float h0 = fr[f].rot.empty() ? 0.0f : verbHeading(fr[f].rot[0]);
-                const float h1 = fr[g].rot.empty() ? 0.0f : verbHeading(fr[g].rot[0]);
-                float dh = h1 - h0;
-                const float kPi = 3.14159265358979323846f;
-                while (dh > kPi) dh -= 2.0f * kPi;
-                while (dh < -kPi) dh += 2.0f * kPi;
-                const float c = std::cos(-h0), s = std::sin(-h0);  // world→local
-                vel[size_t(f)] = {c * wvx - s * wvz, s * wvx + c * wvz, dh / dt};
-            }
-            exVel[i] = std::move(vel);
+            exYaw0[i] = fr[k0].rot.empty() ? 0.0f : verbHeading(fr[k0].rot[0]);
+            exP0[i] = {fr[k0].rootPos[0], fr[k0].rootPos[2]};
+            // One-cycle world travel → aligned frame.
+            exDeltaL[i] = alignXZ(exYaw0[i], fr[k4].rootPos[0] - exP0[i][0],
+                                  fr[k4].rootPos[2] - exP0[i][1]);
         }
-    }
-
-    // Blended heading-relative root velocity {lvx, lvz, ω} at a normalized phase.
-    std::array<double, 3> blendVel(float phase, const std::vector<float>& w) const {
-        double vx = 0, vz = 0, om = 0;
-        for (size_t i = 0; i < ex.size() && i < exVel.size() && i < w.size(); ++i) {
-            const auto& vel = exVel[i];
-            const int nf = int(vel.size());
-            if (nf == 0) continue;
-            const float ff = verbWarpFrame(ex[i].key, canon, phase);
-            int f0 = int(ff);
-            if (f0 < 0) f0 = 0;
-            if (f0 > nf - 1) f0 = nf - 1;
-            const int f1 = f0 + 1 < nf ? f0 + 1 : f0;
-            const float a = ff - std::floor(ff);
-            vx += double(w[i]) * (vel[f0][0] * (1 - a) + vel[f1][0] * a);
-            vz += double(w[i]) * (vel[f0][1] * (1 - a) + vel[f1][1] * a);
-            om += double(w[i]) * (vel[f0][2] * (1 - a) + vel[f1][2] * a);
-        }
-        return {vx, vz, om};
     }
 
     // Solve the thin-plate cardinal coefficients over adverb space once.
@@ -487,62 +456,58 @@ struct VerbBlend {
         else blendPoseN(poses, w, mixed);
     }
 
-    // World pose at time `tSec` (the per-frame entry). Phase = fmod over the
-    // fixed cycle clock; the root TRAVELS (absolute per-cycle accumulate, or
-    // relative velocity integration) — no treadmill. Non-const: relative mode
-    // advances the integrator. `tSec` is the open-ended play clock (NOT wrapped
-    // by the caller for this mode), so the cycle counter / dt are monotone.
-    bool sample(double tSec, bvh::Pose& out) {
+    // World pose at time `tSec` (the per-frame entry). The root TRAVELS — no
+    // treadmill — by DIRECT root-pose blending (Approach 1): each clip is
+    // re-rooted to its cycle start with xz + yaw removed (so both start at the
+    // kinematic root facing forward, like the per-clip preview), the root pose
+    // is blended in that common aligned frame, and the per-cycle aligned travel
+    // accumulates so the loop advances with no seam. Aligning the heading is
+    // what stops two clips that travel different WORLD directions from cancelling
+    // or flipping the blended travel. Stateless: the cycle counter comes from
+    // `tSec` (the caller plays mode 5 open-ended, so it is monotone).
+    bool sample(double tSec, bvh::Pose& out) const {
         if (!ready()) return false;
         const double cyc = cycleSec > 1e-6 ? cycleSec : 1.0;
         const double tt = std::max(0.0, tSec);
         const float phase = float(std::fmod(tt, cyc) / cyc);
+        const double cycleIdx = std::floor(tt / cyc);
         std::vector<float> w;
         weights(query, w);
+
+        // Per clip: sample the warped pose, then re-root it into the clip's
+        // key[0]-aligned frame (xz + yaw removed) before blending.
         std::vector<LocalPose> poses(ex.size());
         for (size_t i = 0; i < ex.size(); ++i) {
             const float ff = verbWarpFrame(ex[i].key, canon, phase);
             sampleClipFrameF(ex[i].clip, ff, poses[i]);
+            if (i < exYaw0.size()) {
+                const auto a = alignXZ(exYaw0[i], poses[i].rootPos[0] - exP0[i][0],
+                                       poses[i].rootPos[2] - exP0[i][1]);
+                poses[i].rootPos[0] = a[0];
+                poses[i].rootPos[2] = a[1];
+                if (!poses[i].rot.empty())
+                    poses[i].rot[0] =
+                        (Quatf::yaw(-exYaw0[i]) * poses[i].rot[0]).normalized();
+            }
         }
+
         LocalPose mixed;
         if (poses.size() == 2 && w.size() == 2)
-            blendPose(poses[0], poses[1], w[0], mixed);
+            blendPose(poses[0], poses[1], w[0], mixed);  // aligned root + joints
         else if (useIntrinsicMean)
             blendPoseNMean(poses, w, mixed);
         else
             blendPoseN(poses, w, mixed);
 
-        if (rootMode == Root::Relative) {
-            double dt = travLastT < 0.0 ? 0.0 : (tSec - travLastT);
-            if (dt < 0.0 || dt > 0.5) dt = 0.0;  // seek / first frame ⇒ no step
-            travLastT = tSec;
-            const auto v = blendVel(phase, w);
-            travYaw += v[2] * dt;
-            const double cy = std::cos(travYaw), sy = std::sin(travYaw);
-            travX += (cy * v[0] - sy * v[1]) * dt;  // local → world
-            travZ += (sy * v[0] + cy * v[1]) * dt;
-            if (!mixed.rot.empty()) {  // strip the blended heading, face travYaw
-                const float h0 = verbHeading(mixed.rot[0]);
-                mixed.rot[0] =
-                    (Quatf::yaw(float(travYaw) - h0) * mixed.rot[0]).normalized();
-            }
-            mixed.rootPos[0] = float(travX);
-            mixed.rootPos[2] = float(travZ);  // keep blended Y (bob)
-        } else {
-            // Absolute: per-cycle accumulate XZ so the loop travels forward with
-            // no seam; Y + heading stay as blended above.
-            const double cycleIdx = std::floor(tt / cyc);
-            double dx = 0, dz = 0, gx = 0, gz = 0;
-            for (size_t i = 0; i < ex.size() && i < exRoot0.size() &&
-                               i < w.size(); ++i) {
-                dx += double(w[i]) * (poses[i].rootPos[0] - exRoot0[i][0]);
-                dz += double(w[i]) * (poses[i].rootPos[2] - exRoot0[i][1]);
-                gx += double(w[i]) * exDelta[i][0];
-                gz += double(w[i]) * exDelta[i][1];
-            }
-            mixed.rootPos[0] = float(cycleIdx * gx + dx);
-            mixed.rootPos[2] = float(cycleIdx * gz + dz);
+        // Unwrap: add the blended aligned per-cycle travel for the cycles done.
+        double gx = 0, gz = 0;
+        for (size_t i = 0; i < ex.size() && i < exDeltaL.size() && i < w.size(); ++i) {
+            gx += double(w[i]) * exDeltaL[i][0];
+            gz += double(w[i]) * exDeltaL[i][1];
         }
+        mixed.rootPos[0] += float(cycleIdx * gx);
+        mixed.rootPos[2] += float(cycleIdx * gz);
+
         fk(skel, mixed, out);
         return !out.world.empty();
     }

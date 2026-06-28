@@ -446,11 +446,6 @@ struct MeshInspectorTarget {
     // a motion exaggerates it); off = convex (clamped between the two motions).
     bool kin_verb_extrapolate = true;
     std::function<void(int /*meshId*/, bool /*on*/)> on_kin_verb_extrapolate;
-    // Root mode toggle: off = absolute (blend the real root trajectories); on =
-    // relative velocity (integrate blended heading-relative velocity). Both
-    // travel — neither is a treadmill.
-    bool kin_verb_root_relative = false;
-    std::function<void(int /*meshId*/, bool /*on*/)> on_kin_verb_root_relative;
 
     // No-selection branch: when mesh_id < 0 the right panel renders these
     // Add-Object buttons instead of the per-mesh editors. Callbacks

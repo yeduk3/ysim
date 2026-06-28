@@ -2479,11 +2479,6 @@ struct MeshKinematicInitializer : GeneralMeshInitializer<BE, PR> {
     // the adverb slider past a motion exaggerates it; off = convex (clamped to
     // the two motions). Mirrors verbBlend.convexWeights (= !verbExtrapolate).
     bool verbExtrapolate = true;
-    // Root motion mode: false = absolute (blend the real root trajectories,
-    // default); true = relative velocity (integrate blended heading-relative
-    // velocity — for clips that face/curve differently). Mirrors
-    // verbBlend.rootMode; rebuild applies it.
-    bool verbRootRelative = false;
     bool verbActive() const { return motionMode == 5 && verbBlend.ready(); }
 
     // ── Per-clip motion-selection slots (backs the reusable selector) ──
@@ -9673,7 +9668,6 @@ struct Simulator {
         if (!m || !kin || !m->state.x.ptr) return;
         kin->localTime = timeSec;
         kin->graphSession.resetBlendTravel();  // seek → restart travel integrator
-        kin->verbBlend.resetTravel();          // same for the 2-motion blend
         // A pending re-pack (file swap marked dirty) can leave the live
         // buffer sized for the OLD proxy; writing the new pose would
         // overrun it. The pack realizes localTime anyway.
@@ -10099,9 +10093,6 @@ struct Simulator {
         vb.skel = skel;
         vb.dt = refDt;
         vb.convexWeights = !kin->verbExtrapolate;  // signed weights ⇒ extrapolation
-        vb.rootMode = kin->verbRootRelative
-                          ? mograph::VerbBlend::Root::Relative
-                          : mograph::VerbBlend::Root::Absolute;
         vb.tags = kin->verbTags;
         vb.query.assign(size_t(nt), 0.0f);
         for (int t = 0; t < nt && t < 2; ++t) vb.query[t] = kin->verbQuery[t];
@@ -10247,17 +10238,6 @@ struct Simulator {
         if (!kin) return;
         kin->verbExtrapolate = on;
         kin->verbBlend.convexWeights = !on;  // live (only read at eval time)
-        kin->invalidateRebase();
-    }
-
-    void verbSetRootRelative(int meshId, bool on) {
-        auto* kin = kinematicOf(meshId);
-        if (!kin) return;
-        kin->verbRootRelative = on;
-        kin->verbBlend.rootMode = on ? mograph::VerbBlend::Root::Relative
-                                     : mograph::VerbBlend::Root::Absolute;
-        kin->verbBlend.resetTravel();  // switching frames ⇒ restart from origin
-        setKinematicTime(meshId, 0.0);
         kin->invalidateRebase();
     }
 
@@ -21361,13 +21341,10 @@ static int runSelfTest() {
                              "ghostOk=" + std::to_string(int(ghostOk)) + " gd=" +
                                  std::to_string(gd));
 
-                    // VAB-10/11: the blended root TRAVELS (no treadmill) — net
-                    // path grows over ~10 s of open-ended play while every
+                    // VAB-10: the blended root TRAVELS (no treadmill) — net path
+                    // grows over ~10 s of open-ended play while every
                     // consecutive-frame root step stays small (no seam teleport).
-                    // Checked for both absolute and relative-velocity root modes.
-                    auto travelProbe = [&](mograph::VerbBlend::Root rm) {
-                        k->verbBlend.rootMode = rm;
-                        k->verbBlend.resetTravel();
+                    {
                         k->verbBlend.query = {50.0f};
                         float maxStep = 0.0f, pathLen = 0.0f;
                         bvh::Pose prev, cur;
@@ -21384,23 +21361,73 @@ static int runSelfTest() {
                             }
                             prev = cur;
                         }
-                        return std::array<float, 2>{pathLen, maxStep};
-                    };
-                    const float h = k->verbBlend.skel.height;
-                    const auto absT = travelProbe(mograph::VerbBlend::Root::Absolute);
-                    if (absT[0] > 0.5f * h && absT[1] < 0.05f * h)
-                        pass("VAB-10 / absolute root travels across cycles without seam teleport");
-                    else
-                        fail("VAB-10 / absolute root travels across cycles without seam teleport",
-                             "pathLen=" + std::to_string(absT[0]) + " maxStep=" +
-                                 std::to_string(absT[1]) + " h=" + std::to_string(h));
-                    const auto relT = travelProbe(mograph::VerbBlend::Root::Relative);
-                    if (relT[0] > 0.3f * h && relT[1] < 0.05f * h)
-                        pass("VAB-11 / relative-velocity root travels (integrated) without teleport");
-                    else
-                        fail("VAB-11 / relative-velocity root travels (integrated) without teleport",
-                             "pathLen=" + std::to_string(relT[0]) + " maxStep=" +
-                                 std::to_string(relT[1]) + " h=" + std::to_string(h));
+                        const float h = k->verbBlend.skel.height;
+                        if (pathLen > 0.5f * h && maxStep < 0.05f * h)
+                            pass("VAB-10 / blended root travels across cycles without seam teleport");
+                        else
+                            fail("VAB-10 / blended root travels across cycles without seam teleport",
+                                 "pathLen=" + std::to_string(pathLen) + " maxStep=" +
+                                     std::to_string(maxStep) + " h=" + std::to_string(h));
+                    }
+
+                    // VAB-11 (flip regression): two clips travel OPPOSITE world
+                    // directions but are both forward in their own frame (heading
+                    // aligned with travel). The yaw-aligned root blend must still
+                    // travel (≠0) and keep ONE direction across the adverb sweep —
+                    // the old world-frame blend cancelled to ~0 at the midpoint and
+                    // flipped sign. Built on the real reference skeleton.
+                    {
+                        const mograph::Skeleton rs = k->skel();
+                        auto moveClip = [&](float dirX, float yaw) {
+                            mograph::Clip c;
+                            c.dt = 1.0f / 30.0f;
+                            c.frames.resize(40);
+                            for (int f = 0; f < 40; ++f) {
+                                auto& p = c.frames[size_t(f)];
+                                p.rot.assign(rs.joints.size(), mograph::Quatf::identity());
+                                if (!p.rot.empty()) p.rot[0] = mograph::Quatf::yaw(yaw);
+                                p.rootPos = {dirX * 0.05f * float(f), 0.9f, 0.0f};
+                            }
+                            return c;
+                        };
+                        mograph::VerbBlend mv;
+                        mv.skel = rs;
+                        mv.tags = {"t"};
+                        mv.query = {50.0f};
+                        mv.convexWeights = false;
+                        mograph::VerbExample ea, eb;
+                        ea.clip = moveClip(+1.0f, 1.5708f);   // +X, faces +X
+                        ea.key = {0, 10, 20, 30, 39};
+                        ea.adverb = {0.0f};
+                        eb.clip = moveClip(-1.0f, -1.5708f);  // -X, faces -X
+                        eb.key = {0, 10, 20, 30, 39};
+                        eb.adverb = {100.0f};
+                        mv.ex = {ea, eb};
+                        mv.rebuild();
+                        auto netTravel = [&](float q) {
+                            mv.query = {q};
+                            bvh::Pose s0, s1;
+                            mv.sample(0.0, s0);
+                            mv.sample(2.0 * mv.cycleSec, s1);
+                            return std::array<float, 2>{
+                                s1.world[0].t[0] - s0.world[0].t[0],
+                                s1.world[0].t[2] - s0.world[0].t[2]};
+                        };
+                        const auto mid = netTravel(50.0f);
+                        const float midDist = std::sqrt(mid[0] * mid[0] + mid[1] * mid[1]);
+                        bool consistent = true;
+                        std::array<float, 2> ref = netTravel(0.0f);
+                        for (int qi = 1; qi <= 4 && consistent; ++qi) {
+                            const auto d = netTravel(float(qi) * 25.0f);
+                            if (ref[0] * d[0] + ref[1] * d[1] <= 0.0f) consistent = false;
+                        }
+                        if (midDist > 0.5f && consistent)
+                            pass("VAB-11 / yaw-aligned root blend: opposite-heading clips travel, no direction flip");
+                        else
+                            fail("VAB-11 / yaw-aligned root blend: opposite-heading clips travel, no direction flip",
+                                 "midDist=" + std::to_string(midDist) + " consistent=" +
+                                     std::to_string(int(consistent)));
+                    }
 
                     k->verbBlend = mograph::VerbBlend{};  // restore for later blocks
                 }
@@ -23748,7 +23775,6 @@ int main(int argc, char** argv) {
                     target.kin_verb_ready = kin->verbActive();
                     target.kin_verb_preview = kin->verbPreview;
                     target.kin_verb_extrapolate = kin->verbExtrapolate;
-                    target.kin_verb_root_relative = kin->verbRootRelative;
                     if (kin->motionMode == 5) {
                         target.kin_status = kin->verbStatus;
                         target.kin_verb_tags = kin->verbTags;
@@ -23947,10 +23973,6 @@ int main(int argc, char** argv) {
                     target.on_kin_verb_extrapolate =
                         [&simulator](int id, bool on) {
                             simulator.verbSetExtrapolate(id, on);
-                        };
-                    target.on_kin_verb_root_relative =
-                        [&simulator](int id, bool on) {
-                            simulator.verbSetRootRelative(id, on);
                         };
                 }
             }
