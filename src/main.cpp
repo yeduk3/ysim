@@ -21430,6 +21430,73 @@ static int runSelfTest() {
                                      std::to_string(cosang));
                     }
 
+                    // VAB-12 (tag weight routing): the adverb weight must reach
+                    // the ROOT with the same sign/index it reaches the pose, so
+                    // each endpoint's travel matches ITS clip. Two clips facing
+                    // the SAME way (yaw0=0, so re-rooting is a no-op) but
+                    // TRANSLATING perpendicular: A→+Z, B→+X. Then dir(q=0) must be
+                    // +Z (pure A) and dir(q=100) must be +X (pure B). A flipped
+                    // weight sign, a swapped w[0]/w[1] index, or routing the wrong
+                    // weight to exDeltaL would rotate or swap these — invisible to
+                    // VAB-11 (same-direction clips) and to a "never reverses" test
+                    // (perpendicular, not opposite). Real Walk+Sneak both ≈+Z, so
+                    // this needs the synthetic perpendicular pair to have teeth.
+                    {
+                        const mograph::Skeleton rs = k->skel();
+                        auto travelClip = [&](float dirAng) {
+                            mograph::Clip c;
+                            c.dt = 1.0f / 30.0f;
+                            c.frames.resize(40);
+                            const float cd = std::cos(dirAng), sd = std::sin(dirAng);
+                            for (int f = 0; f < 40; ++f) {
+                                auto& p = c.frames[size_t(f)];
+                                p.rot.assign(rs.joints.size(),
+                                             mograph::Quatf::identity());  // yaw0=0
+                                const float d = 0.05f * float(f);
+                                p.rootPos = {d * sd, 0.9f, d * cd};  // travels @dirAng
+                            }
+                            return c;
+                        };
+                        mograph::VerbBlend mv;
+                        mv.skel = rs;
+                        mv.tags = {"t"};
+                        mv.convexWeights = false;
+                        mograph::VerbExample ea, eb;
+                        ea.clip = travelClip(0.0f);       // A travels +Z
+                        ea.key = {0, 10, 20, 30, 39};
+                        ea.adverb = {0.0f};
+                        eb.clip = travelClip(1.5708f);    // B travels +X
+                        eb.key = {0, 10, 20, 30, 39};
+                        eb.adverb = {100.0f};
+                        mv.ex = {ea, eb};
+                        mv.rebuild();
+                        auto dir = [&](float q) {
+                            mv.query = {q};
+                            bvh::Pose s0, s1;
+                            mv.sample(0.0, s0);
+                            mv.sample(2.0 * mv.cycleSec, s1);
+                            const float dx = s1.world[0].t[0] - s0.world[0].t[0];
+                            const float dz = s1.world[0].t[2] - s0.world[0].t[2];
+                            return std::array<float, 3>{
+                                dx, dz, std::sqrt(dx * dx + dz * dz)};
+                        };
+                        const auto d0 = dir(0.0f), d1 = dir(100.0f);
+                        // q=0 → +Z (dz>0, |dx| small); q=100 → +X (dx>0, |dz| small).
+                        const float cosA0 = d0[2] > 1e-4f ? d0[1] / d0[2] : 0.0f;
+                        const float cosX1 = d1[2] > 1e-4f ? d1[0] / d1[2] : 0.0f;
+                        if (d0[2] > 0.3f && d1[2] > 0.3f && cosA0 > 0.9f &&
+                            cosX1 > 0.9f)
+                            pass("VAB-12 / adverb weight routes to the root with correct sign+index (endpoints match their clip)");
+                        else
+                            fail("VAB-12 / adverb weight routes to the root with correct sign+index (endpoints match their clip)",
+                                 "d0=(" + std::to_string(d0[0]) + "," +
+                                     std::to_string(d0[1]) + ") d1=(" +
+                                     std::to_string(d1[0]) + "," +
+                                     std::to_string(d1[1]) + ") cosA0=" +
+                                     std::to_string(cosA0) + " cosX1=" +
+                                     std::to_string(cosX1));
+                    }
+
                     k->verbBlend = mograph::VerbBlend{};  // restore for later blocks
                 }
                 sim.setKinematicMode(0, 0);
