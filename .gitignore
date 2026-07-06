@@ -8,7 +8,7 @@ compile_commands.json
 imgui.ini
 
 codex/
-profiles/
+profiles/*
 
 .claude/settings.local.json
 CLAUDE.md
@@ -20,5 +20,6 @@ uml/
 .claude/worktrees/
 docs/references/**/*.pdf
 docs/references/**/*.html
+docs/*
 assets/BVH/
 
