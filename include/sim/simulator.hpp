@@ -89,6 +89,15 @@ struct Simulator {
 
     // sim viewer?
     bool pause = true;
+    // Forward-only stepping while paused ('.' = one frame, '>' = one
+    // substep). Pending counters are set by the key callback and consumed
+    // one per update() call; substepCursor persists the mid-frame substep
+    // position so consecutive '>' presses walk one frame's substep loop
+    // across multiple update() calls. No history — backward stepping would
+    // need state snapshots that don't exist yet.
+    Index stepFramesPending   = 0;
+    Index stepSubstepsPending = 0;
+    Index substepCursor       = 0;
     bool checkCollision = true;
     bool enableSelfCollisions = false;
     Index frame = 0;
@@ -2735,6 +2744,11 @@ struct Simulator {
         //Scene<BE, PR>::initialize();
 
         frame = 0;
+        // A rebuild invalidates any mid-frame substep position; stale step
+        // requests must not fire against the fresh state either.
+        substepCursor       = 0;
+        stepFramesPending   = 0;
+        stepSubstepsPending = 0;
 
         // D-025: auto-apply pendingRotations + pendingMaterials so any
         // edit-time rotation (rotateObject) or load-time rotation
@@ -2848,7 +2862,15 @@ struct Simulator {
         // the Inspector) and not see the change reflected in collision
         // / rigid-body / cloth pipelines until they unpaused.
         if (Scene<BE, PR>::dirty) initialize();
-        if(pause) return;
+        // Step-while-paused: a pending frame step runs this update() to the
+        // end of the current frame; a pending substep step runs exactly one
+        // substep and stops mid-frame (pause stays on for both).
+        bool stepOneSubstep = false;
+        if (pause) {
+            if (stepFramesPending > 0)         stepFramesPending--;
+            else if (stepSubstepsPending > 0) { stepSubstepsPending--; stepOneSubstep = true; }
+            else return;
+        }
 
         // Anomaly halt: the integrators' world-bounds guard raised the
         // flag (a vertex went NaN/Inf or escaped the world box) on a
@@ -2906,8 +2928,14 @@ struct Simulator {
             }
         }
         //std::cout << "[Simulator Update] Start update" << std::endl;
-        
-        
+
+        // Per-frame preamble (periodic BVH build, environment forces, rigid
+        // backend step, kinematic pose advance) runs once per FRAME: only at
+        // substepCursor==0. A mid-frame resume (substep stepping stopped
+        // partway, or unpausing mid-frame) must not re-step Bullet or
+        // re-advance kinematic clocks. Body intentionally not re-indented.
+        if (substepCursor == 0) {
+
         if(frame % 10 == 0) {
             // BVH is always rebuilt — click-ray and showBox/showSceneBox use it
             // even when the active broadphase is SpatialHashing.
@@ -3089,12 +3117,18 @@ struct Simulator {
                            m.transformPosition, m.state.x.ptr);
         }
 
+        } // end per-frame preamble (substepCursor == 0)
+
         // Push the per-frame sync tier into the broad + narrow phases: InFrame
         // syncs + reads each substep; None/PerFrame run them async.
         collisionPipeline.broadPhase.syncEachPhase = syncEachPhase();
         collisionPipeline.narrowPhase.syncEachPhase = syncEachPhase();
 
-        for(int i = 0; i < system.subSteps; i++) {
+        // Normal run: full substep range from wherever the cursor sits
+        // (0 unless resuming a mid-frame stop). Substep step: exactly one.
+        const int subBegin = (int)substepCursor;
+        const int subEnd   = stepOneSubstep ? subBegin + 1 : (int)system.subSteps;
+        for(int i = subBegin; i < subEnd; i++) {
 
             //if(i % 10 == 0) checkCollision = true;
             //else checkCollision = false;
@@ -3347,6 +3381,21 @@ struct Simulator {
             std::cout << Scene<BE, PR>::packedCollisionData.numBroadCollisions[0] << ", "
                 << Scene<BE, PR>::packedCollisionData.numNarrowCollisions[0] << '\n';
         }
+
+        // Mid-frame stop (substep stepping): skip the frame postamble; the
+        // cursor marks where the next update() resumes. The commitAndWait
+        // above already ran, so the render shows this substep's result.
+        substepCursor = (Index)subEnd;
+        if (subEnd < (int)system.subSteps) {
+            if (stepOneSubstep)
+                std::cout << "[step] frame " << frame << " substep "
+                          << subEnd << "/" << system.subSteps << "\n";
+            return;
+        }
+        substepCursor = 0;
+        if (stepOneSubstep)
+            std::cout << "[step] frame " << frame << " substep "
+                      << subEnd << "/" << system.subSteps << " (frame complete)\n";
 
         system.acctime += system.h;
         frame++;

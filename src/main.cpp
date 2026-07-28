@@ -861,6 +861,19 @@ int main(int argc, char** argv) {
                 simulator->scene.meshes[0].constraints.fixedParticles[200-1] = !((bool)simulator->scene.meshes[0].constraints.fixedParticles[200-1]);
         } else if(key == GLFW_KEY_SPACE && action == GLFW_PRESS) {
             simulator->pause = !(simulator->pause);
+        } else if(key == GLFW_KEY_PERIOD
+                  && (action == GLFW_PRESS || action == GLFW_REPEAT)) {
+            // '.' = advance one frame, '>' (Shift+.) = advance one substep.
+            // Forward only — no history, so no backward variant. While
+            // running, the first press just pauses (then step from there).
+            // GLFW_REPEAT included so holding the key scrubs.
+            if (!simulator->pause) {
+                simulator->pause = true;
+            } else if (mods & GLFW_MOD_SHIFT) {
+                simulator->stepSubstepsPending++;
+            } else {
+                simulator->stepFramesPending++;
+            }
         } else if(key == GLFW_KEY_B && action == GLFW_PRESS) {
             *debugEachBoxes = !(*debugEachBoxes);
         } else if(key == GLFW_KEY_S && action == GLFW_PRESS) {

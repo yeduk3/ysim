@@ -6062,6 +6062,50 @@ static int runSelfTest() {
         }
     }
 
+    // ---- Block STEP: forward-only stepping while paused ('.' / '>') -----
+    // The key callback bumps stepFramesPending / stepSubstepsPending;
+    // update() consumes one per call with pause held. Assert: a frame step
+    // advances `frame` by exactly 1; substep steps hold `frame` until the
+    // frame's last substep, and an update() with nothing pending is a no-op.
+    {
+        resetScene();
+        sim.addGround(PlaneDirection::XZPlane, tinym::vec3(0, 0, 0), 4.0f);
+        sim.initialize();
+        sim.pause = true;
+        const Index f0 = sim.frame;
+
+        sim.stepFramesPending = 1;
+        sim.update();
+        const bool frameStepped = (sim.frame == f0 + 1) && sim.pause
+                                  && sim.substepCursor == 0;
+        sim.update();  // nothing pending → must not advance
+        const bool idleHeld = (sim.frame == f0 + 1);
+
+        const Index n = sim.system.subSteps;
+        Index heldMidFrame = 0;
+        for (Index s = 0; s < n; ++s) {
+            sim.stepSubstepsPending = 1;
+            sim.update();
+            if (s + 1 < n && sim.frame == f0 + 1 && sim.substepCursor == s + 1)
+                ++heldMidFrame;
+        }
+        const bool subStepped = (sim.frame == f0 + 2) && sim.substepCursor == 0
+                                && heldMidFrame == n - 1 && sim.pause;
+
+        if (frameStepped && idleHeld && subStepped)
+            pass("STEP-1 / paused frame step +1, idle no-op, substep steps complete a frame");
+        else
+            fail("STEP-1 / paused frame step +1, idle no-op, substep steps complete a frame",
+                 "frameStepped=" + std::to_string(frameStepped)
+                 + " idleHeld=" + std::to_string(idleHeld)
+                 + " subStepped=" + std::to_string(subStepped)
+                 + " frame=" + std::to_string(sim.frame)
+                 + " cursor=" + std::to_string(sim.substepCursor)
+                 + " heldMidFrame=" + std::to_string(heldMidFrame) + "/"
+                 + std::to_string(n - 1));
+        sim.pause = true;
+    }
+
     // ---- Block NAN-GUARD: integrator world-bounds guard keeps an --------
     // exploding cloth finite so the frame%10 full BVH rebuild can never
     // see Inf/NaN positions (the GPU-wedge incident: a data-dependent
