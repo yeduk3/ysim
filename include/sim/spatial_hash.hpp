@@ -125,7 +125,7 @@ struct SpatialHashing<METAL, PR> {
     VectorBase<METAL, PR>          radiusReducePartial2; // ceil(m/256/256), ping-pong
     VectorBase<METAL, Index>       faceObj;              // m, owning object id per global face
     VectorBase<METAL, uint32_t>    meshBehaviors;        // numMeshes, BehaviorType per mesh
-    VectorBase<METAL, uint32_t>    meshShapes;           // numMeshes, ShapeType per mesh
+    VectorBase<METAL, uint32_t>    meshShapes;           // numMeshes, ColliderKind per mesh
     VectorBase<METAL, uint8_t>     faceCB;               // m, 8-bit cell-type bitmask
     VectorBase<METAL, SHEntry>     entries;              // m*8, cellID=0xFFFFFFFF sentinel
     VectorBase<METAL, uint32_t>    cellStartFlag;        // m*8, 1 if entry starts a new cell
@@ -267,7 +267,8 @@ struct SpatialHashing<METAL, PR> {
     }
 
     // meshBehaviors[obj] / meshShapes[obj] mirror the per-mesh enums into
-    // GPU-readable arrays. Step 8 reads them per pair.
+    // GPU-readable arrays. Step 8 reads them per pair. P1: meshShapes
+    // carries ColliderKind (the shapePair namespace), not ShapeType.
     void rebuildMeshKinds() {
         Index numMeshes = Scene<METAL, PR>::numMeshes;
         if (meshBehaviors.ptr && meshBehaviors.size == numMeshes) return;
@@ -276,7 +277,7 @@ struct SpatialHashing<METAL, PR> {
         auto& meshes = Scene<METAL, PR>::meshes;
         for (Index i = 0; i < numMeshes; ++i) {
             meshBehaviors[i] = (uint32_t)meshes[i].behaviorType;
-            meshShapes[i]    = (uint32_t)meshes[i].shapeType;
+            meshShapes[i]    = (uint32_t)meshes[i].colliderKind;
         }
     }
 
@@ -1169,7 +1170,7 @@ struct MultiLevelSpatialHashing<METAL, PR> {
         auto& meshes = Scene<METAL, PR>::meshes;
         for (Index i = 0; i < numMeshes; ++i) {
             meshBehaviors[i] = (uint32_t)meshes[i].behaviorType;
-            meshShapes[i]    = (uint32_t)meshes[i].shapeType;
+            meshShapes[i]    = (uint32_t)meshes[i].colliderKind;
         }
     }
 

@@ -1123,6 +1123,47 @@ void drawMeshInspectorWindow(MeshInspectorWindowState& st, const MeshInspectorTa
         }
     }
 
+    // ─── 충돌체 Collider (collider_pipeline_rework.md §1, P0) ────────────
+    // 형태 = 이 메시를 충돌 파이프라인이 어떤 도형으로 볼지(메시/구/박스/
+    // 실린더/평면). 생성 시 초기화자에서 기본값이 정해지고, 여기서 바꾼
+    // 값은 request에 미러링되어 re-pack(이동/회전/오브젝트 추가)을 견딘다.
+    if(t.collider_kind_index>=0){
+        if(AccordionHeader("충돌체","Collider")){
+            ImGui::Dummy({0,kP});ImGui::Indent(kP);
+            static const char* kKinds[5]={"메시 Mesh","구 Sphere","박스 Box","실린더 Cylinder","평면 Plane"};
+            const int ki=t.collider_kind_index>4?4:t.collider_kind_index;
+            ImGui::PushStyleColor(ImGuiCol_Text,kG60);ImGui::TextUnformatted("형태");ImGui::PopStyleColor();ImGui::Dummy({0,4});
+            ImGui::SetNextItemWidth(CW());
+            if(ImGui::BeginCombo("##ckind",kKinds[ki])){
+                for(int i=0;i<5;++i){
+                    bool sel=(i==ki);
+                    if(ImGui::Selectable(kKinds[i],sel)&&!sel&&t.on_collider_kind)
+                        t.on_collider_kind(t.mesh_id,i);
+                    if(sel)ImGui::SetItemDefaultFocus();
+                }
+                ImGui::EndCombo();
+            }
+            if(t.collidable){
+                ImGui::Dummy({0,12});
+                ImGui::PushStyleColor(ImGuiCol_Text,kG60);ImGui::TextUnformatted("충돌 대상");ImGui::PopStyleColor();
+                ImGui::SameLine(kP+CW()-42);
+                if(PillToggle("##ccol",t.collidable)&&t.on_collidable)t.on_collidable(t.mesh_id,*t.collidable);
+            }
+            if(t.self_collide){
+                ImGui::Dummy({0,12});
+                ImGui::PushStyleColor(ImGuiCol_Text,kG60);ImGui::TextUnformatted("자기 충돌");ImGui::PopStyleColor();
+                ImGui::SameLine(kP+CW()-42);
+                if(PillToggle("##cself",t.self_collide)&&t.on_self_collide)t.on_self_collide(t.mesh_id,*t.self_collide);
+                ImGui::Dummy({0,4});
+                ImGui::PushStyleColor(ImGuiCol_Text,kG40);
+                ImGui::PushTextWrapPos(ImGui::GetCursorPosX()+CW());
+                ImGui::TextUnformatted("아직 시뮬레이션에 반영되지 않음 (저장·복원만 됨)");
+                ImGui::PopTextWrapPos();ImGui::PopStyleColor();
+            }
+            ImGui::Unindent(kP);ImGui::Dummy({0,kP});
+        }
+    }
+
     // ─── 서브오브젝트 BVH Sub-object BVH (per-object; master in profiler) ──
     if(t.subobj_split_s&&t.subobj_render){
         if(AccordionHeader("서브오브젝트 BVH","Sub-object BVH")){

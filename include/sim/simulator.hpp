@@ -48,12 +48,20 @@ struct Simulator {
     // re-pack (PSOs + scratch buffers are allocated unconditionally).
     bool useSegmentedBVHQuery = false;
 
-    // Slice (c) A/B toggle. false (default) = ORIGINAL pipeline:
-    // spheres collide via the triangle-soup narrow_pt_tri exactly as
-    // before c-1 (narrow_pt_analytic not dispatched, no sphere gate).
-    // true = analytic sphere path. Flipped at runtime with the 'A'
-    // key for side-by-side comparison.
-    bool useAnalyticPrimitive = false;
+    // P1 (collider_pipeline_rework.md §5, decision 3): the analytic
+    // collider path has NO global toggle any more — it is selected
+    // per-object by GeneralMesh::colliderKind. It is live iff the BVH
+    // broad phase is running (only that path emits analytic markers) and
+    // the scene actually has an analytic collider; under SH / multi-level
+    // SH / the two-mesh experiment the colliders fall back to the
+    // triangle path with the skip gate OFF, so there are no contact
+    // holes. A/B comparison = set the object's collider to Mesh.
+    bool analyticColliderActive() const {
+        return !useSpatialHashing
+            && !useMultiLevelSH
+            && !collisionPipeline.broadPhase.twoMeshExperiment
+            && Scene<BE, PR>::numAnalytic > 0;
+    }
 
     // Substep-cadence knobs for the BVH collision path. 1 == today's
     // behavior (refit + broad + narrow every substep). i % period == 0
@@ -1790,7 +1798,7 @@ struct Simulator {
         // refit() covers per-mesh tree refit AND the SCENE-level rebuild
         // (BroadPhase::refit at src/main.cpp:3961 — single call covers both
         // levels).
-        collisionPipeline.broadPhase.refit();
+        collisionPipeline.broadPhase.refitIncludingAnalytic();
         // S1 refactor: translation is an in-place edit — it overwrites
         // existing pack memory (state.x / xPrev / preview) and refits
         // the BVH above. It does NOT change topology or buffer sizes, so
@@ -1860,7 +1868,7 @@ struct Simulator {
         mesh->rotationQuat = newAbs;
         // D-023: refit the BVH so click-pick reads the rotated pose
         // immediately, even on a paused sim before the next sim.update().
-        collisionPipeline.broadPhase.refit();
+        collisionPipeline.broadPhase.refitIncludingAnalytic();
         // D-025 / D-042 R-4 (2026-05-14): the pre-R-4 pattern
         // `pendingRotations[meshId] = newAbs;` is RETIRED here. R-4's
         // preview write-back above already lands the rotation in
@@ -1967,9 +1975,16 @@ struct Simulator {
                 }
             }
         }
+        // An analytic collider's half-extents are FITTED ONCE and cached
+        // (Scene::analyticLocalHalf), so unlike transformPosition/rotationQuat
+        // they do not follow this in-place edit on their own — drop the fit so
+        // the next refreshAnalyticShapes() re-measures it from the scaled
+        // geometry / the new mesh.scale. Without this a rescaled Sphere/Box/
+        // Cylinder collides at its ORIGINAL size (AC-11).
+        Scene<BE, PR>::invalidateAnalyticFit();
         // D-023 parity: refit the BVH so click-pick reads the new extent
         // immediately, even on a paused sim before the next sim.update().
-        collisionPipeline.broadPhase.refit();
+        collisionPipeline.broadPhase.refitIncludingAnalytic();
     }
 
     // ── Point-selection vertex ops ────────────────────────────────────
@@ -2288,7 +2303,7 @@ struct Simulator {
         for (auto& fv : req->fixedVertices)
             if (fv.vid == pvid) { fv.pos = newPos; break; }
 
-        collisionPipeline.broadPhase.refit();
+        collisionPipeline.broadPhase.refitIncludingAnalytic();
     }
 
     // S3-2: material is a pure in-place value overwrite — write the
@@ -2857,6 +2872,17 @@ struct Simulator {
         // motion. Inert — no consumer yet.
         Scene<BE, PR>::refreshAnalyticShapes();
 
+        // P2 (collider_pipeline_rework.md §5-P2): the broad phase drops the
+        // per-substep triangle-BVH work for analytic colliders exactly when
+        // the analytic narrow path is live, and bounds them from the shape
+        // params instead. `analyticInflate` mirrors the narrow gate band
+        // (narrowAndSortByVertices(radius, margin) → radius + thickness).
+        // Pushed HERE, ahead of the frame%10 build() below, so the TLAS
+        // input and the per-substep refit agree on where each analytic
+        // collider's box comes from.
+        collisionPipeline.broadPhase.analyticBroadSkip = analyticColliderActive();
+        collisionPipeline.broadPhase.analyticInflate   = radius + margin;
+
         // 진행 바 로직: 직전 실행에서 목표 프레임에 도달해 멈춰 있었다면,
         // 다시 재생을 누른 이 시점에서 frame 0으로 되돌린 뒤 진행한다.
         //
@@ -3200,9 +3226,9 @@ struct Simulator {
                             else if (bp.twoMeshExperiment)
                                 bp.detectCollisionsTwoMesh(margin, enableSelfCollisions);
                             else if (useSegmentedBVHQuery)
-                                bp.detectCollisionsSegmented(margin, enableSelfCollisions, useAnalyticPrimitive);
+                                bp.detectCollisionsSegmented(margin, enableSelfCollisions, analyticColliderActive());
                             else
-                                bp.detectCollisions(margin, enableSelfCollisions, useAnalyticPrimitive);
+                                bp.detectCollisions(margin, enableSelfCollisions, analyticColliderActive());
                         };
                         if (profiler) {
                             auto scope = profiler->scoped("broad_detect");
@@ -3236,19 +3262,19 @@ struct Simulator {
                     }
                 }
 
-                // Slice (c-2): the analytic narrow path is driven by broad
-                // markers that ONLY the BVH broad phase emits. Under the SH
-                // broad path no markers exist, so disable analytic there and
-                // let spheres fall back to the (correct) triangle-soup
-                // narrow_pt_tri path (skipSphere stays 0). BVH path = full
-                // analytic. Default broad is BVH, so the toggle behaves as
-                // expected in normal use.
+                // The analytic narrow path is driven by broad markers that
+                // ONLY the BVH broad phase emits. Under the SH / MLSH / two-
+                // mesh paths no markers exist, so analytic is off there and
+                // analytic colliders fall back to the (correct) triangle-soup
+                // narrow_pt_tri path with skipAnalytic == 0 — no contact
+                // holes. Default broad is BVH, so per-object colliderKind
+                // drives everything in normal use.
                 //
-                // Narrow runs EVERY substep on the held broad pair set,
-                // recomputing contact geometry from current positions → the
-                // response stays fresh/stable regardless of cdP.
-                const bool analyticNarrow =
-                    useAnalyticPrimitive && !useSpatialHashing && !useMultiLevelSH;
+                // Narrow runs EVERY substep on the held broad pair set (and
+                // the held analytic markers), recomputing contact geometry
+                // from current positions → the response stays fresh/stable
+                // regardless of cdP.
+                const bool analyticNarrow = analyticColliderActive();
                 if (profiler) {
                     auto scope = profiler->scoped("narrow_phase");
                     collisionPipeline.narrowPhase.narrowAndSortByVertices(radius, margin, analyticNarrow);
@@ -3841,9 +3867,15 @@ struct Simulator {
         }
         // Pinned-vertex constraints live on the request (source of
         // truth, survives pack). Match by id and copy onto the snapshot.
+        // The collider fields (§1 P0) are request-owned for the same
+        // reason, so they ride along in this pass instead of widening
+        // encodeOne's already-long parameter list.
         for (auto& o : s.objects) {
             for (auto& r : Scene<BE,PR>::requestsGeneralMeshes) {
                 if (r.id != o.id) continue;
+                o.colliderKind = colliderKindJson(r.colliderKind);
+                o.collidable   = r.collidable;
+                o.selfCollide  = r.selfCollide;
                 for (const auto& fv : r.fixedVertices) {
                     scene_format::FixedParticle f;
                     f.vid = (int)fv.vid;
@@ -4112,6 +4144,19 @@ struct Simulator {
                     Scene<BE,PR>::requestsGeneralMeshes[idx].isStatic     = o.isStatic;
                     Scene<BE,PR>::requestsGeneralMeshes[idx].clothStiffnessScale =
                         (PR)o.clothStiffnessScale;
+                    // Collider (§1 P0). addGeneralMesh already seeded the
+                    // initializer-derived default, so an absent (or
+                    // unrecognized) collider_kind must LEAVE IT ALONE —
+                    // that is the pre-P0 backward-compat path. collidable
+                    // / selfCollide carry the loader's own defaults
+                    // (true / false) when their keys are absent.
+                    {
+                        ColliderKind ck;
+                        if (colliderKindFromJson(o.colliderKind, ck))
+                            Scene<BE,PR>::requestsGeneralMeshes[idx].colliderKind = ck;
+                        Scene<BE,PR>::requestsGeneralMeshes[idx].collidable  = o.collidable;
+                        Scene<BE,PR>::requestsGeneralMeshes[idx].selfCollide = o.selfCollide;
+                    }
                     // Pinned-vertex constraints. Scene::pack re-applies
                     // these into constraints + state.x + preview, so the
                     // pin AND its location are restored on load.

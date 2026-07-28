@@ -81,6 +81,99 @@ void postInitPbdCloth(SimOf<BE, PR>& simulator) {
     std::cout << "[Main] --scene pbd_cloth: CPU PBD solver active\n";
 }
 
+// ---- P2 analytic-collider scenes (collider_pipeline_rework.md §5-P2) -----
+// One cloth dropped onto one analytic primitive, plus a "zoo" that drapes a
+// single sheet over three primitives standing on a Plane floor. The
+// primitives pick up their analytic colliderKind from their initializer
+// automatically (Sphere/Cube/Cylinder → Sphere/Box/Cylinder); only the grid
+// floor has to be retagged Plane, which postInit does — the same gesture the
+// inspector dropdown performs (request + live mesh, so it survives a repack).
+
+// Shared cloth knobs across the analytic scenes.
+template <typename PR>
+struct AnalyticSceneCloth {
+    static constexpr PR kstretch = PR(1e5);
+    static constexpr PR kshear   = PR(1e5);
+    static constexpr PR kbend    = PR(2e5);
+    static constexpr PR mass     = PR(0.1);
+    static constexpr PR thick    = PR(0.01);
+};
+
+// Retag one mesh's collider, writing BOTH the request (survives Scene::pack)
+// and the live mesh — the inspector's immediate-apply pattern.
+template <typename BE, typename PR>
+void setColliderKind(SimOf<BE, PR>& simulator, int meshId, ColliderKind kind) {
+    if (auto* r = simulator.findRequest(meshId)) r->colliderKind = kind;
+    if (auto* m = Scene<BE, PR>::findById(meshId)) m->colliderKind = kind;
+}
+
+// "analytic_sphere" / "_box" / "_cylinder": a 1 m sheet released 0.6 m above
+// a size-1.2 primitive centred at the origin. Moderate drop, no fixed
+// particles — the cloth drapes over the cap.
+template <typename BE, typename PR>
+void setupAnalyticSphere(SimOf<BE, PR>& simulator, SysOf<BE, PR>&) {
+    using C = AnalyticSceneCloth<PR>;
+    simulator.addSphere(tinym::vec3(0, 0, 0), 16, 1.2);              // id 0
+    simulator.addCloth(24, 1.0, tinym::vec3(0, 1.2, 0),
+                       C::kstretch, C::kshear, C::kbend, C::thick, C::mass);
+}
+
+template <typename BE, typename PR>
+void setupAnalyticBox(SimOf<BE, PR>& simulator, SysOf<BE, PR>&) {
+    using C = AnalyticSceneCloth<PR>;
+    simulator.addCube(tinym::vec3(0, 0, 0), 4, 1.2);                 // id 0
+    simulator.addCloth(24, 1.0, tinym::vec3(0, 1.2, 0),
+                       C::kstretch, C::kshear, C::kbend, C::thick, C::mass);
+}
+
+template <typename BE, typename PR>
+void setupAnalyticCylinder(SimOf<BE, PR>& simulator, SysOf<BE, PR>&) {
+    using C = AnalyticSceneCloth<PR>;
+    simulator.addCylinder(tinym::vec3(0, 0, 0), 24, 1.2);            // id 0
+    simulator.addCloth(24, 1.0, tinym::vec3(0, 1.2, 0),
+                       C::kstretch, C::kshear, C::kbend, C::thick, C::mass);
+}
+
+// "analytic_plane": a grid floor retagged Plane (infinite half-space, local
+// +Y up) + a 1.5 m sheet released 1 m above it. The grid's own extent is
+// irrelevant to collision after P2 — the broad phase never culls a Plane pair
+// on the source grid's AABB any more.
+template <typename BE, typename PR>
+void setupAnalyticPlane(SimOf<BE, PR>& simulator, SysOf<BE, PR>&) {
+    using C = AnalyticSceneCloth<PR>;
+    simulator.addGround(PlaneDirection::XZPlane, tinym::vec3(0, 0, 0), 6.0);  // id 0
+    simulator.addCloth(28, 1.5, tinym::vec3(0, 1.0, 0),
+                       C::kstretch, C::kshear, C::kbend, C::thick, C::mass);
+}
+
+template <typename BE, typename PR>
+void postInitAnalyticPlane(SimOf<BE, PR>& simulator) {
+    setColliderKind<BE, PR>(simulator, 0, ColliderKind::Plane);
+    std::cout << "[Main] --scene analytic_plane: mesh 0 retagged Plane collider\n";
+}
+
+// "analytic_zoo": one 4 m sheet draped over a sphere / box / cylinder standing
+// side by side on a Plane floor. Exercises three analytic kinds + the
+// half-space in the SAME broad phase, i.e. multiple markers per cloth per
+// substep and the D1 index invariant across four collider slots.
+template <typename BE, typename PR>
+void setupAnalyticZoo(SimOf<BE, PR>& simulator, SysOf<BE, PR>&) {
+    using C = AnalyticSceneCloth<PR>;
+    simulator.addGround(PlaneDirection::XZPlane, tinym::vec3(0, 0, 0), 8.0);  // id 0
+    simulator.addSphere  (tinym::vec3(-1.5, 0.5, 0), 16, 1.0);   // id 1
+    simulator.addCube    (tinym::vec3( 0.0, 0.5, 0),  4, 1.0);   // id 2
+    simulator.addCylinder(tinym::vec3( 1.5, 0.5, 0), 24, 1.0);   // id 3
+    simulator.addCloth(48, 4.0, tinym::vec3(0, 1.7, 0),
+                       C::kstretch, C::kshear, C::kbend, C::thick, C::mass);  // id 4
+}
+
+template <typename BE, typename PR>
+void postInitAnalyticZoo(SimOf<BE, PR>& simulator) {
+    setColliderKind<BE, PR>(simulator, 0, ColliderKind::Plane);
+    std::cout << "[Main] --scene analytic_zoo: floor retagged Plane; "
+                 "sphere/box/cylinder keep their initializer colliders\n";
+}
+
 template <typename BE, typename PR>
 struct Entry {
     const char* name;
@@ -99,6 +192,16 @@ inline const std::vector<Entry<BE, PR>>& registry() {
           &setupDemoUniform<BE, PR>, &postInitDemoUniform<BE, PR> },
         { "pbd_cloth", "demo_uniform geometry solved by the CPU PBD system",
           &setupPbdCloth<BE, PR>, &postInitPbdCloth<BE, PR> },
+        { "analytic_sphere", "cloth dropped on a Sphere analytic collider",
+          &setupAnalyticSphere<BE, PR>, nullptr },
+        { "analytic_box", "cloth dropped on a Box analytic collider",
+          &setupAnalyticBox<BE, PR>, nullptr },
+        { "analytic_cylinder", "cloth dropped on a Cylinder analytic collider",
+          &setupAnalyticCylinder<BE, PR>, nullptr },
+        { "analytic_plane", "cloth dropped on a Plane (infinite half-space) collider",
+          &setupAnalyticPlane<BE, PR>, &postInitAnalyticPlane<BE, PR> },
+        { "analytic_zoo", "one sheet draped over sphere+box+cylinder on a Plane floor",
+          &setupAnalyticZoo<BE, PR>, &postInitAnalyticZoo<BE, PR> },
     };
     return r;
 }

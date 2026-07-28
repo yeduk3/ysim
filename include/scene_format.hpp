@@ -94,6 +94,16 @@ struct Object {
     // "팽팽함" — uniform multiplier on simulated cloth stiffness.
     // Optional in JSON (default 1.0 for older snapshots / non-cloth).
     double clothStiffnessScale = 1.0;
+    // Per-object collider (docs/design/collider_pipeline_rework.md §1).
+    // colliderKind is stored by NAME — "mesh" | "sphere" | "box" |
+    // "cylinder" | "plane" — never by ordinal, so the enum can grow (a
+    // Convex kind is reserved). EMPTY means "absent from the JSON": the
+    // loader then keeps the kind the initializer implies, which is exactly
+    // what a pre-P0 scene wants. Written only when non-empty so those
+    // scenes stay byte-identical.
+    std::string colliderKind;
+    bool collidable = true;
+    bool selfCollide = false;
     // Point-selection panel constraints. Optional in JSON — older
     // snapshots simply have no pinned vertices.
     std::vector<FixedParticle> fixedParticles;
@@ -317,6 +327,12 @@ inline nlohmann::json toJson(const Object& o) {
     j["apply_wind"] = o.applyWind;
     j["is_static"] = o.isStatic;
     j["cloth_stiffness_scale"] = o.clothStiffnessScale;
+    // collider_kind is omitted when unset (mirrors transform.scale /
+    // fixed_particles) — an unset kind means "derive from the source", and
+    // writing "" would turn a valid absence into an invalid token.
+    if (!o.colliderKind.empty()) j["collider_kind"] = o.colliderKind;
+    j["collidable"] = o.collidable;
+    j["self_collide"] = o.selfCollide;
     if (!o.fixedParticles.empty()) {
         nlohmann::json fp = nlohmann::json::array();
         for (const auto& f : o.fixedParticles) {
@@ -544,6 +560,21 @@ inline Result<Object> objectFromJson(const nlohmann::json& j, int idx,
     if (auto it = j.find("cloth_stiffness_scale");
         it != j.end() && it->is_number()) {
         o.clothStiffnessScale = it->get<double>();
+    }
+    // Collider fields are all optional (backward compat with pre-P0
+    // snapshots). An absent collider_kind leaves the string empty, which
+    // the simulator reads as "keep the initializer-derived default".
+    // Unknown kind names are not rejected here — the simulator's
+    // colliderKindFromJson refuses them and falls back to the default,
+    // so a scene authored against a newer build still loads.
+    if (auto it = j.find("collider_kind"); it != j.end() && it->is_string()) {
+        o.colliderKind = it->get<std::string>();
+    }
+    if (auto it = j.find("collidable"); it != j.end() && it->is_boolean()) {
+        o.collidable = it->get<bool>();
+    }
+    if (auto it = j.find("self_collide"); it != j.end() && it->is_boolean()) {
+        o.selfCollide = it->get<bool>();
     }
     // fixed_particles is optional (backward compat). Malformed entries
     // are skipped rather than failing the whole load.

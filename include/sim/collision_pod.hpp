@@ -12,6 +12,31 @@ enum struct ShapeType : Index {
     Cylinder,
 };
 
+// Per-mesh collider representation (docs/design/collider_pipeline_rework.md
+// §1, phase P0). Distinct axis from ShapeType: ShapeType classifies the
+// mesh's SOURCE primitive (what the initializer built), colliderKind is
+// what the collision pipeline is asked to TREAT it as — the user can point
+// a Sphere-sourced mesh at Mesh collision, or declare an imported prop a
+// Box. The acceleration axis stays fixed in v1 (Mesh → BVH, self → SH), so
+// this enum carries geometry only.
+//
+// Plain sequential values, no bit packing: §6 reserves an appended Convex
+// slot (GJK/EPA or baked SDF) for arbitrary props, so the kind count must
+// stay free to grow. Persisted by NAME (colliderKindJson), never by
+// ordinal, so appending is schema-safe.
+//
+// P1: this IS the collision pipeline's shape identity. BVH::objCollider,
+// BroadCollision/NarrowCollision::shapePair and AnalyticShape::kind all
+// carry ColliderKind values (NOT ShapeType — the two numberings differ).
+// Keep the metal-side YSIM_COLLIDER_* defines in sync.
+enum struct ColliderKind : uint32_t {
+    Mesh = 0,   // triangle soup (BVH) — grid / imported file default
+    Sphere,     // analytic sphere / ellipsoid under non-uniform scale
+    Box,        // OBB
+    Cylinder,
+    Plane,      // infinite half-space, local +Y up (finite floor = Box)
+};
+
 // Picking mode. Object: id-buffer triangle pass → whole-mesh hover/
 // select + outline. Point: id-buffer GL_POINTS pass → per-vertex
 // hover/select with on-screen dots. Exactly one off-screen id pass
@@ -165,6 +190,51 @@ const char* shapeTypeName(ShapeType shapeType) {
     }
 }
 
+// P1 pipeline predicate: everything that is NOT a triangle soup goes
+// through the analytic narrow kernel (broad marker + skipAnalytic gate).
+// Single definition so the broad phase, the pack-time AnalyticShape
+// selection and the narrow dispatch can never disagree.
+inline bool isAnalyticCollider(ColliderKind kind) {
+    return kind != ColliderKind::Mesh;
+}
+
+// Display name (inspector combo / logs), mirroring shapeTypeName.
+inline const char* colliderKindName(ColliderKind kind) {
+    switch (kind) {
+        case ColliderKind::Mesh: return "Mesh";
+        case ColliderKind::Sphere: return "Sphere";
+        case ColliderKind::Box: return "Box";
+        case ColliderKind::Cylinder: return "Cylinder";
+        case ColliderKind::Plane: return "Plane";
+        default: return "Unknown";
+    }
+}
+
+// Persistence token (scene_format "collider_kind"). Lowercase, stable
+// across enum reorderings — the JSON never stores the ordinal.
+inline const char* colliderKindJson(ColliderKind kind) {
+    switch (kind) {
+        case ColliderKind::Mesh: return "mesh";
+        case ColliderKind::Sphere: return "sphere";
+        case ColliderKind::Box: return "box";
+        case ColliderKind::Cylinder: return "cylinder";
+        case ColliderKind::Plane: return "plane";
+        default: return "mesh";
+    }
+}
+
+// Parse a persistence token. Returns false for an unknown/empty token so
+// the caller keeps the initializer-derived default (backward compat: a
+// scene saved before P0 simply has no key).
+inline bool colliderKindFromJson(const std::string& name, ColliderKind& out) {
+    if (name == "mesh")     { out = ColliderKind::Mesh;     return true; }
+    if (name == "sphere")   { out = ColliderKind::Sphere;   return true; }
+    if (name == "box")      { out = ColliderKind::Box;      return true; }
+    if (name == "cylinder") { out = ColliderKind::Cylinder; return true; }
+    if (name == "plane")    { out = ColliderKind::Plane;    return true; }
+    return false;
+}
+
 struct alignas(32) BroadCollision {
     IndexPair indexPair;
     IndexPair objPair;
@@ -191,24 +261,34 @@ struct NarrowCollision {
     IndexPair shapePair;
 };
 
-// Slice (c) — per-primitive analytic collision descriptor. COMPACT
-// array (count = #primitive-shaped meshes, NOT numMeshes; A4): each
-// entry self-describes via objId. Allocated at Scene::pack, contents
-// refilled from the live mesh transform each frame (D3). GPU-visible;
-// vec4-packed so the future analytic narrow kernel reads it without
-// padding surprises. INERT in c-0 — allocated + filled, no consumer
-// kernel yet (c-1 adds it). `prevCenterPad` is reserved for the c-4
-// swept-CCD / Bullet-motion path; v1 is DCD (Q2) so it stays unused.
+// Per-collider analytic descriptor (collider_pipeline_rework.md P1).
+// COMPACT array (count = #meshes whose colliderKind != Mesh, NOT
+// numMeshes): each entry self-describes via objIndex. Allocated at
+// Scene::pack, contents refilled from the live mesh transform each
+// frame (D3). GPU-visible; vec4-packed so the analytic narrow kernel
+// reads it without padding surprises — MUST stay byte-identical to
+// AnalyticShape in src/metal/common_types.metalh.
+//
+// prevCenterPad.xyz / prevRotQuat carry the shape transform at the
+// START of the step the CCD segment spans (rolled forward by
+// Scene::refreshAnalyticShapes). The narrow kernel inverts that motion
+// into the vertex's segment — see collider_pipeline_rework.md §3 —
+// instead of building swept volumes.
 struct alignas(16) AnalyticShape {
     tinym::vec4 centerRadius;   // xyz = world center, w = radius (sphere/cyl)
-    tinym::vec4 halfExtHeight;  // xyz = OBB half-extents (cube), w = cyl half-height
-    tinym::vec4 rotQuat;        // world orientation (w,x,y,z) for OBB cube/cyl
-    tinym::vec4 prevCenterPad;  // xyz = prev center (reserved c-4 CCD); w = pad
-    uint32_t shapeType;         // ShapeType enum value
-    uint32_t objId;             // owning mesh id (debug / NarrowCollision.objPair)
-    uint32_t behaviorType;      // BehaviorType (cloth-vs-prim gate / future prim-prim)
+    tinym::vec4 halfExtHeight;  // xyz = half-extents (box/ellipsoid), w = cyl half-height
+    tinym::vec4 rotQuat;        // world orientation (w,x,y,z), local→world
+    tinym::vec4 prevCenterPad;  // xyz = prev-step center; w = pad
+    tinym::vec4 prevRotQuat;    // prev-step orientation (w,x,y,z)
+    uint32_t kind;              // ColliderKind enum value
+    uint32_t objIndex;          // owning mesh ARRAY INDEX — the objPair namespace (§4)
+    uint32_t behaviorType;      // BehaviorType (cloth-vs-collider gate / future rigid-rigid)
     uint32_t flags;             // bit0 = collidable
 };
+// 5 float4 + 4 uint, 16-aligned — the metal mirror must agree byte for byte
+// or the kernel reads garbage half-extents (silent wrong collisions).
+static_assert(sizeof(AnalyticShape) == 96, "AnalyticShape must match the metal mirror");
+static_assert(alignof(AnalyticShape) == 16, "AnalyticShape must stay 16-aligned");
 
 template <typename BE, typename PR>
 struct Constraints {

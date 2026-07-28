@@ -421,6 +421,62 @@ TEST_CASE("reference-point constraint is optional + omitted when empty") {
     std::remove(path.c_str());
 }
 
+// ---- Per-object collider (collider_pipeline_rework.md §1, P0) ---------
+
+TEST_CASE("collider fields round-trip + absent keys keep defaults") {
+    auto snap = makePopulatedSnapshot();
+    // Unset kind → key absent, so pre-P0 scenes keep their byte shape.
+    {
+        nlohmann::json j = toJson(snap);
+        CHECK_FALSE(j["objects"][0].contains("collider_kind"));
+        CHECK(j["objects"][0]["collidable"] == true);
+        CHECK(j["objects"][0]["self_collide"] == false);
+    }
+    snap.objects[0].colliderKind = "plane";
+    snap.objects[0].collidable = false;
+    snap.objects[0].selfCollide = true;
+    snap.objects[1].colliderKind = "box";
+
+    auto path = tempPath("collider");
+    REQUIRE(writeToFile(snap, path));
+    auto r = readFromFile(path);
+    REQUIRE(r.ok);
+    CHECK(r.value.objects[0].colliderKind == "plane");
+    CHECK(r.value.objects[0].collidable == false);
+    CHECK(r.value.objects[0].selfCollide == true);
+    CHECK(r.value.objects[1].colliderKind == "box");
+    // Object 1 never touched the flags → loader defaults.
+    CHECK(r.value.objects[1].collidable == true);
+    CHECK(r.value.objects[1].selfCollide == false);
+    // save → load → save byte identity.
+    CHECK(toString(snap) == toString(r.value));
+    std::remove(path.c_str());
+}
+
+TEST_CASE("pre-collider scene loads with collider defaults") {
+    // A snapshot with no collider keys at all (the pre-P0 shape) must load
+    // as: kind unset (= "derive from the source"), collidable, no self.
+    auto path = tempPath("collider_absent");
+    REQUIRE(writeText(path, R"({
+      "format_version": 1,
+      "objects": [{
+        "id": 0, "name": "o",
+        "source": {"type":"primitive","shape":"sphere","size":1.0,"tessellation":8},
+        "transform": {"position":[0,0,0],"rotation":[1,0,0,0]},
+        "material": {"base_color":[1,1,1],"metallic":0,"roughness":0.5,
+                     "specular_weight":1,"emission_color":[0,0,0]},
+        "behavior": {"type":"Float"}
+      }]
+    })"));
+    auto r = readFromFile(path);
+    REQUIRE(r.ok);
+    REQUIRE(r.value.objects.size() == 1);
+    CHECK(r.value.objects[0].colliderKind.empty());
+    CHECK(r.value.objects[0].collidable == true);
+    CHECK(r.value.objects[0].selfCollide == false);
+    std::remove(path.c_str());
+}
+
 TEST_CASE("BDD-011/012: missing environment falls back to schema defaults") {
     auto path = tempPath("envdef");
     REQUIRE(writeText(path, R"({"format_version": 1, "objects": []})"));

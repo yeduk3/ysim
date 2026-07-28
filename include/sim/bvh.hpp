@@ -347,7 +347,11 @@ struct BVH<BE, PR, BVHMODE::LINEAR, PRIMITIVE> {
     bool staticCombined = false;
     BehaviorType objBehavior;
     VectorBase<METAL, BehaviorType> objBehaviors;
-    ShapeType objShape;
+    // P1: the COLLISION identity of this object (collider_pipeline_rework.md
+    // decision 1) — not the initializer's ShapeType. This is what the broad
+    // phase branches on and what lands in BroadCollision::shapePair, so
+    // every downstream shape comparison is in the ColliderKind namespace.
+    ColliderKind objCollider;
     VectorBase<METAL, ShapeType> objShapes;
 
     MTL::ComputePipelineState* fillMortonsPSO;
@@ -1194,18 +1198,18 @@ struct BVH<BE, PR, BVHMODE::LINEAR, PRIMITIVE> {
         auto* mesh = Scene<METAL, PR>::findById(objid);
         positions = pos;
         primitives = prim;
-        objShape = ShapeType::Mesh;
+        objCollider = ColliderKind::Mesh;
         if(mesh) {
             velocities = mesh->state.v;
             objBehavior = mesh->behaviorType;
             objStatic = mesh->isStatic;
             staticCombined = false;   // fresh GPU-combined tree → needs one CPU correction if static
             builtForLifetimeId = mesh->lifetimeId;  // D-026
-            // Slice (c-2): cache the authored primitive type so the broad
-            // phase can recognize spheres and route them to the analytic
-            // narrow path (skip triangle-BVH descent) instead of always
-            // treating every object as a triangle soup.
-            objShape = mesh->shapeType;
+            // P1: cache the per-mesh COLLIDER kind so the broad phase can
+            // route any analytic collider (Sphere/Box/Cylinder/Plane) to
+            // the analytic narrow path — skipping the triangle-BVH descent
+            // — instead of always treating every object as a triangle soup.
+            objCollider = mesh->colliderKind;
         }
         //std::cout << "[BVH Build] positions and primitives are assigned" << std::endl;
         Index numPrimitives = primitives.size/PRIMITIVE;
@@ -1820,7 +1824,7 @@ struct BVH<BE, PR, BVHMODE::LINEAR, PRIMITIVE> {
         }
         QueryPointsParams qParams = {
             queryMargin, qnumPoints, qIndex, (Index)objIndex, packedCol.maxNumCollisions,
-            (Index)qmesh.behaviorType, (Index)objBehavior, (Index)qmesh.shapeType, (Index)objShape,
+            (Index)qmesh.behaviorType, (Index)objBehavior, (Index)qmesh.colliderKind, (Index)objCollider,
             (uint32_t)tree.size,
             0u   // single-root: enter at slot 0
         };
@@ -1927,7 +1931,7 @@ struct BVH<BE, PR, BVHMODE::LINEAR, PRIMITIVE> {
             queryMargin, numPairs, (Index)qIndex, (Index)objIndex,
             packedCol.maxNumCollisions,
             (Index)qmesh.behaviorType, (Index)objBehavior,
-            (Index)qmesh.shapeType, (Index)objShape,
+            (Index)qmesh.colliderKind, (Index)objCollider,
             (uint32_t)tree.size, 0u  // entryRoot unused (per-pair)
         };
         MetalGlobalContext::setBuffer(qpos, 0);
@@ -1963,7 +1967,7 @@ struct BVH<BE, PR, BVHMODE::LINEAR, PRIMITIVE> {
             queryMargin, numPairs, (Index)qIndex, (Index)objIndex,
             packedCol.maxNumCollisions,
             (Index)qmesh.behaviorType, (Index)objBehavior,
-            (Index)qmesh.shapeType, (Index)objShape,
+            (Index)qmesh.colliderKind, (Index)objCollider,
             (uint32_t)tree.size, 0u
         };
         MetalGlobalContext::setBuffer(qpos, 0);
@@ -2008,7 +2012,7 @@ struct BVH<BE, PR, BVHMODE::LINEAR, PRIMITIVE> {
         QueryPointsParams qParams = {
             queryMargin, count, (Index)qIndex, (Index)objIndex, packedCol.maxNumCollisions,
             (Index)qmesh.behaviorType, (Index)objBehavior,
-            (Index)qmesh.shapeType, (Index)objShape, (uint32_t)tree.size, 0u };
+            (Index)qmesh.colliderKind, (Index)objCollider, (uint32_t)tree.size, 0u };
         MetalGlobalContext::setBuffer(qpos, 0);
         MetalGlobalContext::setBuffer(primitives, 1);
         MetalGlobalContext::setBuffer(tree, 2);
@@ -2034,7 +2038,7 @@ struct BVH<BE, PR, BVHMODE::LINEAR, PRIMITIVE> {
         QueryPointsParams qParams = {
             queryMargin, maxThreads, (Index)qIndex, (Index)objIndex, packedCol.maxNumCollisions,
             (Index)qmesh.behaviorType, (Index)objBehavior,
-            (Index)qmesh.shapeType, (Index)objShape, (uint32_t)tree.size, 0u };
+            (Index)qmesh.colliderKind, (Index)objCollider, (uint32_t)tree.size, 0u };
         MetalGlobalContext::setBuffer(qpos, 0);
         MetalGlobalContext::setBuffer(primitives, 1);
         MetalGlobalContext::setBuffer(tree, 2);
@@ -2064,7 +2068,7 @@ struct BVH<BE, PR, BVHMODE::LINEAR, PRIMITIVE> {
             queryMargin, (uint32_t)qnumPoints, (Index)qIndex, (Index)objIndex,
             packedCol.maxNumCollisions,
             (Index)qmesh.behaviorType, (Index)objBehavior,
-            (Index)qmesh.shapeType, (Index)objShape,
+            (Index)qmesh.colliderKind, (Index)objCollider,
             (uint32_t)tree.size, (uint32_t)numGroups  // entryRoot repurposed = group count
         };
         MetalGlobalContext::setBuffer(qpos, 0);
@@ -2157,7 +2161,7 @@ struct BVH<BE, PR, BVHMODE::LINEAR, PRIMITIVE> {
             (uint32_t)qIndex, (uint32_t)objIndex,
             perTGCap,
             (uint32_t)qmesh.behaviorType, (uint32_t)objBehavior,
-            (uint32_t)qmesh.shapeType,    (uint32_t)objShape,
+            (uint32_t)qmesh.colliderKind, (uint32_t)objCollider,
             (uint32_t)tree.size,
             0u   // single-root: enter at slot 0
         };
@@ -2381,6 +2385,152 @@ struct BVH<BE, PR, BVHMODE::SCENE, BVHPRIMITIVE::OBJECT> {
     // true ⇒ historical per-section-sync behavior.
     bool syncEachPhase = true;
 
+    // P2 (collider_pipeline_rework.md §5-P2, decision D1): when true, a mesh
+    // whose colliderKind is analytic gets NO per-substep triangle-BVH work
+    // (refit / enlargeTrajectory / refitSwept) and its object-level AABB is
+    // computed from the SHAPE PARAMS instead of the tree. Set per frame by
+    // Simulator::update from analyticColliderActive(), so it is on exactly
+    // when the broad phase emits analytic markers — under SH / ML-SH / the
+    // two-mesh experiment the colliders fall back to the triangle path and
+    // therefore still need their trees refit (member stays false).
+    //
+    // Deliberately NOT applied to build(): objTrees[i] is what
+    // BroadPhase::queryClickRay and showBox() read, and Simulator rebuilds
+    // every 10 frames precisely for them ("BVH is always rebuilt — click-ray
+    // and showBox/showSceneBox use it"). Production picking uses the GL
+    // id-buffer pass, but the harness ray-picks primitives through
+    // queryClickRay (BDD-017 uses two cubes = Box colliders), so the built
+    // tree stays. Colliders are rigid, so a tree refreshed every 10 frames is
+    // exact for them; the per-substep refit is the pure waste P2 removes.
+    bool analyticBroadSkip = false;
+    // Broad-side inflation band for the analytic swept AABB: radius +
+    // thickness, matching what narrow_pt_analytic gates on. Pushed by
+    // Simulator::update (radius + margin) like syncEachPhase.
+    PR analyticInflate = PR(0.03);
+
+    // ---- P2/T2: analytic object-level AABB (no triangle BVH involved) ----
+
+    // Compact AnalyticShape slot owning mesh ARRAY INDEX `objIndex`, or
+    // nullptr. numAnalytic is tiny (a handful of props), so a linear scan
+    // beats a map — same idiom as BruteForce::narrowAnalytic.
+    static const AnalyticShape* analyticShapeOf(Index objIndex) {
+        if (Scene<METAL, PR>::numAnalytic == 0
+            || !Scene<METAL, PR>::meshAnalytic.ptr) return nullptr;
+        for (Index k = 0; k < Scene<METAL, PR>::numAnalytic; ++k)
+            if (Scene<METAL, PR>::meshAnalytic[k].objIndex == (uint32_t)objIndex)
+                return &Scene<METAL, PR>::meshAnalytic[k];
+        return nullptr;
+    }
+
+    // World half-extents of the collider's bounding box at orientation `qv`
+    // (AnalyticShape quat layout: (w, x, y, z) in .x/.y/.z/.w).
+    //   Sphere/Ellipsoid — conservative isotropic bound (max semi-axis), so
+    //                      the box is rotation-invariant and never too small.
+    //   Box              — exact OBB→AABB via the |R|·h trick.
+    //   Cylinder         — the OBB (r, halfHeight, r) through the same trick.
+    static tinym::vec3 analyticWorldHalf(const AnalyticShape& s,
+                                         const tinym::vec4& qv) {
+        tinym::vec3 h(0.0f, 0.0f, 0.0f);
+        switch ((ColliderKind)s.kind) {
+            case ColliderKind::Sphere: {
+                const float r = std::max(std::max(s.halfExtHeight.x,
+                                                  s.halfExtHeight.y),
+                                         s.halfExtHeight.z);
+                return tinym::vec3(r, r, r);   // rotation-invariant bound
+            }
+            case ColliderKind::Box:
+                h = tinym::vec3(s.halfExtHeight.x, s.halfExtHeight.y,
+                                s.halfExtHeight.z);
+                break;
+            case ColliderKind::Cylinder:
+                h = tinym::vec3(s.centerRadius.w, s.halfExtHeight.w,
+                                s.centerRadius.w);
+                break;
+            default:
+                return h;   // Plane / Mesh: no finite extent (handled above)
+        }
+        Quat q; q.w = qv.x; q.x = qv.y; q.y = qv.z; q.z = qv.w;
+        const tinym::vec3 cx = rotateVector(q, tinym::vec3(1.0f, 0.0f, 0.0f));
+        const tinym::vec3 cy = rotateVector(q, tinym::vec3(0.0f, 1.0f, 0.0f));
+        const tinym::vec3 cz = rotateVector(q, tinym::vec3(0.0f, 0.0f, 1.0f));
+        return tinym::vec3(
+            std::fabs(cx.x)*h.x + std::fabs(cy.x)*h.y + std::fabs(cz.x)*h.z,
+            std::fabs(cx.y)*h.x + std::fabs(cy.y)*h.y + std::fabs(cz.y)*h.z,
+            std::fabs(cx.z)*h.x + std::fabs(cy.z)*h.y + std::fabs(cz.z)*h.z);
+    }
+
+    // Rotation-linearization band (§3): ‖Δθ‖ · r_max between the prev and
+    // current orientations. Mirrors BruteForce::analyticRotMargin's intent
+    // on the broad side; 0 for a non-rotating collider.
+    static float analyticRotBand(const AnalyticShape& s) {
+        const tinym::vec4& a = s.rotQuat;
+        const tinym::vec4& b = s.prevRotQuat;
+        double dot = (double)a.x*b.x + (double)a.y*b.y
+                   + (double)a.z*b.z + (double)a.w*b.w;
+        dot = std::fabs(dot);
+        if (dot > 1.0) dot = 1.0;
+        const double theta = 2.0 * std::acos(dot);
+        if (theta <= 0.0) return 0.0f;
+        const double rMax = std::sqrt(
+            (double)s.halfExtHeight.x*s.halfExtHeight.x
+          + (double)s.halfExtHeight.y*s.halfExtHeight.y
+          + (double)s.halfExtHeight.z*s.halfExtHeight.z)
+          + (double)s.centerRadius.w;
+        return (float)(theta * rMax);
+    }
+
+    // Object-level broad AABB for mesh index `i`.
+    //
+    // Returns FALSE when the object has no finite bounding box — i.e. a
+    // Plane collider, which is an infinite half-space (§1). Callers must
+    // then treat every pair involving it as OVERLAPPING; `out` is filled
+    // with a degenerate point box at the collider origin so the scene TLAS
+    // input stays finite/well-formed (the TLAS is display/click-ray only —
+    // the broad pair test below is a direct pairwise overlap).
+    //
+    // Otherwise: the analytic swept box AABB(prev pose) ∪ AABB(cur pose)
+    // inflated by (radius + thickness + rotation margin), or — for a Mesh
+    // collider, or whenever the broad skip is off — the tree's root AABB.
+    bool objectBroadAABB(Index i, AABB4& out) {
+        const AnalyticShape* s =
+            (analyticBroadSkip && i < (Index)objTrees.size()
+             && isAnalyticCollider(objTrees[i].objCollider))
+            ? analyticShapeOf(i) : nullptr;
+        if (!s) { out = objTrees[i].objectRootAABB(); return true; }
+
+        const tinym::vec3 c(s->centerRadius.x, s->centerRadius.y,
+                            s->centerRadius.z);
+        if ((ColliderKind)s->kind == ColliderKind::Plane) {
+            out.min = c; out.max = c; out.i0 = 0; out.i1 = 0;
+            return false;   // infinite half-space: no finite box exists
+        }
+        const tinym::vec3 p(s->prevCenterPad.x, s->prevCenterPad.y,
+                            s->prevCenterPad.z);
+        const tinym::vec3 hc = analyticWorldHalf(*s, s->rotQuat);
+        const tinym::vec3 hp = analyticWorldHalf(*s, s->prevRotQuat);
+        const float pad = (float)analyticInflate + analyticRotBand(*s);
+        const tinym::vec3 padv(pad, pad, pad);
+        out.min = tinym::min(c - hc, p - hp) - padv;
+        out.max = tinym::max(c + hc, p + hp) + padv;
+        out.i0  = 0; out.i1 = 0;
+        return true;
+    }
+
+    // P2/T1 predicate: this mesh's triangle BVH is dead this frame.
+    bool analyticSkip(Index i) const {
+        return analyticBroadSkip && i < (Index)objTrees.size()
+            && isAnalyticCollider(objTrees[i].objCollider);
+    }
+
+    // P2/T3: `collidable == false` drops the mesh from the BVH broad phase
+    // entirely — as query, as target, and as a self-collision source. The
+    // analytic side keeps its own gate (AnalyticShape::flags bit0), so a
+    // marker that somehow survives still no-ops in the kernel.
+    static bool objCollidable(Index i) {
+        auto& ms = Scene<METAL, PR>::meshes;
+        return i < (Index)ms.size() ? ms[i].collidable : true;
+    }
+
     //BVH(SceneObject<METAL, PR>& scene)
     //    : objTrees(scene.numMeshes), positions(scene.numMeshes*3), indices(scene.numMeshes*2) {}
 
@@ -2422,7 +2572,7 @@ struct BVH<BE, PR, BVHMODE::SCENE, BVHPRIMITIVE::OBJECT> {
             if (validateSubObject && objTrees[i].subObjectActive())
                 objTrees[i].validateSubObjectBVH();
             Index pbase = i*6;
-            AABB4 objBox = objTrees[i].objectRootAABB();
+            AABB4 objBox; objectBroadAABB(i, objBox);   // P2/T2 for analytic
             positions[pbase  ] = objBox.min.x;
             positions[pbase+1] = objBox.min.y;
             positions[pbase+2] = objBox.min.z;
@@ -2466,6 +2616,15 @@ struct BVH<BE, PR, BVHMODE::SCENE, BVHPRIMITIVE::OBJECT> {
         // N round-trips into one. Static objects reuse the cached tree (one CPU
         // correction via combineStaticOnce, which syncs itself).
         for(Index i = 0; i < objTrees.size(); ++i) {
+            // P2/T1: an analytic collider's triangle BVH is never descended
+            // (the broad phase emits a marker instead), so refitting it is
+            // pure waste. Skip the whole per-substep tree pass; the object
+            // AABB comes from the shape params in Pass 2. The slot is NOT
+            // compacted and the tree is NOT freed (D1) — array index ==
+            // objPair == statesOffsets subscript must keep holding, and
+            // build() keeps the tree valid for click-ray. combineStaticOnce
+            // is skipped with it: nothing reads this tree's AABBs any more.
+            if (analyticSkip(i)) continue;
             // Static 메시는 리프 AABB가 불변 → 무거운 GPU refit을 건너뛰고
             // build() 때 쓴 캐시 트리/positions를 그대로 재사용한다. TLAS
             // (tree.build 아래)에는 계속 참여 → 충돌 타깃으로 유효.
@@ -2497,7 +2656,7 @@ struct BVH<BE, PR, BVHMODE::SCENE, BVHPRIMITIVE::OBJECT> {
         if (!twoMeshExperiment) {
         for(Index i = 0; i < objTrees.size(); ++i) {
             Index pbase = i*6;
-            AABB4 objBox = objTrees[i].objectRootAABB();
+            AABB4 objBox; objectBroadAABB(i, objBox);   // P2/T2 for analytic
             positions[pbase  ] = objBox.min.x;
             positions[pbase+1] = objBox.min.y;
             positions[pbase+2] = objBox.min.z;
@@ -2525,6 +2684,8 @@ struct BVH<BE, PR, BVHMODE::SCENE, BVHPRIMITIVE::OBJECT> {
         static const bool gpuEnlarge = std::getenv("YSIM_GPU_ENLARGE") != nullptr;
         bool needSync = gpuEnlarge;   // GPU path syncs even when non-grouped
         for(Index i = 0; i < objTrees.size(); ++i) {
+            // P2/T1: analytic collider ⇒ dead triangle BVH, skip (see refit).
+            if (analyticSkip(i)) continue;
             // Static 메시는 속도 0 → 궤적 확장이 no-op이므로 GPU dispatch 생략.
             if (!objTrees[i].objStatic) {
                 objTrees[i].useAgglomerative = useAgglomerative;
@@ -2549,7 +2710,7 @@ struct BVH<BE, PR, BVHMODE::SCENE, BVHPRIMITIVE::OBJECT> {
         if (!twoMeshExperiment) {
         for(Index i = 0; i < objTrees.size(); ++i) {
             Index pbase = i*6;
-            AABB4 objBox = objTrees[i].objectRootAABB();
+            AABB4 objBox; objectBroadAABB(i, objBox);   // P2/T2 for analytic
             positions[pbase  ] = objBox.min.x;
             positions[pbase+1] = objBox.min.y;
             positions[pbase+2] = objBox.min.z;
@@ -2566,6 +2727,19 @@ struct BVH<BE, PR, BVHMODE::SCENE, BVHPRIMITIVE::OBJECT> {
         }
     }
 
+    // Authoring-path refit (D-023): ALSO refreshes the analytic colliders'
+    // triangle trees, which the per-substep refit() skips (P2/T1). Those
+    // trees are what BroadPhase::queryClickRay and showBox() read, so an
+    // inspector translate / rotate / scale must not leave a Sphere or Cube
+    // collider's tree parked on the old pose — FR-003 / FR-004 assert exactly
+    // that. Rare (one call per edit), so the extra refit costs nothing.
+    void refitIncludingAnalytic() {
+        const bool saved = analyticBroadSkip;
+        analyticBroadSkip = false;
+        refit();
+        analyticBroadSkip = saved;
+    }
+
     // Fused refit+enlarge (NEW, parallel to refit()+enlargeTrajectory()). One
     // per-tree swept pass that both refits AND inflates by velocity, then one
     // TLAS build — replacing the two-pass sequence's two objTree passes + two
@@ -2579,8 +2753,14 @@ struct BVH<BE, PR, BVHMODE::SCENE, BVHPRIMITIVE::OBJECT> {
             return;
         }
         for(Index i = 0; i < objTrees.size(); ++i) {
+            // P2/T1: analytic collider ⇒ dead triangle BVH, skip the swept
+            // pass (see refit). NOT a `continue` — this loop also writes the
+            // TLAS input below, which the analytic path still needs.
+            const bool anaSkip = analyticSkip(i);
             // Static 메시: swept refit+enlarge 전체 생략 (AABB 불변, 속도 0).
-            if (!objTrees[i].objStatic) {
+            if (anaSkip) {
+                // nothing to refit
+            } else if (!objTrees[i].objStatic) {
                 objTrees[i].useAgglomerative = useAgglomerative;
                 objTrees[i].useSubObjectBVH = useSubObjectBVH;
                 objTrees[i].subTopMode = subTopMode;
@@ -2607,7 +2787,7 @@ struct BVH<BE, PR, BVHMODE::SCENE, BVHPRIMITIVE::OBJECT> {
             // frame%10 build() still constructs it for click-ray.
             if (!twoMeshExperiment && syncEachPhase) {
             Index pbase = i*6;
-            AABB4 objBox = objTrees[i].objectRootAABB();
+            AABB4 objBox; objectBroadAABB(i, objBox);   // P2/T2 for analytic
             positions[pbase  ] = objBox.min.x;
             positions[pbase+1] = objBox.min.y;
             positions[pbase+2] = objBox.min.z;
@@ -2626,9 +2806,12 @@ struct BVH<BE, PR, BVHMODE::SCENE, BVHPRIMITIVE::OBJECT> {
     }
 
     void checkSelfCollisions(PR margin) {
-        for(auto& tree : objTrees) {
+        for(Index i = 0; i < objTrees.size(); ++i) {
+            auto& tree = objTrees[i];
             if(tree.objBehavior == BehaviorType::Float
             || tree.objBehavior == BehaviorType::Kinematic) continue;
+            if(!objCollidable(i)) continue;   // P2/T3
+            if(analyticSkip(i)) continue;     // P2/T1: no live tree to query
             tree.checkSelfCollisions(margin);
         }
     }
@@ -2660,7 +2843,7 @@ struct BVH<BE, PR, BVHMODE::SCENE, BVHPRIMITIVE::OBJECT> {
         // Push the sync tier so grouped queries pick GPU-brute off InFrame.
         for (auto& tr : objTrees) tr.syncEachPhase = syncEachPhase;
         // Slice (c-2): fresh analytic markers each broad detect.
-        Scene<METAL, PR>::packedCollisionData.analyticPairs.clear();
+        Scene<METAL, PR>::packedCollisionData.beginAnalyticPairs();
 
         // Bidirectional registration. The old `std::set<IndexPair> checked`
         // deduped on the SORTED pair {min,max}, so a colliding pair {A,B}
@@ -2679,13 +2862,18 @@ struct BVH<BE, PR, BVHMODE::SCENE, BVHPRIMITIVE::OBJECT> {
             auto& queryTree = objTrees[q];
             if(queryTree.objBehavior == BehaviorType::Float
             || queryTree.objBehavior == BehaviorType::Kinematic) continue;
+            // P2/T3: collidable == false leaves the broad phase entirely —
+            // as query, as target, and as a self-collision source.
+            if(!objCollidable(q)) continue;
 
             for(Index t = 0; t < objTrees.size(); ++t) {
                 if(q == t) {
                     if(!enableSelfCollisions) continue;
+                    if(analyticSkip(q)) continue;   // P2/T1: no live tree
                     queryTree.checkSelfCollisions(margin);
                     continue;
                 }
+                if(!objCollidable(t)) continue;   // P2/T3
                 // Phase 2: union of k group roots, not slot 0 (= group 0
                 // only), else multi-root objects under-cull and miss pairs.
                 // None/PerFrame (!syncEachPhase) skip this CPU cull —
@@ -2694,32 +2882,42 @@ struct BVH<BE, PR, BVHMODE::SCENE, BVHPRIMITIVE::OBJECT> {
                 // node internally, so always dispatch.
                 bool hit = true;
                 if (syncEachPhase) {
-                    AABB4 qa = queryTree.objectRootAABB();
-                    AABB4 ta = objTrees[t].objectRootAABB();
-                    hit = ta.intersect(qa);
+                    // P2/T2: an analytic collider's box comes from the shape
+                    // params (its triangle BVH is dead). A Plane returns
+                    // false = "infinite half-space, no finite box" and the
+                    // pair is then ALWAYS treated as overlapping — one cheap
+                    // analytic dispatch per cloth per substep, and the fix
+                    // for P1's "Plane only acts where the source grid's AABB
+                    // reaches".
+                    AABB4 qa, ta;
+                    const bool qFinite = objectBroadAABB(q, qa);
+                    const bool tFinite = objectBroadAABB(t, ta);
+                    hit = (!qFinite || !tFinite) ? true : ta.intersect(qa);
                 }
                 if(hit) {
-                    // Slice (c-2): when the analytic toggle is on and either
-                    // side is a Sphere, DON'T descend the sphere's triangle
-                    // BVH (queryPoints) — that traversal + the vertex×triangle
+                    // P1 (decision 2): when EITHER side is an analytic
+                    // collider (colliderKind != Mesh), DON'T descend its
+                    // triangle BVH — that traversal + the vertex×triangle
                     // BroadCollisions it emits are pure waste because
-                    // narrow_pt_tri skips every sphere pair anyway (skipSphere).
-                    // Instead record one analytic marker, but only for the
-                    // (cloth query → sphere target) direction: the reciprocal
-                    // ordered visit (sphere q → cloth t) is the SAME object
-                    // pair, so marking once avoids a double dispatch. sphere→
-                    // sphere and sphere→cloth visits just skip (matching the
-                    // old both-direction skipSphere drop). Cube/Cylinder still
-                    // use triangle soup until c-3, so only Sphere is gated.
+                    // narrow_pt_tri drops every analytic row anyway
+                    // (skipAnalytic). Instead record one analytic marker, and
+                    // only for the (cloth query → analytic target) direction:
+                    // the reciprocal ordered visit (analytic q → cloth t) is
+                    // the SAME object pair, so marking once avoids a double
+                    // dispatch. analytic→analytic is dropped outright (§2:
+                    // Bullet owns rigid↔rigid).
+                    //
+                    // §4: BOTH marker fields are ARRAY INDICES (q, t), the
+                    // same namespace queryPoints puts in objPair.
                     if (analyticEnabled
-                        && (objTrees[t].objShape == ShapeType::Sphere
-                         || queryTree.objShape   == ShapeType::Sphere)) {
+                        && (isAnalyticCollider(objTrees[t].objCollider)
+                         || isAnalyticCollider(queryTree.objCollider))) {
                         bool qCloth =
                             queryTree.objBehavior == BehaviorType::TriangularCloth
                          || queryTree.objBehavior == BehaviorType::FastGridCloth;
-                        if (objTrees[t].objShape == ShapeType::Sphere && qCloth)
-                            Scene<METAL, PR>::packedCollisionData.analyticPairs
-                                .push_back({ q, (Index)objTrees[t].objid });
+                        if (isAnalyticCollider(objTrees[t].objCollider) && qCloth)
+                            Scene<METAL, PR>::packedCollisionData
+                                .pushAnalyticPair(q, t);
                     } else {
                         // D-041 turn-3: pass query INDEX (q, not queryTree.objid)
                         // so broadCollisions.objPair stores indices that the
@@ -2730,6 +2928,9 @@ struct BVH<BE, PR, BVHMODE::SCENE, BVHPRIMITIVE::OBJECT> {
                 }
             }
         }
+        // Publish the deduped fresh-union-held analytic marker set
+        // (PackedCollisionData::endAnalyticPairs explains the carry-over).
+        Scene<METAL, PR>::packedCollisionData.endAnalyticPairs();
         queryEnd();
     }
 
@@ -2742,48 +2943,54 @@ struct BVH<BE, PR, BVHMODE::SCENE, BVHPRIMITIVE::OBJECT> {
                                    bool analyticEnabled=false) {
         queryBegin();
         // Slice (c-2): fresh analytic markers each broad detect.
-        Scene<METAL, PR>::packedCollisionData.analyticPairs.clear();
+        Scene<METAL, PR>::packedCollisionData.beginAnalyticPairs();
 
         std::set<IndexPair> checked;
         for(Index q = 0; q < objTrees.size(); ++q) {
             auto& queryTree = objTrees[q];
             if(queryTree.objBehavior == BehaviorType::Float
             || queryTree.objBehavior == BehaviorType::Kinematic) continue;
+            if(!objCollidable(q)) continue;   // P2/T3
 
             for(Index t = 0; t < objTrees.size(); ++t) {
                 Index a = std::min(q, t);
                 Index b = std::max(q, t);
                 if(q == t) {
                     if(!enableSelfCollisions) continue;
+                    if(analyticSkip(q)) continue;   // P2/T1: no live tree
                     queryTree.checkSelfCollisionsSegmented(margin);
                     checked.insert({a, b});
                     continue;
                 }
+                if(!objCollidable(t)) continue;   // P2/T3
                 if(checked.find({a, b}) != checked.end()) continue;
                 // Phase 2: union of k group roots (see detectCollisions).
-                AABB4 qa = queryTree.objectRootAABB();
-                AABB4 ta = objTrees[t].objectRootAABB();
-                if(ta.intersect(qa)) {
-                    // Slice (c-2): mirror detectCollisions — skip sphere
-                    // triangle-BVH descent, record analytic marker instead.
-                    // Unlike the non-segmented path this loop DEDUPS each
-                    // unordered pair (`checked`), so it visits a (cloth,
-                    // sphere) pair in only ONE ordering — handle BOTH so the
+                // P2/T2: analytic colliders answer from shape params; a
+                // Plane has no finite box ⇒ the pair always overlaps.
+                AABB4 qa, ta;
+                const bool qFinite = objectBroadAABB(q, qa);
+                const bool tFinite = objectBroadAABB(t, ta);
+                if(!qFinite || !tFinite || ta.intersect(qa)) {
+                    // P1: mirror detectCollisions — skip the analytic
+                    // collider's triangle-BVH descent, record a marker
+                    // instead. Unlike the non-segmented path this loop DEDUPS
+                    // each unordered pair (`checked`), so it visits a (cloth,
+                    // collider) pair in only ONE ordering — handle BOTH so the
                     // marker doesn't depend on which index is smaller.
-                    bool tSphere = objTrees[t].objShape == ShapeType::Sphere;
-                    bool qSphere = queryTree.objShape  == ShapeType::Sphere;
-                    if (analyticEnabled && (tSphere || qSphere)) {
+                    // Marker fields are ARRAY INDICES (§4).
+                    bool tAnalytic = isAnalyticCollider(objTrees[t].objCollider);
+                    bool qAnalytic = isAnalyticCollider(queryTree.objCollider);
+                    if (analyticEnabled && (tAnalytic || qAnalytic)) {
                         auto isCloth = [](BehaviorType bt) {
                             return bt == BehaviorType::TriangularCloth
                                 || bt == BehaviorType::FastGridCloth;
                         };
-                        auto& pairs =
-                            Scene<METAL, PR>::packedCollisionData.analyticPairs;
-                        if (tSphere && isCloth(queryTree.objBehavior))
-                            pairs.push_back({ q, (Index)objTrees[t].objid });
-                        else if (qSphere && isCloth(objTrees[t].objBehavior))
-                            pairs.push_back({ t, (Index)queryTree.objid });
-                        // sphere-sphere: skip (no analytic cloth-vs-sphere test)
+                        auto& pc = Scene<METAL, PR>::packedCollisionData;
+                        if (tAnalytic && isCloth(queryTree.objBehavior))
+                            pc.pushAnalyticPair(q, t);
+                        else if (qAnalytic && isCloth(objTrees[t].objBehavior))
+                            pc.pushAnalyticPair(t, q);
+                        // analytic↔analytic: skip (§2, Bullet owns rigid↔rigid)
                     } else {
                         objTrees[t].queryPointsSegmented(q, margin);
                     }
@@ -2791,6 +2998,9 @@ struct BVH<BE, PR, BVHMODE::SCENE, BVHPRIMITIVE::OBJECT> {
                 }
             }
         }
+        // Publish the deduped fresh-union-held analytic marker set
+        // (PackedCollisionData::endAnalyticPairs explains the carry-over).
+        Scene<METAL, PR>::packedCollisionData.endAnalyticPairs();
         queryEnd();
     }
 
@@ -2808,14 +3018,16 @@ struct BVH<BE, PR, BVHMODE::SCENE, BVHPRIMITIVE::OBJECT> {
         queryBegin();
         // Push the sync tier so grouped queries pick GPU-brute off InFrame.
         for (auto& tr : objTrees) tr.syncEachPhase = syncEachPhase;
-        Scene<METAL, PR>::packedCollisionData.analyticPairs.clear();
+        Scene<METAL, PR>::packedCollisionData.clearAnalyticPairs();
         for(Index q = 0; q < objTrees.size(); ++q) {
             auto& queryTree = objTrees[q];
+            if(!objCollidable(q)) continue;   // P2/T3
             for(Index t = 0; t < objTrees.size(); ++t) {
                 if(q == t) {
                     if(enableSelfCollisions) queryTree.checkSelfCollisions(margin);
                     continue;
                 }
+                if(!objCollidable(t)) continue;   // P2/T3
                 // None/PerFrame skip the CPU root-AABB cull (objectRootAABB
                 // reads GPU tree nodes on the CPU → would force a sync); the
                 // GPU query kernel culls per node, so always dispatch.
@@ -2889,7 +3101,7 @@ struct BVH<BE, PR, BVHMODE::SCENE, BVHPRIMITIVE::OBJECT> {
         int kc = cloth.numGroups, ks = human.numGroups;
         if (kc <= 0 || ks <= 0) { detectCollisionsTwoMesh(margin); return; }
         for (auto& tr : objTrees) tr.syncEachPhase = true;
-        Scene<METAL, PR>::packedCollisionData.analyticPairs.clear();
+        Scene<METAL, PR>::packedCollisionData.clearAnalyticPairs();
         queryBegin();
 
         // FULLY ASYNC: no count readbacks. GPU counters bound over-dispatched

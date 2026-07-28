@@ -93,9 +93,11 @@ struct BruteForce<METAL, PR> {
         uint32_t maxNumCollisions;
         float radius;
         float thickness;
-        // Slice (c) A6: 1 ⇒ skip Sphere pairs (analytic path handles
-        // them). 0 ⇒ original behavior (sphere via triangle soup).
-        uint32_t skipSphere;
+        // P1: 1 ⇒ skip every row whose either shapePair lane is a
+        // non-Mesh ColliderKind (the analytic kernel feeds them).
+        // 0 ⇒ analytic colliders go through the triangle soup (SH /
+        // multi-level-SH broad, which emits no analytic markers).
+        uint32_t skipAnalytic;
     };
     // Mirrors AnalyticNarrowParams in common_types.metalh (field order
     // and types MUST match — bound via setBytes).
@@ -107,6 +109,7 @@ struct BruteForce<METAL, PR> {
         uint32_t clothBehavior;
         float    radius;
         float    thickness;
+        float    rotMargin;
     };
     bool narrow(PR radius, PR thickness, bool analyticEnabled = false) {
         typename Scene<METAL, PR>::PackedMeshData& packedMesh = Scene<METAL, PR>::packedMeshData;
@@ -125,8 +128,8 @@ struct BruteForce<METAL, PR> {
         // Slow-touch band is radius + thickness; integrator gates vn-zero
         // and position-push on (distance < thickness) per D-016.
         nparams.thickness = static_cast<float>(thickness);
-        // Only skip sphere pairs here when the analytic path is on.
-        nparams.skipSphere = analyticEnabled ? 1u : 0u;
+        // Only drop analytic rows here when the analytic path is live.
+        nparams.skipAnalytic = analyticEnabled ? 1u : 0u;
 
         MetalGlobalContext::setBuffer(packedCol.broadCollisions, 0);
         MetalGlobalContext::setBuffer(packedCol.numNarrowCollisions, 1);
@@ -169,7 +172,7 @@ struct BruteForce<METAL, PR> {
         nparams.maxNumCollisions   = (uint32_t)packedCol.maxNumCollisions;
         nparams.radius    = radius;
         nparams.thickness = static_cast<float>(thickness);
-        nparams.skipSphere = 0u;
+        nparams.skipAnalytic = 0u;
 
         MetalGlobalContext::setBuffer(packedCol.broadCollisions, 0);
         MetalGlobalContext::setBuffer(packedCol.numNarrowCollisions, 1);
@@ -186,25 +189,70 @@ struct BruteForce<METAL, PR> {
         MetalGlobalContext::dispatchThreads(bruteForcePSO, maxN);
     }
 
-    // Slice (c-1) — analytic cloth-vs-primitive narrow phase. Appends
-    // into the SAME shared narrowCollisions / numNarrowCollisions the
-    // triangle path uses (does NOT resetNarrow — narrow() already did),
-    // so the existing CPU sort + unchanged integrators consume it.
-    // Per-cloth-mesh dispatch (mirrors the integrator dispatch loop):
-    // CPU knows the mesh is cloth, so no GPU behavior buffer needed.
-    // Returns true if at least one dispatch was issued.
-    // Slice (c-2) — broad-marker-driven analytic narrow phase. Consumes
-    // the (cloth, sphere) pairs the BVH broad phase left in
+    // Rotation-linearization margin for one analytic collider
+    // (collider_pipeline_rework.md §3). Motion inversion is EXACT for
+    // translation and 1st-order for rotation, so the inverted segment
+    // can be off by up to theta * r_max, where theta is the collider's
+    // angular delta over the step and r_max its largest local radius.
+    // Inflating the contact band by that amount makes the test
+    // conservative (it can only over-report). Static colliders — every
+    // v1 scene — give prev == cur ⇒ theta = 0 ⇒ margin 0, so this term
+    // costs nothing but is present and correct by construction.
+    static float analyticRotMargin(const AnalyticShape& sh,
+                                   PR radius, PR thickness) {
+        // theta = 2*acos(|dot(qPrev, qCur)|), the geodesic angle between
+        // the two unit quaternions (|.| folds the double cover).
+        double dq = (double)sh.rotQuat.x * (double)sh.prevRotQuat.x
+                  + (double)sh.rotQuat.y * (double)sh.prevRotQuat.y
+                  + (double)sh.rotQuat.z * (double)sh.prevRotQuat.z
+                  + (double)sh.rotQuat.w * (double)sh.prevRotQuat.w;
+        dq = std::fabs(dq);
+        if (dq > 1.0) dq = 1.0;
+        const double theta = 2.0 * std::acos(dq);
+        if (!(theta > 1e-9)) return 0.0f;
+
+        // r_max = the collider's largest local radius, band included.
+        double rMax = 0.0;
+        switch ((ColliderKind)sh.kind) {
+            case ColliderKind::Sphere:
+                rMax = std::max({ (double)sh.halfExtHeight.x,
+                                  (double)sh.halfExtHeight.y,
+                                  (double)sh.halfExtHeight.z });
+                break;
+            case ColliderKind::Box:
+                rMax = std::sqrt((double)sh.halfExtHeight.x * sh.halfExtHeight.x
+                               + (double)sh.halfExtHeight.y * sh.halfExtHeight.y
+                               + (double)sh.halfExtHeight.z * sh.halfExtHeight.z);
+                break;
+            case ColliderKind::Cylinder:
+                rMax = std::sqrt((double)sh.centerRadius.w * sh.centerRadius.w
+                               + (double)sh.halfExtHeight.w * sh.halfExtHeight.w);
+                break;
+            case ColliderKind::Plane:
+                // An infinite half-space has no bounded r_max: the
+                // linearization error grows without limit away from the
+                // origin, so no finite margin is conservative. v1 does
+                // not support a ROTATING plane collider (static in every
+                // scene); 0 is the honest value, not a silent bound.
+                return 0.0f;
+            default:
+                break;
+        }
+        return (float)(theta * (rMax + (double)radius + (double)thickness));
+    }
+
+    // Broad-marker-driven analytic narrow phase. Consumes the (cloth,
+    // analytic collider) pairs the BVH broad phase left in
     // packedCol.analyticPairs (object AABBs overlapped). One dispatch per
     // pair, each testing a single AnalyticShape — so nothing fires while
     // the cloth is still falling (no overlap ⇒ no marker ⇒ no dispatch),
-    // and a cloth that overlaps multiple spheres gets one dispatch each.
+    // and a cloth that overlaps multiple colliders gets one dispatch each.
     // Appends into the SAME shared narrowCollisions / numNarrowCollisions
     // the triangle path uses (narrow() already resetNarrow'd), so the CPU
     // sort + unchanged integrators consume it. No commit here — the caller
     // (narrowAndSortByVertices) encodes this into the SAME command buffer
-    // as narrow_pt_tri and commits ONCE (kills the c-1 per-substep extra
-    // commitAndWait). Returns true if at least one dispatch was issued.
+    // as narrow_pt_tri and commits ONCE. Returns true if at least one
+    // dispatch was issued.
     bool narrowAnalytic(PR radius, PR thickness) {
         if (Scene<METAL, PR>::numAnalytic == 0
             || !Scene<METAL, PR>::meshAnalytic.ptr) return false;
@@ -213,17 +261,24 @@ struct BruteForce<METAL, PR> {
         if (packedCol.analyticPairs.empty()) return false;
         bool dispatched = false;
         for (auto& pr : packedCol.analyticPairs) {
-            // Resolve the sphere's mesh id → compact AnalyticShape[] index
-            // (numAnalytic is tiny; linear scan is cheaper than a map).
+            // Resolve the collider's mesh ARRAY INDEX → compact
+            // AnalyticShape[] slot (§4: both are the same namespace now;
+            // numAnalytic is tiny, so a linear scan beats a map).
             Index sIdx = -1;
             for (Index k = 0; k < Scene<METAL, PR>::numAnalytic; ++k) {
-                if (Scene<METAL, PR>::meshAnalytic[k].objId
-                        == (uint32_t)pr.shapeObjId) { sIdx = k; break; }
+                if (Scene<METAL, PR>::meshAnalytic[k].objIndex
+                        == (uint32_t)pr.shapeObj) { sIdx = k; break; }
             }
             if (sIdx < 0) continue;
-            if ((Scene<METAL, PR>::meshAnalytic[sIdx].flags & 1u) == 0u)
+            const AnalyticShape& sh = Scene<METAL, PR>::meshAnalytic[sIdx];
+            if ((sh.flags & 1u) == 0u)
                 continue;   // not collidable — kernel would no-op anyway
 
+            // Defence in depth for the ARRAY-INDEX namespace: markers are
+            // dropped by Scene::packAnalyticShapes when the array is
+            // renumbered, so this can only fire if a new path forgets to.
+            if (pr.clothObj < 0
+                || pr.clothObj >= (Index)Scene<METAL, PR>::meshes.size()) continue;
             auto& clothMesh = Scene<METAL, PR>::meshes[pr.clothObj];
             uint32_t numVerts = (uint32_t)(clothMesh.state.x.size / 3);
             if (numVerts == 0) continue;
@@ -236,6 +291,7 @@ struct BruteForce<METAL, PR> {
             ap.clothBehavior    = (uint32_t)clothMesh.behaviorType;
             ap.radius           = (float)radius;
             ap.thickness        = (float)thickness;
+            ap.rotMargin        = analyticRotMargin(sh, radius, thickness);
 
             MetalGlobalContext::setBuffer(packedCol.numNarrowCollisions, 0);
             MetalGlobalContext::setBuffer(packedCol.narrowCollisions, 1);
@@ -243,6 +299,9 @@ struct BruteForce<METAL, PR> {
             MetalGlobalContext::setBuffer(packedMesh.statesOffsets, 3);
             MetalGlobalContext::setBuffer(Scene<METAL, PR>::meshAnalytic, 4);
             MetalGlobalContext::setBytes(ap, 5);
+            // x_prev — the swept segment's tail (same buffer narrow()
+            // binds at slot 10 for narrow_pt_tri).
+            MetalGlobalContext::setBuffer(packedMesh.xPrev, 6);
             MetalGlobalContext::dispatchThreads(analyticPSO, numVerts);
             dispatched = true;
         }
@@ -258,7 +317,7 @@ struct BruteForce<METAL, PR> {
         // off the GPU next. InFrame (and any analytic frame) falls through to
         // the historical CPU-bucketing path below, bit-identical.
         if (!syncEachPhase && !analyticEnabled) {
-            Scene<METAL, PR>::packedCollisionData.analyticPairs.clear();
+            Scene<METAL, PR>::packedCollisionData.clearAnalyticPairs();
             narrowGPU(radius, thickness);
             bucketByVerticesGPU();
             return;
@@ -266,24 +325,25 @@ struct BruteForce<METAL, PR> {
 
         // narrow() resets the shared narrow buffers (always), then
         // dispatches the triangle path (only when broad pairs exist).
-        // When the analytic toggle is on, narrowAnalytic appends afterward
-        // into the same buffers (no reset) from the broad markers. Toggle
-        // OFF (default) = original pipeline: narrow_pt_tri handles spheres,
-        // analytic not dispatched.
+        // When the analytic path is live, narrowAnalytic appends afterward
+        // into the same buffers (no reset) from the broad markers.
         //
-        // Slice (c-2): both dispatches are encoded into the SAME command
-        // buffer and committed ONCE here. A compute encoder runs its
-        // dispatches serially with an implicit barrier between them, so the
-        // shared atomic counter / array stay coherent (tri appends first,
-        // analytic continues). This removes the per-substep second
-        // commitAndWait the c-1 path paid (the dominant analytic-ON
-        // overhead the bvh-vs-analytic experiment measured).
+        // Both dispatches are encoded into the SAME command buffer and
+        // committed ONCE here. A compute encoder runs its dispatches
+        // serially with an implicit barrier between them, so the shared
+        // atomic counter / array stay coherent (tri appends first,
+        // analytic continues).
+        //
+        // The markers are deliberately NOT cleared here: with
+        // cdSubstepPeriod > 1 the broad pair set is HELD across substeps
+        // and the analytic markers must be held with it, or the analytic
+        // contacts would vanish on every substep that skips the broad
+        // detect while narrow_pt_tri still drops those rows. Every BVH
+        // broad entry point clears them at its top; the SH paths never
+        // set analyticEnabled, so a stale list there is inert.
         bool tri = narrow(radius, thickness, analyticEnabled);
         bool ana = analyticEnabled && narrowAnalytic(radius, thickness);
         if (tri || ana) MetalGlobalContext::commitAndWait();
-        // Markers consumed; clear so a later SH-broad frame (which does not
-        // populate analyticPairs) can't re-dispatch this frame's pairs.
-        Scene<METAL, PR>::packedCollisionData.analyticPairs.clear();
         if (!tri && !ana) return;
         // Cumulative narrow-contact counter for the harness — `numNarrowCollisions`
         // resets between substeps, so a per-frame harness sample misses contacts

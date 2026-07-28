@@ -272,6 +272,25 @@ struct MeshInspectorTarget {
     bool* is_static = nullptr;
     std::function<void(int /*meshId*/, bool /*isStatic*/)> on_static_change;
 
+    // ── Collider (docs/design/collider_pipeline_rework.md §1, P0) ─────
+    // collider_kind_index is a per-frame snapshot of this mesh's
+    // ColliderKind mapped to a dropdown index:
+    //   0 = Mesh, 1 = Sphere, 2 = Box, 3 = Cylinder, 4 = Plane.
+    // -1 hides the section. The int-index / callback pair keeps this
+    // header free of the ColliderKind enum, exactly like
+    // current_behavior_index does for BehaviorType — production owns the
+    // mapping table both ways. collidable / self_collide alias the live
+    // GeneralMesh fields for in-place preview; their callbacks fire after
+    // the mutation so production can mirror onto the RequestGeneralMesh
+    // (without that mirror the next Scene::pack resets the user's edit).
+    // self_collide is declared-but-unconsumed in P0-P2 — the widget says so.
+    int collider_kind_index = -1;
+    std::function<void(int /*meshId*/, int /*kindIndex*/)> on_collider_kind;
+    bool* collidable = nullptr;
+    bool* self_collide = nullptr;
+    std::function<void(int /*meshId*/, bool /*collidable*/)> on_collidable;
+    std::function<void(int /*meshId*/, bool /*selfCollide*/)> on_self_collide;
+
     // ── Sub-object BVH (per-object; shown only in master cluster mode) ─
     // Per-object controls for the cluster sub-object BVH. subobj_split_s
     // aliases this mesh's split s (1..8, k=4^s); on_subobj_split commits +

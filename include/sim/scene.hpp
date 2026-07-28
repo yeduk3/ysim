@@ -57,6 +57,21 @@ struct GeneralMesh {
     // Persisted via scene_format::Object; mirrored on RequestGeneralMesh.
     bool isStatic = false;
 
+    // ── Collider data model (collider_pipeline_rework.md §1, P0) ────────
+    // colliderKind = how the collision pipeline should REPRESENT this mesh
+    // (geometry axis only; the accel axis is fixed in v1). Defaulted ONCE
+    // at creation from the initializer subtype (Sphere→Sphere, Cube→Box,
+    // Cylinder→Cylinder, Grid/File→Mesh) in Scene::addGeneralMesh — NOT
+    // re-derived at pack, so a user override in the inspector survives.
+    // collidable = master on/off (P2 will skip it in the broad loop);
+    // selfCollide = cloth self-collision gate (P3, SH-based).
+    // All three mirrored on RequestGeneralMesh so they survive Scene::pack
+    // (translate / rotate / add-object all re-pack); round-tripped through
+    // scene_format. INERT in P0 — no consumer yet.
+    ColliderKind colliderKind = ColliderKind::Mesh;
+    bool collidable = true;
+    bool selfCollide = false;
+
     // Plane checkerboard render option (UI-driven; plane/grid meshes only).
     // When true the renderer overrides the surface albedo with a world-space
     // black/white checker (1 world unit per cell) computed in the plane's
@@ -110,6 +125,9 @@ struct GeneralMesh {
           applyGravity(other.applyGravity),
           applyWind(other.applyWind),
           isStatic(other.isStatic),
+          colliderKind(other.colliderKind),
+          collidable(other.collidable),
+          selfCollide(other.selfCollide),
           checkerboard(other.checkerboard),
           clusterSplitS(other.clusterSplitS),
           clusterRender(other.clusterRender)
@@ -206,6 +224,16 @@ struct Scene {
         // changeBehavior). pack copies this onto the realized mesh; the
         // inspector callback writes here in addition to the live field.
         bool isStatic = false;
+        // Mirror of GeneralMesh.colliderKind / collidable / selfCollide
+        // (collider_pipeline_rework.md §1). Request-owned so a user edit in
+        // the inspector survives Scene::pack — without the mirror, the next
+        // translate / rotate / add-object silently reset the collider back
+        // to its initializer-derived default. colliderKind is SEEDED here
+        // once, in addGeneralMesh (defaultColliderKind), and never
+        // re-derived; pack only copies request → mesh.
+        ColliderKind colliderKind = ColliderKind::Mesh;
+        bool collidable = true;
+        bool selfCollide = false;
         // Mirror of GeneralMesh.checkerboard (plane render option) kept on
         // the request so the toggle survives Scene::pack rebuilds. pack
         // copies this onto the realized mesh; the inspector callback writes
@@ -263,6 +291,20 @@ struct Scene {
               behaviorParams(std::move(behaviorParams)) {}
     };
 
+    // Initializer-derived collider default (collider_pipeline_rework.md §1).
+    // Evaluated ONCE per object, at addGeneralMesh time — deliberately NOT
+    // in pack's shapeType cascade, which runs on every rebuild and would
+    // clobber the user's dropdown choice. Primitive initializers get their
+    // matching analytic kind; Grid and File/Assimp/Kinematic stay Mesh (a
+    // grid can be deforming cloth, so mesh collision is the honest default
+    // — the user opts a static grid into Plane via the inspector).
+    static ColliderKind defaultColliderKind(GeneralMeshInitializer<BE, PR>* init) {
+        if (dynamic_cast<MeshSphereInitializer  <BE, PR>*>(init)) return ColliderKind::Sphere;
+        if (dynamic_cast<MeshCubeInitializer    <BE, PR>*>(init)) return ColliderKind::Box;
+        if (dynamic_cast<MeshCylinderInitializer<BE, PR>*>(init)) return ColliderKind::Cylinder;
+        return ColliderKind::Mesh;
+    }
+
     inline static std::vector<RequestGeneralMesh> requestsGeneralMeshes;
     // Reference-point coincidence constraints (point panel). Scene-static
     // so it survives Scene::pack and Simulator::reset (neither clears it);
@@ -288,6 +330,11 @@ struct Scene {
         int newId = (int)requestsGeneralMeshes.size();
         requestsGeneralMeshes.emplace_back(newId, lifetimeMeshCount++,
                                            initializer, behaviorType, behaviorParams);
+        // Collider default, derived from the initializer subtype exactly
+        // once (see defaultColliderKind). From here on the request is the
+        // source of truth: the inspector writes it, pack copies it out,
+        // loadScene overwrites it when the scene file carries a kind.
+        requestsGeneralMeshes.back().colliderKind = defaultColliderKind(initializer);
         numMeshes++;
 
         // D-042 R-1: populate preview state directly from the initializer
@@ -381,22 +428,77 @@ struct Scene {
         VectorBase<BE, uint32_t>       segPrivateCount;
         VectorBase<BE, uint32_t>       segPrivateOffset;
 
-        // Slice (c-2) — analytic-primitive broad markers. The BVH broad
-        // phase, when the analytic toggle is on, finds (cloth query,
-        // sphere target) object pairs whose top-level AABBs overlap and
-        // records them HERE instead of descending the sphere's triangle
+        // Analytic broad markers. The BVH broad phase finds (cloth query,
+        // analytic target) object pairs whose top-level AABBs overlap and
+        // records them HERE instead of descending the target's triangle
         // BVH (which would emit thousands of vertex×triangle BroadCollisions
         // that narrow_pt_tri then skips). narrowAnalytic() consumes these
         // — one dispatch per pair — so the analytic narrow phase only fires
         // when objects actually overlap (zero cost during the fall) and
-        // tests one sphere per cloth instead of all clouds × all shapes.
-        // clothObj = object/statesOffsets INDEX (D-041); shapeObjId = the
-        // sphere mesh id, resolved to a compact AnalyticShape[] index in
-        // narrowAnalytic. Cleared at the top of each broad detect and again
-        // after narrow consumes it (so a later SH-broad frame, which does
-        // not populate this, can't re-dispatch stale pairs).
-        struct AnalyticBroadPair { Index clothObj; Index shapeObjId; };
+        // tests one collider per cloth instead of all cloths × all shapes.
+        //
+        // objPair namespace (collider_pipeline_rework.md §4): BOTH fields
+        // are object ARRAY INDICES (== statesOffsets / objTrees subscript
+        // == BroadCollision::objPair), matching the triangle path. They are
+        // resolved to a compact AnalyticShape[] slot via
+        // AnalyticShape::objIndex in narrowAnalytic.
+        //
+        // Cleared at the top of every broad detect (all BVH variants), NOT
+        // after narrow consumes them: with cdSubstepPeriod > 1 the broad
+        // pair set is deliberately HELD across substeps and the analytic
+        // markers must be held with it, exactly like broadCollisions.
+        struct AnalyticBroadPair { Index clothObj; Index shapeObj; };
+        // What narrowAnalytic consumes: this detect's own markers UNION the
+        // previous detect's own markers.
         std::vector<AnalyticBroadPair> analyticPairs;
+        // This detect's own markers (the union's fresh half).
+        std::vector<AnalyticBroadPair> analyticPairsFresh;
+        // The previous detect's own markers, carried one detect forward.
+        //
+        // WHY the carry-over: the broad AABB and the CCD segment point in
+        // OPPOSITE time directions. enlargeTrajectory inflates the leaf boxes
+        // from the current x FORWARD by v*subh, so at substep n the marker
+        // covers [x_n, x_n + v*subh]; but xPrev is snapshotted AFTER the
+        // narrow phase (simulator.hpp `system.snapshotXPrev`), so at substep
+        // n the narrow segment is the BACKWARD interval [x_{n-1}, x_n]. The
+        // two intervals are the same swath of space one substep apart — so a
+        // thin collider that the marker catches at substep n is only crossed
+        // by the segment at substep n+1, when the marker is already gone, and
+        // the swept test never fires. Holding each marker for exactly one
+        // extra detect realigns them. Conservative (at worst one extra
+        // analytic dispatch per pair per substep, and only while the objects
+        // are near each other) and confined to the analytic path.
+        std::vector<AnalyticBroadPair> analyticPairsHeld;
+
+        // BVH broad-phase bracket. begin() rotates last detect's own markers
+        // into the held slot; the detect loop pushes into the fresh slot;
+        // end() publishes the deduped union.
+        void beginAnalyticPairs() {
+            analyticPairsHeld = analyticPairsFresh;
+            analyticPairsFresh.clear();
+            analyticPairs.clear();
+        }
+        void pushAnalyticPair(Index clothObj, Index shapeObj) {
+            analyticPairsFresh.push_back({clothObj, shapeObj});
+        }
+        void endAnalyticPairs() {
+            analyticPairs = analyticPairsFresh;
+            for (const auto& h : analyticPairsHeld) {
+                bool dup = false;
+                for (const auto& p : analyticPairs)
+                    if (p.clothObj == h.clothObj && p.shapeObj == h.shapeObj) {
+                        dup = true; break;
+                    }
+                if (!dup) analyticPairs.push_back(h);
+            }
+        }
+        // Broad paths that emit no analytic markers (SH / multi-level SH /
+        // two-mesh / cluster) drop the whole carry-over chain.
+        void clearAnalyticPairs() {
+            analyticPairs.clear();
+            analyticPairsFresh.clear();
+            analyticPairsHeld.clear();
+        }
 
         void resetNarrow() {
             std::memset(narrowCollisions.ptr, 0, sizeof(NarrowCollision)*numNarrowCollisions[0]);
@@ -414,76 +516,211 @@ struct Scene {
     };
     inline static RayTracedData rayTracedData;
 
-    // Slice (c) — compact analytic-primitive array (A4). numAnalytic =
-    // #meshes whose shapeType is Sphere/Cube/Cylinder. Allocated in
-    // packAnalyticShapes() at pack; contents refilled by
-    // refreshAnalyticShapes() each update (D3). No consumer in c-0.
+    // Compact analytic-collider array. numAnalytic = #meshes whose
+    // colliderKind != Mesh (P1: the COLLIDER axis selects, not the
+    // initializer's ShapeType — a user can declare an imported prop a
+    // Box, or send a Sphere-sourced mesh back through triangle
+    // collision). Allocated in packAnalyticShapes() at pack; contents
+    // refilled by refreshAnalyticShapes() each update (D3).
     inline static VectorBase<BE, AnalyticShape> meshAnalytic;
     inline static Index numAnalytic = 0;
 
+    // Per-entry canonical half-extents in the collider's LOCAL frame (see
+    // fitAnalyticLocalHalf), cached because the arbitrary-mesh fit is
+    // O(numPoints) while refresh runs per frame. Fitted LAZILY on the first
+    // refresh that runs with live geometry: packAnalyticShapes() executes at
+    // the tail of Scene::pack, BEFORE Scene::initialize() has run the mesh
+    // initializers, so an AABB fit taken there would read unpopulated
+    // positions and collapse the collider to a point. Invalidated by every
+    // pack, so a re-scaled / re-authored collider is re-fitted.
+    inline static std::vector<tinym::vec3> analyticLocalHalf;
+    inline static std::vector<uint8_t> analyticHalfFitted;
+    // false until the first refresh has written a transform, so the
+    // first fill can seed prev == cur (no phantom motion on frame 0).
+    inline static bool analyticPrimed = false;
+
+    // Initializer-classification predicate (ShapeType axis). NOT the
+    // collision-pipeline predicate — that is isAnalyticCollider(colliderKind),
+    // which is what packAnalyticShapes / the broad phase key off since P1.
     static bool isPrimitiveShape(ShapeType s) {
         return s == ShapeType::Sphere
             || s == ShapeType::Cube
             || s == ShapeType::Cylinder;
     }
 
-    // Refill meshAnalytic from the live mesh transform + initializer
-    // intrinsic size. Iterates meshes in the SAME order as the count
-    // pass so entry k always maps to the same mesh across frames.
-    // v1 reads authoring transform (Q2: primitives static; Bullet-
-    // driven motion reconciliation is c-4 / A9).
-    static void refreshAnalyticShapes() {
+    // Canonical LOCAL half-extents for one analytic collider.
+    //
+    // Fit rule (deliberately simple; no manual param editing in v1 —
+    // collider_pipeline_rework.md §1):
+    //  * initializer MATCHES the kind (Sphere/Cube/Cylinder built by the
+    //    matching primitive::*): half = size*0.5 * per-axis scale. Exact,
+    //    because primitive::{sphere,cube,cylinder}(size) all build with
+    //    r = size*0.5 and the scale is what got baked into the vertices.
+    //  * anything else (imported mesh, grid, mismatched initializer):
+    //    REST-POSE LOCAL AABB fit. Vertices are mapped into the collider
+    //    frame (inverse rotation about transformPosition) and the half-
+    //    extent per axis is max(|min|,|max|) — i.e. the smallest
+    //    origin-centred box that contains the geometry. Scale is already
+    //    baked into the vertices, so it is NOT applied again.
+    //    Box  → those half-extents;  Sphere → same, used as ellipsoid
+    //    semi-axes;  Cylinder → radius = max(hx,hz), half-height = hy;
+    //    Plane → unused (a half-space needs only center + rotation).
+    static tinym::vec3 fitAnalyticLocalHalf(GeneralMesh<BE, PR>& m) {
+        PR sz = PR(0);
+        const ColliderKind k = m.colliderKind;
+        if (k == ColliderKind::Sphere) {
+            if (auto* sp = dynamic_cast<MeshSphereInitializer<BE,PR>*>(m.initializer))
+                sz = sp->params.size;
+        } else if (k == ColliderKind::Box) {
+            if (auto* cb = dynamic_cast<MeshCubeInitializer<BE,PR>*>(m.initializer))
+                sz = cb->params.size;
+        } else if (k == ColliderKind::Cylinder) {
+            if (auto* cy = dynamic_cast<MeshCylinderInitializer<BE,PR>*>(m.initializer))
+                sz = cy->params.size;
+        }
+        if (sz > PR(0)) {
+            const PR h = sz * PR(0.5);
+            return tinym::vec3((float)(h * m.scale.x),
+                               (float)(h * m.scale.y),
+                               (float)(h * m.scale.z));
+        }
+
+        // AABB fit from the live (rest-pose, for a rigid collider)
+        // geometry, expressed in the collider's local frame.
+        const PR* x = m.state.x.ptr;
+        const Index n = x ? m.state.x.size / 3 : 0;
+        if (n == 0) return tinym::vec3(0.0f, 0.0f, 0.0f);
+        const Quat qInv = quatConjugate(m.rotationQuat);
+        const tinym::vec3 c = m.transformPosition;
+        float hx = 0.0f, hy = 0.0f, hz = 0.0f;
+        for (Index i = 0; i < n; ++i) {
+            tinym::vec3 w((float)x[i*3+0] - c.x,
+                          (float)x[i*3+1] - c.y,
+                          (float)x[i*3+2] - c.z);
+            tinym::vec3 l = rotateVector(qInv, w);
+            hx = std::max(hx, std::fabs(l.x));
+            hy = std::max(hy, std::fabs(l.y));
+            hz = std::max(hz, std::fabs(l.z));
+        }
+        return tinym::vec3(hx, hy, hz);
+    }
+
+    // Refill meshAnalytic from the live mesh transform + the cached
+    // local half-extents. Iterates meshes in the SAME order as the
+    // count pass so entry k always maps to the same mesh across frames.
+    //
+    // prev{Center,RotQuat} roll: each call moves the PREVIOUS refresh's
+    // transform into the prev slots, so `prev` is the collider pose at
+    // the start of the interval the vertex segment x_prev→x spans. The
+    // caller (Simulator::update) refreshes once per FRAME while the CCD
+    // segment is per SUBSTEP, which makes the derived rotation margin
+    // conservative (frame delta ≥ substep delta) — never optimistic.
+    // v1 reads the authoring transform (colliders are static; Bullet-
+    // driven motion reconciliation is the c-4 / A9 unification).
+    // `fitExtents` is false only for the pack-time seeding call, where the
+    // mesh initializers have not run yet (see analyticLocalHalf).
+    static void refreshAnalyticShapes(bool fitExtents = true) {
         if (numAnalytic == 0 || !meshAnalytic.ptr) return;
         Index k = 0;
         for (Index i = 0; i < (Index)meshes.size(); ++i) {
             auto& m = meshes[i];
-            if (!isPrimitiveShape(m.shapeType)) continue;
-
-            // Intrinsic radius / half-extent (scale 1) from the
-            // initializer; scaled into world units below. The analytic
-            // sphere narrow path is an ELLIPSOID test, so per-axis
-            // scale (+ rotQuat) is honoured via halfExtHeight; non-
-            // uniform scale stretches the collision shape to match the
-            // baked vertices. centerRadius.w stays the nominal (x-axis)
-            // radius for any uniform-radius consumer.
-            PR sz = PR(0);
-            if (auto* sp = dynamic_cast<MeshSphereInitializer  <BE,PR>*>(m.initializer)) sz = sp->params.size;
-            else if (auto* cb = dynamic_cast<MeshCubeInitializer    <BE,PR>*>(m.initializer)) sz = cb->params.size;
-            else if (auto* cy = dynamic_cast<MeshCylinderInitializer<BE,PR>*>(m.initializer)) sz = cy->params.size;
+            if (!isAnalyticCollider(m.colliderKind)) continue;
+            if (k >= numAnalytic) break;
 
             const tinym::vec3 c = m.transformPosition;
-            const tinym::vec3 s = m.scale;
-            // primitive::sphere/cube/cylinder build geometry with
-            // r = size*0.5, so the world half-extent is size*0.5*scale.
-            // (`sz` is the initializer's `size` = full diameter/edge.)
-            const PR hsz = sz * PR(0.5);
+            const tinym::vec4 rot(m.rotationQuat.w, m.rotationQuat.x,
+                                  m.rotationQuat.y, m.rotationQuat.z);
+            if (fitExtents && k < (Index)analyticHalfFitted.size()
+                && !analyticHalfFitted[k]) {
+                analyticLocalHalf[k]  = fitAnalyticLocalHalf(m);
+                analyticHalfFitted[k] = 1;
+            }
+            const tinym::vec3 h = (k < (Index)analyticLocalHalf.size())
+                                ? analyticLocalHalf[k]
+                                : tinym::vec3(0.0f, 0.0f, 0.0f);
+
+            AnalyticShape& dst = meshAnalytic[k];
+            const tinym::vec4 prevQ = analyticPrimed ? dst.rotQuat : rot;
 
             AnalyticShape a{};
-            a.centerRadius  = tinym::vec4(c.x, c.y, c.z, (float)(hsz * s.x));
-            a.halfExtHeight = tinym::vec4((float)(hsz * s.x),
-                                          (float)(hsz * s.y),
-                                          (float)(hsz * s.z),
-                                          (float)(hsz * s.y));
-            a.rotQuat       = tinym::vec4(m.rotationQuat.w, m.rotationQuat.x,
-                                          m.rotationQuat.y, m.rotationQuat.z);
-            a.prevCenterPad = tinym::vec4(c.x, c.y, c.z, 0.0f);
-            a.shapeType     = (uint32_t)m.shapeType;
-            a.objId         = (uint32_t)m.id;
+            a.rotQuat       = rot;
+            a.prevCenterPad = analyticPrimed
+                ? tinym::vec4(dst.centerRadius.x, dst.centerRadius.y,
+                              dst.centerRadius.z, 0.0f)
+                : tinym::vec4(c.x, c.y, c.z, 0.0f);
+            a.prevRotQuat   = prevQ;
+            a.kind          = (uint32_t)m.colliderKind;
+            // §4: objPair carries ARRAY INDEX everywhere. pack() makes
+            // mesh.id == its array index, so `i` and `m.id` agree — `i`
+            // is written because the index is what the contract names.
+            a.objIndex      = (uint32_t)i;
             a.behaviorType  = (uint32_t)m.behaviorType;
-            a.flags         = 1u; // bit0 = collidable
-            meshAnalytic[k++] = a;
+            a.flags         = m.collidable ? 1u : 0u;
+
+            switch (m.colliderKind) {
+                case ColliderKind::Sphere:
+                    // Ellipsoid semi-axes; a uniform sphere reduces exactly.
+                    a.centerRadius  = tinym::vec4(c.x, c.y, c.z, h.x);
+                    a.halfExtHeight = tinym::vec4(h.x, h.y, h.z, h.y);
+                    break;
+                case ColliderKind::Box:
+                    a.centerRadius  = tinym::vec4(c.x, c.y, c.z, 0.0f);
+                    a.halfExtHeight = tinym::vec4(h.x, h.y, h.z, 0.0f);
+                    break;
+                case ColliderKind::Cylinder:
+                    // Local +Y axis; radius from the xz extent.
+                    a.centerRadius  = tinym::vec4(c.x, c.y, c.z,
+                                                  std::max(h.x, h.z));
+                    a.halfExtHeight = tinym::vec4(h.x, h.y, h.z, h.y);
+                    break;
+                case ColliderKind::Plane:
+                    // Infinite half-space, local +Y up: center + rotation
+                    // only. halfExtHeight unused.
+                    a.centerRadius  = tinym::vec4(c.x, c.y, c.z, 0.0f);
+                    a.halfExtHeight = tinym::vec4(0.0f, 0.0f, 0.0f, 0.0f);
+                    break;
+                default:
+                    break;
+            }
+            dst = a;
+            ++k;
         }
+        analyticPrimed = true;
     }
 
-    // Count primitives, (re)allocate the compact buffer, fill it.
-    // Called at the end of Scene::pack (size can change across packs).
+    // Drop the cached LOCAL half-extents so the next refreshAnalyticShapes()
+    // re-fits them from the live geometry / the live mesh scale. Needed by any
+    // authoring edit that changes a collider's SIZE without going through
+    // Scene::pack — Simulator::scaleObject is deliberately an in-place,
+    // no-repack edit, and translate/rotate need nothing because the transform
+    // is re-read every refresh while the extents are cached.
+    static void invalidateAnalyticFit() {
+        std::fill(analyticHalfFitted.begin(), analyticHalfFitted.end(), 0);
+    }
+
+    // Count analytic colliders, (re)allocate the compact buffer, seed it.
+    // Called at the end of Scene::pack (size can change across packs). The
+    // half-extent cache is only INVALIDATED here — the fit itself waits for
+    // the first refresh with live geometry (analyticLocalHalf).
     static void packAnalyticShapes() {
         Index count = 0;
-        for (auto& m : meshes) if (isPrimitiveShape(m.shapeType)) ++count;
+        for (auto& m : meshes) if (isAnalyticCollider(m.colliderKind)) ++count;
         numAnalytic = count;
+        analyticLocalHalf.assign(count, tinym::vec3(0.0f, 0.0f, 0.0f));
+        analyticHalfFitted.assign(count, 0);
+        analyticPrimed = false;      // fresh buffer ⇒ seed prev == cur
+        // Marker fields are mesh ARRAY INDICES, and a pack can renumber or
+        // drop meshes (Simulator::removeMesh compacts ids/indices, resetScene
+        // empties the array). The one-detect carry-over (analyticPairsHeld)
+        // would then hand narrowAnalytic an index into the OLD array — a
+        // wrong-mesh dispatch at best, an out-of-range `meshes[clothObj]` at
+        // worst. Indices are only meaningful within one pack, so the whole
+        // chain dies with the pack that created it.
+        packedCollisionData.clearAnalyticPairs();
         if (count == 0) { meshAnalytic = VectorBase<BE, AnalyticShape>(); return; }
         meshAnalytic = VectorBase<BE, AnalyticShape>(count);
-        refreshAnalyticShapes();
+        refreshAnalyticShapes(/*fitExtents=*/false);
+        analyticPrimed = false;      // seeding pass is not a real prev sample
     }
 
     static void pack() {
@@ -565,6 +802,14 @@ struct Scene {
             meshes[i].applyGravity = req.applyGravity;
             meshes[i].applyWind    = req.applyWind;
             meshes[i].isStatic     = req.isStatic;
+            // Collider data model (§1 P0): request-owned, so the user's
+            // dropdown/checkbox edits survive this rebuild. Copied BEFORE
+            // the shapeType classification cascade below to make the split
+            // explicit — shapeType is re-derived from the initializer every
+            // pack, colliderKind deliberately is NOT.
+            meshes[i].colliderKind = req.colliderKind;
+            meshes[i].collidable   = req.collidable;
+            meshes[i].selfCollide  = req.selfCollide;
             meshes[i].checkerboard = req.checkerboard;
             // Per-object sub-object BVH settings survive reset via the request.
             meshes[i].clusterSplitS = req.clusterSplitS;

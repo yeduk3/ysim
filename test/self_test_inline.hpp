@@ -6157,8 +6157,14 @@ static int runSelfTest() {
             const Index numEdges = e ? cloth->adjacency.edges.size / 2 : 0;
             if (!e || !rest || numEdges == 0) return;
             double acc = 0.0;
+            Index counted = 0;
             for (Index k = 0; k < numEdges; ++k) {
                 const Index a = e[k * 2], b = e[k * 2 + 1];
+                // edges.size is the initializer's UPPER BOUND (210 slots for an
+                // 8x8 grid, 161 real edges); the tail is uninitialised pool
+                // memory reinterpreted as indices. Same guard
+                // MeshAdjacency::recomputeRestLengths applies.
+                if (a >= n || b >= n) continue;
                 double d = 0.0;
                 for (int c = 0; c < 3; ++c) {
                     const double t = (double)cloth->state.x.ptr[b * 3 + c]
@@ -6166,9 +6172,9 @@ static int runSelfTest() {
                     d += t * t;
                 }
                 const double r = (double)rest[k];
-                if (r > 1e-9) acc += std::fabs(std::sqrt(d) - r) / r;
+                if (r > 1e-9) { acc += std::fabs(std::sqrt(d) - r) / r; ++counted; }
             }
-            meanEdgeErr = acc / (double)numEdges;
+            meanEdgeErr = counted ? acc / (double)counted : 0.0;
         };
 
         double y0 = 0, err0 = 0; bool fin0 = true;
@@ -6214,11 +6220,22 @@ static int runSelfTest() {
         // solver settings, only the mesh's kstretch changed: a 100x softer
         // cloth must stretch measurably more. Fails if springConstantsOf /
         // the k mapping is bypassed.
+        //
+        // The cloth DRAPES over a sphere rather than landing flat on a ground
+        // plane: a flat sheet that free-falls onto a floor and stops has no
+        // load on its edges at all, so the only strain it ever showed came from
+        // the contact bounce — and that bounce was an ARTIFACT (PbdSystem used
+        // to convert the whole contact correction into velocity, so a resting
+        // vertex was kicked upward at several m/s every substep; see the
+        // depenetration split in pbd_system.hpp step() (4)). With the artifact
+        // fixed the flat-landing scene deforms by nothing and the clause reads
+        // 0 vs 0. Draped, the hanging skirt genuinely tensions the contacting
+        // ring, which is what a stretch coefficient is supposed to resist.
         auto runAndMeasureStrain = [&](Precision kstretch) -> double {
             resetScene();
             sim.usePbd = true;
-            sim.addGround(PlaneDirection::XZPlane, tinym::vec3(0, 0, 0), 4.0f);
-            sim.addCloth(8, 0.8f, tinym::vec3(0.0f, 0.4f, 0.0f),
+            sim.addSphere(tinym::vec3(0.0f, 0.0f, 0.0f), 3, 1.0f);  // r = 0.5
+            sim.addCloth(8, 0.8f, tinym::vec3(0.0f, 0.9f, 0.0f),
                          kstretch, kstretch, Precision(3e5));
             sim.initialize();
             sim.pause = false;
@@ -6250,12 +6267,17 @@ static int runSelfTest() {
 
         // Build the quads from a fresh FLAT cloth, then step and re-measure
         // the same quads against their stored phi0.
+        // Same scene swap as PBD-4 and for the same reason: a sheet that lands
+        // flat on a floor stays flat, so every kbend gives the identical
+        // (near-zero) dihedral deviation once the contact-bounce artifact is
+        // gone. Draping over a sphere forces real curvature, which is exactly
+        // what a bend coefficient must resist.
         auto runBendDeviation = [&](Precision kbend, size_t* quadCount,
                                     double* maxRestDev) -> double {
             resetScene();
             sim.usePbd = true;
-            sim.addGround(PlaneDirection::XZPlane, tinym::vec3(0, 0, 0), 4.0f);
-            sim.addCloth(8, 0.8f, tinym::vec3(0.0f, 0.4f, 0.0f),
+            sim.addSphere(tinym::vec3(0.0f, 0.0f, 0.0f), 3, 1.0f);  // r = 0.5
+            sim.addCloth(8, 0.8f, tinym::vec3(0.0f, 0.9f, 0.0f),
                          Precision(1e5), Precision(1e5), kbend);
             sim.initialize();
             auto* cloth = Scene<Backend, Precision>::findById(1);
@@ -6320,6 +6342,739 @@ static int runSelfTest() {
 
         sim.pause = true;
         sim.usePbd = false;
+    }
+
+    // ---- Block CK: P0 collider data model (collider_pipeline_rework §1) ---
+    // Three per-mesh fields — colliderKind / collidable / selfCollide —
+    // must (a) default from the INITIALIZER subtype exactly once at
+    // creation, (b) survive a re-pack after the user overrides them, and
+    // (c) round-trip through scene JSON. The re-pack clause is the real
+    // guard: the fields live on RequestGeneralMesh precisely because
+    // Scene::pack rebuilds every GeneralMesh from the request, so a
+    // mesh-only edit would be silently reset by the next translate /
+    // rotate / add-object. Bug-probe: drop the `meshes[i].colliderKind =
+    // req.colliderKind` copy in pack (or write only the mesh in the
+    // inspector callback) → clause 2 FAILs.
+    {
+        resetScene();
+        sim.addSphere(tinym::vec3(0.0f, 1.0f, 0.0f), 3, 0.4f);   // id 0
+        sim.addCloth(4, 0.5f, tinym::vec3(0.0f, 2.0f, 0.0f),
+                     1e3, 1e3, 1e3, 0.01f, 0.1f);                // id 1 (grid)
+        sim.addCylinder(tinym::vec3(2.0f, 1.0f, 0.0f), 8, 0.3f); // id 2
+        sim.initialize();
+
+        auto kindOf = [&](int id) -> int {
+            auto* m = Scene<Backend, Precision>::findById(id);
+            return m ? (int)m->colliderKind : -1;
+        };
+
+        // ---- Clause 1 — initializer-derived defaults --------------------
+        bool defaultsOk =
+            kindOf(0) == (int)ColliderKind::Sphere
+         && kindOf(1) == (int)ColliderKind::Mesh      // grid stays mesh
+         && kindOf(2) == (int)ColliderKind::Cylinder;
+        {
+            auto* m0 = Scene<Backend, Precision>::findById(0);
+            defaultsOk = defaultsOk && m0 && m0->collidable && !m0->selfCollide;
+        }
+        if (defaultsOk)
+            pass("CK-1 / colliderKind defaults derive from the initializer (Sphere/Grid/Cylinder)");
+        else
+            fail("CK-1 / colliderKind defaults derive from the initializer (Sphere/Grid/Cylinder)",
+                 "kinds = " + std::to_string(kindOf(0)) + "," +
+                 std::to_string(kindOf(1)) + "," + std::to_string(kindOf(2)) +
+                 " (expected 1,0,3 with collidable=1 selfCollide=0)");
+
+        // ---- Clause 2 — user override survives a re-pack ----------------
+        // Exactly what the inspector callbacks do: write the live mesh AND
+        // the request. Then force a full rebuild by adding another object.
+        auto edit = [&](int id, ColliderKind k, bool collidable, bool self) {
+            if (auto* m = Scene<Backend, Precision>::findById(id)) {
+                m->colliderKind = k; m->collidable = collidable; m->selfCollide = self;
+            }
+            if (auto* r = sim.findRequest(id)) {
+                r->colliderKind = k; r->collidable = collidable; r->selfCollide = self;
+            }
+        };
+        edit(0, ColliderKind::Plane, /*collidable=*/false, /*self=*/true);
+        edit(1, ColliderKind::Box,   /*collidable=*/true,  /*self=*/true);
+
+        sim.addCube(tinym::vec3(-2.0f, 1.0f, 0.0f), 2, 0.3f);    // id 3
+        sim.initialize();                                        // → Scene::pack
+
+        auto* p0 = Scene<Backend, Precision>::findById(0);
+        auto* p1 = Scene<Backend, Precision>::findById(1);
+        auto* p3 = Scene<Backend, Precision>::findById(3);
+        bool repackOk =
+            p0 && p0->colliderKind == ColliderKind::Plane
+               && !p0->collidable && p0->selfCollide
+         && p1 && p1->colliderKind == ColliderKind::Box
+               && p1->collidable && p1->selfCollide
+         // the newly added cube still gets its own derived default
+         && p3 && p3->colliderKind == ColliderKind::Box
+               && p3->collidable && !p3->selfCollide;
+        if (repackOk)
+            pass("CK-2 / colliderKind/collidable/selfCollide survive Scene::pack (request-owned)");
+        else
+            fail("CK-2 / colliderKind/collidable/selfCollide survive Scene::pack (request-owned)",
+                 std::string("post-pack mesh0 kind=")
+                 + (p0 ? std::to_string((int)p0->colliderKind) : "?")
+                 + " collidable=" + (p0 ? std::to_string((int)p0->collidable) : "?")
+                 + " self=" + (p0 ? std::to_string((int)p0->selfCollide) : "?")
+                 + " | mesh1 kind=" + (p1 ? std::to_string((int)p1->colliderKind) : "?")
+                 + " | mesh3 kind=" + (p3 ? std::to_string((int)p3->colliderKind) : "?"));
+
+        // ---- Clause 3 — scene JSON round-trip ---------------------------
+        // save → text → parse → load → pack, then re-read the same fields.
+        const std::string text = scene_format::toString(sim.toSnapshot());
+        auto parsed = scene_format::parseString(text);
+        bool parseOk = parsed.ok;
+        bool jsonOk = false;
+        if (parseOk) {
+            sim.applySnapshot(parsed.value, "");
+            sim.initialize();
+            auto* q0 = Scene<Backend, Precision>::findById(0);
+            auto* q1 = Scene<Backend, Precision>::findById(1);
+            auto* q3 = Scene<Backend, Precision>::findById(3);
+            jsonOk =
+                q0 && q0->colliderKind == ColliderKind::Plane
+                   && !q0->collidable && q0->selfCollide
+             && q1 && q1->colliderKind == ColliderKind::Box
+                   && q1->collidable && q1->selfCollide
+             && q3 && q3->colliderKind == ColliderKind::Box
+                   && q3->collidable && !q3->selfCollide;
+        }
+        if (parseOk && jsonOk)
+            pass("CK-3 / collider fields round-trip through scene JSON");
+        else
+            fail("CK-3 / collider fields round-trip through scene JSON",
+                 parseOk ? "fields differ after save/load"
+                         : ("scene JSON parse failed: " + parsed.error.message));
+    }
+
+    // ---- Block AC: P1 analytic colliders, all kinds, swept CCD ----------
+    // collider_pipeline_rework.md §3/§5-P1. The pipeline now keys collision
+    // off GeneralMesh::colliderKind (no global toggle): a Sphere/Box/
+    // Cylinder/Plane collider is pulled out of the triangle BVH descent by
+    // the broad phase and answered by narrow_pt_analytic, which tests the
+    // motion-inverted segment x_prev→x_cur against the STATIC canonical
+    // shape in the collider's local frame.
+    //
+    // The rest band below is a BAND, not a point: the contact response
+    // (physics.metal integrate_cloth) pushes to exactly clothThickness but
+    // only fires while d < thickness, and the object-level AABB cull gets no
+    // margin, so a settled cloth sawtooths inside [surface, surface+
+    // thickness] instead of parking on the upper edge. Both clauses are
+    // still load-bearing: the floor clause fails on any penetration, the
+    // band clause fails if the cloth falls through (way below) or never
+    // lands (way above).
+    {
+        const Precision clothThickness = Precision(0.01);
+        const double kFloorEps = 0.005;   // never inside the surface
+        const double kRestTol  = 0.015;   // band around the thickness rest
+
+        // Solver: the default symplectic path at the APPLICATION's substep
+        // count (50), not the self-test's cheap 8 — a real cloth explodes at
+        // 8 substeps under explicit springs (see the NAN-GUARD block), which
+        // would mask the collider behaviour these clauses are about. Restored
+        // at the end of the block.
+        const size_t acSavedSubSteps = system.subSteps;
+        const Precision acSavedSubh  = system.subh;
+        system.subSteps = 50;
+        system.subh     = system.h / Precision(50);
+
+        // Inspector-equivalent collider override: write BOTH the request
+        // (survives Scene::pack) and, if realized, the live mesh.
+        auto setKind = [&](int id, ColliderKind k) {
+            if (auto* r = sim.findRequest(id)) r->colliderKind = k;
+            if (auto* m = Scene<Backend, Precision>::findById(id)) m->colliderKind = k;
+        };
+        // Smallest signed distance from `surfaceOf` over every cloth vertex.
+        auto minSurfaceDist = [&](int clothId, auto surfaceOf) -> double {
+            auto* m = Scene<Backend, Precision>::findById(clothId);
+            if (!m || !m->state.x.ptr) return std::numeric_limits<double>::quiet_NaN();
+            const Index n = m->state.x.size / 3;
+            double lo = 1e30;
+            for (Index i = 0; i < n; ++i) {
+                const double px = (double)m->state.x.ptr[i*3+0];
+                const double py = (double)m->state.x.ptr[i*3+1];
+                const double pz = (double)m->state.x.ptr[i*3+2];
+                if (!std::isfinite(px) || !std::isfinite(py) || !std::isfinite(pz))
+                    return std::numeric_limits<double>::quiet_NaN();
+                lo = std::min(lo, surfaceOf(px, py, pz));
+            }
+            return lo;
+        };
+        auto restCheck = [&](const char* name, double dist) {
+            if (!std::isfinite(dist))
+                fail(name, "non-finite cloth vertex");
+            else if (dist < -kFloorEps)
+                fail(name, "cloth penetrated the collider: min surface distance "
+                     + std::to_string(dist) + " < -" + std::to_string(kFloorEps));
+            else if (dist > (double)clothThickness + kRestTol)
+                fail(name, "cloth never settled on the collider: min surface distance "
+                     + std::to_string(dist) + " > thickness+"
+                     + std::to_string(kRestTol));
+            else
+                pass(name);
+        };
+
+        // ---- AC-1 — Sphere collider ------------------------------------
+        // Sphere size 1.0 ⇒ r = 0.5 centred at the origin. A 0.6 sheet
+        // drapes over the cap, so the contacting vertices sit at r+thickness
+        // while the skirt hangs further out — min RADIAL distance is the
+        // right measure (min-y would read the skirt, not the contact).
+        {
+            resetScene();
+            sim.addSphere(tinym::vec3(0.0f, 0.0f, 0.0f), 3, 1.0f);          // id 0
+            sim.addCloth(8, 0.6f, tinym::vec3(0.0f, 0.9f, 0.0f),
+                         1e5, 1e5, 3e5, clothThickness);                    // id 1
+            sim.initialize();
+            sim.pause = false;   // earlier blocks leave the sim paused
+            for (int f = 0; f < 60; ++f) sim.update();
+            MetalGlobalContext::commitAndWait();
+            const double d = minSurfaceDist(1, [](double x, double y, double z) {
+                return std::sqrt(x*x + y*y + z*z) - 0.5;
+            });
+            restCheck("AC-1 / cloth rests on a Sphere collider (analytic CCD)", d);
+        }
+
+        // ---- AC-2 — Box collider ---------------------------------------
+        // Cube size 1.0 ⇒ half-extents 0.5, top face at y = 0.5. A 0.6
+        // sheet fits inside the 1.0 face, so every vertex lands on it.
+        {
+            resetScene();
+            sim.addCube(tinym::vec3(0.0f, 0.0f, 0.0f), 2, 1.0f);            // id 0
+            sim.addCloth(8, 0.6f, tinym::vec3(0.0f, 0.9f, 0.0f),
+                         1e5, 1e5, 3e5, clothThickness);                    // id 1
+            sim.initialize();
+            sim.pause = false;   // earlier blocks leave the sim paused
+            for (int f = 0; f < 60; ++f) sim.update();
+            MetalGlobalContext::commitAndWait();
+            const double d = minSurfaceDist(1, [](double, double y, double) {
+                return y - 0.5;
+            });
+            restCheck("AC-2 / cloth rests on a Box collider (analytic CCD)", d);
+        }
+
+        // ---- AC-3 — Cylinder collider ----------------------------------
+        // primitive::cylinder(size=1) ⇒ r = 0.5, y in [-0.5, 0.5]; the cloth
+        // half-diagonal (0.42) stays inside the top cap radius.
+        {
+            resetScene();
+            sim.addCylinder(tinym::vec3(0.0f, 0.0f, 0.0f), 12, 1.0f);       // id 0
+            sim.addCloth(8, 0.6f, tinym::vec3(0.0f, 0.9f, 0.0f),
+                         1e5, 1e5, 3e5, clothThickness);                    // id 1
+            sim.initialize();
+            sim.pause = false;   // earlier blocks leave the sim paused
+            for (int f = 0; f < 60; ++f) sim.update();
+            MetalGlobalContext::commitAndWait();
+            const double d = minSurfaceDist(1, [](double, double y, double) {
+                return y - 0.5;
+            });
+            restCheck("AC-3 / cloth rests on a Cylinder collider (analytic CCD)", d);
+        }
+
+        // ---- AC-4 — Plane collider -------------------------------------
+        // A grid mesh retagged Plane through the request — the exact gesture
+        // the inspector dropdown performs. Infinite half-space, local +Y up,
+        // so the surface is y = 0 regardless of the grid's tessellation.
+        {
+            resetScene();
+            sim.addGround(PlaneDirection::XZPlane, tinym::vec3(0, 0, 0), 4.0f);  // id 0
+            setKind(0, ColliderKind::Plane);
+            sim.addCloth(8, 0.6f, tinym::vec3(0.0f, 0.4f, 0.0f),
+                         1e5, 1e5, 3e5, clothThickness);                    // id 1
+            sim.initialize();
+            sim.pause = false;   // earlier blocks leave the sim paused
+            for (int f = 0; f < 60; ++f) sim.update();
+            MetalGlobalContext::commitAndWait();
+            const double d = minSurfaceDist(1, [](double, double y, double) {
+                return y;
+            });
+            restCheck("AC-4 / cloth rests on a Plane collider (analytic CCD)", d);
+        }
+
+        // ---- AC-5 — start-penetrated recovery --------------------------
+        // The regression this whole rework exists for. A cloth is BORN
+        // inside a Box collider (centre y = 0.2, box half-extent 0.5). On
+        // the first substep x_prev == x, so `a` is already inside: the
+        // entry-side rule picks the minimum-penetration axis OF `a` (+Y
+        // here, since |0.2| - 0.5 is the largest gap) and must never flip to
+        // the far (-Y) face. Recovery therefore has to be UPWARD, and the
+        // cloth must end up resting on the top face — not squeezed out the
+        // bottom.
+        {
+            resetScene();
+            sim.addCube(tinym::vec3(0.0f, 0.0f, 0.0f), 2, 1.0f);            // id 0
+            sim.addCloth(6, 0.4f, tinym::vec3(0.0f, 0.2f, 0.0f),
+                         1e5, 1e5, 3e5, clothThickness);                    // id 1
+            sim.initialize();
+            sim.pause = false;   // earlier blocks leave the sim paused
+
+            auto meanY = [&]() -> double {
+                auto* m = Scene<Backend, Precision>::findById(1);
+                if (!m || !m->state.x.ptr) return std::numeric_limits<double>::quiet_NaN();
+                const Index n = m->state.x.size / 3;
+                double acc = 0.0;
+                for (Index i = 0; i < n; ++i) acc += (double)m->state.x.ptr[i*3+1];
+                return acc / (double)n;
+            };
+            const double y0 = meanY();
+            for (int f = 0; f < 60; ++f) sim.update();
+            MetalGlobalContext::commitAndWait();
+            const double y1 = meanY();
+            const double dTop = minSurfaceDist(1, [](double, double y, double) {
+                return y - 0.5;
+            });
+
+            if (!std::isfinite(y0) || !std::isfinite(y1) || !std::isfinite(dTop))
+                fail("AC-5 / start-penetrated cloth recovers on the ENTRY side of a Box",
+                     "non-finite cloth vertex");
+            else if (!(y1 > y0))
+                fail("AC-5 / start-penetrated cloth recovers on the ENTRY side of a Box",
+                     "exit displacement has the wrong sign: mean y " + std::to_string(y0)
+                     + " -> " + std::to_string(y1) + " (ejected through the far side?)");
+            else if (dTop < -kFloorEps)
+                fail("AC-5 / start-penetrated cloth recovers on the ENTRY side of a Box",
+                     "cloth still inside the box after 60 frames: min (y - 0.5) = "
+                     + std::to_string(dTop));
+            else
+                pass("AC-5 / start-penetrated cloth recovers on the ENTRY side of a Box");
+        }
+
+        // ---- AC-6 — fast-drop tunneling guard --------------------------
+        // Zero-thickness collider (a grid retagged Box ⇒ local AABB fit gives
+        // half-extents (2, 0, 2)) and ONE substep per frame, so subh = 1/60.
+        // The cloth is released 1.5 m up: it reaches ~5.4 m/s at the slab,
+        // i.e. ~90 mm per substep versus a 54 mm inflated slab
+        // (2*(0 + radius + margin) = 2*0.027). A DCD-only test samples above
+        // the band on one substep and below it on the next and sees NOTHING;
+        // the swept segment test cannot miss it. Speeds stay moderate — the
+        // signal comes from the substep count and the zero-thickness
+        // collider, not from an absurd velocity.
+        {
+            const size_t savedSubSteps = system.subSteps;
+            const Precision savedSubh  = system.subh;
+            system.subSteps = 1;
+            system.subh     = system.h;
+
+            resetScene();
+            sim.addGround(PlaneDirection::XZPlane, tinym::vec3(0, 0, 0), 4.0f);  // id 0
+            setKind(0, ColliderKind::Box);
+            // Near-free particles: explicit springs are unconditionally
+            // unstable at subh = 1/60 for a real cloth, and the claim under
+            // test is about the collision test, not the solver. A floppy
+            // sheet is also the purest tunneling probe.
+            sim.addCloth(6, 0.4f, tinym::vec3(0.0f, 1.5f, 0.0f),
+                         1.0f, 1.0f, 1.0f, clothThickness);                 // id 1
+            sim.initialize();
+            sim.pause = false;   // earlier blocks leave the sim paused
+            for (int f = 0; f < 90; ++f) sim.update();
+            MetalGlobalContext::commitAndWait();
+
+            const double dMin = minSurfaceDist(1, [](double, double y, double) {
+                return y;
+            });
+            const double dMax = [&]() -> double {
+                auto* m = Scene<Backend, Precision>::findById(1);
+                if (!m || !m->state.x.ptr) return std::numeric_limits<double>::quiet_NaN();
+                const Index n = m->state.x.size / 3;
+                double hi = -1e30;
+                for (Index i = 0; i < n; ++i)
+                    hi = std::max(hi, (double)m->state.x.ptr[i*3+1]);
+                return hi;
+            }();
+
+            system.subSteps = savedSubSteps;
+            system.subh     = savedSubh;
+
+            if (!std::isfinite(dMin) || !std::isfinite(dMax))
+                fail("AC-6 / fast drop does not tunnel through a zero-thickness collider",
+                     "non-finite cloth vertex");
+            else if (!(dMax < 1.5))
+                fail("AC-6 / fast drop does not tunnel through a zero-thickness collider",
+                     "cloth never fell (max y = " + std::to_string(dMax) + ")");
+            else if (dMin < -kFloorEps)
+                fail("AC-6 / fast drop does not tunnel through a zero-thickness collider",
+                     "cloth passed through: min y = " + std::to_string(dMin));
+            else
+                pass("AC-6 / fast drop does not tunnel through a zero-thickness collider");
+        }
+
+        // ---- AC-7 — collidable == false removes the collider ------------
+        // P2/T3. The master on/off switch is a BROAD-phase skip (query AND
+        // target), so a Box collider with collidable=false must produce no
+        // contact at all and the cloth free-falls past it; flipping the same
+        // scene back to collidable=true must rest it on the top face. Two
+        // clauses so a cloth that never falls (a broken scene) can't pass the
+        // first one by accident.
+        auto setCollidable = [&](int id, bool on) {
+            if (auto* r = sim.findRequest(id)) r->collidable = on;
+            if (auto* m = Scene<Backend, Precision>::findById(id)) m->collidable = on;
+        };
+        {
+            auto& packedCol = Scene<Backend, Precision>::packedCollisionData;
+
+            // (a) collidable = false ⇒ falls through, zero contacts.
+            resetScene();
+            sim.addCube(tinym::vec3(0.0f, 0.0f, 0.0f), 2, 1.0f);            // id 0
+            sim.addCloth(8, 0.6f, tinym::vec3(0.0f, 0.9f, 0.0f),
+                         1e5, 1e5, 3e5, clothThickness);                    // id 1
+            sim.initialize();
+            setCollidable(0, false);
+            sim.pause = false;
+            packedCol.cumulativeNarrowCollisions = 0;
+            for (int f = 0; f < 60; ++f) sim.update();
+            MetalGlobalContext::commitAndWait();
+            const double offTopY = minSurfaceDist(1, [](double, double y, double) {
+                return y;
+            });
+            const size_t offContacts = packedCol.cumulativeNarrowCollisions;
+
+            // (b) the same box retagged **Mesh** ⇒ the analytic flags-bit0
+            // layer cannot help here, so this clause isolates the P2/T3 BROAD
+            // skip: without it the triangle path would still emit pairs and
+            // the cloth would rest.
+            resetScene();
+            sim.addCube(tinym::vec3(0.0f, 0.0f, 0.0f), 2, 1.0f);            // id 0
+            sim.addCloth(8, 0.6f, tinym::vec3(0.0f, 0.9f, 0.0f),
+                         1e5, 1e5, 3e5, clothThickness);                    // id 1
+            setKind(0, ColliderKind::Mesh);
+            sim.initialize();
+            setKind(0, ColliderKind::Mesh);
+            setCollidable(0, false);
+            sim.pause = false;
+            packedCol.cumulativeNarrowCollisions = 0;
+            for (int f = 0; f < 60; ++f) sim.update();
+            MetalGlobalContext::commitAndWait();
+            const double offMeshY = minSurfaceDist(1, [](double, double y, double) {
+                return y;
+            });
+            const size_t offMeshContacts = packedCol.cumulativeNarrowCollisions;
+
+            // (c) same scene, collidable = true ⇒ rests on the top face.
+            resetScene();
+            sim.addCube(tinym::vec3(0.0f, 0.0f, 0.0f), 2, 1.0f);            // id 0
+            sim.addCloth(8, 0.6f, tinym::vec3(0.0f, 0.9f, 0.0f),
+                         1e5, 1e5, 3e5, clothThickness);                    // id 1
+            sim.initialize();
+            setCollidable(0, true);
+            sim.pause = false;
+            for (int f = 0; f < 60; ++f) sim.update();
+            MetalGlobalContext::commitAndWait();
+            const double onTopD = minSurfaceDist(1, [](double, double y, double) {
+                return y - 0.5;
+            });
+
+            const char* n7 = "AC-7 / collidable=false removes the collider, "
+                             "collidable=true restores it";
+            if (!std::isfinite(offTopY) || !std::isfinite(onTopD))
+                fail(n7, "non-finite cloth vertex");
+            else if (!(offTopY < -1.0))
+                fail(n7, "cloth did NOT fall through the non-collidable box: "
+                     "min y = " + std::to_string(offTopY) + " (expected < -1.0)");
+            else if (offContacts != 0)
+                fail(n7, "non-collidable box still produced contacts: "
+                     + std::to_string(offContacts));
+            else if (!std::isfinite(offMeshY))
+                fail(n7, "non-finite cloth vertex (Mesh-collider clause)");
+            else if (!(offMeshY < -1.0))
+                fail(n7, "cloth did NOT fall through the non-collidable MESH "
+                     "collider (broad-phase skip missing): min y = "
+                     + std::to_string(offMeshY) + " (expected < -1.0)");
+            else if (offMeshContacts != 0)
+                fail(n7, "non-collidable MESH collider still produced contacts: "
+                     + std::to_string(offMeshContacts));
+            else if (onTopD < -kFloorEps || onTopD > (double)clothThickness + kRestTol)
+                fail(n7, "collidable=true did not restore the rest: "
+                     "min (y - 0.5) = " + std::to_string(onTopD));
+            else
+                pass(n7);
+        }
+
+        // ---- AC-8 — broad-skip + index invariant ------------------------
+        // P2/T1+D1. An analytic Sphere's triangle BVH is no longer refit, so
+        // AC-1's rest now runs end-to-end through the skipped-tree path. In
+        // the SAME scene a second collider is retagged Mesh and must still
+        // collide through the untouched triangle path — that is the guard for
+        // D1's "keep the slot, empty the AABB": if the skipped slot were
+        // compacted away, the Mesh collider's array index (and therefore its
+        // statesOffsets subscript) would shift and its cloth would fall
+        // through.
+        {
+            resetScene();
+            sim.addSphere(tinym::vec3(-1.0f, 0.0f, 0.0f), 3, 1.0f);         // id 0 (analytic)
+            sim.addCube  (tinym::vec3( 1.0f, 0.0f, 0.0f), 2, 1.0f);         // id 1 (retagged Mesh)
+            sim.addCloth(8, 0.6f, tinym::vec3(-1.0f, 0.9f, 0.0f),
+                         1e5, 1e5, 3e5, clothThickness);                    // id 2
+            sim.addCloth(8, 0.6f, tinym::vec3( 1.0f, 0.9f, 0.0f),
+                         1e5, 1e5, 3e5, clothThickness);                    // id 3
+            setKind(0, ColliderKind::Sphere);
+            setKind(1, ColliderKind::Mesh);
+            sim.initialize();
+            setKind(0, ColliderKind::Sphere);
+            setKind(1, ColliderKind::Mesh);
+            sim.pause = false;
+            for (int f = 0; f < 60; ++f) sim.update();
+            MetalGlobalContext::commitAndWait();
+
+            const double dSphere = minSurfaceDist(2, [](double x, double y, double z) {
+                const double dx = x + 1.0;
+                return std::sqrt(dx*dx + y*y + z*z) - 0.5;
+            });
+            const double dMesh = minSurfaceDist(3, [](double, double y, double) {
+                return y - 0.5;
+            });
+
+            const char* n8 = "AC-8 / analytic broad-skip rests, and a Mesh "
+                             "collider in the same scene still collides";
+            if (!std::isfinite(dSphere) || !std::isfinite(dMesh))
+                fail(n8, "non-finite cloth vertex");
+            else if (dSphere < -kFloorEps
+                  || dSphere > (double)clothThickness + kRestTol)
+                fail(n8, "analytic Sphere rest broke: min radial distance "
+                     + std::to_string(dSphere));
+            else if (dMesh < -kFloorEps
+                  || dMesh > (double)clothThickness + kRestTol)
+                fail(n8, "Mesh collider in the same scene lost its contact "
+                     "(index invariant?): min (y - 0.5) = "
+                     + std::to_string(dMesh));
+            else
+                pass(n8);
+        }
+
+        // ---- AC-11 — scaleObject resizes the analytic collider ----------
+        // P2 authoring parity. translate/rotate feed the AnalyticShape through
+        // GeneralMesh::transformPosition / rotationQuat, which
+        // refreshAnalyticShapes re-reads every frame, so those follow for
+        // free. The half-extents do NOT: they live in the
+        // Scene::analyticLocalHalf cache, fitted once and invalidated only by
+        // Scene::pack — and scaleObject is deliberately a NO-repack edit
+        // ("recomputeRestLengths overwrites the rest arrays in place, so we no
+        // longer need the D-041 dirty=true").
+        //
+        // The scale must land AFTER the lazy fit has already run (the cloth is
+        // rested on the box first), or the first refresh would pick up the new
+        // scale for free and the clause would prove nothing. Shrinking is used
+        // rather than growing so the assertion is a plain fall to a lower rest
+        // height with no start-penetration semantics mixed in. Bug probe: drop
+        // the invalidateAnalyticFit() call in scaleObject → the collider keeps
+        // its 0.5 half-extent, the cloth never falls, min(y - 0.25) ~ 0.26.
+        {
+            resetScene();
+            sim.addCube(tinym::vec3(0.0f, 0.0f, 0.0f), 2, 1.0f);            // id 0
+            // 0.3 sheet (half-diagonal 0.21) still fits inside the SHRUNK
+            // 0.5-wide top face, so min(y - 0.25) reads the contact and not an
+            // overhanging skirt.
+            sim.addCloth(8, 0.3f, tinym::vec3(0.0f, 0.9f, 0.0f),
+                         1e5, 1e5, 3e5, clothThickness);                    // id 1
+            sim.initialize();
+            sim.pause = false;
+            for (int f = 0; f < 40; ++f) sim.update();   // rests on y = 0.5
+            sim.scaleObject(0, tinym::vec3(0.5f, 0.5f, 0.5f));  // top face y = 0.25
+            for (int f = 0; f < 60; ++f) sim.update();
+            MetalGlobalContext::commitAndWait();
+            const double d = minSurfaceDist(1, [](double, double y, double) {
+                return y - 0.25;
+            });
+            restCheck("AC-11 / scaleObject resizes the analytic collider", d);
+            sim.pause = true;
+        }
+
+        // ---- AC-9 — PBD solver x analytic colliders ---------------------
+        // The one combination P0..P2 never executed: the CPU PBD solver
+        // (Simulator::usePbd) consuming ANALYTIC narrow rows. Two traps meet
+        // here:
+        //  (1) pbd-system-handoff.md "알려진 함정" — a contact re-applied as a
+        //      FIXED push every Gauss-Seidel sweep is turned into velocity by
+        //      v = (p-x)/dt and LAUNCHES the cloth. PbdSystem re-evaluates the
+        //      contact as an inequality at the predicted position,
+        //      d(p) = nd.w + n.(p-x); that identity only holds if nd.w was
+        //      measured from the SAME x along the SAME n — which is exactly
+        //      what narrow_pt_analytic's emit convention promises (normal at
+        //      TOI/entry, signed distance of the CURRENT position along it).
+        //  (2) the analytic rows carry indexPair.target == 0 for every shape,
+        //      so PBD's (objPair.target, indexPair.target) dedup key leans
+        //      entirely on objPair.target being the collider's ARRAY INDEX.
+        // Both clauses therefore assert BOTH a correct rest height and a
+        // bounded velocity / no upward launch.
+        {
+            auto pbdMaxSpeed = [&](int clothId) -> double {
+                auto* m = Scene<Backend, Precision>::findById(clothId);
+                if (!m || !m->state.v.ptr) return std::numeric_limits<double>::quiet_NaN();
+                const Index n = m->state.v.size / 3;
+                double hi = 0.0;
+                for (Index i = 0; i < n; ++i) {
+                    const double vx = (double)m->state.v.ptr[i*3+0];
+                    const double vy = (double)m->state.v.ptr[i*3+1];
+                    const double vz = (double)m->state.v.ptr[i*3+2];
+                    if (!std::isfinite(vx) || !std::isfinite(vy) || !std::isfinite(vz))
+                        return std::numeric_limits<double>::quiet_NaN();
+                    hi = std::max(hi, std::sqrt(vx*vx + vy*vy + vz*vz));
+                }
+                return hi;
+            };
+            auto maxYOf = [&](int clothId) -> double {
+                auto* m = Scene<Backend, Precision>::findById(clothId);
+                if (!m || !m->state.x.ptr) return std::numeric_limits<double>::quiet_NaN();
+                const Index n = m->state.x.size / 3;
+                double hi = -1e30;
+                for (Index i = 0; i < n; ++i)
+                    hi = std::max(hi, (double)m->state.x.ptr[i*3+1]);
+                return hi;
+            };
+
+            // A launched cloth leaves through the top: the drop height is the
+            // ceiling a correctly-converging contact can never exceed. 0.1 m of
+            // slack covers the settle bounce.
+            //
+            // The speed clause is deliberately measured on the SETTLED window
+            // (the last 15 of 60 frames) and not on the peak: the peak is
+            // legitimate free fall — the 0.6 m sheet's skirt keeps dropping
+            // past a 0.5 m collider long after the cap has landed, and ~4 m/s
+            // there says nothing about the contact. A cloth at rest on the
+            // collider must be nearly still, so 0.5 m/s is the discriminator;
+            // one re-applied 0.01 m push per sweep at subh = 1/3000 is 30 m/s,
+            // and eight of them 240, so the trap misses by 2-3 decades.
+            const double kLaunchSlack = 0.10;
+            const double kSpeedBound  = 0.50;
+            const int    kSettleFrame = 45;
+
+            struct PbdCase {
+                const char* name;
+                bool box;           // false = Sphere collider
+                double dropY;
+            };
+            const PbdCase cases[2] = {
+                { "AC-9a / PBD cloth rests on a Sphere collider without launching",
+                  false, 0.9 },
+                { "AC-9b / PBD cloth rests on a Box collider without launching",
+                  true,  0.9 },
+            };
+
+            for (const auto& tc : cases) {
+                resetScene();
+                sim.usePbd = true;
+                if (tc.box) sim.addCube  (tinym::vec3(0.0f, 0.0f, 0.0f), 2, 1.0f);
+                else        sim.addSphere(tinym::vec3(0.0f, 0.0f, 0.0f), 3, 1.0f);
+                sim.addCloth(8, 0.6f, tinym::vec3(0.0f, (float)tc.dropY, 0.0f),
+                             1e5, 1e5, 3e5, clothThickness);                // id 1
+                sim.initialize();
+                sim.pause = false;
+
+                double peakY = -1e30, peakSpeed = 0.0;
+                bool blew = false;
+                for (int f = 0; f < 60; ++f) {
+                    sim.update();
+                    MetalGlobalContext::commitAndWait();
+                    const double my = maxYOf(1);
+                    const double ms = pbdMaxSpeed(1);
+                    if (!std::isfinite(my) || !std::isfinite(ms)) { blew = true; break; }
+                    peakY = std::max(peakY, my);
+                    if (f >= kSettleFrame) peakSpeed = std::max(peakSpeed, ms);
+                }
+                sim.pause  = true;
+                sim.usePbd = false;
+
+                const double d = tc.box
+                    ? minSurfaceDist(1, [](double, double y, double) { return y - 0.5; })
+                    : minSurfaceDist(1, [](double x, double y, double z) {
+                          return std::sqrt(x*x + y*y + z*z) - 0.5; });
+                const double vEnd = pbdMaxSpeed(1);
+
+                if (blew || !std::isfinite(d) || !std::isfinite(vEnd))
+                    fail(tc.name, "non-finite cloth state under PBD + analytic collider");
+                else if (peakY > tc.dropY + kLaunchSlack)
+                    fail(tc.name, "cloth LAUNCHED (PBD contact re-push trap): peak y "
+                         + std::to_string(peakY) + " > drop height "
+                         + std::to_string(tc.dropY) + " + "
+                         + std::to_string(kLaunchSlack));
+                else if (peakSpeed > kSpeedBound)
+                    fail(tc.name, "contact correction leaked into velocity: settled |v| "
+                         + std::to_string(peakSpeed) + " > "
+                         + std::to_string(kSpeedBound) + " m/s");
+                else if (d < -kFloorEps)
+                    fail(tc.name, "cloth penetrated the collider: min surface distance "
+                         + std::to_string(d));
+                else if (d > (double)clothThickness + kRestTol)
+                    fail(tc.name, "cloth never settled: min surface distance "
+                         + std::to_string(d) + " > thickness+"
+                         + std::to_string(kRestTol));
+                else
+                    pass(tc.name);
+            }
+
+            // ---- AC-10 — PBD + start-penetrated Box -------------------------
+            // PBD analogue of AC-5. Under PBD the depenetration is a POSITION
+            // correction and v = (p-x)/dt would turn a 0.3 m rescue into ~900
+            // m/s, so this is simultaneously the entry-side test and the test
+            // that the correction is not reflected into velocity.
+            {
+                resetScene();
+                sim.usePbd = true;
+                sim.addCube(tinym::vec3(0.0f, 0.0f, 0.0f), 2, 1.0f);        // id 0
+                sim.addCloth(6, 0.4f, tinym::vec3(0.0f, 0.2f, 0.0f),
+                             1e5, 1e5, 3e5, clothThickness);                // id 1
+                sim.initialize();
+                sim.pause = false;
+
+                auto meanY = [&]() -> double {
+                    auto* m = Scene<Backend, Precision>::findById(1);
+                    if (!m || !m->state.x.ptr) return std::numeric_limits<double>::quiet_NaN();
+                    const Index n = m->state.x.size / 3;
+                    double acc = 0.0;
+                    for (Index i = 0; i < n; ++i) acc += (double)m->state.x.ptr[i*3+1];
+                    return acc / (double)n;
+                };
+                const double y0 = meanY();
+                double peakY = -1e30, peakSpeed = 0.0;
+                bool blew = false;
+                for (int f = 0; f < 60; ++f) {
+                    sim.update();
+                    MetalGlobalContext::commitAndWait();
+                    const double my = maxYOf(1);
+                    const double ms = pbdMaxSpeed(1);
+                    if (!std::isfinite(my) || !std::isfinite(ms)) { blew = true; break; }
+                    peakY = std::max(peakY, my);
+                    peakSpeed = std::max(peakSpeed, ms);
+                }
+                sim.pause  = true;
+                sim.usePbd = false;
+
+                const double y1 = meanY();
+                const double dTop = minSurfaceDist(1, [](double, double y, double) {
+                    return y - 0.5;
+                });
+                const char* n10 = "AC-10 / PBD start-penetrated cloth recovers on the "
+                                  "ENTRY side of a Box without launching";
+                // A recovery that ends at rest on the top face cannot exceed
+                // 0.5 + thickness by more than the settle band.
+                const double kTopCeiling = 0.5 + (double)clothThickness + 0.2;
+                if (blew || !std::isfinite(y0) || !std::isfinite(y1) || !std::isfinite(dTop))
+                    fail(n10, "non-finite cloth vertex");
+                else if (peakY > kTopCeiling)
+                    fail(n10, "cloth LAUNCHED out of the box: peak y "
+                         + std::to_string(peakY) + " > " + std::to_string(kTopCeiling));
+                else if (peakSpeed > 6.0)
+                    fail(n10, "depenetration leaked into velocity: peak |v| "
+                         + std::to_string(peakSpeed) + " > 6.0 m/s");
+                else if (!(y1 > y0))
+                    fail(n10, "exit displacement has the wrong sign: mean y "
+                         + std::to_string(y0) + " -> " + std::to_string(y1)
+                         + " (ejected through the far side?)");
+                else if (dTop < -kFloorEps)
+                    fail(n10, "cloth still inside the box after 60 frames: "
+                         "min (y - 0.5) = " + std::to_string(dTop));
+                else
+                    pass(n10);
+            }
+        }
+
+        sim.pause       = true;
+        sim.usePbd      = false;
+        system.subSteps = acSavedSubSteps;
+        system.subh     = acSavedSubh;
     }
 
     if (failures == 0) {

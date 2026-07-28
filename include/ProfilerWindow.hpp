@@ -64,7 +64,6 @@ void drawProfilerWindow(
     bool* use_segmented_bvh_query = nullptr,
     bool* use_agglomerative_bvh = nullptr,
     bool* enable_refit = nullptr,
-    bool* use_analytic_primitive = nullptr,
     bool* use_spatial_hashing = nullptr,
     // Substep cadence knobs (Simulator::refitSubstepPeriod / cdSubstepPeriod,
     // both Index == uint32_t). 1 = every substep. Live-editable sliders.

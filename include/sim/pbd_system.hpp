@@ -339,11 +339,57 @@ struct PbdSystem<METAL, PR> {
                 }
             };
 
+            // Visit every DEDUPED contact of vertex i as (normal, d(x)).
+            // Shared by the projection sweeps and the velocity update below so
+            // the two can never disagree about which contacts are active.
+            const bool contactsForMesh = haveContacts && mi + 1 < (Index)off.size;
+            const Index colBase = contactsForMesh ? off.ptr[mi] : Index(0);
+            auto forEachContact = [&](Index i, auto&& fn) {
+                if (!contactsForMesh) return;
+                const Index begin = colOff.ptr[colBase + i];
+                const Index end   = colOff.ptr[colBase + i + 1];
+                for (Index c = begin; c < end; ++c) {
+                    // Dedup coincident (targetObj, targetTri) contacts — the
+                    // hash broad phases list one per incident query triangle,
+                    // and summing them over-corrects. Analytic rows carry
+                    // indexPair.target == 0 for every shape, so this key only
+                    // separates them because objPair.target is the collider's
+                    // mesh ARRAY INDEX (collider_pipeline_rework.md §4).
+                    bool dup = false;
+                    for (Index q = begin; q < c; ++q)
+                        // .target == the kernel's .y lane (IndexPair is a union
+                        // of {query,target} / {point,triangle}).
+                        if (colFacet.ptr[q].objPair.target == colFacet.ptr[c].objPair.target &&
+                            colFacet.ptr[q].indexPair.target == colFacet.ptr[c].indexPair.target) {
+                            dup = true; break;
+                        }
+                    if (dup) continue;
+
+                    const auto& nd = colFacet.ptr[c].collisionNormalAndDistance;
+                    const Vec3 raw((PR)nd.x, (PR)nd.y, (PR)nd.z);
+                    const PR nlen = raw.norm();
+                    if (nlen < PR(1e-6)) continue;
+                    fn(raw / nlen, (PR)nd.w);
+                }
+            };
+
             // --- (2) Gauss-Seidel constraint projection.
             for (int it = 0; it < iterations; ++it) {
                 if (restLen) {
-                    for (Index e = 0; e < numEdges; ++e)
-                        projectDistance(edges[e*2], edges[e*2+1], restLen[e], kS);
+                    for (Index e = 0; e < numEdges; ++e) {
+                        const Index ea = edges[e*2], eb = edges[e*2+1];
+                        // `numEdges` is an UPPER BOUND: MeshGridInitializerParams
+                        // allocates 2(k-1)k + 2(k-1)^2 edge slots but
+                        // MeshAdjacencyInitializer only writes the deduplicated
+                        // subset (161 of 210 for an 8x8 grid). The tail is
+                        // uninitialised pool memory — floats reinterpreted as
+                        // indices — so it must be skipped exactly the way
+                        // MeshAdjacency::recomputeRestLengths already does
+                        // (mesh_state.hpp `inRange`). Without this the solver
+                        // reads x/m far outside the mesh and segfaults.
+                        if (ea >= n || eb >= n) continue;
+                        projectDistance(ea, eb, restLen[e], kS);
+                    }
                 }
                 if (kB > PR(0)) {
                     for (const auto& bq : bc.quads) projectBend(bq, kB);
@@ -352,49 +398,25 @@ struct PbdSystem<METAL, PR> {
                 // --- (3) contacts as inequality constraints. Same contact
                 // set and same (distance < thickness) gate the integrate
                 // kernel uses (D-016), applied to the predicted position.
-                if (haveContacts && mi + 1 < (Index)off.size) {
-                    const Index base = off.ptr[mi];
-                    for (Index i = 0; i < n; ++i) {
-                        if (mask[i] == PR(0)) continue;
-                        const Index begin = colOff.ptr[base + i];
-                        const Index end   = colOff.ptr[base + i + 1];
-                        for (Index c = begin; c < end; ++c) {
-                            // Dedup coincident (targetObj, targetTri) contacts
-                            // — the hash broad phases list one per incident
-                            // query triangle, and summing them over-corrects.
-                            bool dup = false;
-                            for (Index q = begin; q < c; ++q)
-                                // .target == the kernel's .y lane (IndexPair
-                                // is a union of {query,target} / {point,triangle}).
-                                if (colFacet.ptr[q].objPair.target == colFacet.ptr[c].objPair.target &&
-                                    colFacet.ptr[q].indexPair.target == colFacet.ptr[c].indexPair.target) {
-                                    dup = true; break;
-                                }
-                            if (dup) continue;
-
-                            const auto& nd = colFacet.ptr[c].collisionNormalAndDistance;
-                            const Vec3 raw((PR)nd.x, (PR)nd.y, (PR)nd.z);
-                            const PR nlen = raw.norm();
-                            if (nlen < PR(1e-6)) continue;
-                            const Vec3 nrm = raw / nlen;
-
-                            // The kernel pushes by (thickness - distance)
-                            // ONCE per substep, and that push never feeds back
-                            // into velocity. PBD's v = (p-x)/dt turns every
-                            // position delta into velocity, so re-applying a
-                            // FIXED push each Gauss-Seidel sweep accumulates
-                            // and launches the cloth. Make the contact a real
-                            // inequality instead: the narrow phase measured
-                            // `distance` along n from x, so the signed
-                            // distance of the CURRENT predicted position is
-                            // distance + n.(p - x). Once the push satisfies
-                            // it, later sweeps are no-ops.
-                            const PR distance = (PR)nd.w
-                                + nrm.dot(vertexAt(p, i) - vertexAt(x, i));
-                            if (distance >= thickness) continue;
-                            vertexRef(p, i) += nrm * (thickness - distance);
-                        }
-                    }
+                for (Index i = 0; contactsForMesh && i < n; ++i) {
+                    if (mask[i] == PR(0)) continue;
+                    forEachContact(i, [&](const Vec3& nrm, PR d0) {
+                        // The kernel pushes by (thickness - distance)
+                        // ONCE per substep, and that push never feeds back
+                        // into velocity. PBD's v = (p-x)/dt turns every
+                        // position delta into velocity, so re-applying a
+                        // FIXED push each Gauss-Seidel sweep accumulates
+                        // and launches the cloth. Make the contact a real
+                        // inequality instead: the narrow phase measured
+                        // `distance` along n from x, so the signed
+                        // distance of the CURRENT predicted position is
+                        // distance + n.(p - x). Once the push satisfies
+                        // it, later sweeps are no-ops.
+                        const PR distance = d0
+                            + nrm.dot(vertexAt(p, i) - vertexAt(x, i));
+                        if (distance >= thickness) return;
+                        vertexRef(p, i) += nrm * (thickness - distance);
+                    });
                 }
             }
 
@@ -412,7 +434,36 @@ struct PbdSystem<METAL, PR> {
                     ++sanitizeCount;
                     continue;
                 }
-                vertexRef(v, i) = (pi - vertexAt(x, i)) * (invDt * velScale);
+                // DEPENETRATION IS NOT MOTION. v = (p-x)/dt reports the WHOLE
+                // position delta as velocity, including the part of a contact
+                // correction that only undid overlap the vertex was already in
+                // when the substep began. A cloth born 0.3 m inside a box gets
+                // rescued in one sweep, and at subh = 1/3000 that 0.31 m
+                // teleport reads as ~930 m/s: the cloth leaves the scene
+                // (measured, AC-10). physics.metal's integrate_cloth never has
+                // this problem because its `pos += (thickness - distance) * n`
+                // push is applied to the position ONLY and never touches vel.
+                //
+                // The invariant that separates the two cases: a contact may
+                // reverse the approach the vertex actually made this substep
+                // (that is ordinary collision response, restitution <= 1), but
+                // it may never send the vertex out FASTER than it came in —
+                // anything past that is pre-existing overlap being undone, i.e.
+                // a teleport, and it must not become velocity. `freeDelta` is
+                // the unconstrained predict-step displacement (the same
+                // (v + a*dt)*dt the predict loop used), so -freeDelta.n is
+                // exactly the approach along this contact's normal.
+                const PR wi = invMass(i);
+                const Vec3 accel = (wi > PR(0) && ext) ? vertexAt(ext, i) * wi : Vec3();
+                const Vec3 freeDelta = (vertexAt(v, i) + accel * dt) * dt;
+                Vec3 delta = pi - vertexAt(x, i);
+                forEachContact(i, [&](const Vec3& nrm, PR) {
+                    const PR dn = delta.dot(nrm);
+                    if (dn <= PR(0)) return;
+                    const PR approach = std::max(PR(0), -freeDelta.dot(nrm));
+                    if (dn > approach) delta -= nrm * (dn - approach);
+                });
+                vertexRef(v, i) = delta * (invDt * velScale);
                 vertexRef(x, i) = pi;
             }
         }

@@ -871,14 +871,6 @@ int main(int argc, char** argv) {
             simulator->logSHPerSubstep = !(simulator->logSHPerSubstep);
             std::cout << "[main] logSHPerSubstep = "
                       << (simulator->logSHPerSubstep ? "on" : "off") << "\n";
-        } else if(key == GLFW_KEY_A && action == GLFW_PRESS) {
-            // Slice (c) A/B: flip analytic-primitive collision on/off
-            // at runtime to compare against the original triangle-soup
-            // pipeline (default off).
-            simulator->useAnalyticPrimitive = !(simulator->useAnalyticPrimitive);
-            std::cout << "[main] useAnalyticPrimitive = "
-                      << (simulator->useAnalyticPrimitive ? "on (analytic)" : "off (original)")
-                      << "\n";
         } else if(key == GLFW_KEY_G && action == GLFW_PRESS) {
             // BVH detect+reduce A/B toggle: baseline queryPoints
             // (per-leaf-hit global atomicAdd) vs queryPointsSegmented
@@ -1394,6 +1386,43 @@ int main(int argc, char** argv) {
                         }
                         break;
                     }
+                };
+                // Collider panel (collider_pipeline_rework.md §1, P0).
+                // The dropdown index is a per-frame snapshot of the live
+                // ColliderKind; the two pills alias the live bools. Every
+                // edit writes BOTH the mesh (immediate effect / display)
+                // and the request (survives Scene::pack — a later
+                // translate or add-object would otherwise reset it back
+                // to the initializer-derived default).
+                target.collider_kind_index = (int)selectedMesh->colliderKind;
+                target.on_collider_kind = [&simulator](int id, int kindIndex) {
+                    static const ColliderKind kIndexToKind[] = {
+                        ColliderKind::Mesh,
+                        ColliderKind::Sphere,
+                        ColliderKind::Box,
+                        ColliderKind::Cylinder,
+                        ColliderKind::Plane,
+                    };
+                    if (kindIndex < 0 || kindIndex > 4) return;
+                    const ColliderKind k = kIndexToKind[kindIndex];
+                    if (auto* m = Scene<Backend, Precision>::findById(id))
+                        m->colliderKind = k;
+                    if (auto* r = simulator.findRequest(id))
+                        r->colliderKind = k;
+                };
+                target.collidable   = &selectedMesh->collidable;
+                target.self_collide = &selectedMesh->selfCollide;
+                target.on_collidable = [&simulator](int id, bool on) {
+                    if (auto* m = Scene<Backend, Precision>::findById(id))
+                        m->collidable = on;
+                    if (auto* r = simulator.findRequest(id))
+                        r->collidable = on;
+                };
+                target.on_self_collide = [&simulator](int id, bool on) {
+                    if (auto* m = Scene<Backend, Precision>::findById(id))
+                        m->selfCollide = on;
+                    if (auto* r = simulator.findRequest(id))
+                        r->selfCollide = on;
                 };
                 // Sub-object BVH panel — shown ONLY when the profiler's
                 // master "Cluster mode" is on. Per-object controls (the
@@ -2998,7 +3027,6 @@ int main(int argc, char** argv) {
                 &simulator.useSegmentedBVHQuery,
                 &simulator.collisionPipeline.broadPhase.useAgglomerative,
                 &simulator.collisionPipeline.broadPhase.enableRefit,
-                &simulator.useAnalyticPrimitive,
                 &simulator.useSpatialHashing,
                 &simulator.refitSubstepPeriod,
                 &simulator.cdSubstepPeriod,
@@ -3024,7 +3052,6 @@ int main(int argc, char** argv) {
                 &simulator.useSegmentedBVHQuery,
                 &simulator.collisionPipeline.broadPhase.useAgglomerative,
                 &simulator.collisionPipeline.broadPhase.enableRefit,
-                &simulator.useAnalyticPrimitive,
                 &simulator.useSpatialHashing,
                 &simulator.refitSubstepPeriod,
                 &simulator.cdSubstepPeriod,
