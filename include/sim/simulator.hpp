@@ -17,6 +17,14 @@ struct Simulator {
     PbdSystem<BE, PR> pbd;
     bool usePbd = false;
 
+    // Sibling CPU Projective Dynamics solver (Liu 2013 local-global), wired
+    // exactly like `pbd` above and for the same reasons — it borrows
+    // `system.subh` and shares the collision pipeline. `usePd` takes priority
+    // over `usePbd` at the dispatch sites below, so the two flags can never
+    // both consume the same substep.
+    PdSystem<BE, PR> pd;
+    bool usePd = false;
+
     //using BroadPhase = BVH<BVHMODE::LINEAR, BVHPRIMITIVE::TRIANGLE, PR>;
     using BroadPhase = BVH<BE, PR, BVHMODE::SCENE, BVHPRIMITIVE::OBJECT>;
     using NarrowPhase = BruteForce<METAL, PR>;
@@ -3344,16 +3352,20 @@ struct Simulator {
             // old CPU memcpy loop. Rides the current encoder (no sync).
             system.snapshotXPrev(scene);
 
-            // Solver dispatch. `usePbd` picks the CPU PBD sibling; the
-            // symplectic System still owns timing (subh) and the xPrev
+            // Solver dispatch. `usePd` picks the CPU Projective Dynamics
+            // sibling, `usePbd` the CPU PBD one; PD wins when both are set so
+            // the priority is a total order and no substep is stepped twice.
+            // The symplectic System still owns timing (subh) and the xPrev
             // snapshot above, so switching mid-run needs no re-init.
             if (profiler) {
                 auto scope = profiler->scoped("system_update");
-                if (usePbd) pbd.step(scene, system.subh);
-                else        system.update(scene);
+                if (usePd)       pd.step(scene, system.subh);
+                else if (usePbd) pbd.step(scene, system.subh);
+                else             system.update(scene);
             } else {
-                if (usePbd) pbd.step(scene, system.subh);
-                else        system.update(scene);
+                if (usePd)       pd.step(scene, system.subh);
+                else if (usePbd) pbd.step(scene, system.subh);
+                else             system.update(scene);
             }
 
             // Experiment: PerFrame + perFrameSubstepCommit → flush this substep's

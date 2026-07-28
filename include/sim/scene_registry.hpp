@@ -81,6 +81,32 @@ void postInitPbdCloth(SimOf<BE, PR>& simulator) {
     std::cout << "[Main] --scene pbd_cloth: CPU PBD solver active\n";
 }
 
+// "pd_cloth": the pbd_cloth scene solved by the CPU Projective Dynamics
+// sibling instead. Identical geometry on purpose — the two CPU solvers are
+// only comparable if the scene is byte-identical, so `--scene pbd_cloth` vs
+// `--scene pd_cloth` is a one-flag A/B.
+template <typename BE, typename PR>
+void setupPdCloth(SimOf<BE, PR>& simulator, SysOf<BE, PR>& /*system*/) {
+    const PR kstretch = 1e5, kshear = 1e5, kbend = 2e5;
+    const PR mass = 0.1, thickness = 0.01;
+    simulator.addPlane(PlaneDirection::XZPlane, tinym::vec3(0, 0, 0), 24, 3.0,
+                       0.1, BehaviorType::Float);
+    simulator.addCloth(20, 1, tinym::vec3(0, 0.6, 0), kstretch, kshear, kbend,
+                       thickness, mass);
+    simulator.mlBroadPhase.floorExcludeDiag = 1e9f;   // exclude NOTHING
+}
+
+template <typename BE, typename PR>
+void postInitPdCloth(SimOf<BE, PR>& simulator) {
+    simulator.usePd = true;
+    // PD projects contacts from the CONTACT SET once per substep (post-solve),
+    // so it needs a fresh one every substep for the same reason PBD does — a
+    // held broad phase would let the cloth drift through.
+    simulator.cdSubstepPeriod    = 1;
+    simulator.refitSubstepPeriod = 1;
+    std::cout << "[Main] --scene pd_cloth: CPU Projective Dynamics solver active\n";
+}
+
 // ---- P2 analytic-collider scenes (collider_pipeline_rework.md §5-P2) -----
 // One cloth dropped onto one analytic primitive, plus a "zoo" that drapes a
 // single sheet over three primitives standing on a Plane floor. The
@@ -192,6 +218,8 @@ inline const std::vector<Entry<BE, PR>>& registry() {
           &setupDemoUniform<BE, PR>, &postInitDemoUniform<BE, PR> },
         { "pbd_cloth", "demo_uniform geometry solved by the CPU PBD system",
           &setupPbdCloth<BE, PR>, &postInitPbdCloth<BE, PR> },
+        { "pd_cloth", "pbd_cloth geometry solved by the CPU PD (Liu 2013) system",
+          &setupPdCloth<BE, PR>, &postInitPdCloth<BE, PR> },
         { "analytic_sphere", "cloth dropped on a Sphere analytic collider",
           &setupAnalyticSphere<BE, PR>, nullptr },
         { "analytic_box", "cloth dropped on a Box analytic collider",
