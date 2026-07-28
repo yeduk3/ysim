@@ -299,8 +299,8 @@ static int runSelfTest() {
                          // residual gravity-per-substep penetration was 0.18mm
                          // (D-013 swept-CCD numerical floor); 8 keeps it well
                          // below the BDD-007 tunneling threshold.
-    ExplicitSystem<Backend, Precision> system(h, subSteps);
-    Simulator<Backend, Precision, ExplicitSystem<Backend, Precision>> sim(system);
+    SymplecticSystem<Backend, Precision> system(h, subSteps);
+    Simulator<Backend, Precision, SymplecticSystem<Backend, Precision>> sim(system);
     sim.pause = false;  // self-test wants update() to actually step.
 
     // ---- Block 1: CM-002 regression — re-running pack() is safe. ---------
@@ -6127,6 +6127,199 @@ static int runSelfTest() {
                      "non-finite or out-of-box vertex after 240 frames");
         }
         sim.pause = true;
+    }
+
+    // ---- Block PBD: CPU PBD system (Simulator::usePbd) ------------------
+    // Same 8x8 cloth with the default kstretch=1e5 springs that the NAN-GUARD
+    // block above uses precisely BECAUSE it explodes under the symplectic
+    // integrator at these substep counts. PBD projects positions instead of
+    // integrating stiff forces, so the identical scene must stay bounded,
+    // hold its rest lengths, and not fall through the ground.
+    {
+        resetScene();
+        sim.usePbd = true;
+        sim.addGround(PlaneDirection::XZPlane, tinym::vec3(0, 0, 0), 4.0f); // id 0
+        sim.addCloth(8, 0.8f, tinym::vec3(0.0f, 0.4f, 0.0f));               // id 1
+        sim.initialize();
+
+        auto clothStats = [&](double& minY, double& meanEdgeErr, bool& finite) {
+            auto* cloth = Scene<Backend, Precision>::findById(1);
+            minY = 1e30; meanEdgeErr = 0.0; finite = true;
+            if (!cloth) { finite = false; return; }
+            const Index n = cloth->state.x.size / 3;
+            for (Index i = 0; i < n; ++i) {
+                for (int c = 0; c < 3; ++c)
+                    if (!std::isfinite((double)cloth->state.x.ptr[i * 3 + c])) finite = false;
+                minY = std::min(minY, (double)cloth->state.x.ptr[i * 3 + 1]);
+            }
+            const Index* e = cloth->adjacency.edges.ptr;
+            const Precision* rest = cloth->adjacency.restEdgeLengths.ptr;
+            const Index numEdges = e ? cloth->adjacency.edges.size / 2 : 0;
+            if (!e || !rest || numEdges == 0) return;
+            double acc = 0.0;
+            for (Index k = 0; k < numEdges; ++k) {
+                const Index a = e[k * 2], b = e[k * 2 + 1];
+                double d = 0.0;
+                for (int c = 0; c < 3; ++c) {
+                    const double t = (double)cloth->state.x.ptr[b * 3 + c]
+                                   - (double)cloth->state.x.ptr[a * 3 + c];
+                    d += t * t;
+                }
+                const double r = (double)rest[k];
+                if (r > 1e-9) acc += std::fabs(std::sqrt(d) - r) / r;
+            }
+            meanEdgeErr = acc / (double)numEdges;
+        };
+
+        double y0 = 0, err0 = 0; bool fin0 = true;
+        clothStats(y0, err0, fin0);
+
+        sim.pause = false;
+        for (int f = 0; f < 60; ++f) sim.update();
+        MetalGlobalContext::commitAndWait();
+
+        double y1 = 0, err1 = 0; bool fin1 = true;
+        clothStats(y1, err1, fin1);
+
+        if (!fin1)
+            fail("PBD-1 / stiff cloth stays finite under PBD where the symplectic path explodes",
+                 "non-finite vertex after 60 frames");
+        else
+            pass("PBD-1 / stiff cloth stays finite under PBD where the symplectic path explodes");
+
+        // Inextensibility is what PBD buys: mean |len-rest|/rest must stay
+        // small. Loose bound (10%) — this is a blow-up detector, not a
+        // convergence benchmark.
+        if (err1 > 0.10)
+            fail("PBD-2 / distance constraints hold rest lengths",
+                 "mean edge strain " + std::to_string(err1) + " > 0.10 (was "
+                 + std::to_string(err0) + " at rest)");
+        else
+            pass("PBD-2 / distance constraints hold rest lengths");
+
+        // Contact projection: cloth starts at y=0.4 above a ground plane at
+        // y=0, must fall (y decreases) but never sink appreciably below it.
+        if (!(y1 < y0 - 1e-4))
+            fail("PBD-3 / cloth falls under gravity",
+                 "min y did not decrease (" + std::to_string(y0) + " -> "
+                 + std::to_string(y1) + ")");
+        else if (y1 < -0.05)
+            fail("PBD-3 / cloth does not tunnel through the ground",
+                 "min y = " + std::to_string(y1) + " (ground at 0)");
+        else
+            pass("PBD-3 / cloth falls under gravity and rests on the ground");
+
+        // PBD-4: the per-mesh stretch coefficient must actually drive PBD (it
+        // used to run on a fixed solver-global stiffness). Same scene, same
+        // solver settings, only the mesh's kstretch changed: a 100x softer
+        // cloth must stretch measurably more. Fails if springConstantsOf /
+        // the k mapping is bypassed.
+        auto runAndMeasureStrain = [&](Precision kstretch) -> double {
+            resetScene();
+            sim.usePbd = true;
+            sim.addGround(PlaneDirection::XZPlane, tinym::vec3(0, 0, 0), 4.0f);
+            sim.addCloth(8, 0.8f, tinym::vec3(0.0f, 0.4f, 0.0f),
+                         kstretch, kstretch, Precision(3e5));
+            sim.initialize();
+            sim.pause = false;
+            for (int f = 0; f < 60; ++f) sim.update();
+            MetalGlobalContext::commitAndWait();
+            double y = 0, err = 0; bool fin = true;
+            clothStats(y, err, fin);
+            sim.pause = true;
+            return fin ? err : std::numeric_limits<double>::quiet_NaN();
+        };
+        const double strainStiff = runAndMeasureStrain(Precision(1e5));
+        const double strainSoft  = runAndMeasureStrain(Precision(1e3));
+        if (!std::isfinite(strainStiff) || !std::isfinite(strainSoft))
+            fail("PBD-4 / per-mesh stretch coefficient drives the PBD solver",
+                 "non-finite cloth in one of the two runs");
+        else if (!(strainSoft > strainStiff * 1.5))
+            fail("PBD-4 / per-mesh stretch coefficient drives the PBD solver",
+                 "kstretch 1e3 strain " + std::to_string(strainSoft)
+                 + " not meaningfully above kstretch 1e5 strain "
+                 + std::to_string(strainStiff)
+                 + " — mesh coefficients are being ignored");
+        else
+            pass("PBD-4 / per-mesh stretch coefficient drives the PBD solver");
+
+        // PBD-5: dihedral bending constraint (Müller 2007 eq 21-29), which
+        // replaced the opposite-vertex distance spring.
+        using Pbd = PbdSystem<Backend, Precision>;
+        const double kPi = std::acos(-1.0);
+
+        // Build the quads from a fresh FLAT cloth, then step and re-measure
+        // the same quads against their stored phi0.
+        auto runBendDeviation = [&](Precision kbend, size_t* quadCount,
+                                    double* maxRestDev) -> double {
+            resetScene();
+            sim.usePbd = true;
+            sim.addGround(PlaneDirection::XZPlane, tinym::vec3(0, 0, 0), 4.0f);
+            sim.addCloth(8, 0.8f, tinym::vec3(0.0f, 0.4f, 0.0f),
+                         Precision(1e5), Precision(1e5), kbend);
+            sim.initialize();
+            auto* cloth = Scene<Backend, Precision>::findById(1);
+            if (!cloth) return std::numeric_limits<double>::quiet_NaN();
+            std::vector<Pbd::BendQuad> quads;
+            Pbd::buildBendQuads(*cloth, quads);
+            if (quadCount) *quadCount = quads.size();
+            if (maxRestDev) {
+                double mx = 0.0;
+                for (const auto& q : quads)
+                    mx = std::max(mx, std::fabs((double)q.phi0 - kPi));
+                *maxRestDev = mx;
+            }
+            sim.pause = false;
+            for (int f = 0; f < 60; ++f) sim.update();
+            MetalGlobalContext::commitAndWait();
+            sim.pause = true;
+            cloth = Scene<Backend, Precision>::findById(1);
+            if (!cloth) return std::numeric_limits<double>::quiet_NaN();
+            double acc = 0.0; int cnt = 0;
+            for (const auto& q : quads) {
+                Pbd::Vec3 n1, n2; Precision l23, l24, d;
+                if (!Pbd::dihedral(cloth->state.x.ptr, q.p1, q.p2, q.p3, q.p4,
+                                   n1, n2, l23, l24, d)) continue;
+                acc += std::fabs(std::acos((double)d) - (double)q.phi0);
+                ++cnt;
+            }
+            return cnt ? acc / (double)cnt : std::numeric_limits<double>::quiet_NaN();
+        };
+
+        size_t quadCount = 0;
+        double maxRestDev = 0.0;
+        const double devStiff = runBendDeviation(Precision(1e6), &quadCount, &maxRestDev);
+        const double devSoft  = runBendDeviation(Precision(1e4), nullptr, nullptr);
+
+        // (a) The two normals are DELIBERATELY built with opposite
+        // orientation (n1 from p2xp3, n2 from p2xp4), so a flat rest sheet
+        // must give d = -1, i.e. phi0 = pi. A quad ordering that "fixed" the
+        // winding to make the normals agree would land at 0 instead and the
+        // gradients (21-28) would no longer match the constraint.
+        if (quadCount == 0)
+            fail("PBD-5 / dihedral bend quads built from facet adjacency",
+                 "no interior-edge quads found on an 8x8 cloth");
+        else if (maxRestDev > 0.05)
+            fail("PBD-5 / flat rest sheet has phi0 == pi (opposite-normal convention)",
+                 "max |phi0 - pi| = " + std::to_string(maxRestDev)
+                 + " rad over " + std::to_string(quadCount) + " quads");
+        else
+            pass("PBD-5 / dihedral bend quads built, flat rest sheet gives phi0 == pi");
+
+        // (b) The constraint must actually resist bending: a 100x stiffer
+        // kbend has to hold the sheet closer to its rest dihedral angle.
+        if (!std::isfinite(devStiff) || !std::isfinite(devSoft))
+            fail("PBD-6 / bend stiffness resists dihedral deviation",
+                 "non-finite dihedral measurement");
+        else if (!(devStiff < devSoft))
+            fail("PBD-6 / bend stiffness resists dihedral deviation",
+                 "kbend 1e6 deviation " + std::to_string(devStiff)
+                 + " not below kbend 1e4 deviation " + std::to_string(devSoft));
+        else
+            pass("PBD-6 / bend stiffness resists dihedral deviation");
+
+        sim.pause = true;
+        sim.usePbd = false;
     }
 
     if (failures == 0) {

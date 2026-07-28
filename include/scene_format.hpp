@@ -107,13 +107,13 @@ struct Environment {
     Vec3 backgroundColor{0.68, 0.85, 0.95};
 };
 
-// Solver timing for the ExplicitSystem driving the sim. Optional in
+// Solver timing for the SymplecticSystem driving the sim. Optional in
 // JSON for backward compat: scenes saved before this field load with
 // the engine defaults (1/60 s per frame, 60 substeps), exactly the
 // values a fresh launch uses.
 struct Simulation {
-    double timePerFrame = 1.0 / 60.0; // ExplicitSystem::h (seconds)
-    int    subSteps     = 60;         // ExplicitSystem::subSteps
+    double timePerFrame = 1.0 / 60.0; // SymplecticSystem::h (seconds)
+    int    subSteps     = 60;         // SymplecticSystem::subSteps
 };
 
 // A reference-point coincidence constraint set in the point-selection

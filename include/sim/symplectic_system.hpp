@@ -3,10 +3,16 @@
 // Fragment header: included in order by main.cpp after the preamble;
 // relies on that preamble (using Index, std includes) and on earlier
 // fragments. Not independently compilable by design.
+//
+// Naming: this was called ExplicitSystem, but the integrator is symplectic
+// (semi-implicit) Euler, not explicit/forward Euler — the integrate kernels
+// update velocity first and step position with the ALREADY-updated velocity
+// (`vel += subh*f/m; ... pos += subh*vel`, physics.metal integrate_cloth /
+// integrate_cloth_grid). Renamed to match what it actually does.
 
-struct ExplicitSystem {};
+struct SymplecticSystem {};
 template <typename PR>
-struct ExplicitSystem<CPU, PR> {
+struct SymplecticSystem<CPU, PR> {
     using Vector = VectorBase<CPU, PR>;
     using Vectorui = VectorBase<CPU, unsigned int>;
 
@@ -17,10 +23,10 @@ struct ExplicitSystem<CPU, PR> {
     PR kair = -0.1;
     PR kd = 0.1;
 
-    ExplicitSystem(PR h=1/PR(60), Index subSteps=50) : h(h), subSteps(subSteps), subh(h/subSteps) {}
+    SymplecticSystem(PR h=1/PR(60), Index subSteps=50) : h(h), subSteps(subSteps), subh(h/subSteps) {}
 
     //void initialize(SceneObject<CPU, PR>& sceneObjects) {
-    //    std::cout << "[System Creation] Try to create Explicit System..." << std::endl;
+    //    std::cout << "[System Creation] Try to create Symplectic System..." << std::endl;
     //}
 
     void clearForce(Scene<CPU, PR>& sceneObjects) { 
@@ -154,7 +160,7 @@ struct ExplicitSystem<CPU, PR> {
 
 
 template <typename PR>
-struct ExplicitSystem<METAL, PR> {
+struct SymplecticSystem<METAL, PR> {
     using Vector = VectorBase<METAL, PR>;
     using Vectorui = VectorBase<METAL, unsigned int>;
 
@@ -194,9 +200,9 @@ struct ExplicitSystem<METAL, PR> {
     // TODO: bending은 더 강하게 줘야할 듯. - 교수님
 
 
-    ExplicitSystem(PR h=1/PR(60), Index subSteps=50) 
+    SymplecticSystem(PR h=1/PR(60), Index subSteps=50) 
         : h(h), subSteps(subSteps), subh(h/subSteps) {
-        std::cout << "[System Creation] Try to create Explicit System..." << std::endl;
+        std::cout << "[System Creation] Try to create Symplectic System..." << std::endl;
         std::cout << "  - Connecting device..." << std::endl;
         //device = MTL::CreateSystemDefaultDevice();
         //pool = ByteMemoryPool<METAL>(device, 50*1024*1024*sizeof(PR));

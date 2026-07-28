@@ -1075,15 +1075,20 @@ void drawMeshInspectorWindow(MeshInspectorWindowState& st, const MeshInspectorTa
         float sc=*t.cloth_stiffness_scale;float k=(sc>0)?std::log10(sc):0;if(k<-2)k=-2;if(k>2)k=2;
         ImGui::Dummy({0,kP});ImGui::Indent(kP);
         if(InlineSlider("팽팽함",&k,-2,2)){float ns=std::pow(10.f,k);*t.cloth_stiffness_scale=ns;t.on_cloth_stiffness_scale(t.mesh_id,ns);}
-        // Per-type stiffness coefficients (log10 slider, 1e2..1e7).
-        // A null pointer keeps that row hidden — FastGridCloth omits
-        // shear, TriangularCloth shows all three.
+        // Per-type stiffness coefficients (log10 slider). The range comes
+        // from the target, not a constant: the active solver decides which
+        // band of spring constants is meaningful (see the *_log_range
+        // comment in MeshInspectorWindow.hpp). A null pointer keeps that
+        // row hidden — FastGridCloth omits shear, and the PBD solver omits
+        // it too (no shear constraint set).
         auto clothK=[&](const char* lbl,float* val,
-                        const std::function<void(int,float)>& cb){
+                        const std::function<void(int,float)>& cb,
+                        const float* range){
             if(!val||!cb) return;
-            float lk=(*val>0)?std::log10(*val):2.f;
-            if(lk<2)lk=2;if(lk>7)lk=7;
-            if(InlineSlider(lbl,&lk,2,7)){
+            const float lo=range[0],hi=range[1];
+            float lk=(*val>0)?std::log10(*val):lo;
+            if(lk<lo)lk=lo;if(lk>hi)lk=hi;
+            if(InlineSlider(lbl,&lk,lo,hi)){
                 float nv=std::pow(10.f,lk);*val=nv;cb(t.mesh_id,nv);}
             ImGui::Dummy({0,8});
         };
@@ -1091,9 +1096,9 @@ void drawMeshInspectorWindow(MeshInspectorWindowState& st, const MeshInspectorTa
             ImGui::PushStyleColor(ImGuiCol_Text,kG60);
             ImGui::TextUnformatted("강성");ImGui::PopStyleColor();
             ImGui::Dummy({0,8});}
-        clothK("스트레치",t.cloth_stretch,t.on_cloth_stretch);
-        clothK("시어",    t.cloth_shear,  t.on_cloth_shear);
-        clothK("벤드",    t.cloth_bend,   t.on_cloth_bend);
+        clothK("스트레치",t.cloth_stretch,t.on_cloth_stretch,t.cloth_stretch_log_range);
+        clothK("시어",    t.cloth_shear,  t.on_cloth_shear,  t.cloth_shear_log_range);
+        clothK("벤드",    t.cloth_bend,   t.on_cloth_bend,   t.cloth_bend_log_range);
         ImGui::Unindent(kP);ImGui::Dummy({0,kP});
     }
 

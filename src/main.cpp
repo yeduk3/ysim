@@ -59,13 +59,20 @@ using Index = uint32_t;
 #include "sim/mesh_state.hpp"
 #include "sim/initializers.hpp"
 #include "sim/collision_pod.hpp"
+// Must sit here, not next to simulator.hpp: scene/spatial_hash/bvh/bruteforce
+// each END with a dangling `template <...>` line that heads the NEXT fragment,
+// so nothing can be inserted between them. collision_pod.hpp closes cleanly,
+// and PbdSystem only needs Scene/GeneralMesh as declared template names
+// (mesh_state.hpp forward-declares both) — its bodies are dependent.
+#include "sim/pbd_system.hpp"
 #include "sim/material_quat.hpp"
 #include "sim/scene.hpp"
 #include "sim/spatial_hash.hpp"
 #include "sim/bvh.hpp"
 #include "sim/bruteforce.hpp"
 #include "sim/simulator.hpp"
-#include "sim/explicit_system.hpp"
+#include "sim/symplectic_system.hpp"
+#include "sim/scene_registry.hpp"
 
 // Compile-time backend name for the req-6 engine check. The build wires
 // exactly one backend (METAL today); a config asking for a different one is
@@ -137,25 +144,84 @@ struct SimulatorBuilder {
 // Included last: it needs the full engine + GL helpers above in scope.
 #include "../test/self_test_inline.hpp"
 
+// Distinguishes a --scene RunConfig file path from a registry scene name.
+static bool endsWithJson(const std::string& s) {
+    return s.size() >= 5 && s.compare(s.size() - 5, 5, ".json") == 0;
+}
+
+// Usage / help text for --list / --help / -h and the unknown-flag error path.
+// Lists the accepted flags and the named-scene registry (this build is METAL).
+static void printUsage(std::ostream& os) {
+    os << "usage: ysim [--scene <name|file.json>] [--demo-uniform] "
+          "[--self-test] [--list]\n\n"
+       << "flags:\n"
+       << "  --scene <name>       run a named scene from the registry (below)\n"
+       << "  --scene <file.json>  load a RunConfig scene file\n"
+       << "  --demo-uniform       launch the ML-spatial-hash uniform demo scene\n"
+       << "  --self-test          run headless self-tests and exit\n"
+       << "  --list, --help, -h   print this help and exit\n\n"
+       << "named scenes (--scene <name>):\n";
+    for (const auto& e : scene_registry::registry<METAL, Precision>())
+        os << "  " << e.name << "  -  " << e.description << "\n";
+    os << "\nNote: --scene also accepts a RunConfig *.json file path.\n";
+}
+
 int main(int argc, char** argv) {
     if (argc > 1 && std::string(argv[1]) == "--self-test") {
         return runSelfTest();
     }
-    // --scene <file.json>: drive the interactive app from a RunConfig instead
-    // of the hardcoded default scene. Functionally identical to GUI File>Load
-    // (req 3); the config's profile block (req 2) can run a headless N-frame
-    // capture + sidecar (req 4).
-    std::string scenePath;
-    for (int i = 1; i + 1 < argc; ++i) {
-        if (std::string(argv[i]) == "--scene") { scenePath = argv[i + 1]; break; }
-    }
-    // --demo-uniform: launch the GUI on the multi-level-spatial-hash demo scene
-    // (cloth on a tessellated floor — uniform face size, the hgrid sweet spot)
-    // with ML already the active broad phase and a held-pair cadence that is both
-    // stable and fast. Mirrors runMlDriveDiag("uniform").
+    // ── CLI parse (before any GL / window creation) ──────────────────────
+    //   --scene <name|file.json> : named registry scene, or a RunConfig file
+    //                              (functionally identical to GUI File>Load,
+    //                              req 3; its profile block can run a headless
+    //                              N-frame capture + sidecar, req 2/4).
+    //   --demo-uniform           : the ML-spatial-hash uniform demo scene
+    //                              (== `--scene demo_uniform`, same registry
+    //                              entry). Mirrors runMlDriveDiag("uniform").
+    //   --list / --help / -h     : print usage + scenes and exit (no window).
+    // Unknown --flags are a hard error (previously silently ignored, launching
+    // the GUI anyway). Non-flag positional args keep their prior no-op.
+    std::string scenePath;   // --scene value: registry name OR *.json path
     bool demoUniform = false;
-    for (int i = 1; i < argc; ++i)
-        if (std::string(argv[i]) == "--demo-uniform") { demoUniform = true; break; }
+    bool wantList = false;
+    for (int i = 1; i < argc; ++i) {
+        const std::string a = argv[i];
+        if (a == "--scene") {
+            if (i + 1 >= argc) {
+                std::cerr << "--scene requires a value\n";
+                return 1;
+            }
+            scenePath = argv[++i];
+        } else if (a == "--demo-uniform") {
+            demoUniform = true;
+        } else if (a == "--list" || a == "--help" || a == "-h") {
+            wantList = true;
+        } else if (a == "--self-test") {
+            // Handled at the top of main() when first; ignored elsewhere.
+        } else if (a.rfind("--", 0) == 0) {
+            std::cerr << "unknown option: '" << a << "'\n\n";
+            printUsage(std::cerr);
+            return 1;
+        }
+        // else: non-flag positional argument → prior behavior (ignored).
+    }
+
+    if (wantList) {
+        printUsage(std::cout);
+        return 0;   // before window creation: no GL, no GUI.
+    }
+
+    // Validate a named scene before any GL/window work (find() is a pure
+    // registry lookup) so a typo'd name fails fast instead of flashing a
+    // window. METAL matches printUsage; the registry rows are backend-agnostic.
+    if (!scenePath.empty() && !endsWithJson(scenePath)
+        && !scene_registry::find<METAL, Precision>(scenePath)) {
+        std::cerr << "unknown scene: '" << scenePath << "'\n"
+                  << "named scenes:\n";
+        for (const auto& e : scene_registry::registry<METAL, Precision>())
+            std::cerr << "  " << e.name << "\n";
+        return 1;
+    }
 
     std::cout << "Run simulator" << std::endl;
 
@@ -184,8 +250,8 @@ int main(int argc, char** argv) {
     //ByteMemoryPool<METAL> pool(50*1024*1024*sizeof(Precision));
     Precision h = 1/Precision(60);
     Index subSteps = 1;
-    ExplicitSystem<Backend, Precision> system(h, subSteps);
-    Simulator<Backend, Precision, ExplicitSystem<Backend, Precision>> simulator(system);
+    SymplecticSystem<Backend, Precision> system(h, subSteps);
+    Simulator<Backend, Precision, SymplecticSystem<Backend, Precision>> simulator(system);
     std::cout << "[Main] simulator created" << std::endl;
 
     //Index particleNum1D = 20;
@@ -193,13 +259,16 @@ int main(int argc, char** argv) {
     //Precision kstretch = 2e3;
     //Precision kshear = 2e3;
     //Precision kbend = 4e3;
-    Index particleNum1D = 20;
-    Precision size1D = 0.5;
-    Precision kstretch = 1e5;
-    Precision kshear = 1e5;
-    Precision kbend = 2e5;
-    Precision mass = 0.1;
-    Precision thickness = 0.01;
+    // Cloth material constants for the built-in scenes now live with their
+    // scene in scene_registry.hpp (demo_uniform); kept here (commented) for
+    // reference by the disabled experiments below.
+    //Index particleNum1D = 20;
+    //Precision size1D = 0.5;
+    //Precision kstretch = 1e5;
+    //Precision kshear = 1e5;
+    //Precision kbend = 2e5;
+    //Precision mass = 0.1;
+    //Precision thickness = 0.01;
     //simulator.addClothGridFast(particleNum1D, size1D, kstretch, kshear, kbend, thickness, mass);
     //simulator.addClothGridFast(100, 1, kstretch, kshear, kbend, thickness, mass);
     //for(int i = 0; i < 1; i++) 
@@ -209,9 +278,15 @@ int main(int argc, char** argv) {
     // from the live default sim on export).
     sim_config::RunConfig runConfig;
     bool haveRunConfig = false;
-    if (!scenePath.empty()) {
+    // Set when a named registry scene is chosen (needed again after
+    // initialize() for its optional post-init hook, e.g. demo_uniform's ML
+    // broad-phase activation). Stays null on the *.json path.
+    const scene_registry::Entry<Backend, Precision>* activeScene = nullptr;
+
+    if (!scenePath.empty() && endsWithJson(scenePath)) {
+        // --scene <file.json>: RunConfig path (unchanged SimulatorBuilder).
         auto bres = SimulatorBuilder<Backend, Precision,
-            ExplicitSystem<Backend, Precision>>::fromFile(scenePath);
+            SymplecticSystem<Backend, Precision>>::fromFile(scenePath);
         if (!bres.ok) {
             std::cerr << "[--scene] load failed: " << bres.error.message << "\n";
             return 1;
@@ -225,18 +300,24 @@ int main(int argc, char** argv) {
         haveRunConfig = true;
         std::cout << "[--scene] loaded " << scenePath << " ("
                   << runConfig.scene.objects.size() << " objects)\n";
-    } else if (demoUniform) {
-        // Tessellated floor (3 wide, 24x24 -> face ~0.12) as a static Float + a
-        // cloth (1 wide, 20x20 -> face ~0.05). All faces within ~2x -> every grid
-        // cell stays sparse, no oversized primitive. ML-friendly geometry.
-        simulator.addPlane(PlaneDirection::XZPlane, tinym::vec3(0, 0, 0), 24, 3.0,
-                           0.1, BehaviorType::Float);
-        simulator.addCloth(20, 1, tinym::vec3(0, 0.6, 0), kstretch, kshear, kbend, thickness, mass);
-        simulator.mlBroadPhase.floorExcludeDiag = 1e9f;   // exclude NOTHING
     } else {
-        // Default scene: just a checkerboard floor (no cloth, no obstacle).
-        simulator.addGround(PlaneDirection::XZPlane, tinym::vec3(0, 0, 0), 50);
-        Scene<Backend, Precision>::requestsGeneralMeshes.back().checkerboard = true;
+        // Named scene: explicit `--scene <name>`, `--demo-uniform`, or the
+        // no-arg default. All three resolve to one registry entry so each
+        // scene has a single definition (scene_registry.hpp).
+        const std::string sceneName =
+            !scenePath.empty() ? scenePath
+          : demoUniform        ? std::string("demo_uniform")
+                               : std::string("default");
+        activeScene = scene_registry::find<Backend, Precision>(sceneName);
+        if (!activeScene) {
+            std::cerr << "unknown scene: '" << sceneName << "'\n"
+                      << "named scenes:\n";
+            for (const auto& e : scene_registry::registry<Backend, Precision>())
+                std::cerr << "  " << e.name << "\n";
+            return 1;
+        }
+        activeScene->setup(simulator, system);
+        std::cout << "[scene] built '" << activeScene->name << "'\n";
     }
 
     std::cout << "[Main] mesh added to scene" << std::endl;
@@ -244,16 +325,11 @@ int main(int argc, char** argv) {
     simulator.initialize();
     std::cout << "[Main] simulator is initialized" << std::endl;
 
-    if (demoUniform) {
-        // Multi-level spatial hash as the active broad phase, held over cdP=8
-        // substeps (stable + ~20-26fps on this scene; BVH tunnels at this
-        // cadence). Toggle off live with the Profiler "Multi-level Spatial Hash"
-        // checkbox / CD-period slider to A/B against BVH.
-        simulator.useMultiLevelSH   = true;
-        simulator.useSpatialHashing = false;
-        simulator.cdSubstepPeriod    = 8;
-        simulator.refitSubstepPeriod = 8;
-        std::cout << "[Main] --demo-uniform: ML broad phase active, cdP=8\n";
+    // Post-initialize scene configuration (e.g. demo_uniform's ML broad-phase
+    // activation, which must run after initialize()). Drives off the registry
+    // entry so `--demo-uniform` and `--scene demo_uniform` behave identically.
+    if (activeScene && activeScene->postInit) {
+        activeScene->postInit(simulator);
     }
 
     // if(Scene<Backend, Precision>::numMeshes > 0) {
@@ -565,7 +641,7 @@ int main(int argc, char** argv) {
 #endif
 
     struct CallbacksDataPack {
-        Simulator<Backend, Precision, ExplicitSystem<Backend, Precision>>* simulator;
+        Simulator<Backend, Precision, SymplecticSystem<Backend, Precision>>* simulator;
         bool* debugEachBoxes;
         bool* debugSceneBox;
         bool* debugCollisions;
@@ -1175,6 +1251,24 @@ int main(int argc, char** argv) {
                     target.on_cloth_stretch = [setF](int id, float v){ setF(id, &FastGridClothBehaviorParams<Precision>::kstretch, v); };
                     target.cloth_bend = &fp->kbend;
                     target.on_cloth_bend = [setF](int id, float v){ setF(id, &FastGridClothBehaviorParams<Precision>::kbend, v); };
+                }
+                // Solver-dependent slider range. PBD divides the same
+                // coefficient by its per-channel reference and clamps to
+                // [0,1], so everything above the reference is a dead zone —
+                // cap the slider there and give it two decades of travel so
+                // the meaningful band is actually reachable. Shear is hidden
+                // under PBD: adjacency has no shear constraint set (the grid
+                // diagonals are ordinary edges, already projected with the
+                // stretch coefficient).
+                if (simulator.usePbd) {
+                    const float sRef = std::log10((float)simulator.pbd.stretchRef);
+                    const float bRef = std::log10((float)simulator.pbd.bendRef);
+                    target.cloth_stretch_log_range[0] = sRef - 2.0f;
+                    target.cloth_stretch_log_range[1] = sRef;
+                    target.cloth_bend_log_range[0]    = bRef - 2.0f;
+                    target.cloth_bend_log_range[1]    = bRef;
+                    target.cloth_shear = nullptr;
+                    target.on_cloth_shear = nullptr;
                 }
                 // D-027: material inspector path. base_color is set above;
                 // wire the other 4 material fields + the commit callback so
@@ -2098,7 +2192,7 @@ int main(int argc, char** argv) {
             };
 
             // ── 시뮬레이션 환경 Simulation ───────────────────────
-            // Edits the live ExplicitSystem driving the sim: `h` is
+            // Edits the live SymplecticSystem driving the sim: `h` is
             // the per-frame time step (default 1/60 s), `subSteps` the
             // substep count per frame (default 60). subh = h/subSteps
             // is only computed in the System ctor, so it MUST be
@@ -2140,6 +2234,40 @@ int main(int argc, char** argv) {
 
                 ImGui::Dummy({0, 20});
                 panelToggleRow("rtSync", "실시간 동기화", &realtimeSimSync);
+
+                // Solver A/B: symplectic (GPU) vs PBD (CPU). Both consume the
+                // same subh / substep loop / collision pipeline, so switching
+                // is live — no re-init needed. Cloth stiffness is NOT here:
+                // both solvers read the per-mesh stretch/shear/bend from the
+                // mesh inspector (PBD maps them onto its [0,1] projection
+                // weights internally), so there is one place to edit them.
+                ImGui::Dummy({0, 20});
+                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.420f, 0.463f, 0.518f, 1.0f));
+                ImGui::TextUnformatted("솔버");
+                ImGui::PopStyleColor();
+                ImGui::Dummy({0, 4});
+                ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - P);
+                {
+                    const char* solverNames[] = { "Symplectic (GPU)", "PBD (CPU)" };
+                    int solverIdx = simulator.usePbd ? 1 : 0;
+                    if (ImGui::Combo("##solver", &solverIdx, solverNames,
+                                     IM_ARRAYSIZE(solverNames))) {
+                        simulator.usePbd = (solverIdx == 1);
+                    }
+                }
+
+                if (simulator.usePbd) {
+                    ImGui::Dummy({0, 12});
+                    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.420f, 0.463f, 0.518f, 1.0f));
+                    ImGui::TextUnformatted("PBD 반복 횟수");
+                    ImGui::PopStyleColor();
+                    ImGui::Dummy({0, 4});
+                    ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - P);
+                    if (ImGui::InputInt("##pbdIter", &simulator.pbd.iterations)
+                        && simulator.pbd.iterations < 1) {
+                        simulator.pbd.iterations = 1;
+                    }
+                }
 
                 ImGui::Unindent(P);
                 ImGui::Dummy({0, P});

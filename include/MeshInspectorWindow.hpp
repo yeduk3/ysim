@@ -192,6 +192,16 @@ struct MeshInspectorTarget {
     std::function<void(int, float)> on_cloth_shear;
     float* cloth_bend = nullptr;
     std::function<void(int, float)> on_cloth_bend;
+    // log10 min/max for each 강성 slider — SOLVER DEPENDENT. The force
+    // solver consumes spring constants across the whole 1e2..1e7 band
+    // (the defaults below). PBD maps the same field onto a [0,1]
+    // projection weight by dividing by a per-channel reference and
+    // clamping, so everything above that reference is a dead zone;
+    // the caller narrows the range to the band that actually does
+    // something. Per channel because the references differ.
+    float cloth_stretch_log_range[2] = { 2.f, 7.f };
+    float cloth_shear_log_range[2]   = { 2.f, 7.f };
+    float cloth_bend_log_range[2]    = { 2.f, 7.f };
     // FR-005 / D-027 inspector material path. The 4 scalar/vec3 pointers
     // read the mesh's material fields (D-005's v1 OpenPBR subset: base_color,
     // metallic, roughness, specular_weight, emission_color). Widgets mutate

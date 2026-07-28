@@ -9,6 +9,14 @@ struct Simulator {
 
     Scene<BE, PR> scene;
 
+    // Sibling CPU PBD solver (docs/design/pbd-system-handoff.md §4 option A).
+    // `usePbd` swaps which solver consumes the substep — everything else
+    // (broad/narrow phase, xPrev snapshot, timing, profiling) is shared. PBD
+    // borrows `system.subh` rather than owning timing fields, so the snapshot
+    // restore path keeps a single source of truth.
+    PbdSystem<BE, PR> pbd;
+    bool usePbd = false;
+
     //using BroadPhase = BVH<BVHMODE::LINEAR, BVHPRIMITIVE::TRIANGLE, PR>;
     using BroadPhase = BVH<BE, PR, BVHMODE::SCENE, BVHPRIMITIVE::OBJECT>;
     using NarrowPhase = BruteForce<METAL, PR>;
@@ -3276,11 +3284,16 @@ struct Simulator {
             // old CPU memcpy loop. Rides the current encoder (no sync).
             system.snapshotXPrev(scene);
 
+            // Solver dispatch. `usePbd` picks the CPU PBD sibling; the
+            // symplectic System still owns timing (subh) and the xPrev
+            // snapshot above, so switching mid-run needs no re-init.
             if (profiler) {
                 auto scope = profiler->scoped("system_update");
-                system.update(scene);
+                if (usePbd) pbd.step(scene, system.subh);
+                else        system.update(scene);
             } else {
-                system.update(scene);
+                if (usePbd) pbd.step(scene, system.subh);
+                else        system.update(scene);
             }
 
             // Experiment: PerFrame + perFrameSubstepCommit → flush this substep's
