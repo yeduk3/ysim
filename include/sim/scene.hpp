@@ -343,6 +343,16 @@ struct Scene {
         // source of truth: the inspector writes it, pack copies it out,
         // loadScene overwrites it when the scene file carries a kind.
         requestsGeneralMeshes.back().colliderKind = defaultColliderKind(initializer);
+        // ...except for cloth: an analytic collider represents a rigid/static
+        // shape by its parameters, so a DEFORMING mesh carrying one is a dead
+        // combination (BVH self-collision skips it, the broad marker branch
+        // swallows its query pairs, narrow drops its rows via skipAnalytic).
+        // A sphere/cube/cylinder requested AS cloth — scene-registry code or
+        // the inspector's behavior dropdown — must start on the triangle soup.
+        // Mirrors Simulator::changeBehavior's cloth cases.
+        if (behaviorType == BehaviorType::TriangularCloth
+            || behaviorType == BehaviorType::FastGridCloth)
+            requestsGeneralMeshes.back().colliderKind = ColliderKind::Mesh;
         numMeshes++;
 
         // D-042 R-1: populate preview state directly from the initializer

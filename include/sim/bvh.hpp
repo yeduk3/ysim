@@ -2816,14 +2816,19 @@ struct BVH<BE, PR, BVHMODE::SCENE, BVHPRIMITIVE::OBJECT> {
         }
     }
 
-    void queryBegin() {
+    // `resetCounter == false`: reset the per-tree overflow diagnostics but
+    // LEAVE numBroadCollisions[0] alone, so this detect appends to rows a
+    // previous producer already wrote (the useCpuShSelf hybrid). See
+    // detectCollisions' comment for why the CPU producer must go first.
+    void queryBegin(bool resetCounter = true) {
         if (syncEachPhase) {
             for(auto& tree : objTrees) {
                 tree.qFlag[0].stackOverflow = 0;
                 tree.qFlag[0].collisionOverflow = 0;
             }
-            Scene<METAL, PR>::packedCollisionData.numBroadCollisions[0] = 0;
-        } else {
+            if (resetCounter)
+                Scene<METAL, PR>::packedCollisionData.numBroadCollisions[0] = 0;
+        } else if (resetCounter) {
             // Async (None/PerFrame): the broad-pair counter MUST be reset on
             // the GPU, encoded into the stream — a CPU write here would not
             // order with the in-flight detect dispatches, so all 60 substeps'
@@ -2837,9 +2842,18 @@ struct BVH<BE, PR, BVHMODE::SCENE, BVHPRIMITIVE::OBJECT> {
             MetalGlobalContext::dispatchThreads(resetPSO, 1);
         }
     }
+    // `resetCounter == false` keeps queryBegin()'s counter reset OFF, i.e.
+    // this detect APPENDS to whatever rows numBroadCollisions[0] already
+    // holds instead of starting from 0. Sole consumer: the CPU-hash SELF hybrid
+    // (Simulator::useCpuShSelf), which writes its host-side self rows FIRST
+    // and then lets these GPU query kernels' device atomics continue from
+    // that count. Order matters — a CPU append AFTER this call would race the
+    // still-pending GPU atomics under the async tiers. Default true ⇒ byte-
+    // identical behavior for every existing caller.
     void detectCollisions(PR margin, bool enableSelfCollisions=true,
-                          bool analyticEnabled=false) {
-        queryBegin();
+                          bool analyticEnabled=false,
+                          bool resetCounter=true) {
+        queryBegin(resetCounter);
         // Push the sync tier so grouped queries pick GPU-brute off InFrame.
         for (auto& tr : objTrees) tr.syncEachPhase = syncEachPhase;
         // Slice (c-2): fresh analytic markers each broad detect.
@@ -2939,9 +2953,11 @@ struct BVH<BE, PR, BVHMODE::SCENE, BVHPRIMITIVE::OBJECT> {
     // queryPointsSegmented (paper Alg.2 stream registration). Kept as a
     // SEPARATE method so the baseline path stays bench-compatible and
     // can be deprecated cleanly once the segmented path is proven.
+    // `resetCounter`: same append semantics as detectCollisions above.
     void detectCollisionsSegmented(PR margin, bool enableSelfCollisions=true,
-                                   bool analyticEnabled=false) {
-        queryBegin();
+                                   bool analyticEnabled=false,
+                                   bool resetCounter=true) {
+        queryBegin(resetCounter);
         // Slice (c-2): fresh analytic markers each broad detect.
         Scene<METAL, PR>::packedCollisionData.beginAnalyticPairs();
 

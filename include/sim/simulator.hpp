@@ -46,6 +46,45 @@ struct Simulator {
     MultiLevelSpatialHashing<METAL, PR> mlBroadPhase;
     bool useMultiLevelSH = false;
 
+    // CPU uniform-grid spatial-hash broadphase (third sibling). Selected when
+    // useCpuSpatialHashing == true, which takes priority over BOTH GPU hashes
+    // in the substep dispatch chain. Emits VERTEX-major rows and writes
+    // numBroadCollisions[0] on the CPU, so the sync narrow phase's counter
+    // gate is truthful without any commitAndWait — see CpuSpatialHash's
+    // header comment for why the GPU SH path fails that gate under usePbd/
+    // usePd. Intended for the CPU solvers (x is CPU-fresh every substep).
+    CpuSpatialHash<PR> cpuShBroadPhase;
+    bool useCpuSpatialHashing = false;
+
+    // HYBRID mode: keep the BVH as the main broad phase (so the analytic
+    // markers it alone emits keep flowing) but source the SELF-collision
+    // rows from cpuShBroadPhase instead of the BVH's per-object
+    // checkSelfCollisions. Lets a normal BVH scene turn self-collision on
+    // and pay only the CPU hash's cheap vertex-major rows.
+    //
+    // Ordering is load-bearing (see CpuSpatialHash::detectSelfCollisions):
+    // the CPU self pass runs FIRST and owns the counter reset, then the BVH
+    // detect runs with self OFF and resetCounter == false so its device
+    // atomics append after the CPU rows. Reversing that would race the
+    // still-pending GPU atomics under the async sync tiers.
+    //
+    // Inactive (silently) under twoMeshExperiment / clusterVFPipeline —
+    // those paths own their own broad loop. Same CPU-solver caveat as the
+    // full CPU path, and one more: the CPU self pass writes the counter
+    // host-side, which only orders against GPU work that is already
+    // COMPLETE. usePbd/usePd commitAndWait at the top of every substep, so
+    // that holds there; under the GPU symplectic solver on the None/PerFrame
+    // async tiers a previous substep's query kernels may still be in flight
+    // and would race this write (and x itself is GPU-pending). Intended for
+    // the CPU solvers / InFrame.
+    //
+    // DEFAULT ON: this is now THE self-collision mechanism under the plain
+    // BVH broad phase, and it is what makes the inspector's per-object
+    // "자기 충돌" checkbox (GeneralMesh::selfCollide) do anything at all —
+    // the BVH's own checkSelfCollisions only ever consulted the scene-wide
+    // enableSelfCollisions flag. Set false to fall back to that old path.
+    bool useCpuShSelf = true;
+
     // BVH path A/B toggle (only meaningful when useSpatialHashing == false).
     //   false (default) -> baseline queryPoints (per-leaf-hit global atomicAdd)
     //   true            -> queryPointsSegmented (per-TG private + reduce)
@@ -67,6 +106,7 @@ struct Simulator {
     bool analyticColliderActive() const {
         return !useSpatialHashing
             && !useMultiLevelSH
+            && !useCpuSpatialHashing
             && !collisionPipeline.broadPhase.twoMeshExperiment
             && Scene<BE, PR>::numAnalytic > 0;
     }
@@ -2067,6 +2107,28 @@ struct Simulator {
                              + std::to_string((double)perVertexMass));
     }
 
+    // "두께" — per-mesh contact thickness (metres). The distance the contact
+    // response resolves to: PbdSystem reads it every step via thicknessOf,
+    // and the narrow/integrate paths read the same behaviorParams field, so
+    // a write here lands on the NEXT substep with no re-pack. Mirrors both
+    // the live mesh and its request (the setObjectMass idiom) so the edit
+    // survives Scene::pack. Touches no rigid backend — safe to call live
+    // from a drag. Cloth behaviors only; other variants are ignored.
+    void setClothThickness(int meshId, PR thickness) {
+        if (!(thickness > PR(0))) thickness = PR(1e-4);
+        auto apply = [&](BehaviorParams<PR>& bp) {
+            if (auto* c = std::get_if<ClothBehaviorParams<PR>>(&bp))
+                c->thickness = thickness;
+            else if (auto* g = std::get_if<FastGridClothBehaviorParams<PR>>(&bp))
+                g->thickness = thickness;
+        };
+        if (auto* mesh = Scene<BE, PR>::findById(meshId)) apply(mesh->behaviorParams);
+        for (auto& req : Scene<BE, PR>::requestsGeneralMeshes)
+            if (req.id == meshId) { apply(req.behaviorParams); break; }
+        scene_log::logObject("두께 변경: obj " + std::to_string(meshId) + " → "
+                             + std::to_string((double)thickness));
+    }
+
     // ── Point-selection vertex ops ────────────────────────────────────
     // Render-vertex (gl_VertexID over the bound MeshGL buffer = preview
     // renderXPtr) → physics-vertex index. For grid/sphere/file the two
@@ -2555,6 +2617,12 @@ struct Simulator {
                 if (r.id == mesh->id) {
                     r.behaviorType   = mesh->behaviorType;
                     r.behaviorParams = mesh->behaviorParams;
+                    // colliderKind is normally request-owned and NEVER
+                    // re-derived at pack — but the cloth cases below
+                    // deliberately overwrite the live field, so mirror it
+                    // back or the next pack would restore the old kind. A
+                    // no-op for every case that doesn't touch it.
+                    r.colliderKind   = mesh->colliderKind;
                     break;
                 }
             }
@@ -2577,6 +2645,17 @@ struct Simulator {
                 mesh->behaviorParams = ClothBehaviorParams<PR>{
                     PR(1e5), PR(1e5), PR(3e5), PR(0.01)
                 };
+                // A cloth with an ANALYTIC collider is a dead combination:
+                // the analytic path represents rigid/static shapes by their
+                // parameters, so a deforming mesh tagged Sphere/Box/... is
+                // triple-dropped — BVH self-collision skips it
+                // (analyticSkip), the broad marker branch swallows its query
+                // pairs, and narrow_pt_tri drops its rows via skipAnalytic.
+                // Retagging a primitive to cloth must therefore reset the
+                // collider to the triangle-soup representation. The dirty
+                // re-pack below re-derives numAnalytic, which also retires
+                // the now-ghost analytic shape entry.
+                mesh->colliderKind = ColliderKind::Mesh;
                 syncBroadPhaseCaches(BehaviorType::TriangularCloth);
                 return markDirtyAndAccept();
             case BehaviorType::FastGridCloth: {
@@ -2611,6 +2690,8 @@ struct Simulator {
                     restB, restB,
                     PR(1e5), PR(1e5), PR(3e5), PR(0.001)
                 };
+                // Same dead-combination reset as TriangularCloth above.
+                mesh->colliderKind = ColliderKind::Mesh;
                 syncBroadPhaseCaches(BehaviorType::FastGridCloth);
                 return markDirtyAndAccept();
             }
@@ -2760,13 +2841,27 @@ struct Simulator {
         shBroadPhase                     = decltype(shBroadPhase){};
         mlBroadPhase                     = decltype(mlBroadPhase){};
 
-        // Broad-phase method headless hook: YSIM_BROADPHASE=sh|ml selects the
-        // single-level or multi-level spatial hash (default BVH). Tunables:
+        // Broad-phase method headless hook: YSIM_BROADPHASE=sh|ml|cpu selects
+        // the single-level GPU hash, the multi-level GPU hash, or the CPU
+        // uniform-grid hash (default BVH). Tunables:
         // YSIM_ML_LEVELS=<L>, YSIM_FLOOR_DIAG=<world-diag exclusion threshold>.
         if (const char* bp = std::getenv("YSIM_BROADPHASE")) {
             std::string s(bp);
             if (s == "sh") { useSpatialHashing = true;  useMultiLevelSH = false; }
             else if (s == "ml") { useMultiLevelSH = true; useSpatialHashing = false; }
+            else if (s == "cpu") {
+                useCpuSpatialHashing = true;
+                useSpatialHashing    = false;
+                useMultiLevelSH      = false;
+            }
+        }
+        // Hybrid A/B lever (OPTIONAL — the hybrid is on by default and is
+        // reachable from the GUI checkbox / scene registry; this only exists
+        // to force it either way for a comparison run).
+        //   YSIM_CPUSH_SELF=0 → BVH's own checkSelfCollisions
+        //   YSIM_CPUSH_SELF=1 → CPU-hash self rows (the default)
+        if (const char* hs = std::getenv("YSIM_CPUSH_SELF")) {
+            useCpuShSelf = (std::atoi(hs) != 0);
         }
         if (const char* lv = std::getenv("YSIM_ML_LEVELS")) {
             int L = std::atoi(lv);
@@ -3241,7 +3336,34 @@ struct Simulator {
                 const bool doRefit = (i % refitP == 0);
                 const bool doBroad = (i % cdP    == 0);
 
-                if (useMultiLevelSH) {
+                if (useCpuSpatialHashing) {
+                    // CPU uniform-grid hash. Pure CPU: no dispatch, no
+                    // commitAndWait, and numBroadCollisions[0] is written
+                    // host-side so the sync narrow phase's counter gate is
+                    // already truthful when narrowAndSortByVertices runs.
+                    // refit() is a no-op (grid rebuilt each detect), mirroring
+                    // the two GPU hash branches below.
+                    cpuShBroadPhase.verbose = logSHPerSubstep;
+                    if (doRefit) {
+                        if (profiler) {
+                            auto scope = profiler->scoped("broad_refit");
+                            cpuShBroadPhase.refit();
+                        } else {
+                            cpuShBroadPhase.refit();
+                        }
+                    }
+                    if (doBroad) {
+                        if (profiler) {
+                            auto scope = profiler->scoped("broad_detect");
+                            cpuShBroadPhase.detectCollisions(margin, enableSelfCollisions);
+                        } else {
+                            cpuShBroadPhase.detectCollisions(margin, enableSelfCollisions);
+                        }
+                        if (logSHPerSubstep) {
+                            cpuShBroadPhase.printLastStats(std::cout, frame, i);
+                        }
+                    }
+                } else if (useMultiLevelSH) {
                     // Multi-level (hgrid) spatial hash. Same surface as the
                     // single-level path; detectCollisions rebuilds the grid and
                     // emits its own mlsh_* per-stage scopes. refit() is a no-op.
@@ -3332,11 +3454,44 @@ struct Simulator {
                     }
                     if (doBroad) {
                         auto& bp = collisionPipeline.broadPhase;
+                        // Hybrid self-collision source (useCpuShSelf): only on
+                        // the two PLAIN BVH paths — the two-mesh / cluster-VF
+                        // experiments own their own broad loop and stay
+                        // untouched (hybrid silently inactive there).
+                        //
+                        // Fires on the scene-wide flag OR on any single mesh's
+                        // per-object "자기 충돌" toggle: the whole point of the
+                        // per-object checkbox is that it works WITHOUT the
+                        // global switch. The scan is over Scene::meshes (a
+                        // handful of entries) once per broad detect.
+                        bool anyMeshSelfCollide = false;
+                        for (const auto& mm : Scene<BE, PR>::meshes)
+                            if (mm.selfCollide) { anyMeshSelfCollide = true; break; }
+                        const bool hybridSelf =
+                            useCpuShSelf
+                            && (enableSelfCollisions || anyMeshSelfCollide)
+                            && !bp.twoMeshExperiment && !bp.clusterVFPipeline;
                         auto runDetect = [&]() {
                             if (bp.twoMeshExperiment && bp.clusterVFPipeline)
                                 bp.detectCollisionsCluster(margin);
                             else if (bp.twoMeshExperiment)
                                 bp.detectCollisionsTwoMesh(margin, enableSelfCollisions);
+                            else if (hybridSelf) {
+                                // ORDER IS LOAD-BEARING: CPU self rows first
+                                // (this call owns the counter reset), then the
+                                // BVH detect with self OFF and resetCounter ==
+                                // false so its device atomics append after
+                                // them. A CPU append AFTER the BVH encode would
+                                // race the still-pending GPU atomics.
+                                cpuShBroadPhase.detectSelfCollisions(
+                                    margin, enableSelfCollisions);
+                                if (useSegmentedBVHQuery)
+                                    bp.detectCollisionsSegmented(margin, /*self*/false,
+                                        analyticColliderActive(), /*resetCounter*/false);
+                                else
+                                    bp.detectCollisions(margin, /*self*/false,
+                                        analyticColliderActive(), /*resetCounter*/false);
+                            }
                             else if (useSegmentedBVHQuery)
                                 bp.detectCollisionsSegmented(margin, enableSelfCollisions, analyticColliderActive());
                             else

@@ -303,6 +303,731 @@ static int runSelfTest() {
     Simulator<Backend, Precision, SymplecticSystem<Backend, Precision>> sim(system);
     sim.pause = false;  // self-test wants update() to actually step.
 
+    // ── YSIM_TEST_CPSH — CPU spatial-hash broad phase (isolated) ─────────
+    // Env-gated fast path: runs ONLY the CPSH checks and returns, so the
+    // 40-block suite stays out of the loop while this sibling is iterated
+    // on. Everything here drives the CPU PBD solver, which is the intended
+    // consumer (state.x is CPU-fresh every substep).
+    if (std::getenv("YSIM_TEST_CPSH")) {
+        using Clock = std::chrono::steady_clock;
+        const Precision cpshThickness = Precision(0.01);
+        // A/B lever for the SAME three scenes: YSIM_TEST_CPSH=bvh (or =sh)
+        // runs them on the baseline broad phase instead, so the perf lines
+        // below are directly comparable. Anything else = the CPU hash.
+        const std::string cpshMode = std::getenv("YSIM_TEST_CPSH");
+        const bool cpshUseBvh = (cpshMode == "bvh");
+        const bool cpshUseGpuSh = (cpshMode == "sh");
+        const bool cpshBvhSelf  = (cpshMode == "bvhself");
+
+        auto minYOfId = [&](int objId) -> double {
+            auto* m = Scene<Backend, Precision>::findById(objId);
+            if (!m || !m->state.x.ptr) return std::numeric_limits<double>::quiet_NaN();
+            const Index n = m->state.x.size / 3;
+            if (n == 0) return std::numeric_limits<double>::quiet_NaN();
+            double lo = 1e30;
+            for (Index i = 0; i < n; ++i)
+                lo = std::min(lo, (double)m->state.x.ptr[i * 3 + 1]);
+            return lo;
+        };
+        auto anyNonFinite = [&](int objId) -> bool {
+            auto* m = Scene<Backend, Precision>::findById(objId);
+            if (!m || !m->state.x.ptr) return true;
+            const Index n = m->state.x.size;
+            for (Index i = 0; i < n; ++i)
+                if (!std::isfinite((double)m->state.x.ptr[i])) return true;
+            return false;
+        };
+        // Post-initialize activation: the YSIM_BROADPHASE hook inside
+        // initialize() is a SEPARATE entry point — set the flag directly so
+        // the test never depends on the caller's environment.
+        auto armCpsh = [&](bool selfOn) {
+            sim.usePbd                = true;
+            sim.usePd                 = false;
+            sim.useCpuSpatialHashing  = !cpshUseBvh && !cpshUseGpuSh;
+            sim.useSpatialHashing     = cpshUseGpuSh;
+            sim.useMultiLevelSH       = false;
+            sim.cdSubstepPeriod       = 1;
+            sim.refitSubstepPeriod    = 1;
+            sim.useCpuShSelf          = false;
+            sim.enableSelfCollisions  = selfOn;
+            sim.pause                 = false;
+        };
+        // Hybrid arming: broad phase stays the DEFAULT BVH, only the self
+        // rows come from the CPU hash. Set after initialize() for the same
+        // reason as armCpsh — the env hook is a separate entry point.
+        auto armHybrid = [&]() {
+            sim.usePbd                = true;
+            sim.usePd                 = false;
+            sim.useCpuSpatialHashing  = false;
+            sim.useSpatialHashing     = false;
+            sim.useMultiLevelSH       = false;
+            // YSIM_TEST_CPSH=bvhself runs CPSH-4/5 on the BVH's OWN
+            // checkSelfCollisions instead, for a like-for-like cost compare.
+            sim.useCpuShSelf          = !cpshBvhSelf;
+            sim.cdSubstepPeriod       = 1;
+            sim.refitSubstepPeriod    = 1;
+            sim.enableSelfCollisions  = true;
+            sim.pause                 = false;
+        };
+        auto reportPerf = [&](const char* tag, int frames, double ms) {
+            auto& bp = sim.cpuShBroadPhase;
+            std::cerr << "[CPSH perf] " << tag << ": " << frames << " frames in "
+                      << ms << " ms (" << (frames ? ms / frames : 0.0)
+                      << " ms/frame) | detects=" << bp.totalCalls
+                      << " rowsEmitted=" << bp.totalRows
+                      << " rowsDropped=" << bp.totalDropped
+                      << " lastRows=" << bp.lastStats.rows
+                      << " lastCand=" << bp.lastStats.candidates
+                      << " lastTgtFaces=" << bp.lastStats.targetFaces
+                      << " cellSize=" << bp.lastStats.cellSize
+                      << " lastDetectMs=" << bp.lastStats.ms_total << "\n";
+        };
+
+        system.subSteps = 8;
+        system.subh     = system.h / Precision(8);
+
+        // ---- CPSH-1 — inter-object: cloth falls onto a Float floor. -----
+        {
+            resetScene();
+            sim.addPlane(PlaneDirection::XZPlane, tinym::vec3(0, 0, 0), 24,
+                         Precision(3.0), Precision(0.1),
+                         BehaviorType::Float);                        // id 0
+            sim.addCloth(20, Precision(1), tinym::vec3(0.0f, 0.6f, 0.0f),
+                         1e5, 1e5, 2e5, cpshThickness);               // id 1
+            sim.initialize();
+            armCpsh(false);
+            sim.cpuShBroadPhase.totalRows = sim.cpuShBroadPhase.totalDropped =
+                sim.cpuShBroadPhase.totalCalls = 0;
+
+            const size_t narrowBefore =
+                Scene<Backend, Precision>::packedCollisionData.cumulativeNarrowCollisions;
+            const int frames = 120;
+            const auto t0 = Clock::now();
+            for (int f = 0; f < frames; ++f) {
+                sim.update();
+                MetalGlobalContext::commitAndWait();
+            }
+            const double ms = std::chrono::duration<double, std::milli>(
+                Clock::now() - t0).count();
+            sim.pause = true;
+            const size_t narrowGrew =
+                Scene<Backend, Precision>::packedCollisionData.cumulativeNarrowCollisions
+                - narrowBefore;
+            const double lowY = minYOfId(1);
+            reportPerf("CPSH-1", frames, ms);
+            std::cerr << "[CPSH perf] CPSH-1 narrowContacts=" << narrowGrew
+                      << " clothMinY=" << lowY << "\n";
+
+            const char* n1 = "CPSH-1 / CPU spatial hash: cloth rests on the "
+                             "Float floor and narrow contacts fire";
+            if (anyNonFinite(1) || !std::isfinite(lowY))
+                fail(n1, "non-finite cloth state");
+            else if (narrowGrew == 0)
+                fail(n1, "narrow phase never ran (cumulativeNarrowCollisions "
+                         "did not grow across 120 frames)");
+            else if (!(lowY > -0.05))
+                fail(n1, "cloth tunneled through the floor: min y "
+                     + std::to_string(lowY) + " <= -0.05");
+            else
+                pass(n1);
+        }
+
+        // ---- CPSH-2 — two-way cloth-cloth (no floor). --------------------
+        {
+            resetScene();
+            const Index kG = 9;
+            sim.addCloth(kG, Precision(1.0), tinym::vec3(0.0f, 0.6f, 0.0f),
+                         1e5, 1e5, 3e5, cpshThickness);               // id 0
+            {
+                auto& req = Scene<Backend, Precision>::requestsGeneralMeshes.back();
+                const float hh = 0.5f, yy = 0.6f;
+                const uint32_t vids[4] = { 0, (uint32_t)kG - 1,
+                                           (uint32_t)(kG * (kG - 1)),
+                                           (uint32_t)(kG * kG - 1) };
+                const tinym::vec3 ps[4] = { {-hh, yy, -hh}, {hh, yy, -hh},
+                                            {-hh, yy,  hh}, {hh, yy,  hh} };
+                for (int i = 0; i < 4; ++i)
+                    req.fixedVertices.push_back(FixedVertex{vids[i], ps[i]});
+            }
+            sim.addCloth(7, Precision(0.5), tinym::vec3(0.0f, 0.75f, 0.0f),
+                         1e5, 1e5, 3e5, cpshThickness);               // id 1
+            sim.initialize();
+            armCpsh(true);
+            sim.cpuShBroadPhase.totalRows = sim.cpuShBroadPhase.totalDropped =
+                sim.cpuShBroadPhase.totalCalls = 0;
+
+            uint64_t twoWayTotal = 0;
+            bool blew = false;
+            const int frames = 60;
+            const auto t0 = Clock::now();
+            for (int f = 0; f < frames; ++f) {
+                sim.update();
+                MetalGlobalContext::commitAndWait();
+                twoWayTotal += sim.pbd.twoWayContactCount;
+                if (anyNonFinite(0) || anyNonFinite(1)) { blew = true; break; }
+            }
+            const double ms = std::chrono::duration<double, std::milli>(
+                Clock::now() - t0).count();
+            sim.pause = true;
+            const double topLow = minYOfId(1);
+            reportPerf("CPSH-2", frames, ms);
+            std::cerr << "[CPSH perf] CPSH-2 twoWayTotal=" << twoWayTotal
+                      << " topMinY=" << topLow << "\n";
+
+            const char* n2 = "CPSH-2 / CPU spatial hash: two-way cloth-cloth "
+                             "rows reach the PBD contact path";
+            if (blew || !std::isfinite(topLow))
+                fail(n2, "non-finite cloth state in the two-cloth stack");
+            else if (twoWayTotal == 0)
+                fail(n2, "two-way contact path never ran "
+                         "(twoWayContactCount stayed 0 across 60 frames)");
+            else if (!(topLow > 0.30))
+                fail(n2, "top sheet fell through the pinned sheet: min y "
+                     + std::to_string(topLow) + " <= 0.30");
+            else
+                pass(n2);
+        }
+
+        // ---- CPSH-3 — self rows from the PBD-8 folded taco. --------------
+        {
+            resetScene();
+            const Index kG8 = 12;
+            sim.addCloth(kG8, Precision(0.6), tinym::vec3(0.0f, 0.8f, 0.0f),
+                         1e5, 1e5, 3e5, cpshThickness);               // id 0
+            {
+                auto& req = Scene<Backend, Precision>::requestsGeneralMeshes.back();
+                // Two diagonally-opposite corners pinned 4 mm apart: the
+                // sheet folds into a hanging taco whose halves stay in
+                // layer-on-layer contact — only q==t rows express that.
+                req.fixedVertices.push_back(
+                    FixedVertex{0u, tinym::vec3(0.0f, 0.8f, 0.0f)});
+                req.fixedVertices.push_back(
+                    FixedVertex{(uint32_t)(kG8 * kG8 - 1),
+                                tinym::vec3(0.004f, 0.8f, 0.004f)});
+            }
+            sim.initialize();
+            armCpsh(true);
+            sim.cpuShBroadPhase.totalRows = sim.cpuShBroadPhase.totalDropped =
+                sim.cpuShBroadPhase.totalCalls = 0;
+
+            uint64_t selfTotal = 0;
+            bool blew = false;
+            const int frames = 90;
+            const auto t0 = Clock::now();
+            for (int f = 0; f < frames; ++f) {
+                sim.update();
+                MetalGlobalContext::commitAndWait();
+                selfTotal += sim.pbd.selfContactCount;
+                if (anyNonFinite(0)) { blew = true; break; }
+            }
+            const double ms = std::chrono::duration<double, std::milli>(
+                Clock::now() - t0).count();
+            sim.pause = true;
+            reportPerf("CPSH-3", frames, ms);
+            std::cerr << "[CPSH perf] CPSH-3 selfTotal=" << selfTotal << "\n";
+
+            const char* n3 = "CPSH-3 / CPU spatial hash: folded sheet emits "
+                             "self rows and stays finite";
+            if (blew)
+                fail(n3, "non-finite cloth state in the folded-sheet scene");
+            else if (selfTotal == 0)
+                fail(n3, "no self rows consumed (selfContactCount stayed 0 "
+                         "across 90 frames of a folded hanging sheet)");
+            else
+                pass(n3);
+        }
+
+        // ---- CPSH-4 — HYBRID: BVH broad + CPU-hash self rows. ------------
+        // Same folded taco as CPSH-3, but the broad phase stays the default
+        // BVH; only the q==t rows come from the CPU hash.
+        {
+            resetScene();
+            const Index kG8 = 12;
+            sim.addCloth(kG8, Precision(0.6), tinym::vec3(0.0f, 0.8f, 0.0f),
+                         1e5, 1e5, 3e5, cpshThickness);               // id 0
+            {
+                auto& req = Scene<Backend, Precision>::requestsGeneralMeshes.back();
+                req.fixedVertices.push_back(
+                    FixedVertex{0u, tinym::vec3(0.0f, 0.8f, 0.0f)});
+                req.fixedVertices.push_back(
+                    FixedVertex{(uint32_t)(kG8 * kG8 - 1),
+                                tinym::vec3(0.004f, 0.8f, 0.004f)});
+            }
+            sim.initialize();
+            armHybrid();
+            sim.cpuShBroadPhase.totalRows = sim.cpuShBroadPhase.totalDropped =
+                sim.cpuShBroadPhase.totalCalls = 0;
+
+            uint64_t selfTotal = 0;
+            bool blew = false;
+            const int frames = 90;
+            const auto t0 = Clock::now();
+            for (int f = 0; f < frames; ++f) {
+                sim.update();
+                MetalGlobalContext::commitAndWait();
+                selfTotal += sim.pbd.selfContactCount;
+                if (anyNonFinite(0)) { blew = true; break; }
+            }
+            const double ms = std::chrono::duration<double, std::milli>(
+                Clock::now() - t0).count();
+            sim.pause = true;
+            reportPerf("CPSH-4", frames, ms);
+            std::cerr << "[CPSH perf] CPSH-4 selfTotal=" << selfTotal << "\n";
+
+            const char* n4 = "CPSH-4 / hybrid: BVH broad + CPU-hash self rows "
+                             "feed the PBD self-contact path";
+            if (blew)
+                fail(n4, "non-finite cloth state in the folded-sheet scene");
+            else if (selfTotal == 0)
+                fail(n4, "no self rows consumed (selfContactCount stayed 0 "
+                         "across 90 frames with useCpuShSelf on)");
+            else
+                pass(n4);
+        }
+
+        // ---- CPSH-5 — hybrid keeps inter-object + analytic intact. -------
+        // pbd_cloth_ball replica (scene_registry.hpp:93): Float floor +
+        // corner-pinned cloth + Rigid ball whose default collider is an
+        // analytic Sphere. Runs twice — with and without the ball — so the
+        // deflection clause is an A/B against the cloth's own ball-free sag
+        // (the absolute-dip clause alone cannot separate sag from contact).
+        {
+            const Index kG5 = 20;
+            auto centerYOf = [&](int objId, Index n1D) -> double {
+                auto* m = Scene<Backend, Precision>::findById(objId);
+                if (!m || !m->state.x.ptr) return std::numeric_limits<double>::quiet_NaN();
+                const Index c = (n1D / 2) * n1D + (n1D / 2);
+                if (c * 3 + 1 >= m->state.x.size)
+                    return std::numeric_limits<double>::quiet_NaN();
+                return (double)m->state.x.ptr[c * 3 + 1];
+            };
+            auto centroidYOf = [&](int objId) -> double {
+                auto* m = Scene<Backend, Precision>::findById(objId);
+                if (!m || !m->state.x.ptr) return std::numeric_limits<double>::quiet_NaN();
+                const Index n = m->state.x.size / 3;
+                if (n == 0) return std::numeric_limits<double>::quiet_NaN();
+                double acc = 0.0;
+                for (Index i = 0; i < n; ++i) acc += (double)m->state.x.ptr[i * 3 + 1];
+                return acc / (double)n;
+            };
+            // Builds floor(id 0) + pinned cloth(id 1) [+ Rigid ball(id 2)].
+            auto buildBallScene = [&](bool withBall) {
+                resetScene();
+                sim.addPlane(PlaneDirection::XZPlane, tinym::vec3(0, 0, 0), 24,
+                             Precision(3.0), Precision(0.1),
+                             BehaviorType::Float);                    // id 0
+                sim.addCloth(kG5, Precision(1), tinym::vec3(0.0f, 0.6f, 0.0f),
+                             1e5, 1e5, 2e5, cpshThickness);           // id 1
+                {
+                    auto& req = Scene<Backend, Precision>::requestsGeneralMeshes.back();
+                    const float hh = 0.5f, yy = 0.6f;
+                    const uint32_t vids[4] = { 0, (uint32_t)kG5 - 1,
+                                               (uint32_t)(kG5 * (kG5 - 1)),
+                                               (uint32_t)(kG5 * kG5 - 1) };
+                    const tinym::vec3 ps[4] = { {-hh, yy, -hh}, {hh, yy, -hh},
+                                                {-hh, yy,  hh}, {hh, yy,  hh} };
+                    for (int i = 0; i < 4; ++i)
+                        req.fixedVertices.push_back(FixedVertex{vids[i], ps[i]});
+                }
+                if (withBall)
+                    sim.addSphere(tinym::vec3(0.0f, 1.0f, 0.0f), 16, 0.5f,
+                                  0.1f, BehaviorType::Rigid);         // id 2
+                sim.initialize();
+                armHybrid();
+            };
+
+            // Ball-free baseline: how far the pinned sheet sags on its own.
+            buildBallScene(false);
+            double baseCenterMin = 1e30;
+            for (int f = 0; f < 90; ++f) {
+                sim.update();
+                MetalGlobalContext::commitAndWait();
+                const double cy = centerYOf(1, kG5);
+                if (std::isfinite(cy)) baseCenterMin = std::min(baseCenterMin, cy);
+            }
+            sim.pause = true;
+
+            buildBallScene(true);
+            sim.cpuShBroadPhase.totalRows = sim.cpuShBroadPhase.totalDropped =
+                sim.cpuShBroadPhase.totalCalls = 0;
+            double dropCenterMin = 1e30, clothLowest = 1e30;
+            bool blew = false;
+            const int frames = 90;
+            const auto t0 = Clock::now();
+            for (int f = 0; f < frames; ++f) {
+                sim.update();
+                MetalGlobalContext::commitAndWait();
+                if (anyNonFinite(1) || anyNonFinite(2)) { blew = true; break; }
+                const double cy = centerYOf(1, kG5);
+                if (std::isfinite(cy)) dropCenterMin = std::min(dropCenterMin, cy);
+                clothLowest = std::min(clothLowest, minYOfId(1));
+            }
+            const double ms = std::chrono::duration<double, std::milli>(
+                Clock::now() - t0).count();
+            sim.pause = true;
+            const double ballY = centroidYOf(2);
+            reportPerf("CPSH-5", frames, ms);
+            std::cerr << "[CPSH perf] CPSH-5 clothMinY=" << clothLowest
+                      << " centerMin(ball)=" << dropCenterMin
+                      << " centerMin(no ball)=" << baseCenterMin
+                      << " ballCentroidY=" << ballY
+                      << " numAnalytic=" << (long long)Scene<Backend, Precision>::numAnalytic
+                      << "\n";
+
+            const char* n5 = "CPSH-5 / hybrid: floor contact + analytic ball "
+                             "deflection survive with CPU-hash self rows on";
+            if (blew || !std::isfinite(clothLowest) || !std::isfinite(dropCenterMin)
+                || !std::isfinite(baseCenterMin))
+                fail(n5, "non-finite state in the floor+cloth+ball scene");
+            else if (!(clothLowest > -0.05))
+                fail(n5, "cloth tunneled through the floor: min y "
+                     + std::to_string(clothLowest) + " <= -0.05 (BVH "
+                     "inter-object path broken by the hybrid?)");
+            else if (!(dropCenterMin < 0.6 - 0.03))
+                fail(n5, "cloth center never deflected: min y "
+                     + std::to_string(dropCenterMin) + " >= 0.57");
+            else if (!(dropCenterMin < baseCenterMin - 0.02))
+                fail(n5, "deflection is just the cloth's own sag: with-ball "
+                     + std::to_string(dropCenterMin) + " vs ball-free "
+                     + std::to_string(baseCenterMin)
+                     + " (analytic markers not flowing under the hybrid?)");
+            else
+                pass(n5);
+        }
+
+        // ---- CPSH-6 — the user's inspector flow, headless. ---------------
+        // pbd_cloth_ball → retag the Rigid ball to cloth in the behavior
+        // dropdown → tick THAT MESH's 자기 충돌 box, global switch OFF.
+        // Two clauses: the retag must clear the analytic collider (else the
+        // mesh is triple-dropped), and the per-object box must switch the
+        // self pass on — measured as ROWS EMITTED for that mesh, A/B against
+        // the same run with the box unticked.
+        //
+        // NOT asserted here: selfContactCount, nor even self ROWS. Measured,
+        // this ball does not self-intersect — a closed sphere shell under
+        // PBD's stiff stretch constraints keeps its shape (ballY stays
+        // [0.50, 1.00] for the whole run) while happily two-way-contacting
+        // the sheet below it (~9300 contacts). With the exact
+        // point-triangle self precull in place, zero self ROWS is the
+        // CORRECT answer for this geometry. So the observable here is
+        // whether the per-object flag SWITCHES THE SELF PASS ON at all:
+        // detectSelfCollisions is invoked (totalCalls) and this mesh's faces
+        // are the ones it hashed (targetFaces). Real self CONTACTS are
+        // asserted in CPSH-6b, on a sheet that actually folds onto itself.
+        {
+            const Index kG6 = 20;
+            // Runs the flow; `tick` decides whether the per-object box is
+            // checked. Reports the ball's colliderKind after the dirty
+            // re-pack and the self-pass rows emitted over the 90 frames.
+            auto runFlow = [&](bool tick, int& kindAfter, uint64_t& selfPassRuns,
+                               uint32_t& selfFaces, bool& blew) -> uint64_t {
+                resetScene();
+                sim.addPlane(PlaneDirection::XZPlane, tinym::vec3(0, 0, 0), 24,
+                             Precision(3.0), Precision(0.1),
+                             BehaviorType::Float);                    // id 0
+                sim.addCloth(kG6, Precision(1), tinym::vec3(0.0f, 0.6f, 0.0f),
+                             1e5, 1e5, 2e5, cpshThickness);           // id 1
+                {
+                    auto& req = Scene<Backend, Precision>::requestsGeneralMeshes.back();
+                    const float hh = 0.5f, yy = 0.6f;
+                    const uint32_t vids[4] = { 0, (uint32_t)kG6 - 1,
+                                               (uint32_t)(kG6 * (kG6 - 1)),
+                                               (uint32_t)(kG6 * kG6 - 1) };
+                    const tinym::vec3 ps[4] = { {-hh, yy, -hh}, {hh, yy, -hh},
+                                                {-hh, yy,  hh}, {hh, yy,  hh} };
+                    for (int i = 0; i < 4; ++i)
+                        req.fixedVertices.push_back(FixedVertex{vids[i], ps[i]});
+                }
+                sim.addSphere(tinym::vec3(0.0f, 1.0f, 0.0f), 16, 0.5f,
+                              0.1f, BehaviorType::Rigid);             // id 2
+                sim.initialize();
+                // Scene defaults mirror postInitPbdClothBall EXCEPT the
+                // global self switch, which stays OFF throughout.
+                sim.usePbd = true; sim.usePd = false;
+                sim.useCpuSpatialHashing = false;
+                sim.useSpatialHashing = false; sim.useMultiLevelSH = false;
+                sim.useCpuShSelf = true;          // the shipped default
+                sim.cdSubstepPeriod = 1; sim.refitSubstepPeriod = 1;
+                sim.enableSelfCollisions = false; // ← global stays off
+                sim.pause = false;
+
+                for (int f = 0; f < 10; ++f) {
+                    sim.update();
+                    MetalGlobalContext::commitAndWait();
+                }
+                // Inspector step 1: behavior dropdown → 천(TriangularCloth).
+                sim.changeBehavior(2, BehaviorType::TriangularCloth);
+                // The dirty flag makes the NEXT update() re-pack; pump one
+                // frame so the retag is realized before we read colliderKind.
+                sim.update();
+                MetalGlobalContext::commitAndWait();
+                {
+                    auto* m = Scene<Backend, Precision>::findById(2);
+                    kindAfter = m ? (int)m->colliderKind : -1;
+                }
+                // Inspector step 2: the per-object 자기 충돌 pill — exactly
+                // what on_self_collide does (live mesh + request mirror).
+                if (tick) {
+                    if (auto* m = Scene<Backend, Precision>::findById(2))
+                        m->selfCollide = true;
+                    if (auto* r = sim.findRequest(2)) r->selfCollide = true;
+                }
+                uint64_t selfTotal = 0, twoWayTotal = 0;
+                blew = false;
+                sim.cpuShBroadPhase.totalCalls = 0;
+                sim.cpuShBroadPhase.lastStats = decltype(sim.cpuShBroadPhase.lastStats){};
+                for (int f = 0; f < 90; ++f) {
+                    sim.update();
+                    MetalGlobalContext::commitAndWait();
+                    selfTotal   += sim.pbd.selfContactCount;
+                    twoWayTotal += sim.pbd.twoWayContactCount;
+                    if (anyNonFinite(1) || anyNonFinite(2)) { blew = true; break; }
+                }
+                sim.pause = true;
+                selfPassRuns = sim.cpuShBroadPhase.totalCalls;
+                selfFaces    = sim.cpuShBroadPhase.lastStats.targetFaces;
+                std::cerr << "   [CPSH-6 " << (tick ? "checked" : "unchecked")
+                          << "] colliderKind=" << kindAfter
+                          << " numAnalytic="
+                          << (long long)Scene<Backend, Precision>::numAnalytic
+                          << " selfPassRuns=" << selfPassRuns
+                          << " selfFacesHashed=" << selfFaces
+                          << " selfRows=" << sim.cpuShBroadPhase.totalRows
+                          << " selfContacts=" << selfTotal
+                          << " twoWayContacts=" << twoWayTotal << "\n";
+                return selfTotal;
+            };
+
+            int kindOn = -1, kindOff = -1;
+            uint64_t runsOn = 0, runsOff = 0;
+            uint32_t facesOn = 0, facesOff = 0;
+            bool blewOn = false, blewOff = false;
+            const auto t0 = Clock::now();
+            const uint64_t selfOn  = runFlow(true,  kindOn,  runsOn,  facesOn,  blewOn);
+            const uint64_t selfOff = runFlow(false, kindOff, runsOff, facesOff, blewOff);
+            const double ms = std::chrono::duration<double, std::milli>(
+                Clock::now() - t0).count();
+            std::cerr << "[CPSH perf] CPSH-6: 202 frames in " << ms << " ms | "
+                      << "colliderKindAfterRetag=" << kindOn << " (0==Mesh) "
+                      << "selfPassRuns=" << runsOn << "/" << runsOff
+                      << " selfFacesHashed=" << facesOn << "/" << facesOff
+                      << " selfContacts=" << selfOn << "/" << selfOff << "\n";
+
+            const char* n6 = "CPSH-6 / inspector flow: retag ball to cloth "
+                             "clears the analytic collider and the per-object "
+                             "자기 충돌 switches the self pass on (global OFF)";
+            if (blewOn || blewOff)
+                fail(n6, "non-finite state during the retag flow");
+            else if (kindOn != (int)ColliderKind::Mesh)
+                fail(n6, "changeBehavior(TriangularCloth) left colliderKind at "
+                     + std::to_string(kindOn) + " (expected 0 = Mesh); an "
+                     "analytic-collider cloth is triple-dropped");
+            else if (Scene<Backend, Precision>::numAnalytic != 0)
+                fail(n6, "the ghost analytic shape survived the retag: "
+                         "numAnalytic = " + std::to_string(
+                             (long long)Scene<Backend, Precision>::numAnalytic));
+            else if (runsOn == 0)
+                fail(n6, "per-object 자기 충돌 never invoked the self pass "
+                         "across 90 frames with the global switch off");
+            else if (facesOn == 0)
+                fail(n6, "the self pass ran but hashed no faces — the ticked "
+                         "mesh was not included");
+            else if (runsOff != 0)
+                fail(n6, "the per-object gate does not gate: the unticked run "
+                     "still invoked the self pass " + std::to_string(runsOff)
+                     + " times");
+            else
+                pass(n6);
+        }
+
+        // ---- CPSH-6a — the same flow as REGISTRY CODE, not env vars. -----
+        // Drive scene_registry's pbd_cloth_ball_self exactly as `--scene`
+        // does (setup + postInit) and check the two things that scene is
+        // supposed to guarantee without any environment variable: the
+        // cloth-tagged sphere seeds colliderKind = Mesh (no ghost analytic
+        // shape) and its per-object selfCollide survives Scene::pack.
+        {
+            resetScene();
+            scene_registry::setupPbdClothBallSelf<Backend, Precision>(sim, system);
+            sim.initialize();
+            scene_registry::postInitPbdClothBallSelf<Backend, Precision>(sim);
+            auto* ball = Scene<Backend, Precision>::findById(2);
+            const int  kind = ball ? (int)ball->colliderKind : -1;
+            const bool self = ball ? ball->selfCollide : false;
+            const bool cloth = ball
+                && ball->behaviorType == BehaviorType::TriangularCloth;
+            const long long nAna = (long long)Scene<Backend, Precision>::numAnalytic;
+            bool blew6a = false;
+            sim.cpuShBroadPhase.totalCalls = 0;
+            sim.cpuShBroadPhase.lastStats = decltype(sim.cpuShBroadPhase.lastStats){};
+            sim.pause = false;
+            for (int f = 0; f < 30; ++f) {
+                sim.update();
+                MetalGlobalContext::commitAndWait();
+                if (anyNonFinite(1) || anyNonFinite(2)) { blew6a = true; break; }
+            }
+            sim.pause = true;
+            const uint64_t runs  = sim.cpuShBroadPhase.totalCalls;
+            const uint32_t faces = sim.cpuShBroadPhase.lastStats.targetFaces;
+            std::cerr << "[CPSH perf] CPSH-6a scene=pbd_cloth_ball_self "
+                      << "ballColliderKind=" << kind << " selfCollide=" << self
+                      << " cloth=" << cloth << " numAnalytic=" << nAna
+                      << " globalSelf=" << sim.enableSelfCollisions
+                      << " selfPassRuns(30f)=" << runs
+                      << " selfFacesHashed=" << faces << "\n";
+
+            const char* n6a = "CPSH-6a / scene registry: pbd_cloth_ball_self "
+                              "reaches the self pass with no env var";
+            if (blew6a)
+                fail(n6a, "non-finite state booting the registry scene");
+            else if (!cloth)
+                fail(n6a, "ball is not TriangularCloth after setup");
+            else if (kind != (int)ColliderKind::Mesh)
+                fail(n6a, "cloth-tagged sphere kept an analytic collider: kind "
+                     + std::to_string(kind) + " (expected 0 = Mesh)");
+            else if (nAna != 0)
+                fail(n6a, "scene has a ghost analytic shape: numAnalytic = "
+                     + std::to_string(nAna));
+            else if (!self)
+                fail(n6a, "request selfCollide did not survive Scene::pack");
+            else if (sim.enableSelfCollisions)
+                fail(n6a, "scene left the GLOBAL self switch on — the point of "
+                          "this scene is that the per-object flag alone works");
+            else if (runs == 0)
+                fail(n6a, "per-object flag never invoked the self pass over 30 "
+                          "frames (the scene needs an env var → not delivered)");
+            else if (faces == 0)
+                fail(n6a, "the self pass ran but hashed no faces — the "
+                          "selfCollide mesh was not included");
+            else
+                pass(n6a);
+        }
+
+        // ---- CPSH-6b — per-object toggle → real self CONTACTS. -----------
+        // The CPSH-3 folded taco (a sheet that provably lands on itself),
+        // driven ONLY by the per-object 자기 충돌 flag with the scene-wide
+        // enableSelfCollisions off. A/B against the same scene unticked.
+        {
+            auto runTaco = [&](bool tick, bool& blew) -> uint64_t {
+                resetScene();
+                const Index kG8 = 12;
+                sim.addCloth(kG8, Precision(0.6), tinym::vec3(0.0f, 0.8f, 0.0f),
+                             1e5, 1e5, 3e5, cpshThickness);           // id 0
+                {
+                    auto& req = Scene<Backend, Precision>::requestsGeneralMeshes.back();
+                    req.fixedVertices.push_back(
+                        FixedVertex{0u, tinym::vec3(0.0f, 0.8f, 0.0f)});
+                    req.fixedVertices.push_back(
+                        FixedVertex{(uint32_t)(kG8 * kG8 - 1),
+                                    tinym::vec3(0.004f, 0.8f, 0.004f)});
+                    // The inspector pill, set BEFORE initialize so pack
+                    // carries it onto the realized mesh (the request is the
+                    // pack-surviving source of truth).
+                    req.selfCollide = tick;
+                }
+                sim.initialize();
+                sim.usePbd = true; sim.usePd = false;
+                sim.useCpuSpatialHashing = false;
+                sim.useSpatialHashing = false; sim.useMultiLevelSH = false;
+                sim.useCpuShSelf = true;
+                sim.cdSubstepPeriod = 1; sim.refitSubstepPeriod = 1;
+                sim.enableSelfCollisions = false;   // ← global stays off
+                sim.pause = false;
+                uint64_t selfTotal = 0;
+                blew = false;
+                for (int f = 0; f < 90; ++f) {
+                    sim.update();
+                    MetalGlobalContext::commitAndWait();
+                    selfTotal += sim.pbd.selfContactCount;
+                    if (anyNonFinite(0)) { blew = true; break; }
+                }
+                sim.pause = true;
+                return selfTotal;
+            };
+            bool blewOn = false, blewOff = false;
+            const auto t0 = Clock::now();
+            const uint64_t onSelf  = runTaco(true,  blewOn);
+            const uint64_t offSelf = runTaco(false, blewOff);
+            const double ms = std::chrono::duration<double, std::milli>(
+                Clock::now() - t0).count();
+            std::cerr << "[CPSH perf] CPSH-6b: 180 frames in " << ms
+                      << " ms | selfContacts(checked)=" << onSelf
+                      << " selfContacts(unchecked)=" << offSelf << "\n";
+
+            const char* n6b = "CPSH-6b / per-object 자기 충돌 alone drives real "
+                              "self CONTACTS through PBD (global switch OFF)";
+            if (blewOn || blewOff)
+                fail(n6b, "non-finite cloth state in the folded-sheet scene");
+            else if (onSelf == 0)
+                fail(n6b, "checked run produced no self contacts across 90 "
+                          "frames of a folded hanging sheet");
+            else if (offSelf != 0)
+                fail(n6b, "unchecked run still produced "
+                     + std::to_string(offSelf) + " self contacts");
+            else
+                pass(n6b);
+        }
+
+        // ---- CPSH-7 — 두께 (setClothThickness) drives the resting height. -
+        // Floor + free cloth under PBD: the contact constraint resolves to
+        // `thickness`, so a thicker cloth must come to rest higher.
+        {
+            auto restAtThickness = [&](float thick) -> double {
+                resetScene();
+                sim.addPlane(PlaneDirection::XZPlane, tinym::vec3(0, 0, 0), 24,
+                             Precision(3.0), Precision(0.1),
+                             BehaviorType::Float);                    // id 0
+                sim.addCloth(12, Precision(1), tinym::vec3(0.0f, 0.4f, 0.0f),
+                             1e5, 1e5, 2e5, cpshThickness);           // id 1
+                sim.initialize();
+                armCpsh(false);          // CPU hash broad; contacts every substep
+                sim.setClothThickness(1, (Precision)thick);
+                for (int f = 0; f < 150; ++f) {
+                    sim.update();
+                    MetalGlobalContext::commitAndWait();
+                }
+                sim.pause = true;
+                // Mean vertex height at rest: the sheet is flat on the floor,
+                // and the mean is far less noisy than min/max under the
+                // substep sawtooth the contact push leaves behind.
+                auto* m = Scene<Backend, Precision>::findById(1);
+                if (!m || !m->state.x.ptr) return std::numeric_limits<double>::quiet_NaN();
+                const Index n = m->state.x.size / 3;
+                double acc = 0.0;
+                for (Index i = 0; i < n; ++i) acc += (double)m->state.x.ptr[i * 3 + 1];
+                return n ? acc / (double)n : std::numeric_limits<double>::quiet_NaN();
+            };
+            const auto t0 = Clock::now();
+            const double rThin  = restAtThickness(0.01f);
+            const double rThick = restAtThickness(0.03f);
+            const double ms = std::chrono::duration<double, std::milli>(
+                Clock::now() - t0).count();
+            std::cerr << "[CPSH perf] CPSH-7: 300 frames in " << ms
+                      << " ms | rest(t=0.01)=" << rThin
+                      << " rest(t=0.03)=" << rThick << "\n";
+
+            const char* n7 = "CPSH-7 / setClothThickness: resting height "
+                             "tracks the per-mesh 두께";
+            if (!std::isfinite(rThin) || !std::isfinite(rThick))
+                fail(n7, "non-finite cloth state in the thickness sweep");
+            else if (!(rThick > rThin + 0.01))
+                fail(n7, "thicker cloth did not rest higher: t=0.03 rest "
+                     + std::to_string(rThick) + " vs t=0.01 rest "
+                     + std::to_string(rThin) + " (need +0.01)");
+            else
+                pass(n7);
+        }
+
+        sim.pause                = true;
+        sim.useCpuShSelf         = false;
+        sim.usePbd               = false;
+        sim.useCpuSpatialHashing = false;
+        sim.enableSelfCollisions = false;
+        if (failures == 0) std::cerr << "[self-test] CPSH checks passed\n";
+        else std::cerr << "[self-test] " << failures << " CPSH failure(s)\n";
+        return failures;
+    }
+
     // ---- Block 1: CM-002 regression — re-running pack() is safe. ---------
     buildSyntheticScene(sim);   // loads test/fixtures/synthetic.json
     sim.initialize();
