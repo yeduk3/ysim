@@ -1654,6 +1654,61 @@ struct CpuSpatialHash {
         return maxExtent;
     }
 
+    // Squared distance from a point to a triangle (Ericson, Real-Time
+    // Collision Detection §5.1.5). Used ONLY by the self-row precull below.
+    static inline float pointTriSq(const float p[3], const float a[3],
+                                   const float b[3], const float c[3]) {
+        auto dot = [](const float* u, const float* v) {
+            return u[0]*v[0] + u[1]*v[1] + u[2]*v[2];
+        };
+        float ab[3], ac[3], ap[3], q[3];
+        for (int i = 0; i < 3; ++i) {
+            ab[i] = b[i] - a[i]; ac[i] = c[i] - a[i]; ap[i] = p[i] - a[i];
+        }
+        const float d1 = dot(ab, ap), d2 = dot(ac, ap);
+        if (d1 <= 0.f && d2 <= 0.f) { for (int i=0;i<3;++i) q[i] = a[i]; }
+        else {
+            float bp[3]; for (int i=0;i<3;++i) bp[i] = p[i] - b[i];
+            const float d3 = dot(ab, bp), d4 = dot(ac, bp);
+            if (d3 >= 0.f && d4 <= d3) { for (int i=0;i<3;++i) q[i] = b[i]; }
+            else {
+                const float vc = d1*d4 - d3*d2;
+                if (vc <= 0.f && d1 >= 0.f && d3 <= 0.f) {
+                    const float den = d1 - d3;
+                    const float v = (den != 0.f) ? d1/den : 0.f;
+                    for (int i=0;i<3;++i) q[i] = a[i] + v*ab[i];
+                } else {
+                    float cp[3]; for (int i=0;i<3;++i) cp[i] = p[i] - c[i];
+                    const float d5 = dot(ab, cp), d6 = dot(ac, cp);
+                    if (d6 >= 0.f && d5 <= d6) { for (int i=0;i<3;++i) q[i] = c[i]; }
+                    else {
+                        const float vb = d5*d2 - d1*d6;
+                        if (vb <= 0.f && d2 >= 0.f && d6 <= 0.f) {
+                            const float den = d2 - d6;
+                            const float w = (den != 0.f) ? d2/den : 0.f;
+                            for (int i=0;i<3;++i) q[i] = a[i] + w*ac[i];
+                        } else {
+                            const float va = d3*d6 - d5*d4;
+                            if (va <= 0.f && (d4-d3) >= 0.f && (d5-d6) >= 0.f) {
+                                const float den = (d4-d3) + (d5-d6);
+                                const float w = (den != 0.f) ? (d4-d3)/den : 0.f;
+                                for (int i=0;i<3;++i) q[i] = b[i] + w*(c[i]-b[i]);
+                            } else {
+                                const float den = va + vb + vc;
+                                const float v = (den != 0.f) ? vb/den : 0.f;
+                                const float w = (den != 0.f) ? vc/den : 0.f;
+                                for (int i=0;i<3;++i) q[i] = a[i] + ab[i]*v + ac[i]*w;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        float s = 0.f;
+        for (int i = 0; i < 3; ++i) { const float e = p[i]-q[i]; s += e*e; }
+        return s;
+    }
+
     // Insert the current `faces` into the generation-stamped grid. Stamping
     // keeps the map's buckets and each cell vector's capacity warm across
     // calls (map.clear() would free every one of them).
@@ -1682,7 +1737,8 @@ struct CpuSpatialHash {
 
     // Probe one query mesh's vertices against the current grid and APPEND
     // rows at [count, cap). `selfOnly` keeps q == t rows only (hybrid pass).
-    void probeMeshVertices(Index q, float invCs, bool enableSelfCollisions,
+    void probeMeshVertices(Index q, float m, float invCs,
+                           bool enableSelfCollisions,
                            bool selfOnly, BroadCollision* out, Index cap,
                            Index& count, uint32_t& dropped) {
         auto& meshes = Scene<METAL, PR>::meshes;
@@ -1699,7 +1755,7 @@ struct CpuSpatialHash {
         const uint32_t shpQ = (uint32_t)qm.colliderKind;
 
         for (Index v = 0; v < nv; ++v) {
-            float vlo[3], vhi[3];
+            float vlo[3], vhi[3], pCur[3], pPrev[3];
             bool ok = true;
             for (int a = 0; a < 3; ++a) {
                 const float pc = (float)X[v * 3 + a];
@@ -1708,6 +1764,7 @@ struct CpuSpatialHash {
                 // Guard a garbage / teleported xPrev: a sweep longer than
                 // a metre is a pin snap, not motion — use the point.
                 if (!std::isfinite(pp) || std::abs(pp - pc) > 1.f) pp = pc;
+                pCur[a] = pc; pPrev[a] = pp;
                 vlo[a] = std::min(pc, pp);
                 vhi[a] = std::max(pc, pp);
             }
@@ -1762,6 +1819,36 @@ struct CpuSpatialHash {
                             const uint32_t b = fr.localFace * 3;
                             if (TF[b] == v || TF[b + 1] == v
                                 || TF[b + 2] == v) continue;
+                            // EXACT point-triangle precull, self rows only.
+                            // The AABB test above cannot reject the
+                            // diagonally-opposite triangle of the vertex's
+                            // OWN 1-ring quad: on a regular grid the vertex
+                            // sits exactly ON that triangle's un-inflated
+                            // AABB corner, so every flat sheet emitted ~1
+                            // junk row PER FACE forever. True distance there
+                            // is a full edge length. Those rows never became
+                            // contacts, but they consumed the row budget and
+                            // — because they shift the order of
+                            // narrowCollisions → vertColFacets → PBD's
+                            // Gauss-Seidel projection — perturbed marginal
+                            // scenes (they flipped PBD-7 to zero contacts).
+                            // Both swept endpoints are tested: per-substep
+                            // cloth motion is orders of magnitude below an
+                            // edge length, so this keeps the conservatism
+                            // that matters. Inter-object rows are NOT
+                            // touched — only q == t takes this branch.
+                            {
+                                const PR* TX = meshes[t].state.x.ptr;
+                                float A[3], B[3], C[3];
+                                for (int a2 = 0; a2 < 3; ++a2) {
+                                    A[a2] = (float)TX[TF[b    ]*3 + a2];
+                                    B[a2] = (float)TX[TF[b + 1]*3 + a2];
+                                    C[a2] = (float)TX[TF[b + 2]*3 + a2];
+                                }
+                                const float m2 = m * m;
+                                if (pointTriSq(pCur,  A, B, C) > m2
+                                 && pointTriSq(pPrev, A, B, C) > m2) continue;
+                            }
                         }
                         ++lastStats.candidates;
                         if (count >= cap) { ++dropped; continue; }
@@ -1802,7 +1889,8 @@ struct CpuSpatialHash {
         if (numMeshes == 0 || !packedCol.broadCollisions.ptr) return;
 
         // 2) Collect target-face key boxes from the live state.x.
-        const float maxExtent = collectFaceBoxes((float)margin, kAllMeshes);
+        const float m = (float)margin;
+        const float maxExtent = collectFaceBoxes(m, kAllMeshes);
         if (faces.empty()) {
             lastStats.ms_total = std::chrono::duration<double, std::milli>(
                 Clock::now() - t0).count();
@@ -1828,8 +1916,8 @@ struct CpuSpatialHash {
             if (!qm.collidable) continue;
             if (qm.behaviorType == BehaviorType::Float
                 || qm.behaviorType == BehaviorType::Kinematic) continue;
-            probeMeshVertices(q, invCs, enableSelfCollisions, /*selfOnly*/false,
-                              out, cap, count, dropped);
+            probeMeshVertices(q, m, invCs, enableSelfCollisions,
+                              /*selfOnly*/false, out, cap, count, dropped);
         }
 
         // 6) Publish the count CPU-side — the sync narrow phase reads this
@@ -1849,7 +1937,12 @@ struct CpuSpatialHash {
     // Same CPU-solver caveat as detectCollisions: `x` is read host-side, so
     // under the GPU symplectic solver mid-frame positions are GPU-pending
     // and this reads frame-stale x between syncs. Intended for usePbd/usePd.
-    void detectSelfCollisions(PR margin) {
+    // `globalSelf` = Simulator::enableSelfCollisions (the scene-wide switch).
+    // A mesh contributes self rows when the global switch is on OR when its
+    // own inspector toggle (GeneralMesh::selfCollide, "자기 충돌") is set —
+    // this is what makes the per-object checkbox load-bearing instead of the
+    // save/restore-only field it used to be.
+    void detectSelfCollisions(PR margin, bool globalSelf) {
         using Clock = std::chrono::steady_clock;
         const auto t0 = Clock::now();
 
@@ -1874,18 +1967,20 @@ struct CpuSpatialHash {
             // row volume — cloth only.
             if (qm.behaviorType != BehaviorType::TriangularCloth
                 && qm.behaviorType != BehaviorType::FastGridCloth) continue;
+            if (!globalSelf && !qm.selfCollide) continue;
             if (!qm.state.x.ptr || !qm.adjacency.facets.ptr) continue;
             if (qm.adjacency.facets.size < 3) continue;
 
             // One grid per mesh: only that mesh's own faces are candidates,
             // and its own face size sets the cell size.
-            const float maxExtent = collectFaceBoxes((float)margin, q);
+            const float m = (float)margin;
+            const float maxExtent = collectFaceBoxes(m, q);
             if (faces.empty()) continue;
             const float cs = cellSizeFrom(maxExtent);
             lastStats.cellSize = (double)cs;
             const float invCs = 1.f / cs;
             rebuildGridFromFaces(invCs);
-            probeMeshVertices(q, invCs, /*enableSelfCollisions*/true,
+            probeMeshVertices(q, m, invCs, /*enableSelfCollisions*/true,
                               /*selfOnly*/true, out, cap, count, dropped);
         }
 

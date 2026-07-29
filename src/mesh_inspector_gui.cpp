@@ -1121,6 +1121,25 @@ void drawMeshInspectorWindow(MeshInspectorWindowState& st, const MeshInspectorTa
         clothK("스트레치",t.cloth_stretch,t.on_cloth_stretch,t.cloth_stretch_log_range);
         clothK("시어",    t.cloth_shear,  t.on_cloth_shear,  t.cloth_shear_log_range);
         clothK("벤드",    t.cloth_bend,   t.on_cloth_bend,   t.cloth_bend_log_range);
+        // ─── 두께 (contact thickness, metres) ─────────────────────────
+        // Linear DragFloat, not a log slider: the useful band is a single
+        // decade (1 mm .. 5 cm) and the number is a physical length the
+        // user reads directly. Commits live (no Bullet recycle involved).
+        if(t.cloth_thickness&&t.on_thickness){
+            ImGui::Dummy({0,12});
+            ImGui::PushStyleColor(ImGuiCol_Text,kG60);ImGui::TextUnformatted("두께");ImGui::PopStyleColor();
+            ImGui::SameLine(kP+60);
+            ImGui::SetNextItemWidth(CW()-60);
+            ImGui::PushID("thick");
+            if(ImGui::DragFloat("##th",t.cloth_thickness,0.001f,0.001f,0.05f,"%.3f"))
+                t.on_thickness(t.mesh_id,*t.cloth_thickness);
+            ImGui::PopID();
+            ImGui::Dummy({0,4});
+            ImGui::PushStyleColor(ImGuiCol_Text,kG40);
+            ImGui::PushTextWrapPos(ImGui::GetCursorPosX()+CW());
+            ImGui::TextUnformatted("접촉이 밀어내는 거리 (m) — 겹친 천이 벌어지는 간격");
+            ImGui::PopTextWrapPos();ImGui::PopStyleColor();
+        }
         ImGui::Unindent(kP);ImGui::Dummy({0,kP});
     }
 
@@ -1179,7 +1198,7 @@ void drawMeshInspectorWindow(MeshInspectorWindowState& st, const MeshInspectorTa
                 ImGui::Dummy({0,4});
                 ImGui::PushStyleColor(ImGuiCol_Text,kG40);
                 ImGui::PushTextWrapPos(ImGui::GetCursorPosX()+CW());
-                ImGui::TextUnformatted("아직 시뮬레이션에 반영되지 않음 (저장·복원만 됨)");
+                ImGui::TextUnformatted("이 물체만 자기 충돌 (전역 스위치 없이도 동작, 천 전용)");
                 ImGui::PopTextWrapPos();ImGui::PopStyleColor();
             }
             ImGui::Unindent(kP);ImGui::Dummy({0,kP});

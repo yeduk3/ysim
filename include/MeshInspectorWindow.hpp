@@ -203,6 +203,15 @@ struct MeshInspectorTarget {
     std::function<void(int, float)> on_cloth_shear;
     float* cloth_bend = nullptr;
     std::function<void(int, float)> on_cloth_bend;
+    // "두께" — cloth-only contact thickness (metres). This is the distance
+    // the contact response resolves to, so it is the knob that decides how
+    // far apart two colliding cloth layers park. Reads the live
+    // ClothBehaviorParams/FastGridClothBehaviorParams field; the callback
+    // routes through Simulator::setClothThickness, which writes the live
+    // mesh AND the request mirror so the edit survives Scene::pack.
+    // Unlike mass this touches no rigid backend, so it commits live on drag.
+    float* cloth_thickness = nullptr;
+    std::function<void(int, float)> on_thickness;
     // log10 min/max for each 강성 slider — SOLVER DEPENDENT. The force
     // solver consumes spring constants across the whole 1e2..1e7 band
     // (the defaults below). PBD maps the same field onto a [0,1]
@@ -294,7 +303,9 @@ struct MeshInspectorTarget {
     // GeneralMesh fields for in-place preview; their callbacks fire after
     // the mutation so production can mirror onto the RequestGeneralMesh
     // (without that mirror the next Scene::pack resets the user's edit).
-    // self_collide is declared-but-unconsumed in P0-P2 — the widget says so.
+    // self_collide is LIVE: CpuSpatialHash::detectSelfCollisions includes a
+    // cloth mesh when the scene-wide enableSelfCollisions OR this per-object
+    // flag is set (Simulator::useCpuShSelf, on by default).
     int collider_kind_index = -1;
     std::function<void(int /*meshId*/, int /*kindIndex*/)> on_collider_kind;
     bool* collidable = nullptr;

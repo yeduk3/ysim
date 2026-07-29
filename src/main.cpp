@@ -1273,6 +1273,27 @@ int main(int argc, char** argv) {
                     target.cloth_bend = &fp->kbend;
                     target.on_cloth_bend = [setF](int id, float v){ setF(id, &FastGridClothBehaviorParams<Precision>::kbend, v); };
                 }
+                // "두께" — contact thickness. Both variants carry the field
+                // under the same name; bind whichever the mesh actually
+                // holds. PbdSystem::thicknessOf and the narrow/integrate
+                // paths read behaviorParams live, so the edit lands on the
+                // next substep; setClothThickness mirrors mesh + request so
+                // it also survives Scene::pack.
+                {
+                    float* thickPtr = nullptr;
+                    if (auto* cp = std::get_if<ClothBehaviorParams<Precision>>(
+                            &selectedMesh->behaviorParams))
+                        thickPtr = &cp->thickness;
+                    else if (auto* fp = std::get_if<FastGridClothBehaviorParams<Precision>>(
+                            &selectedMesh->behaviorParams))
+                        thickPtr = &fp->thickness;
+                    if (thickPtr) {
+                        target.cloth_thickness = thickPtr;
+                        target.on_thickness = [&simulator](int id, float v) {
+                            simulator.setClothThickness(id, (Precision)v);
+                        };
+                    }
+                }
                 // Solver-dependent slider range. PBD divides the same
                 // coefficient by its per-channel reference and clamps to
                 // [0,1], so everything above the reference is a dead zone —

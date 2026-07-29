@@ -129,6 +129,67 @@ void postInitPbdClothBall(SimOf<BE, PR>& simulator) {
                  "cloth, Rigid ball drop\n";
 }
 
+// "pbd_cloth_ball_self": pbd_cloth_ball with the ball retagged CLOTH and
+// ONLY its per-object 자기 충돌 (selfCollide) toggle set — the scene-wide
+// enableSelfCollisions stays FALSE on purpose. This is the user's inspector
+// flow expressed as code: retag a primitive to cloth, tick that one mesh's
+// self-collision box, and self rows must appear. It exercises three things
+// that used to be broken together:
+//   * addGeneralMesh seeds colliderKind = Mesh for a cloth-tagged sphere
+//     (an analytic collider on a deforming mesh is triple-dropped);
+//   * RequestGeneralMesh::selfCollide survives Scene::pack onto the mesh;
+//   * CpuSpatialHash::detectSelfCollisions honours the PER-OBJECT flag with
+//     the global switch off (Simulator::useCpuShSelf, default on).
+template <typename BE, typename PR>
+void setupPbdClothBallSelf(SimOf<BE, PR>& simulator, SysOf<BE, PR>& /*system*/) {
+    const PR kstretch = 1e5, kshear = 1e5, kbend = 2e5;
+    const PR mass = 0.1, thickness = 0.01;
+    const Index n = 20;
+    const PR size = 1, y = 0.6;
+    simulator.addPlane(PlaneDirection::XZPlane, tinym::vec3(0, 0, 0), 24, 3.0,
+                       0.1, BehaviorType::Float);                        // id 0
+    simulator.addCloth(n, size, tinym::vec3(0, (float)y, 0), kstretch, kshear,
+                       kbend, thickness, mass);                          // id 1
+    {
+        auto& req = Scene<BE, PR>::requestsGeneralMeshes.back();
+        const float h = (float)(size / 2);
+        const uint32_t vids[4] = { 0, (uint32_t)n - 1,
+                                   (uint32_t)(n * (n - 1)),
+                                   (uint32_t)(n * n - 1) };
+        const tinym::vec3 pos[4] = { { -h, (float)y, -h }, { h, (float)y, -h },
+                                     { -h, (float)y,  h }, { h, (float)y,  h } };
+        for (int i = 0; i < 4; ++i)
+            req.fixedVertices.push_back(FixedVertex{ vids[i], pos[i] });
+    }
+    // The ball as CLOTH, not Rigid. addSphere hands addGeneralMesh a
+    // FloatBehaviorParams regardless of the behavior tag, so the request's
+    // params are replaced with real cloth params — otherwise thicknessOf /
+    // springConstantsOf would read 0 and the sheet would have no contact
+    // thickness and no stiffness.
+    simulator.addSphere(tinym::vec3(0, 1.0, 0), 16, 0.5, PR(0.1),
+                        BehaviorType::TriangularCloth);                  // id 2
+    {
+        auto& req = Scene<BE, PR>::requestsGeneralMeshes.back();
+        req.behaviorParams = ClothBehaviorParams<PR>{ kstretch, kshear,
+                                                      kbend, thickness };
+        req.selfCollide = true;   // ← the ONLY self-collision switch here
+    }
+    simulator.mlBroadPhase.floorExcludeDiag = 1e9f;   // exclude NOTHING
+}
+
+template <typename BE, typename PR>
+void postInitPbdClothBallSelf(SimOf<BE, PR>& simulator) {
+    simulator.usePbd = true;
+    simulator.cdSubstepPeriod    = 1;
+    simulator.refitSubstepPeriod = 1;
+    // DELIBERATELY off: the point of this scene is that the per-object
+    // toggle alone must produce self rows.
+    simulator.enableSelfCollisions = false;
+    std::cout << "[Main] --scene pbd_cloth_ball_self: CPU PBD solver, "
+                 "cloth-tagged ball, PER-OBJECT self-collision only "
+                 "(global enableSelfCollisions off)\n";
+}
+
 // "pbd_cloth_stack": two PBD cloths, one corner-pinned sheet (id 1) with a
 // smaller free sheet (id 2) dropped onto it, over a Float floor. The
 // cross-cloth contacts are the two-way path's reason to exist: both meshes
@@ -311,6 +372,9 @@ inline const std::vector<Entry<BE, PR>>& registry() {
           &setupPbdCloth<BE, PR>, &postInitPbdCloth<BE, PR> },
         { "pbd_cloth_ball", "corner-pinned PBD cloth + a 0.5 m Rigid ball drop",
           &setupPbdClothBall<BE, PR>, &postInitPbdClothBall<BE, PR> },
+        { "pbd_cloth_ball_self", "pbd_cloth_ball with a CLOTH-tagged ball; "
+                                 "per-object 자기 충돌 only (global self off)",
+          &setupPbdClothBallSelf<BE, PR>, &postInitPbdClothBallSelf<BE, PR> },
         { "pbd_cloth_stack", "two PBD cloths stacked; cross-cloth two-way contacts",
           &setupPbdClothStack<BE, PR>, &postInitPbdClothStack<BE, PR> },
         { "pd_cloth", "pbd_cloth geometry solved by the CPU PD (Liu 2013) system",
