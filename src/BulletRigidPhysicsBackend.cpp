@@ -195,6 +195,23 @@ void BulletRigidPhysicsBackend::setAngularVelocity(BodyHandle handle, tinym::vec
     slot.body->setAngularVelocity(btVector3(w.x, w.y, w.z));
 }
 
+void BulletRigidPhysicsBackend::setPosition(BodyHandle handle, tinym::vec3 p) {
+    if (handle < 0 || handle >= static_cast<BodyHandle>(bodies_.size())) return;
+    auto& slot = bodies_[handle];
+    if (!slot.body) return;
+    // Keep the current rotation; only the origin moves.
+    btTransform tr = slot.body->getCenterOfMassTransform();
+    tr.setOrigin(btVector3(p.x, p.y, p.z));
+    slot.body->setCenterOfMassTransform(tr);
+    // The interpolation transform is what the motion state / the next
+    // substep's sub-frame interpolation reads; leaving it stale makes the
+    // body visually snap back for one step.
+    slot.body->setInterpolationWorldTransform(tr);
+    // A sleeping (deactivated) island is skipped by stepSimulation, which
+    // would silently drop this write. Wake it.
+    slot.body->activate(true);
+}
+
 void BulletRigidPhysicsBackend::setGravity(tinym::vec3 gravity) {
     if (world_) world_->setGravity(btVector3(gravity.x, gravity.y, gravity.z));
 }

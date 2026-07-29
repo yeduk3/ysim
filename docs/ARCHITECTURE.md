@@ -1,137 +1,121 @@
 # Architecture
 
 > Owner: **Planner**. Generators read this to know boundaries; Estimators read this to detect violations.
-> Updated: 2026-05-06
+> Updated: 2026-07-22 (main.cpp split into `include/sim/` fragment headers + tests/benches removed; supersedes the 2026-07-12 v2 rewrite).
+> Companion docs: [VISION.md](VISION.md) (why), [COLLISION_PIPELINE.md](COLLISION_PIPELINE.md) (collision detail), [ROADMAP.md](ROADMAP.md) (when).
 
 ## 1. System purpose
 
-ysim is a macOS simulation engine for cloth and rigid-body shots, sitting between Houdini (too complex) and Unreal (real-time-biased). v1 is an end-to-end author → simulate → save → reload → export-to-Alembic flow. The architecture is shaped by four non-negotiable constraints from the PRD: backend extensibility (CPU/Metal today, more later), cache-friendly memory layout, replaceable simulation parts, and templates over inheritance on the hot path.
+ysim is a macOS GPU simulation engine and **personal research platform** for cloth dynamics, collision detection, and (kinematic) character motion. The design goal is *replaceable simulation stages*: solver, broad phase, narrow phase, and response should each be swappable so algorithms from papers can be implemented and compared quantitatively. (This reframes the v1 "authoring tool" purpose — see VISION.md §1.)
 
-The architecture is dual-GPU: **OpenGL for rendering**, **Metal compute for simulation**. ImGui sits on the OpenGL backend because presentation is OpenGL-based.
+Dual-GPU strategy: **OpenGL renders, Metal compute simulates.** ImGui sits on the OpenGL backend. Single-threaded on the CPU side; all parallelism is GPU-internal.
 
-## 2. Boxes
+## 2. Current reality (as-built, 2026-07)
 
-Each box is a conceptual subsystem. File-level structure is mostly flat (the bulk of v1 lives in `src/main.cpp`); the boxes below describe *responsibilities*, not files. The Estimator should flag any change that blurs a box's responsibilities into another's.
+The engine was split out of `src/main.cpp` on 2026-07-22: `src/main.cpp` is now a ~2,970-line **app shell** (preamble includes, the ordered `#include "sim/*"` list, `backendName<>`, `SimulatorBuilder`, `int main` → CLI dispatch + GLFW/ImGui main loop). The sim classes live in `include/sim/` **fragment headers** — cut region-by-region along the boundaries below, `#include`d in order by `main.cpp` after its preamble, so the TU is byte-equivalent to the old monolith. They rely on that preamble (`using Index`, std/GL/Metal includes) and on earlier fragments; **not independently compilable by design** (a later slice makes them standalone `sim/core/…` modules per §4). All embedded tests/benches were removed (§6.4); the validity self-test moved to `test/self_test_inline.hpp`.
 
-### 2.1 Application shell
+### 2.1 include/sim/ fragment map
 
-The GLFW window, the main loop, and the ImGui context. Owns the input dispatch (mouse/keyboard → selection, gizmo, inspector edits) and the frame pacing. Does **not** own simulation state or rendering primitives — it tells those subsystems when to step and when to draw.
+Ordered as `main.cpp` includes them (each was a contiguous slice of the old main.cpp):
 
-### 2.2 Scene model
+| Header (`include/sim/`) | ~Lines | Contents |
+|---|---|---|
+| `core_types.hpp` | 657 | Backend tags (`CPU`/`CUDA`/`METAL`), `MemoryBlock`, `ByteMemoryPool`, `MetalGlobalContext`, `MetalKernelContext`, `VectorBase`, `Matrix`, `SparseMatrix` |
+| `mesh_state.hpp` | 519 | `DebugLineGL`/`DebugPointGL`; `BehaviorType`, `ExternalForces`, `MeshState<BE,PR>`, `MeshAdjacency`, initializer base |
+| `initializers.hpp` | 607 | `MeshGridInitializer`, `MeshFileInitializer`, `AssimpMeshFileInitializer`, sphere/cylinder/cube |
+| `collision_pod.hpp` | 458 | selection/preset PODs, `NarrowCollision`, `Constraints`, cloth params, `TriangularClothBehavior<METAL>`, `FastGridClothBehavior<METAL>` |
+| `material_quat.hpp` | 713 | `Material`, `Quat` math family, `MeshKinematicInitializer` (motion-system host) |
+| `scene.hpp` | 896 | `GeneralMesh<BE,PR>`, `Ray`/`RayHit`, `SceneEnvironment`, `Scene<BE,PR>` |
+| `spatial_hash.hpp` | 1,501 | `RadixSorter<METAL>`, `SpatialHashing<METAL>`, `MultiLevelSpatialHashing<METAL>` |
+| `bvh.hpp` | 2,993 | `BVH<…,LINEAR,PRIMITIVE>` per-mesh LBVH; `BVH<…,SCENE,OBJECT>` TLAS; `BroadPhase` |
+| `bruteforce.hpp` | 469 | `BruteForce<CPU/METAL>` narrow phase, `CollisionPipeline` |
+| `simulator.hpp` | 4,145 | **`Simulator<BE,PR,System>`**: add* factories, `update`, transforms, rigid wiring, save/load, ray pick, motion driver |
+| `explicit_system.hpp` | 446 | `ExplicitSystem<CPU/METAL>` (integration + force dispatch) |
 
-The in-memory representation of an authored scene: object list (`GeneralMesh<BE, PR>`), per-object transforms (position + quaternion), materials, behavior tags (`BehaviorType`) and behavior parameter structs (`BehaviorParams<PR> = std::variant<...>`), global forces (`ExternalForces`). This is the shared truth read by the renderer, written by the simulation, edited by the GUI, and serialized by scene I/O.
+`test/self_test_inline.hpp` (~6,140 lines, 40+ BDD validity blocks) is `#include`d last by `main.cpp` and reached via `--self-test`.
 
-The scene model is **template-parameterized on backend** (`Scene<METAL, PR>` today; `Scene<CPU, PR>` reserved). New behaviors extend the variant; new fields extend `MeshState` / `MeshAdjacency`. No virtual dispatch.
+### 2.2 What is already cleanly extracted
 
-### 2.3 Renderer
+`include/sim/*.hpp` (the fragment headers above — mechanical extraction, TU-equivalent, pre-§4). Fully decoupled: `include/scene_format.hpp` (headless, versioned JSON), `include/sim_config.hpp` (`RunConfig`), `include/MeshInspectorWindow.hpp` + `src/mesh_inspector_gui.cpp` (callback-struct decoupling — the model to imitate), rigid backends (`include/{Null,Euler,Bullet}RigidPhysicsBackend.hpp`, `include/RigidPhysicsTypes.hpp`), the motion stack (`include/{bvh_motion,motion_clip,motion_graph,motion_verb,kinematic_body,mesh_cluster}.hpp`), `include/FrameProfiler.hpp`, `include/SceneActionLog.hpp`, `include/primitive_geometry.hpp`.
 
-OpenGL pipeline that reads the scene model and draws each frame. Owns shader programs (`src/shader/*.vert/.frag/.geom`), framebuffers, the camera, and ray-pick selection. Does **not** know about Metal, behavior dispatch, or collision detection — it consumes positions/normals/transforms and renders them.
+### 2.3 Behaviors
 
-### 2.4 GUI / inspector
+`BehaviorType`: `TriangularCloth`, `FastGridCloth`, `Elastic` (reserved), `Rigid`, `Float`, `Fluid` (reserved), `Generator` (reserved), **`Kinematic`** (added ~2026-06; hosts the motion-graph/blend-space/verb system — previously undocumented). Cloth behaviors dispatch inside `ExplicitSystem::update`; Rigid and Kinematic are driven at the `Simulator::update` layer on the CPU.
 
-ImGui-driven panels that mutate the scene model: object list, inspector for the selected object (transform, material, behavior tag + params), environment forces (gravity, wind), profiler window, scene I/O actions. Lives on the OpenGL ImGui backend. Edits propagate live (`BDD-018`); no pause/resume required.
+Adding a behavior today touches: the enum, a params struct, a behavior kernel + `.metal` kernel, `ExplicitSystem`/`Simulator` dispatch, `scene_format` name tables, and the inspector combo. Not localized — a known cost until the System extraction (§4).
 
-### 2.5 Simulation pipeline
+### 2.4 Rigid (as-built vs design)
 
-The hot path. One simulation step is a fixed sequence of stages, each replaceable independently of the others (`PRD §5.1`):
+`docs/design/rigid_physics_backend.md` specified a `RigidBackend` template param selected via `std::variant`. As built, `Simulator` hard-codes `BulletRigidPhysicsBackend rigid_`. The duck-typed 12-method contract is real and all three backends satisfy it; swapping is a one-line type edit. Rigid→mesh sync is **translation-only** (no rotation propagation) — an open gap. Quat marshalling: ysim `{w,x,y,z}` ↔ Bullet `(x,y,z,w)`.
 
-- **Behavior dispatch** — for each object, dispatch to its behavior's per-step kernel based on `BehaviorType`. v1 has user-facing `Float`, `Cloth` (`TriangularCloth` + `FastGridCloth`), and (planned) `Rigid`.
-- **Force computation** — gravity + wind applied to non-`Float` objects, plus behavior-internal forces (e.g. spring forces for cloth).
-- **Broad phase** — LBVH built per object and per scene; produces candidate collision pairs. Spatial-hashing variant exists (`src/metal/spatialhashing.metal`) but is parked for performance.
-- **Narrow phase** — point-triangle intersection (`src/metal/bruteforce.metal`) over candidate pairs.
-- **Integration** — explicit Euler for cloth today; rigid integration delegated to Bullet or Jolt (code-level switch, PRD Q4).
-- **Constraint response** — collision constraints applied to corrected positions/velocities.
+### 2.5 Backend abstraction: reality check
 
-All stages run as Metal compute kernels (`src/metal/*.metal`) dispatched from C++ via a singleton `MetalGlobalContext` and `MetalKernelContext`. Memory is allocated through `ByteMemoryPool<METAL>` / `MemoryBlock<METAL, T>` — no ad-hoc allocations on the hot path (`PRD §5.1`).
+`CUDA` is a tag with zero implementations. `CPU` is a type-system reservation (D-012 resolved testing via headless Metal self-test instead). The entire engine is monomorphized to `<METAL, float>`. The templates buy a no-vtable hot path and a future seam, at the cost of compile time and cognitive load. **Policy: keep the tags, stop pretending — no new code needs a CPU mirror** (see VISION.md §3).
 
-### 2.6 Scene I/O (planned — persistence slice)
+## 3. Simulation pipeline (per frame)
 
-Save/load of the scene model to a versioned, human-diffable format (provisionally JSON, PRD Q3 → resolved by Planner; see `.agent/PROJECT_STATE.md`). Reads the same scene model the GUI mutates; reuses the same construction paths the GUI uses for primitive creation and mesh import (so authoring and loading produce identical in-memory state). Does **not** touch the simulation pipeline or the renderer.
+Full detail with kernel names and file:line anchors in [COLLISION_PIPELINE.md](COLLISION_PIPELINE.md). Summary:
 
-### 2.7 Export (planned — export slice)
+1. Every 10th frame: LBVH topology rebuild (`broadPhase.build`).
+2. `applyEnvironmentForces` (gravity·mass + wind → per-vertex buffer).
+3. Rigid: Bullet `step` once per frame, snap mesh to body centroid.
+4. Kinematic: advance motion clock, `writePose` (one-way coupling; xPrev keeps the previous pose for the swept narrow phase).
+5. Substep loop (~50–60×): refit(+swept enlarge) → broad detect → narrow (`narrow_pt_tri`) → per-vertex CSR bucketing → `snapshotXPrev` → `System::update` (Pass 1 forces, Pass 2 integrate **with collision response fused in**).
+6. Frame boundary: `commitAndWait` → `syncPreviewFromState` → render.
 
-Alembic baker that consumes per-frame simulation output over a chosen frame range and writes a `.abc` file. Reads the simulation pipeline's per-step state but is **outside** the hot path — bake is a user-triggered, finite operation, not a per-frame cost.
+Solver: explicit force evaluation + semi-implicit (symplectic) Euler. No implicit solve, no constraint solver — response is a velocity filter + position projection inside the integrate kernels.
 
-### 2.8 Profiler
+## 4. Target module structure (extraction plan)
 
-`FrameProfiler` + `FrameProfilerHistory` sample named timing sections in the simulation pipeline and surface them in a GUI window. CSV export to `profiles/`. New sections are registered dynamically by name. History collection pauses when simulation is paused.
-
-## 3. Arrows
-
-Who initiates, what crosses the boundary, sync vs. async.
+Strangler pattern: extract from main.cpp module by module; never a big-bang rewrite (`arch-test/` is frozen as a reference/lessons repository — its `PORT_MAP.md` de-risks step 1 below). Target dependency graph:
 
 ```
-                       ┌────────────────────┐
-                       │ Application shell  │  (initiates everything)
-                       └─────────┬──────────┘
-                                 │
-                ┌────────────────┼────────────────┐
-                ▼                ▼                ▼
-         ┌──────────┐     ┌──────────┐     ┌──────────────┐
-         │   GUI    │     │ Renderer │     │  Simulation  │
-         └────┬─────┘     └────▲─────┘     │   pipeline   │
-              │ mutate         │ read       └──────▲───────┘
-              ▼                │                   │ read+write
-            ┌────────────────────────────┐         │
-            │       Scene model          │◄────────┘
-            └────┬───────────────▲───────┘
-                 │ read           │ write
-                 ▼                │
-            ┌──────────┐    ┌──────────┐
-            │ Scene IO │    │ Profiler │  (samples sim pipeline)
-            └──────────┘    └──────────┘
-                                 ▲
-                                 │
-                            ┌────┴─────┐
-                            │  Export  │  (reads sim output frames)
-                            └──────────┘
+app (main loop, CLI dispatch)
+ ├── editor/        ImGui panels (inspector pattern: callback structs, no engine types)
+ ├── render/        OpenGL, shaders, id-buffer picking   — never sees Metal
+ └── sim/
+      ├── core/     backend tags, MemoryPool, VectorBase, Metal contexts, MeshState, Scene
+      ├── collision/ BroadPhase variants + NarrowPhase + response params
+      ├── system/   ISystem seam: ExplicitSystem | XPBDSystem | ImplicitSystem
+      ├── rigid/    RigidPhysicsBackend contract (exists)
+      └── motion/   mograph/kinematic (exists, feature-frozen)
+persist/  scene_format, sim_config (exists, headless)
 ```
 
-- **Shell → everything**: synchronous per-frame call. Shell decides when to step the sim and when to draw.
-- **GUI → Scene model**: synchronous, mutates fields directly. Lives on the same thread as the renderer.
-- **Renderer → Scene model**: synchronous read each frame. Never writes back.
-- **Simulation pipeline → Scene model**: read at start of step, write at end of step. Mutation happens through Metal-resident buffers; the C++-side `Scene` views the same memory through `MemoryBlock<METAL, T>`.
-- **Scene I/O ↔ Scene model**: synchronous, only on user save/load actions. Never invoked from the hot path.
-- **Profiler → Simulation pipeline**: passive — section markers are inserted *into* the simulation kernels; profiler aggregates results. Profiler does not steer the simulation.
-- **Export → Simulation pipeline**: pulls per-frame output during a finite bake operation. Not on the hot path.
+Extraction order and the *reason* each is worth it:
 
-There is **no** asynchronous boundary in v1. Single-threaded except for what Metal does internally on the GPU.
+1. **core/** — mechanical, low-risk (arch-test already ported it once). Unblocks everything else.
+2. **system/** — the first seam with a real second implementation waiting: `XPBDSystem` (ROADMAP M2). Interface sketch: `struct System { void snapshotXPrev(Scene&); void update(Scene&, SubstepCtx); }` — duck-typed like the rigid contract, selected per-`RunConfig` (`engine.system: Explicit|XPBD`), monomorphized via `std::variant` at the Simulator level. Per-substep granularity ⇒ dispatch cost irrelevant.
+3. **collision/** — broad-phase selection is already runtime bools (`useSpatialHashing`, `useMultiLevelSH`, …); formalize as an enum-dispatched `BroadPhaseKind` and pull the classes out.
+4. **Simulator split** — last: separate scene mutation (editor commands) from stepping (pipeline orchestration).
 
-## 4. Boundaries (Estimator-enforced invariants)
+**Dispatch policy** (settles the template-vs-virtual tension between production and arch-test): inside kernels and per-vertex loops — templates/enum switch only, as today. At stage boundaries invoked ≤ once per substep — `std::variant`/`visit` or even virtual is fine; measurability is zero, replaceability is the point.
 
-Violations of any of these are a `BLOCK`-class concern.
+## 5. Boundaries (Estimator-enforced invariants)
 
-### 4.1 Backend boundary (`BDD-103`)
+Carried over from v1, still binding, with updates:
 
-The renderer, GUI, scene I/O, and export must **not** depend on Metal-specific types or kernels. They consume the scene model through its template-parameterized interface only. Adding a new behavior or swapping a simulation stage must not require touching `src/shader/*`, the OpenGL render loop, ImGui windows, or the scene-IO code.
+- **5.1 Backend boundary** — renderer, GUI, scene I/O never depend on Metal types. (Unenforceable inside one TU; becomes checkable as modules extract. Extracted headers already comply.)
+- **5.2 No virtual dispatch on the per-vertex hot path.** Stage-boundary dispatch is exempt (§4).
+- **5.3 No ad-hoc allocations on the hot path** — everything through `ByteMemoryPool`/`MemoryBlock`.
+- **5.4 `BehaviorType` values are on-disk format** — append only, never reorder. (Now includes `Kinematic`.)
+- **5.5 macOS/Metal-only platform surface.** Gate via backend tag, not `#ifdef`.
+- **5.6 Single-machine determinism only** (BDD-102).
+- **5.7 (new) GPU wedge safety** — any new kernel with a loop needs an iteration cap and index-range guard; any kernel writing positions goes through `sanitizeIntegrateOutput`-style non-finite handling (fast-math makes `isnan` unreliable; check exponent bits).
+- **5.8 (new) xPrev discipline** — slot 10 (`xPrev`) is the swept narrow phase's contract: it must hold start-of-previous-substep positions for sim meshes and previous-frame pose for Kinematic meshes. Any new integrator/system must call `snapshotXPrev` at the same point in the substep or CCD silently degrades.
 
-Concretely: a diff that introduces a new collision pipeline and also touches `src/main.cpp`'s render or GUI sections is suspect — the Estimator should ask whether the GUI/render edits are *consequence* (a new inspector field for new behavior parameters) or *coupling* (the renderer learning about the new pipeline).
+## 6. Known debts (acknowledged, scheduled or frozen)
 
-### 4.2 No virtual dispatch on the hot path (`PRD §5.1`)
+1. main.cpp monolith → **split into `include/sim/` fragment headers (2026-07-22)**; main.cpp is now a ~2,970-line app shell. Still one TU (fragments are ordered `#include`s, not standalone modules) — the §4 standalone-module extraction (ROADMAP M1/M2) is the remaining step.
+2. Docs drift: DECISIONS.md stops at D-042 (2026-05-14); the June–July motion/BVH-variant/analytic arc has no decision records. Policy: resume decision records from today **forward**; backfill only when a module is touched.
+3. `TEST_MATRIX.md` cites stale main.cpp line numbers (now doubly stale — the self-test lives in `test/self_test_inline.hpp`).
+4. Removed 2026-07-22: all embedded CLI bench harnesses (perf, ~15 runners + their `main` dispatch) and the `src/temp.cpp`/`test_temp.cpp`/`test/test_sap_topphase.cpp` scratch files. Kept as validity infra: `test/self_test_inline.hpp` (BDD self-test) and the doctest suite (`test/{scene_io,sim_config,motion_blend,primitive}_test.cpp`). Still unwired: edge LBVH kernels (no edge-edge narrow phase yet — intentional next step, COLLISION_PIPELINE §6).
+5. `MeshAnimationWriter`/Alembic design doc unimplemented — **deliberately dropped** (VISION §3), doc kept for the record.
+6. Rigid rotation propagation missing (translation-only vertex sync).
 
-Behavior dispatch goes through templates and `std::variant`; no `virtual` functions in `MeshState`, `Scene`, `BehaviorParams`, or any per-step code. New behaviors extend the variant. The cost is compile time; the win is no vtable indirection and predictable layout.
+## 7. Open structural questions
 
-### 4.3 No ad-hoc allocations on the hot path
-
-All per-frame buffers go through `ByteMemoryPool<BE>` / `MemoryBlock<BE, T>`. New per-frame data structures must allocate from the pool, not via `new`/`malloc`/`std::vector::push_back` on each step.
-
-### 4.4 BehaviorType identifiers are reserved
-
-The `BehaviorType` enum values (`TriangularCloth`, `FastGridCloth`, `Elastic`, `Rigid`, `Float`, `Fluid`, `Generator`) are part of the on-disk scene format. Reordering or renumbering them silently corrupts saved scenes. Adding a new behavior appends to the enum; never inserts into the middle.
-
-### 4.5 macOS-only platform surface (v1)
-
-The simulation backend depends on Metal (`xcrun metal` / `metallib`). The CPU backend exists in the type system for testability and future portability but is **not** a v1 shipping target. Code that gates Metal-specific logic must do so through the backend tag (`<METAL, PR>`), not through `#ifdef __APPLE__`.
-
-### 4.6 Single-machine determinism, only
-
-`BDD-102` promises that two runs of the same saved scene on the same machine produce visually identical bakes. Cross-machine and cross-build determinism are **not** promised. Code reviews that introduce new sources of nondeterminism (e.g., unordered atomic accumulation in a kernel) within a single machine should be flagged; cross-machine drift should not be escalated to BLOCK in v1.
-
-## 5. Open structural questions
-
-The Planner is tracking these. Each lists what would force a decision.
-
-- **Q-A — Where does the Rigid behavior's Bullet/Jolt adapter live?** It cannot live in the simulation pipeline alongside the Metal kernels (Bullet and Jolt are CPU libraries). Options: (i) a sibling box "rigid bridge" that runs on CPU between Metal sim steps and feeds positions back to GPU buffers; (ii) ship rigid as a `<CPU, PR>` `Scene` view, decoupling rigid's backend from cloth's. Decision forced by the rigid-body slice (`FR-008` / `BDD-008`).
-- **Q-B — How do persisted scenes reference imported meshes when the asset moves?** v1 references by path; if the path becomes invalid, `loadScene` fails. Embedding mesh data in the scene file is the alternative. Decision forced by user reports of broken loads, or by the LLM-control v2 needing to manipulate scenes without their assets present.
-- **Q-C — How is the Alembic export decoupled from the live simulation step rate?** The bake frame rate (e.g., 24/30/60 fps) is independent of the simulation substep. Open: does the export pull from a recorded buffer of all sub-steps and resample to the requested rate, or does the simulation run at the export rate during a bake? Decision forced by the export slice (PRD Q6 → blocks `FR-013`).
-- **Q-D — Who owns the test backend (CPU)?** **Resolved by D-012 (2026-05-07): headless Metal harness, not CPU backend reference.** The CPU backend stays as type-system reservation only for v1; sim-step assertions run via `ysim --self-test` against the same Metal pipeline the GUI uses, with a SKIP path when no Metal device is available so the gate stays runnable on Linux Estimator hosts. CPU implementation revisits if v2 cross-machine determinism becomes a goal.
+- **Q-E — XPBD and the collision contract.** XPBD wants contacts as *constraints* solved in its iteration loop, not a velocity filter in the integrator. Does `NarrowCollision` + per-vertex CSR survive as the interface, with each System free to consume contacts its own way? (Working assumption: yes — detection is System-agnostic, response is System-owned.) Forced by ROADMAP M2.
+- **Q-F — Where does friction state live?** Coulomb friction needs per-contact tangential info and possibly warm-starting across substeps. Buffer ownership (CollisionPipeline vs System) to be decided with the first friction implementation (ROADMAP M3).
+- **Q-G — Kinematic skinning.** `kinematic::BodyProxy` writes joint spheres+bones, not a skinned character mesh. Is a proper LBS skin needed for the flagship demo, or do proxy capsules collide well enough? Forced by ROADMAP M4.
+- Q-B (asset paths in saved scenes) and Q-C (export cadence) from v1: Q-B still open but low-pressure; Q-C dropped with Alembic.

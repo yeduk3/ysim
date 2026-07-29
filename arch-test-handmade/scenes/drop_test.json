@@ -1,0 +1,12 @@
+{
+  "name": "drop_test",
+  "solver": "xpbd",
+  "broad_phase": "lbvh",
+  "narrow_phase": "proximity",
+  "dt": 0.016666,
+  "substeps": 4,
+  "objects": [
+    { "name": "cloth", "kind": "cloth", "vertices": 1024 },
+    { "name": "floor", "kind": "floor", "vertices": 4 }
+  ]
+}

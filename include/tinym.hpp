@@ -14,12 +14,27 @@ namespace tinym {
 //using T = float;
 
 template <typename T>
+struct vec3_base;
+
+template <typename T>
 struct vec3_view_base {
     T* ptr;
     vec3_view_base(T* ptr) : ptr(ptr) {}
     T& operator[](int i) { return ptr[i]; }
     const T& operator[](int i) const { return ptr[i]; }
+    // Write-through to the mapped memory. Defined out-of-line below because
+    // vec3_base is not complete yet. These only ADD candidates for
+    // `view op= vec3` — `vec3 op= view` keeps using vec3_base's own
+    // operators, so no existing overload resolution changes.
+    vec3_view_base& operator= (const vec3_base<T>& v);
+    vec3_view_base& operator+=(const vec3_base<T>& v);
+    vec3_view_base& operator-=(const vec3_base<T>& v);
 };
+
+// Read a vec3 out of 3 contiguous scalars (the const counterpart of
+// vec3_view_base, which needs a mutable pointer).
+template <typename T>
+inline vec3_base<T> vec3_at(const T* p) { return vec3_base<T>(p[0], p[1], p[2]); }
 template <typename T>
 struct vec3_base {
     union {
@@ -71,6 +86,19 @@ struct vec3_base {
         return os;
     }
 };
+
+template <typename T>
+inline vec3_view_base<T>& vec3_view_base<T>::operator=(const vec3_base<T>& v) {
+    ptr[0] = v.x; ptr[1] = v.y; ptr[2] = v.z; return *this;
+}
+template <typename T>
+inline vec3_view_base<T>& vec3_view_base<T>::operator+=(const vec3_base<T>& v) {
+    ptr[0] += v.x; ptr[1] += v.y; ptr[2] += v.z; return *this;
+}
+template <typename T>
+inline vec3_view_base<T>& vec3_view_base<T>::operator-=(const vec3_base<T>& v) {
+    ptr[0] -= v.x; ptr[1] -= v.y; ptr[2] -= v.z; return *this;
+}
 
 using vec3 = vec3_base<float>;
 using vec3ui = vec3_base<uint>;

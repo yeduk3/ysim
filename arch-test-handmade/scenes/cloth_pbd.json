@@ -1,0 +1,12 @@
+{
+  "name": "cloth_pbd_json",
+  "solver": "pbd",
+  "broad_phase": "lbvh",
+  "narrow_phase": "proximity",
+  "dt": 0.016666,
+  "substeps": 10,
+  "objects": [
+    { "name": "sheet", "kind": "cloth", "vertices": 900 },
+    { "name": "floor", "kind": "floor", "vertices": 4 }
+  ]
+}

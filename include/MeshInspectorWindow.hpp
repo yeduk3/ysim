@@ -175,6 +175,17 @@ struct MeshInspectorTarget {
     // Both must be set together to enable the InputFloat3 row.
     tinym::vec3* scale = nullptr;
     std::function<void(int, tinym::vec3)> on_scale;
+    // 질량 — PER-VERTEX mass, shown for every mesh type (cloth uses it in
+    // the PBD/force solvers; a Rigid mesh's Bullet body derives its total
+    // mass from the same numbers). The pointer reads the live value out of
+    // MeshState::m; mass_num_points is the mesh's vertex count so the widget
+    // can display the derived total (per-vertex × numPoints). Pointer and
+    // callback must both be set to enable the row; the callback routes
+    // through Simulator::setObjectMass, which rewrites state.m AND the
+    // initializer params so the edit survives Scene::pack and save/load.
+    float* mass_per_vertex = nullptr;
+    int mass_num_points = 0;
+    std::function<void(int, float)> on_mass;
     // "팽팽함" — cloth-only uniform stiffness multiplier. Non-null only
     // when the selected mesh is a cloth behavior; the slider is hidden
     // otherwise. Reads the live value via the pointer; commits through
@@ -192,6 +203,25 @@ struct MeshInspectorTarget {
     std::function<void(int, float)> on_cloth_shear;
     float* cloth_bend = nullptr;
     std::function<void(int, float)> on_cloth_bend;
+    // "두께" — cloth-only contact thickness (metres). This is the distance
+    // the contact response resolves to, so it is the knob that decides how
+    // far apart two colliding cloth layers park. Reads the live
+    // ClothBehaviorParams/FastGridClothBehaviorParams field; the callback
+    // routes through Simulator::setClothThickness, which writes the live
+    // mesh AND the request mirror so the edit survives Scene::pack.
+    // Unlike mass this touches no rigid backend, so it commits live on drag.
+    float* cloth_thickness = nullptr;
+    std::function<void(int, float)> on_thickness;
+    // log10 min/max for each 강성 slider — SOLVER DEPENDENT. The force
+    // solver consumes spring constants across the whole 1e2..1e7 band
+    // (the defaults below). PBD maps the same field onto a [0,1]
+    // projection weight by dividing by a per-channel reference and
+    // clamping, so everything above that reference is a dead zone;
+    // the caller narrows the range to the band that actually does
+    // something. Per channel because the references differ.
+    float cloth_stretch_log_range[2] = { 2.f, 7.f };
+    float cloth_shear_log_range[2]   = { 2.f, 7.f };
+    float cloth_bend_log_range[2]    = { 2.f, 7.f };
     // FR-005 / D-027 inspector material path. The 4 scalar/vec3 pointers
     // read the mesh's material fields (D-005's v1 OpenPBR subset: base_color,
     // metallic, roughness, specular_weight, emission_color). Widgets mutate
@@ -261,6 +291,27 @@ struct MeshInspectorTarget {
     // Optional; the Environment row renders the pill only when set.
     bool* is_static = nullptr;
     std::function<void(int /*meshId*/, bool /*isStatic*/)> on_static_change;
+
+    // ── Collider (docs/design/collider_pipeline_rework.md §1, P0) ─────
+    // collider_kind_index is a per-frame snapshot of this mesh's
+    // ColliderKind mapped to a dropdown index:
+    //   0 = Mesh, 1 = Sphere, 2 = Box, 3 = Cylinder, 4 = Plane.
+    // -1 hides the section. The int-index / callback pair keeps this
+    // header free of the ColliderKind enum, exactly like
+    // current_behavior_index does for BehaviorType — production owns the
+    // mapping table both ways. collidable / self_collide alias the live
+    // GeneralMesh fields for in-place preview; their callbacks fire after
+    // the mutation so production can mirror onto the RequestGeneralMesh
+    // (without that mirror the next Scene::pack resets the user's edit).
+    // self_collide is LIVE: CpuSpatialHash::detectSelfCollisions includes a
+    // cloth mesh when the scene-wide enableSelfCollisions OR this per-object
+    // flag is set (Simulator::useCpuShSelf, on by default).
+    int collider_kind_index = -1;
+    std::function<void(int /*meshId*/, int /*kindIndex*/)> on_collider_kind;
+    bool* collidable = nullptr;
+    bool* self_collide = nullptr;
+    std::function<void(int /*meshId*/, bool /*collidable*/)> on_collidable;
+    std::function<void(int /*meshId*/, bool /*selfCollide*/)> on_self_collide;
 
     // ── Sub-object BVH (per-object; shown only in master cluster mode) ─
     // Per-object controls for the cluster sub-object BVH. subobj_split_s

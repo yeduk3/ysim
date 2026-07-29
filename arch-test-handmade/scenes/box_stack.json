@@ -1,0 +1,14 @@
+{
+  "name": "box_stack",
+  "solver": "explicit",
+  "broad_phase": "spatial_hash",
+  "narrow_phase": "exhaustive",
+  "dt": 0.008333,
+  "substeps": 3,
+  "objects": [
+    { "name": "box_0", "kind": "rigid", "vertices": 8 },
+    { "name": "box_1", "kind": "rigid", "vertices": 8 },
+    { "name": "box_2", "kind": "rigid", "vertices": 8 },
+    { "name": "ground", "kind": "floor", "vertices": 4 }
+  ]
+}

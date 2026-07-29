@@ -1070,20 +1070,47 @@ void drawMeshInspectorWindow(MeshInspectorWindowState& st, const MeshInspectorTa
         }
     }
 
+    // ─── 질량 Mass ───────────────────────────────────────────────────
+    // Per-vertex mass (the authoring convention: every entry of MeshState::m
+    // holds this value), with the derived total shown underneath. Committed
+    // on edit-finished rather than per drag frame — setObjectMass recycles
+    // the Bullet body, which is not something to do 60x a second.
+    if(t.mass_per_vertex&&t.on_mass){
+        ImGui::Dummy({0,kP});ImGui::Indent(kP);
+        ImGui::PushStyleColor(ImGuiCol_Text,kG60);ImGui::TextUnformatted("질량");ImGui::PopStyleColor();
+        ImGui::SameLine(kP+60);
+        ImGui::SetNextItemWidth(CW()-60);
+        ImGui::PushID("mass");
+        ImGui::DragFloat("##m",t.mass_per_vertex,0.001f,1e-6f,1e6f,"%.4g");
+        if(ImGui::IsItemDeactivatedAfterEdit())t.on_mass(t.mesh_id,*t.mass_per_vertex);
+        ImGui::PopID();
+        ImGui::Dummy({0,4});
+        ImGui::PushStyleColor(ImGuiCol_Text,kG60);
+        ImGui::Text("총질량 = %.4g x %d = %.4g",*t.mass_per_vertex,t.mass_num_points,
+                    (*t.mass_per_vertex)*(float)t.mass_num_points);
+        ImGui::PopStyleColor();
+        ImGui::Unindent(kP);ImGui::Dummy({0,kP});
+    }
+
     // ─── 팽팽함 ──────────────────────────────────────────────────────
     if(t.cloth_stiffness_scale&&t.on_cloth_stiffness_scale){
         float sc=*t.cloth_stiffness_scale;float k=(sc>0)?std::log10(sc):0;if(k<-2)k=-2;if(k>2)k=2;
         ImGui::Dummy({0,kP});ImGui::Indent(kP);
         if(InlineSlider("팽팽함",&k,-2,2)){float ns=std::pow(10.f,k);*t.cloth_stiffness_scale=ns;t.on_cloth_stiffness_scale(t.mesh_id,ns);}
-        // Per-type stiffness coefficients (log10 slider, 1e2..1e7).
-        // A null pointer keeps that row hidden — FastGridCloth omits
-        // shear, TriangularCloth shows all three.
+        // Per-type stiffness coefficients (log10 slider). The range comes
+        // from the target, not a constant: the active solver decides which
+        // band of spring constants is meaningful (see the *_log_range
+        // comment in MeshInspectorWindow.hpp). A null pointer keeps that
+        // row hidden — FastGridCloth omits shear, and the PBD solver omits
+        // it too (no shear constraint set).
         auto clothK=[&](const char* lbl,float* val,
-                        const std::function<void(int,float)>& cb){
+                        const std::function<void(int,float)>& cb,
+                        const float* range){
             if(!val||!cb) return;
-            float lk=(*val>0)?std::log10(*val):2.f;
-            if(lk<2)lk=2;if(lk>7)lk=7;
-            if(InlineSlider(lbl,&lk,2,7)){
+            const float lo=range[0],hi=range[1];
+            float lk=(*val>0)?std::log10(*val):lo;
+            if(lk<lo)lk=lo;if(lk>hi)lk=hi;
+            if(InlineSlider(lbl,&lk,lo,hi)){
                 float nv=std::pow(10.f,lk);*val=nv;cb(t.mesh_id,nv);}
             ImGui::Dummy({0,8});
         };
@@ -1091,9 +1118,28 @@ void drawMeshInspectorWindow(MeshInspectorWindowState& st, const MeshInspectorTa
             ImGui::PushStyleColor(ImGuiCol_Text,kG60);
             ImGui::TextUnformatted("강성");ImGui::PopStyleColor();
             ImGui::Dummy({0,8});}
-        clothK("스트레치",t.cloth_stretch,t.on_cloth_stretch);
-        clothK("시어",    t.cloth_shear,  t.on_cloth_shear);
-        clothK("벤드",    t.cloth_bend,   t.on_cloth_bend);
+        clothK("스트레치",t.cloth_stretch,t.on_cloth_stretch,t.cloth_stretch_log_range);
+        clothK("시어",    t.cloth_shear,  t.on_cloth_shear,  t.cloth_shear_log_range);
+        clothK("벤드",    t.cloth_bend,   t.on_cloth_bend,   t.cloth_bend_log_range);
+        // ─── 두께 (contact thickness, metres) ─────────────────────────
+        // Linear DragFloat, not a log slider: the useful band is a single
+        // decade (1 mm .. 5 cm) and the number is a physical length the
+        // user reads directly. Commits live (no Bullet recycle involved).
+        if(t.cloth_thickness&&t.on_thickness){
+            ImGui::Dummy({0,12});
+            ImGui::PushStyleColor(ImGuiCol_Text,kG60);ImGui::TextUnformatted("두께");ImGui::PopStyleColor();
+            ImGui::SameLine(kP+60);
+            ImGui::SetNextItemWidth(CW()-60);
+            ImGui::PushID("thick");
+            if(ImGui::DragFloat("##th",t.cloth_thickness,0.001f,0.001f,0.05f,"%.3f"))
+                t.on_thickness(t.mesh_id,*t.cloth_thickness);
+            ImGui::PopID();
+            ImGui::Dummy({0,4});
+            ImGui::PushStyleColor(ImGuiCol_Text,kG40);
+            ImGui::PushTextWrapPos(ImGui::GetCursorPosX()+CW());
+            ImGui::TextUnformatted("접촉이 밀어내는 거리 (m) — 겹친 천이 벌어지는 간격");
+            ImGui::PopTextWrapPos();ImGui::PopStyleColor();
+        }
         ImGui::Unindent(kP);ImGui::Dummy({0,kP});
     }
 
@@ -1113,6 +1159,47 @@ void drawMeshInspectorWindow(MeshInspectorWindowState& st, const MeshInspectorTa
             if(t.apply_wind){
                 ImGui::PushStyleColor(ImGuiCol_Text,kG60);ImGui::TextUnformatted("바람");ImGui::PopStyleColor();
                 ImGui::SameLine(kP+CW()-42);if(PillToggle("##wd",t.apply_wind))fE();ImGui::Dummy({0,12});
+            }
+            ImGui::Unindent(kP);ImGui::Dummy({0,kP});
+        }
+    }
+
+    // ─── 충돌체 Collider (collider_pipeline_rework.md §1, P0) ────────────
+    // 형태 = 이 메시를 충돌 파이프라인이 어떤 도형으로 볼지(메시/구/박스/
+    // 실린더/평면). 생성 시 초기화자에서 기본값이 정해지고, 여기서 바꾼
+    // 값은 request에 미러링되어 re-pack(이동/회전/오브젝트 추가)을 견딘다.
+    if(t.collider_kind_index>=0){
+        if(AccordionHeader("충돌체","Collider")){
+            ImGui::Dummy({0,kP});ImGui::Indent(kP);
+            static const char* kKinds[5]={"메시 Mesh","구 Sphere","박스 Box","실린더 Cylinder","평면 Plane"};
+            const int ki=t.collider_kind_index>4?4:t.collider_kind_index;
+            ImGui::PushStyleColor(ImGuiCol_Text,kG60);ImGui::TextUnformatted("형태");ImGui::PopStyleColor();ImGui::Dummy({0,4});
+            ImGui::SetNextItemWidth(CW());
+            if(ImGui::BeginCombo("##ckind",kKinds[ki])){
+                for(int i=0;i<5;++i){
+                    bool sel=(i==ki);
+                    if(ImGui::Selectable(kKinds[i],sel)&&!sel&&t.on_collider_kind)
+                        t.on_collider_kind(t.mesh_id,i);
+                    if(sel)ImGui::SetItemDefaultFocus();
+                }
+                ImGui::EndCombo();
+            }
+            if(t.collidable){
+                ImGui::Dummy({0,12});
+                ImGui::PushStyleColor(ImGuiCol_Text,kG60);ImGui::TextUnformatted("충돌 대상");ImGui::PopStyleColor();
+                ImGui::SameLine(kP+CW()-42);
+                if(PillToggle("##ccol",t.collidable)&&t.on_collidable)t.on_collidable(t.mesh_id,*t.collidable);
+            }
+            if(t.self_collide){
+                ImGui::Dummy({0,12});
+                ImGui::PushStyleColor(ImGuiCol_Text,kG60);ImGui::TextUnformatted("자기 충돌");ImGui::PopStyleColor();
+                ImGui::SameLine(kP+CW()-42);
+                if(PillToggle("##cself",t.self_collide)&&t.on_self_collide)t.on_self_collide(t.mesh_id,*t.self_collide);
+                ImGui::Dummy({0,4});
+                ImGui::PushStyleColor(ImGuiCol_Text,kG40);
+                ImGui::PushTextWrapPos(ImGui::GetCursorPosX()+CW());
+                ImGui::TextUnformatted("이 물체만 자기 충돌 (전역 스위치 없이도 동작, 천 전용)");
+                ImGui::PopTextWrapPos();ImGui::PopStyleColor();
             }
             ImGui::Unindent(kP);ImGui::Dummy({0,kP});
         }

@@ -35,7 +35,6 @@ void drawProfilerWindow(
     bool* use_segmented_bvh_query,
     bool* use_agglomerative_bvh,
     bool* enable_refit,
-    bool* use_analytic_primitive,
     bool* use_spatial_hashing,
     std::uint32_t* refit_substep_period,
     std::uint32_t* cd_substep_period,
@@ -138,12 +137,6 @@ void drawProfilerWindow(
             ImGui::TextDisabled("[applies on next BVH rebuild]");
         }
     }
-    if (use_analytic_primitive) {
-        ImGui::Checkbox("Analytic Primitive (A)", use_analytic_primitive);
-        ImGui::SameLine();
-        ImGui::TextDisabled(*use_analytic_primitive ? "[analytic]" : "[triangle-soup]");
-    }
-
     if (refit_substep_period || cd_substep_period) {
         ImGui::Separator();
         ImGui::TextDisabled("Collision cadence (per substep, 1 = every substep)");
