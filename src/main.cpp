@@ -65,6 +65,9 @@ using Index = uint32_t;
 // and PbdSystem only needs Scene/GeneralMesh as declared template names
 // (mesh_state.hpp forward-declares both) — its bodies are dependent.
 #include "sim/pbd_system.hpp"
+// Same slot, same constraint: PdSystem is a sibling CPU solver that only
+// needs Scene/GeneralMesh as declared template names.
+#include "sim/pd_system.hpp"
 #include "sim/material_quat.hpp"
 #include "sim/scene.hpp"
 #include "sim/spatial_hash.hpp"
@@ -1278,6 +1281,11 @@ int main(int argc, char** argv) {
                 // under PBD: adjacency has no shear constraint set (the grid
                 // diagonals are ordinary edges, already projected with the
                 // stretch coefficient).
+                // PD is deliberately absent from this remap: its weights ARE
+                // the spring constants (no [0,1] projection weight, no
+                // reference), so it shares the symplectic path's full slider
+                // range and its shear entry stays visible for the same reason
+                // the symplectic path keeps it.
                 if (simulator.usePbd) {
                     const float sRef = std::log10((float)simulator.pbd.stretchRef);
                     const float bRef = std::log10((float)simulator.pbd.bendRef);
@@ -2303,11 +2311,44 @@ int main(int argc, char** argv) {
                 ImGui::Dummy({0, 4});
                 ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - P);
                 {
-                    const char* solverNames[] = { "Symplectic (GPU)", "PBD (CPU)" };
-                    int solverIdx = simulator.usePbd ? 1 : 0;
+                    // Index order must match the dispatch priority in
+                    // Simulator::update (PD > PBD > symplectic); the combo
+                    // writes an exclusive pair so the two flags can never
+                    // both be set from here.
+                    const char* solverNames[] = { "Symplectic (GPU)", "PBD (CPU)",
+                                                  "PD (CPU)" };
+                    int solverIdx = simulator.usePd ? 2 : (simulator.usePbd ? 1 : 0);
                     if (ImGui::Combo("##solver", &solverIdx, solverNames,
                                      IM_ARRAYSIZE(solverNames))) {
                         simulator.usePbd = (solverIdx == 1);
+                        simulator.usePd  = (solverIdx == 2);
+                    }
+                }
+
+                if (simulator.usePd) {
+                    ImGui::Dummy({0, 12});
+                    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.420f, 0.463f, 0.518f, 1.0f));
+                    ImGui::TextUnformatted("PD 반복 횟수");
+                    ImGui::PopStyleColor();
+                    ImGui::Dummy({0, 4});
+                    ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - P);
+                    if (ImGui::InputInt("##pdIter", &simulator.pd.iterations)
+                        && simulator.pd.iterations < 1) {
+                        simulator.pd.iterations = 1;
+                    }
+                    // Damping is a per-substep velocity scale (0 = none); PD's
+                    // implicit solve already dissipates, so this is a knob for
+                    // killing residual jitter, not the main damping source.
+                    ImGui::Dummy({0, 12});
+                    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.420f, 0.463f, 0.518f, 1.0f));
+                    ImGui::TextUnformatted("PD 감쇠");
+                    ImGui::PopStyleColor();
+                    ImGui::Dummy({0, 4});
+                    ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - P);
+                    {
+                        float pdDamping = (float)simulator.pd.damping;
+                        if (ImGui::SliderFloat("##pdDamping", &pdDamping, 0.0f, 0.2f))
+                            simulator.pd.damping = (Precision)pdDamping;
                     }
                 }
 

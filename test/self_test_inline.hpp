@@ -6388,6 +6388,307 @@ static int runSelfTest() {
         sim.usePbd = false;
     }
 
+    // ---- Block PD: CPU Projective Dynamics system (Simulator::usePd) ------
+    // Liu 2013 local-global (Projective Dynamics restricted to springs) on the
+    // same 8x8 kstretch=1e5 cloth the PBD block uses. The four clauses isolate
+    // the four things this solver can get wrong INDEPENDENTLY of each other:
+    //   PD-1  the prefactored global solve runs at all (finite, pins held),
+    //   PD-2  the local/global loop actually converges the constraints,
+    //   PD-3  the momentum term is right (springs are internal ⇒ they cannot
+    //         change the centre of mass, so COM velocity must be exactly g·t),
+    //   PD-4  the POST-solve contact projection + depenetration/motion split
+    //         (the AC-10 launch failure) survived the port from PBD.
+    {
+        // Same edge-tail guard the PBD block documents: adjacency.edges.size is
+        // the initializer's UPPER BOUND (210 slots for an 8x8 grid, 161 real
+        // edges) and the tail is uninitialised pool memory reinterpreted as
+        // indices.
+        auto pdClothStats = [&](int id, double& minY, double& meanEdgeErr,
+                                bool& finite) {
+            auto* cloth = Scene<Backend, Precision>::findById(id);
+            minY = 1e30; meanEdgeErr = 0.0; finite = true;
+            if (!cloth || !cloth->state.x.ptr) { finite = false; return; }
+            const Index n = cloth->state.x.size / 3;
+            for (Index i = 0; i < n; ++i) {
+                for (int c = 0; c < 3; ++c)
+                    if (!std::isfinite((double)cloth->state.x.ptr[i * 3 + c])) finite = false;
+                minY = std::min(minY, (double)cloth->state.x.ptr[i * 3 + 1]);
+            }
+            const Index* e = cloth->adjacency.edges.ptr;
+            const Precision* rest = cloth->adjacency.restEdgeLengths.ptr;
+            const Index numEdges = e ? cloth->adjacency.edges.size / 2 : 0;
+            if (!e || !rest || numEdges == 0) return;
+            double acc = 0.0;
+            Index counted = 0;
+            for (Index k = 0; k < numEdges; ++k) {
+                const Index a = e[k * 2], b = e[k * 2 + 1];
+                if (a >= n || b >= n) continue;
+                double d = 0.0;
+                for (int c = 0; c < 3; ++c) {
+                    const double t = (double)cloth->state.x.ptr[b * 3 + c]
+                                   - (double)cloth->state.x.ptr[a * 3 + c];
+                    d += t * t;
+                }
+                const double r = (double)rest[k];
+                if (r > 1e-9) { acc += std::fabs(std::sqrt(d) - r) / r; ++counted; }
+            }
+            meanEdgeErr = counted ? acc / (double)counted : 0.0;
+        };
+        auto pdMaxSpeed = [&](int id) -> double {
+            auto* m = Scene<Backend, Precision>::findById(id);
+            if (!m || !m->state.v.ptr) return std::numeric_limits<double>::quiet_NaN();
+            const Index n = m->state.v.size / 3;
+            double hi = 0.0;
+            for (Index i = 0; i < n; ++i) {
+                const double vx = (double)m->state.v.ptr[i*3+0];
+                const double vy = (double)m->state.v.ptr[i*3+1];
+                const double vz = (double)m->state.v.ptr[i*3+2];
+                if (!std::isfinite(vx) || !std::isfinite(vy) || !std::isfinite(vz))
+                    return std::numeric_limits<double>::quiet_NaN();
+                hi = std::max(hi, std::sqrt(vx*vx + vy*vy + vz*vz));
+            }
+            return hi;
+        };
+        // Mass-weighted mean vertical velocity — the COM velocity, which is
+        // the quantity internal forces provably cannot touch.
+        auto pdComVy = [&](int id) -> double {
+            auto* m = Scene<Backend, Precision>::findById(id);
+            if (!m || !m->state.v.ptr || !m->state.m.ptr)
+                return std::numeric_limits<double>::quiet_NaN();
+            const Index n = m->state.v.size / 3;
+            double num = 0.0, den = 0.0;
+            for (Index i = 0; i < n; ++i) {
+                const double mi = (double)m->state.m.ptr[i*3];
+                const double vy = (double)m->state.v.ptr[i*3+1];
+                if (!std::isfinite(vy)) return std::numeric_limits<double>::quiet_NaN();
+                num += mi * vy; den += mi;
+            }
+            return den > 0.0 ? num / den : std::numeric_limits<double>::quiet_NaN();
+        };
+
+        // ---- PD-1 / PD-2: pinned sheet sagging under gravity, no collider.
+        // No floor on purpose — this clause is about the SOLVE, so nothing
+        // from the contact path may enter it.
+        resetScene();
+        sim.usePd = true;
+        sim.pd.sanitizeCount = 0;
+        sim.addCloth(8, 0.8f, tinym::vec3(0.0f, 1.0f, 0.0f));   // id 0
+        sim.initialize();
+        // Pin through the same API the GUI uses, so the pin also lands in
+        // RequestGeneralMesh::fixedVertices and would survive a re-pack.
+        sim.setVertexFixed(0, 0, true);
+        sim.setVertexFixed(0, 7, true);
+
+        std::vector<Index> pinnedVids;
+        std::vector<double> pinnedPos;
+        {
+            auto* cloth = Scene<Backend, Precision>::findById(0);
+            if (cloth && cloth->constraints.fixedParticles.ptr) {
+                const Index n = cloth->state.x.size / 3;
+                for (Index i = 0; i < n; ++i)
+                    if (cloth->constraints.fixedParticles.ptr[i] == Precision(0)) {
+                        pinnedVids.push_back(i);
+                        for (int c = 0; c < 3; ++c)
+                            pinnedPos.push_back((double)cloth->state.x.ptr[i*3+c]);
+                    }
+            }
+        }
+
+        double sagY0 = 0, sagErr0 = 0; bool sagFin0 = true;
+        pdClothStats(0, sagY0, sagErr0, sagFin0);
+
+        sim.pause = false;
+        for (int f = 0; f < 60; ++f) sim.update();
+        MetalGlobalContext::commitAndWait();
+        sim.pause = true;
+
+        double sagY1 = 0, sagErr1 = 0; bool sagFin1 = true;
+        pdClothStats(0, sagY1, sagErr1, sagFin1);
+
+        double maxPinDrift = 0.0;
+        {
+            auto* cloth = Scene<Backend, Precision>::findById(0);
+            if (!cloth || pinnedVids.empty()) maxPinDrift = 1e30;
+            else for (size_t p = 0; p < pinnedVids.size(); ++p)
+                for (int c = 0; c < 3; ++c)
+                    maxPinDrift = std::max(maxPinDrift,
+                        std::fabs((double)cloth->state.x.ptr[pinnedVids[p]*3+c]
+                                  - pinnedPos[p*3+c]));
+        }
+
+        if (pinnedVids.empty())
+            fail("PD-1 / pinned sheet solves, holds its pins and sags",
+                 "setVertexFixed pinned no vertex — the mask never reached the mesh");
+        else if (!sagFin1)
+            fail("PD-1 / pinned sheet solves, holds its pins and sags",
+                 "non-finite vertex after 60 frames");
+        else if (sim.pd.sanitizeCount != 0)
+            fail("PD-1 / pinned sheet solves, holds its pins and sags",
+                 "sanitize guard fired " + std::to_string(sim.pd.sanitizeCount)
+                 + " times (the solve produced NaN/Inf)");
+        // A pinned vertex is never written back at all (PdSystem step (4)),
+        // so the only drift possible here is a bug, not the soft-pin residual.
+        else if (maxPinDrift > 1e-6)
+            fail("PD-1 / pinned sheet solves, holds its pins and sags",
+                 "pinned vertex moved by " + std::to_string(maxPinDrift) + " m");
+        else if (!(sagY1 < sagY0 - 1e-3))
+            fail("PD-1 / pinned sheet solves, holds its pins and sags",
+                 "min y did not drop (" + std::to_string(sagY0) + " -> "
+                 + std::to_string(sagY1) + ") — gravity or the momentum term is dead");
+        else
+            pass("PD-1 / pinned sheet solves, holds its pins and sags");
+
+        // Inextensibility is the point of the implicit solve: at kstretch 1e5
+        // the per-edge tension (a few tens of N at the pins) divided by k is
+        // O(1e-4), so a 10% mean bound is a convergence/blow-up detector with
+        // three decades of headroom — the same loose bound PBD-2 uses.
+        if (!sagFin1)
+            fail("PD-2 / local/global loop converges the stretch constraints",
+                 "non-finite cloth");
+        else if (sagErr1 > 0.10)
+            fail("PD-2 / local/global loop converges the stretch constraints",
+                 "mean edge strain " + std::to_string(sagErr1) + " > 0.10 (was "
+                 + std::to_string(sagErr0) + " at rest)");
+        else
+            pass("PD-2 / local/global loop converges the stretch constraints");
+
+        // ---- PD-3: free fall. No pins, no collider, no contacts. Summing the
+        // global system's rows makes the springs cancel pairwise (L has zero
+        // row sums, and the local term enters as +k·d at a and -k·d at b), so
+        // Σm·q == Σm·s exactly: the COM must fall at exactly g·t. This is the
+        // clause that fails if the momentum term is dropped, mis-scaled by h,
+        // or if the external force is applied twice.
+        resetScene();
+        sim.usePd = true;
+        sim.addCloth(8, 0.8f, tinym::vec3(0.0f, 2.0f, 0.0f));   // id 0
+        sim.initialize();
+        sim.pause = false;
+        for (int f = 0; f < 60; ++f) sim.update();   // 60 * (1/60) s = 1.0 s
+        MetalGlobalContext::commitAndWait();
+        sim.pause = true;
+
+        const double vyCom = pdComVy(0);
+        const double vyExpect =
+            (double)Scene<Backend, Precision>::environment.gravity.y * 1.0;
+        if (!std::isfinite(vyCom))
+            fail("PD-3 / free-fall COM velocity tracks g*t",
+                 "non-finite velocity after 60 frames");
+        else if (std::fabs(vyCom - vyExpect) > std::fabs(vyExpect) * 0.05)
+            fail("PD-3 / free-fall COM velocity tracks g*t",
+                 "COM vy = " + std::to_string(vyCom) + " m/s, expected "
+                 + std::to_string(vyExpect) + " m/s after 1.0 s");
+        else
+            pass("PD-3 / free-fall COM velocity tracks g*t");
+
+        // ---- PD-4: start-PENETRATED cloth, the scene PBD's AC-10 uses.
+        // DEVIATION from the design note, deliberately: a sheet merely dropped
+        // onto a floor never has PRE-EXISTING overlap, so it does not exercise
+        // the depenetration/motion split at all — measured, that scene has the
+        // PBD and PD paths producing the SAME rigid elastic bounce (~2.7 m/s
+        // at frame 60 under BOTH solvers), because with restitution-free
+        // contact and damping 0 nothing dissipates a flat sheet's drop energy.
+        // A "settled speed" bound there would fail for PbdSystem too, i.e. it
+        // would measure the scene, not the clamp.
+        //
+        // AC-10's scene is the one that DOES measure it: the cloth is born
+        // 0.3 m inside a box, so the very first contact correction is almost
+        // entirely overlap being undone. v = (q-x)/h would report that rescue
+        // as ~900 m/s at subh = 1/3000 and the cloth would leave the scene;
+        // the clamp caps it at the approach speed the vertex actually made.
+        // Same substep count (50) as the AC block for the same reason — the
+        // failure magnitude scales with 1/subh — restored afterwards.
+        {
+            const size_t pdSavedSubSteps = system.subSteps;
+            const Precision pdSavedSubh  = system.subh;
+            system.subSteps = 50;
+            system.subh     = system.h / Precision(50);
+
+            auto meanY = [&](int id) -> double {
+                auto* m = Scene<Backend, Precision>::findById(id);
+                if (!m || !m->state.x.ptr) return std::numeric_limits<double>::quiet_NaN();
+                const Index n = m->state.x.size / 3;
+                double acc = 0.0;
+                for (Index i = 0; i < n; ++i) acc += (double)m->state.x.ptr[i*3+1];
+                return n ? acc / (double)n : std::numeric_limits<double>::quiet_NaN();
+            };
+            auto maxY = [&](int id) -> double {
+                auto* m = Scene<Backend, Precision>::findById(id);
+                if (!m || !m->state.x.ptr) return std::numeric_limits<double>::quiet_NaN();
+                const Index n = m->state.x.size / 3;
+                double hi = -1e30;
+                for (Index i = 0; i < n; ++i) hi = std::max(hi, (double)m->state.x.ptr[i*3+1]);
+                return hi;
+            };
+            auto minY = [&](int id) -> double {
+                auto* m = Scene<Backend, Precision>::findById(id);
+                if (!m || !m->state.x.ptr) return std::numeric_limits<double>::quiet_NaN();
+                const Index n = m->state.x.size / 3;
+                double lo = 1e30;
+                for (Index i = 0; i < n; ++i) lo = std::min(lo, (double)m->state.x.ptr[i*3+1]);
+                return lo;
+            };
+
+            resetScene();
+            sim.usePd = true;
+            sim.pd.sanitizeCount = 0;
+            sim.addCube(tinym::vec3(0.0f, 0.0f, 0.0f), 2, 1.0f);     // id 0, Box, top face y=0.5
+            sim.addCloth(6, 0.4f, tinym::vec3(0.0f, 0.2f, 0.0f),
+                         Precision(1e5), Precision(1e5), Precision(3e5),
+                         Precision(0.01));                            // id 1, born INSIDE
+            sim.initialize();
+            sim.pause = false;
+
+            const double y0 = meanY(1);
+            double peakY = -1e30, peakSpeed = 0.0;
+            bool blew = false;
+            for (int f = 0; f < 60; ++f) {
+                sim.update();
+                MetalGlobalContext::commitAndWait();
+                const double my = maxY(1);
+                const double ms = pdMaxSpeed(1);
+                if (!std::isfinite(my) || !std::isfinite(ms)) { blew = true; break; }
+                peakY = std::max(peakY, my);
+                peakSpeed = std::max(peakSpeed, ms);
+            }
+            sim.pause = true;
+            const double y1 = meanY(1);
+            const double dTop = minY(1) - 0.5;   // signed distance to the top face
+
+            const char* n4 = "PD-4 / start-penetrated cloth recovers on the ENTRY "
+                             "side without launching (depenetration clamp)";
+            // A recovery that ends at rest on the top face cannot exceed
+            // 0.5 + thickness by more than the settle band; and a leaked
+            // rescue is 2-3 decades past the 6 m/s bound, not a few percent.
+            const double kTopCeiling = 0.5 + 0.01 + 0.2;
+            if (blew || !std::isfinite(y0) || !std::isfinite(y1) || !std::isfinite(dTop))
+                fail(n4, "non-finite cloth vertex");
+            else if (sim.pd.sanitizeCount != 0)
+                fail(n4, "sanitize guard fired " + std::to_string(sim.pd.sanitizeCount)
+                     + " times");
+            else if (peakY > kTopCeiling)
+                fail(n4, "cloth LAUNCHED out of the box: peak y "
+                     + std::to_string(peakY) + " > " + std::to_string(kTopCeiling));
+            else if (peakSpeed > 6.0)
+                fail(n4, "depenetration leaked into velocity: peak |v| "
+                     + std::to_string(peakSpeed) + " > 6.0 m/s");
+            else if (!(y1 > y0))
+                fail(n4, "exit displacement has the wrong sign: mean y "
+                     + std::to_string(y0) + " -> " + std::to_string(y1)
+                     + " (ejected through the far side?)");
+            else if (dTop < -0.005)
+                fail(n4, "cloth still inside the box after 60 frames: "
+                     "min (y - 0.5) = " + std::to_string(dTop));
+            else
+                pass(n4);
+
+            system.subSteps = pdSavedSubSteps;
+            system.subh     = pdSavedSubh;
+        }
+
+        sim.pause = true;
+        sim.usePd = false;
+    }
+
     // ---- Block CK: P0 collider data model (collider_pipeline_rework §1) ---
     // Three per-mesh fields — colliderKind / collidable / selfCollide —
     // must (a) default from the INITIALIZER subtype exactly once at
