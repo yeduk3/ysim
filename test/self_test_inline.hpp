@@ -7385,14 +7385,17 @@ static int runSelfTest() {
 
     // ---- Block PD: CPU Projective Dynamics system (Simulator::usePd) ------
     // Liu 2013 local-global (Projective Dynamics restricted to springs) on the
-    // same 8x8 kstretch=1e5 cloth the PBD block uses. The four clauses isolate
-    // the four things this solver can get wrong INDEPENDENTLY of each other:
+    // same 8x8 kstretch=1e5 cloth the PBD block uses. The clauses isolate the
+    // things this solver can get wrong INDEPENDENTLY of each other:
     //   PD-1  the prefactored global solve runs at all (finite, pins held),
     //   PD-2  the local/global loop actually converges the constraints,
     //   PD-3  the momentum term is right (springs are internal ⇒ they cannot
     //         change the centre of mass, so COM velocity must be exactly g·t),
-    //   PD-4  the POST-solve contact projection + depenetration/motion split
-    //         (the AC-10 launch failure) survived the port from PBD.
+    //   PD-4  the per-iteration contact projection + depenetration/motion
+    //         split (the AC-10 launch failure) survived the port from PBD,
+    //   PD-5  two-way cross-cloth rows correct BOTH sheets (PBD-7's scene),
+    //   PD-6  self rows reach the two-way path without adding energy
+    //         (PBD-8's folded taco, A/B against a self-off baseline).
     {
         // Same edge-tail guard the PBD block documents: adjacency.edges.size is
         // the initializer's UPPER BOUND (210 slots for an 8x8 grid, 161 real
@@ -7678,6 +7681,188 @@ static int runSelfTest() {
 
             system.subSteps = pdSavedSubSteps;
             system.subh     = pdSavedSubh;
+        }
+
+        // ---- PD-5 / PD-6: contact parity with the PBD path. Both scenes are
+        // lifted from PBD-7 / PBD-8 and run at the same 50-substep count those
+        // clauses use, so their (loose) bounds carry over. What they exercise
+        // is the contact machinery ported from PbdSystem step (3) into PD's
+        // iteration loop: two-way vertex-triangle rows (PD-5) and self rows
+        // (PD-6) — both of which the first PD ship, with its one-sided
+        // post-solve push, could not express at all.
+        {
+            const size_t pdSavedSubSteps2 = system.subSteps;
+            const Precision pdSavedSubh2  = system.subh;
+            system.subSteps = 50;
+            system.subh     = system.h / Precision(50);
+
+            auto centroidYOf = [&](int objId) -> double {
+                auto* m = Scene<Backend, Precision>::findById(objId);
+                if (!m || !m->state.x.ptr) return std::numeric_limits<double>::quiet_NaN();
+                const Index n = m->state.x.size / 3;
+                if (n == 0) return std::numeric_limits<double>::quiet_NaN();
+                double acc = 0.0;
+                for (Index i = 0; i < n; ++i) acc += (double)m->state.x.ptr[i*3+1];
+                return acc / (double)n;
+            };
+            auto minYOf = [&](int objId) -> double {
+                auto* m = Scene<Backend, Precision>::findById(objId);
+                if (!m || !m->state.x.ptr) return std::numeric_limits<double>::quiet_NaN();
+                const Index n = m->state.x.size / 3;
+                double lo = 1e30;
+                for (Index i = 0; i < n; ++i)
+                    lo = std::min(lo, (double)m->state.x.ptr[i*3+1]);
+                return lo;
+            };
+            auto maxYOf = [&](int objId) -> double {
+                auto* m = Scene<Backend, Precision>::findById(objId);
+                if (!m || !m->state.x.ptr) return std::numeric_limits<double>::quiet_NaN();
+                const Index n = m->state.x.size / 3;
+                double hi = -1e30;
+                for (Index i = 0; i < n; ++i)
+                    hi = std::max(hi, (double)m->state.x.ptr[i*3+1]);
+                return hi;
+            };
+
+            // ---- PD-5 — two-way cross-cloth contact (PBD-7's scene). ------
+            // A free sheet dropped on a corner-pinned sheet. Both are live
+            // cloths, so every vertex-triangle row must correct BOTH sides
+            // (mass-weighted) instead of pushing only the query vertex.
+            {
+                resetScene();
+                sim.usePd = true;
+                sim.enableSelfCollisions = true;
+                const Index kG = 9;
+                sim.addCloth(kG, 1.0f, tinym::vec3(0.0f, 0.6f, 0.0f),
+                             1e5, 1e5, 3e5, Precision(0.01));            // id 0
+                {
+                    auto& req = Scene<Backend, Precision>::requestsGeneralMeshes.back();
+                    const float hh = 0.5f, yy = 0.6f;
+                    const uint32_t vids[4] = { 0, (uint32_t)kG - 1,
+                                               (uint32_t)(kG * (kG - 1)),
+                                               (uint32_t)(kG * kG - 1) };
+                    const tinym::vec3 ps[4] = { {-hh, yy, -hh}, {hh, yy, -hh},
+                                                {-hh, yy,  hh}, {hh, yy,  hh} };
+                    for (int i = 0; i < 4; ++i)
+                        req.fixedVertices.push_back(FixedVertex{vids[i], ps[i]});
+                }
+                sim.addCloth(7, 0.5f, tinym::vec3(0.0f, 0.75f, 0.0f),
+                             1e5, 1e5, 3e5, Precision(0.01));            // id 1
+                sim.initialize();
+                sim.pause = false;
+
+                uint64_t twoWayTotal = 0;
+                double topMaxY = -1e30;
+                bool blew5 = false;
+                for (int f = 0; f < 60; ++f) {
+                    sim.update();
+                    MetalGlobalContext::commitAndWait();
+                    twoWayTotal += sim.pd.twoWayContactCount;
+                    const double ty = maxYOf(1);
+                    if (!std::isfinite(ty) || !std::isfinite(centroidYOf(0)))
+                        { blew5 = true; break; }
+                    topMaxY = std::max(topMaxY, ty);
+                }
+                sim.pause = true;
+
+                const double aC = centroidYOf(0), bC = centroidYOf(1);
+                const double bLow = minYOf(1);
+                const char* n5 = "PD-5 / two-way cross-cloth contact under PD: "
+                                 "top sheet rests on the pinned sheet";
+                if (blew5 || !std::isfinite(aC) || !std::isfinite(bC)
+                    || !std::isfinite(bLow))
+                    fail(n5, "non-finite cloth state in the two-cloth stack");
+                else if (twoWayTotal == 0)
+                    fail(n5, "two-way contact path never ran (twoWayContactCount "
+                         "stayed 0 across 60 frames)");
+                else if (topMaxY > 0.75 + 0.10)
+                    fail(n5, "top sheet LAUNCHED: peak y "
+                         + std::to_string(topMaxY) + " > 0.85");
+                else if (!(bC > aC))
+                    fail(n5, "top sheet ended below the pinned sheet's centroid: "
+                         + std::to_string(bC) + " <= " + std::to_string(aC)
+                         + " (fell through?)");
+                else if (bLow < 0.30)
+                    fail(n5, "top sheet fell through the pinned sheet: min y "
+                         + std::to_string(bLow));
+                else
+                    pass(n5);
+            }
+
+            // ---- PD-6 — self rows reach the two-way path (PBD-8's taco). --
+            // Two opposite corners pinned 4 mm apart fold the sheet into a
+            // hanging taco whose halves stay in layer-on-layer contact —
+            // only q==t rows express that. The pin TELEPORTS the far corner
+            // at pack time and injects a real whip, so the launch clause is
+            // A/B against a self-off baseline, exactly like PBD-8.
+            {
+                const Index kG6 = 12;
+                auto buildFoldScene = [&](bool selfOn) {
+                    resetScene();
+                    sim.usePd = true;
+                    sim.enableSelfCollisions = selfOn;
+                    sim.addCloth(kG6, 0.6f, tinym::vec3(0.0f, 0.8f, 0.0f),
+                                 1e5, 1e5, 3e5, Precision(0.01));        // id 0
+                    auto& req = Scene<Backend, Precision>::requestsGeneralMeshes.back();
+                    req.fixedVertices.push_back(
+                        FixedVertex{0u, tinym::vec3(0.0f, 0.8f, 0.0f)});
+                    req.fixedVertices.push_back(
+                        FixedVertex{(uint32_t)(kG6*kG6 - 1),
+                                    tinym::vec3(0.004f, 0.8f, 0.004f)});
+                    sim.initialize();
+                    sim.pause = false;
+                };
+                uint64_t selfTotal = 0;
+                auto runFold = [&](double& peakAll, double& peakLate,
+                                   bool countSelf) -> bool {
+                    peakAll = -1e30; peakLate = -1e30;
+                    for (int f = 0; f < 90; ++f) {
+                        sim.update();
+                        MetalGlobalContext::commitAndWait();
+                        if (countSelf) selfTotal += sim.pd.selfContactCount;
+                        const double my = maxYOf(0);
+                        if (!std::isfinite(my)) return false;
+                        peakAll = std::max(peakAll, my);
+                        if (f >= 60) peakLate = std::max(peakLate, my);
+                    }
+                    return true;
+                };
+
+                double basePeak, baseLate, selfPeak, selfLate;
+                buildFoldScene(false);
+                const bool okBase = runFold(basePeak, baseLate, false);
+                sim.pause = true;
+                buildFoldScene(true);
+                const bool okSelf = runFold(selfPeak, selfLate, true);
+                sim.pause = true;
+
+                const char* n6 = "PD-6 / folded sheet feeds self rows through "
+                                 "PD's two-way path";
+                if (!okBase || !okSelf)
+                    fail(n6, "non-finite cloth state in the folded-sheet scene");
+                else if (selfTotal == 0)
+                    fail(n6, "no self rows consumed (selfContactCount stayed 0 "
+                         "across 90 frames of a folded hanging sheet)");
+                else if (selfPeak > basePeak + 0.15)
+                    fail(n6, "self handling ADDED energy: peak y "
+                         + std::to_string(selfPeak) + " with self rows vs "
+                         + std::to_string(basePeak) + " without");
+                // Relative, not absolute: the pin-teleport whip is undamped
+                // and the baseline itself never settles inside 90 frames.
+                // Self handling must merely not make the late window WORSE
+                // than the row-free baseline.
+                else if (selfLate > baseLate + 0.15)
+                    fail(n6, "self rows left the sheet MORE energetic late: "
+                         "late-window peak y " + std::to_string(selfLate)
+                         + " with self rows vs " + std::to_string(baseLate)
+                         + " without");
+                else
+                    pass(n6);
+            }
+
+            sim.enableSelfCollisions = false;
+            system.subSteps = pdSavedSubSteps2;
+            system.subh     = pdSavedSubh2;
         }
 
         sim.pause = true;

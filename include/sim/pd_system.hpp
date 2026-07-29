@@ -9,7 +9,7 @@
 // dependent. Not independently compilable by design.
 //
 // CPU Projective Dynamics (Bouaziz et al. 2014) restricted to spring
-// constraints, i.e. Liu, Bargteil, Popović 2013 "Fast Simulation of
+// constraints, i.e. Liu, Bargteil, O'Brien, Kavan 2013 "Fast Simulation of
 // Mass-Spring Systems" — block coordinate descent alternating a LOCAL
 // per-spring projection with a GLOBAL linear solve whose matrix is CONSTANT
 // for a fixed topology / timestep / stiffness, so it is factored once
@@ -34,6 +34,18 @@
 // kernels integrate — so there is no ref-mapping here and none is wanted.
 // The mesh inspector's numbers mean the same thing to the symplectic path
 // and to PD.
+//
+// Contacts: NOT the paper's implicit collision handling (Bouaziz 2014 §6
+// adds each collision as a unilateral half-space constraint INSIDE the
+// energy, whose w·I lands on the system diagonal, and §8 keeps the
+// factorization current with rank updates/downdates). A contact here never
+// enters the matrix — that is the price of keeping ONE prefactored system
+// for the whole run. Instead the same contact machinery PbdSystem::step
+// carries (one-sided pushes with rigid-body coupling, two-way
+// vertex-triangle rows including self contacts) is run as an inequality
+// projection pass once per local/global iteration, after every mesh's
+// global solve — see step (3) below for why that is safe and what it
+// trades away.
 //
 // ponytail: one commitAndWait per substep, same cost the PBD path pays. The
 // factorization is amortized but the solve is CPU-serial; port the local
@@ -63,6 +75,15 @@ struct PdSystem<METAL, PR> {
     // this today — the guard's job is to keep a blown-up vertex from
     // poisoning the whole mesh. Same role as PbdSystem::sanitizeCount.
     uint32_t sanitizeCount = 0;
+
+    // Two-way contact statistics for the LAST step() call. `selfContactCount`
+    // is the subset whose target mesh is the query mesh itself. Reset at the
+    // top of step(); read by the self-tests. Same contract as PbdSystem's.
+    uint32_t twoWayContactCount = 0;
+    uint32_t selfContactCount   = 0;
+    // Number of one-sided contact rows that fed a coupled rigid body this
+    // step(). Reset at the top of step() like the counters above.
+    uint32_t rigidCoupleCount   = 0;
 
     // Soft-pin penalty weight. A pinned vertex gets wPin on its diagonal and
     // wPin * (its CURRENT position) in the RHS, instead of being eliminated
@@ -120,6 +141,38 @@ struct PdSystem<METAL, PR> {
     }
     static Vec3Ref vertexRef(PR* base, Index i) { return Vec3Ref(base + i * 3); }
 
+    // Inverse mass, zero for pinned vertices — a pinned vertex is infinitely
+    // heavy, so the momentum target holds it in place and a contact moves
+    // only its partner. Static (m/mask passed in) because a two-way contact
+    // evaluates it against the PARTNER mesh's arrays, not just the mesh
+    // being solved. Same contract as PbdSystem::invMassOf.
+    static PR invMassOf(const PR* m, const PR* mask, Index i) {
+        const PR mi3 = m[i * 3];
+        return (mask[i] != PR(0) && mi3 > PR(0)) ? PR(1) / mi3 : PR(0);
+    }
+
+    // ── Cloth → rigid-body coupling ──────────────────────────────────────
+    // Positional correction owed to each RIGID mesh, indexed by the mesh
+    // ARRAY INDEX. A one-sided cloth-vs-rigid contact splits its
+    // depenetration mass-weighted: the cloth vertex takes its share here and
+    // now, the body's share accumulates into this vector.
+    //
+    // NOT reset per step(): the narrow phase measured its `distance` against
+    // the FRAME-FROZEN body (a Rigid's analytic shape and verts only move in
+    // the next frame's update() preamble), so the correction has to keep
+    // accumulating across every substep of the frame and be pushed to Bullet
+    // once, at frame completion. Simulator::update calls beginFrameRigid()
+    // once per frame to zero it, and zeroes each entry as it writes it back.
+    // Identical contract to PbdSystem::rigidDelta — the Simulator applies
+    // whichever solver's vector is live.
+    std::vector<Vec3> rigidDelta;
+
+    // Zero the per-frame rigid coupling accumulator. Called once per FRAME
+    // by Simulator::update (not per substep).
+    void beginFrameRigid(Index numMeshes) {
+        rigidDelta.assign((size_t)numMeshes, Vec3());
+    }
+
     // One spring = one PD constraint. `bend` selects which of the two mesh
     // coefficients weights it, and is stored INSTEAD of a baked k so that
     // editing kstretch/kbend in the inspector only refactors the matrix — it
@@ -147,15 +200,49 @@ struct PdSystem<METAL, PR> {
         // the factorization.
         std::unique_ptr<Eigen::SimplicialLDLT<Eigen::SparseMatrix<double>>> factor;
         bool valid = false;       // false => factorization failed, skip mesh
+        // Per-substep solve state, kept here only so the allocations persist
+        // across substeps (every value is rewritten each step). n x 3: the
+        // system is scalar n x n and the three coordinates are INDEPENDENT
+        // (a spring's energy is isotropic, so the same L couples x, y and
+        // z), which is the whole reason one factorization serves all of
+        // them. Eigen solves the three columns in one back-substitution
+        // call. `q` must be PER MESH (not a shared scratch): a two-way
+        // contact writes into the PARTNER mesh's iterate, so every active
+        // cloth's block stays live for the whole iteration phase — the same
+        // reason PbdSystem::predBlocks is per mesh.
+        Eigen::MatrixXd rhsBase, rhs, q;
+        // Accumulated two-way contact displacement (flat 3N), zeroed each
+        // substep. The velocity update needs to know how much of a vertex's
+        // position delta came from contact projection so depenetration does
+        // not become velocity — PbdSystem::cDispBlocks, same idea.
+        std::vector<PR> cd;
     };
     std::vector<MeshCache> cache;   // parallel to Scene::meshes
 
-    // Scratch, grown and reused across substeps. n x 3: the system is scalar
-    // n x n and the three coordinates are INDEPENDENT (a spring's energy is
-    // isotropic, so the same L couples x, y and z), which is the whole reason
-    // one factorization serves all of them. Eigen solves the three columns in
-    // one back-substitution call.
-    Eigen::MatrixXd sTarget, rhsBase, rhs, q;
+    // Everything one active cloth mesh needs during the iteration phase,
+    // resolved once per substep. Contacts reach ACROSS contexts (the
+    // partner's live iterate, masses, facets and thickness), which is why
+    // this is a struct and not a set of per-mesh locals — the same shape as
+    // PbdSystem::SolveCtx.
+    struct SolveCtx {
+        Index mi = 0;                 // Scene::meshes array index
+        PR* x = nullptr;
+        PR* v = nullptr;
+        PR* cd = nullptr;             // MeshCache::cd.data()
+        const PR* m = nullptr;
+        const PR* ext = nullptr;
+        const PR* mask = nullptr;
+        Index n = 0;
+        PR thickness = PR(0);
+        double kS = 0.0, kB = 0.0;
+        const Index* facets = nullptr;
+        Index numFacets = 0;
+        MeshCache* mc = nullptr;      // springs, factor, rhs/q matrices
+        bool contactsForMesh = false;
+        Index colBase = 0;
+    };
+    std::vector<SolveCtx> ctxs;      // one per ACTIVE cloth mesh
+    std::vector<int> ctxOfMesh;      // mesh array index -> ctxs index, -1 = none
 
     // Stretch springs from the edge list + bend springs from the facet list.
     //
@@ -163,7 +250,7 @@ struct PdSystem<METAL, PR> {
     // each other across an interior edge), NOT a dihedral-angle constraint:
     // PD needs every constraint to be a quadratic distance-to-a-projected-set
     // energy, and the dihedral form is only expressible that way through a
-    // per-quad linear operator (Bouaziz 2014 §4.3 bending element) — real
+    // per-quad linear operator (Bouaziz 2014 §5.4 bending element) — real
     // matrix blocks, not a scalar Laplacian entry. Deliberately out of scope;
     // the opposite-vertex spring resists the same deformation to first order
     // and keeps the assembly a plain graph Laplacian.
@@ -243,6 +330,10 @@ struct PdSystem<METAL, PR> {
         // CPU reads them. Same reason PbdSystem::step opens with it.
         MetalGlobalContext::commitAndWait();
 
+        twoWayContactCount = 0;
+        selfContactCount   = 0;
+        rigidCoupleCount   = 0;
+
         auto& off      = Scene<METAL, PR>::packedMeshData.statesOffsets;
         auto& colFacet = Scene<METAL, PR>::packedCollisionData.vertColFacets;
         auto& colOff   = Scene<METAL, PR>::packedCollisionData.vertColFacetsOffsets;
@@ -250,11 +341,20 @@ struct PdSystem<METAL, PR> {
 
         const double h = (double)dt;
         const double invH2 = 1.0 / (h * h);
+        const Index numMeshes = (Index)sceneObjects.meshes.size();
 
         if (cache.size() != sceneObjects.meshes.size())
             cache.resize(sceneObjects.meshes.size());
+        ctxs.clear();
+        ctxOfMesh.assign((size_t)numMeshes, -1);
 
-        for (Index mi = 0; mi < (Index)sceneObjects.meshes.size(); ++mi) {
+        // --- (1) per mesh: cache/refactor the global matrix, build the
+        // momentum target and warm start. Every active cloth must reach its
+        // warm-started iterate before ANY contact is projected: a two-way
+        // contact reads the partner's live iterate, so a partner still
+        // sitting at x would be solved against stale geometry — the same
+        // predict-all-first rule PbdSystem::step (1) documents.
+        for (Index mi = 0; mi < numMeshes; ++mi) {
             auto& mesh = sceneObjects.meshes[mi];
             if (!clothLike(mesh.behaviorType)) continue;
             if (mesh.isStatic) continue;
@@ -268,20 +368,11 @@ struct PdSystem<METAL, PR> {
 
             const Index n = (Index)mesh.state.x.size / 3;
             if (n == 0) continue;
-            const PR thickness = thicknessOf(mesh.behaviorParams);
 
             PR kSpringStretch, kSpringBend;
             springConstantsOf(mesh, kSpringStretch, kSpringBend);
             const double kS = (double)kSpringStretch;
             const double kB = (double)kSpringBend;
-
-            // Inverse mass, zero for pinned vertices — a pinned vertex is
-            // infinitely heavy, so the momentum target holds it in place and
-            // external forces never enter its row.
-            auto invMass = [&](Index i) -> PR {
-                const PR mi3 = m[i * 3];
-                return (mask[i] != PR(0) && mi3 > PR(0)) ? PR(1) / mi3 : PR(0);
-            };
 
             MeshCache& mc = cache[mi];
             const Index numFacets = (Index)mesh.adjacency.facets.size / 3;
@@ -333,8 +424,8 @@ struct PdSystem<METAL, PR> {
                 std::vector<Eigen::Triplet<double>> trip;
                 trip.reserve((size_t)n + mc.springs.size() * 4);
                 for (Index i = 0; i < n; ++i) {
-                    const double mi = (double)m[i * 3];
-                    double diag = (mi > 0.0 ? mi : 1e-9) * invH2;
+                    const double mi3 = (double)m[i * 3];
+                    double diag = (mi3 > 0.0 ? mi3 : 1e-9) * invH2;
                     if (mask[i] == PR(0)) diag += kPinWeight;
                     trip.emplace_back((int)i, (int)i, diag);
                 }
@@ -362,58 +453,145 @@ struct PdSystem<METAL, PR> {
             // frame's state rather than integrated with garbage.
             if (!mc.valid || !mc.factor) continue;
 
-            sTarget.resize((int)n, 3);
-            rhsBase.resize((int)n, 3);
-            rhs.resize((int)n, 3);
+            mc.rhsBase.resize((int)n, 3);
+            mc.rhs.resize((int)n, 3);
+            mc.q.resize((int)n, 3);
+            mc.cd.assign((size_t)n * 3, PR(0));
 
-            // --- (1) momentum target s = x + h·v + h²·M⁻¹·f_ext. This is the
-            // ONLY place external forces enter; spring forces are the energy
+            // Momentum target s = x + h·v + h²·M⁻¹·f_ext. This is the ONLY
+            // place external forces enter; spring forces are the energy
             // terms the local/global loop minimizes, not an explicit force.
-            // Pinned vertices target their current position.
+            // Pinned vertices target their current position. The iterate q
+            // starts AT the momentum target — the unconstrained prediction,
+            // which is also the descent's warm start (Bouaziz Alg. 1 l.2).
             for (Index i = 0; i < n; ++i) {
-                const PR w = invMass(i);
+                const PR w = invMassOf(m, mask, i);
                 const Vec3 xi = vertexAt(x, i);
                 Vec3 si = xi;
                 if (w > PR(0)) {
                     const Vec3 accel = ext ? vertexAt(ext, i) * w : Vec3();
                     si = xi + (vertexAt(v, i) + accel * dt) * dt;
                 }
-                sTarget((int)i, 0) = (double)si.x;
-                sTarget((int)i, 1) = (double)si.y;
-                sTarget((int)i, 2) = (double)si.z;
+                mc.q((int)i, 0) = (double)si.x;
+                mc.q((int)i, 1) = (double)si.y;
+                mc.q((int)i, 2) = (double)si.z;
 
-                const double mi = (double)m[i * 3];
-                const double wm = (mi > 0.0 ? mi : 1e-9) * invH2;
-                rhsBase((int)i, 0) = wm * (double)si.x;
-                rhsBase((int)i, 1) = wm * (double)si.y;
-                rhsBase((int)i, 2) = wm * (double)si.z;
+                const double mi3 = (double)m[i * 3];
+                const double wm = (mi3 > 0.0 ? mi3 : 1e-9) * invH2;
+                mc.rhsBase((int)i, 0) = wm * (double)si.x;
+                mc.rhsBase((int)i, 1) = wm * (double)si.y;
+                mc.rhsBase((int)i, 2) = wm * (double)si.z;
                 if (mask[i] == PR(0)) {
                     // Pin term uses the CURRENT position, so a pin that moved
                     // since the factorization is honoured without a refactor.
-                    rhsBase((int)i, 0) += kPinWeight * (double)xi.x;
-                    rhsBase((int)i, 1) += kPinWeight * (double)xi.y;
-                    rhsBase((int)i, 2) += kPinWeight * (double)xi.z;
+                    mc.rhsBase((int)i, 0) += kPinWeight * (double)xi.x;
+                    mc.rhsBase((int)i, 1) += kPinWeight * (double)xi.y;
+                    mc.rhsBase((int)i, 2) += kPinWeight * (double)xi.z;
                 }
             }
 
-            // --- (2) local/global block coordinate descent (Liu 2013 §3).
-            // q starts at the momentum target — the unconstrained prediction,
-            // which is also the descent's warm start.
-            q = sTarget;
-            for (int it = 0; it < iterations; ++it) {
-                rhs = rhsBase;
+            SolveCtx c;
+            c.mi   = mi;
+            c.x    = x;
+            c.v    = v;
+            c.cd   = mc.cd.data();
+            c.m    = m;
+            c.ext  = ext;
+            c.mask = mask;
+            c.n    = n;
+            c.thickness = thicknessOf(mesh.behaviorParams);
+            c.kS = kS;
+            c.kB = kB;
+            c.facets    = mesh.adjacency.facets.ptr;
+            c.numFacets = numFacets;
+            c.mc = &mc;
+            c.contactsForMesh = haveContacts && mi + 1 < (Index)off.size;
+            c.colBase = c.contactsForMesh ? off.ptr[mi] : Index(0);
+            ctxOfMesh[mi] = (int)ctxs.size();
+            ctxs.push_back(c);
+        }
+        if (ctxs.empty()) return;
+
+        // Read/write one vertex of a context's live iterate. The iterate is
+        // double (the solve's precision); contact math runs in PR like PBD's
+        // and the corrections are added back into the double iterate.
+        auto qVec = [](const SolveCtx& c, Index i) -> Vec3 {
+            return Vec3((PR)c.mc->q((int)i, 0),
+                        (PR)c.mc->q((int)i, 1),
+                        (PR)c.mc->q((int)i, 2));
+        };
+        auto qAdd = [](const SolveCtx& c, Index i, const Vec3& d) {
+            c.mc->q((int)i, 0) += (double)d.x;
+            c.mc->q((int)i, 1) += (double)d.y;
+            c.mc->q((int)i, 2) += (double)d.z;
+        };
+
+        // Visit every DEDUPED contact of vertex i as (row, normal, d(x)).
+        // Shared by the contact projection and the velocity update below
+        // so the two can never disagree about which contacts are active.
+        // Lifted verbatim from PbdSystem::step — see there for the dedup
+        // rationale (one row per incident query triangle would
+        // over-correct; analytic rows carry indexPair.target == 0 for
+        // every shape so the key leans on objPair.target being the
+        // collider's mesh ARRAY INDEX, collider_pipeline_rework.md §4).
+        auto forEachContact = [&](const SolveCtx& c, Index i, auto&& fn) {
+            if (!c.contactsForMesh) return;
+            const Index begin = colOff.ptr[c.colBase + i];
+            const Index end   = colOff.ptr[c.colBase + i + 1];
+            for (Index r = begin; r < end; ++r) {
+                bool dup = false;
+                for (Index qi = begin; qi < r; ++qi)
+                    if (colFacet.ptr[qi].objPair.target == colFacet.ptr[r].objPair.target &&
+                        colFacet.ptr[qi].indexPair.target == colFacet.ptr[r].indexPair.target) {
+                        dup = true; break;
+                    }
+                if (dup) continue;
+
+                const NarrowCollision& row = colFacet.ptr[r];
+                const auto& nd = row.collisionNormalAndDistance;
+                const Vec3 raw((PR)nd.x, (PR)nd.y, (PR)nd.z);
+                const PR nlen = raw.norm();
+                if (nlen < PR(1e-6)) continue;
+                fn(row, raw / nlen, (PR)nd.w);
+            }
+        };
+
+        // A contact is TWO-WAY when its target mesh is itself a live cloth in
+        // this solve — including a SELF row (target == query mesh), which the
+        // narrow phase emits with adjacency-adjacent facets already excluded.
+        // Everything else (Float floor, analytic collider, Rigid, static
+        // cloth) keeps the one-sided push: those targets have no iterate to
+        // correct, and their motion is not ours to change (except the
+        // rigid-coupled share below).
+        auto twoWayTarget = [&](Index t) -> const SolveCtx* {
+            if (t >= numMeshes) return nullptr;
+            const int ci = ctxOfMesh[t];
+            if (ci < 0) return nullptr;
+            const auto& partner = sceneObjects.meshes[t];
+            if (!clothLike(partner.behaviorType) || partner.isStatic) return nullptr;
+            return &ctxs[(size_t)ci];
+        };
+
+        // --- (2) local/global block coordinate descent (Liu 2013 §3),
+        // ITERATION-OUTER / MESH-INNER like PbdSystem step (2): sweeping all
+        // meshes per iteration is what lets a cross-cloth contact see, and be
+        // seen by, the partner's own internal constraints within the substep.
+        for (int it = 0; it < iterations; ++it) {
+            for (SolveCtx& c : ctxs) {
+                MeshCache& mc = *c.mc;
+                mc.rhs = mc.rhsBase;
                 // LOCAL: each spring's auxiliary variable d is the closest
                 // point of its constraint manifold (the sphere of radius
                 // `rest`) to the current edge vector — i.e. the edge
                 // direction scaled to rest length. Closed form, per spring,
                 // embarrassingly parallel.
                 for (const auto& s : mc.springs) {
-                    const double k = s.bend ? kB : kS;
+                    const double k = s.bend ? c.kB : c.kS;
                     if (!(k > 0.0)) continue;
                     const int a = (int)s.a, b = (int)s.b;
-                    double ex = q(a,0) - q(b,0);
-                    double ey = q(a,1) - q(b,1);
-                    double ez = q(a,2) - q(b,2);
+                    double ex = mc.q(a,0) - mc.q(b,0);
+                    double ey = mc.q(a,1) - mc.q(b,1);
+                    double ez = mc.q(a,2) - mc.q(b,2);
                     const double len = std::sqrt(ex*ex + ey*ey + ez*ez);
                     // Coincident endpoints: the direction is undefined. Leave
                     // d equal to the (zero) edge vector so the constraint
@@ -425,120 +603,262 @@ struct PdSystem<METAL, PR> {
                         const double sc = s.rest / len;
                         ex *= sc; ey *= sc; ez *= sc;
                     }
-                    rhs(a,0) += k * ex; rhs(a,1) += k * ey; rhs(a,2) += k * ez;
-                    rhs(b,0) -= k * ex; rhs(b,1) -= k * ey; rhs(b,2) -= k * ez;
+                    mc.rhs(a,0) += k * ex; mc.rhs(a,1) += k * ey; mc.rhs(a,2) += k * ez;
+                    mc.rhs(b,0) -= k * ex; mc.rhs(b,1) -= k * ey; mc.rhs(b,2) -= k * ez;
                 }
                 // GLOBAL: one back-substitution against the prefactored A,
                 // three RHS columns at once. This is the step that makes PD
                 // implicit — every vertex sees every other through A⁻¹, which
                 // is why stiff springs do not explode the way the symplectic
                 // path does at the same substep count.
-                q = mc.factor->solve(rhs);
+                mc.q = mc.factor->solve(mc.rhs);
             }
 
-            // Visit every DEDUPED contact of vertex i as (normal, d(x)).
-            // Shared by the contact projection and the velocity update below
-            // so the two can never disagree about which contacts are active.
-            // Lifted verbatim from PbdSystem::step — see there for the dedup
-            // rationale (one row per incident query triangle would
-            // over-correct; analytic rows carry indexPair.target == 0 for
-            // every shape so the key leans on objPair.target being the
-            // collider's mesh ARRAY INDEX, collider_pipeline_rework.md §4).
-            const bool contactsForMesh = haveContacts && mi + 1 < (Index)off.size;
-            const Index colBase = contactsForMesh ? off.ptr[mi] : Index(0);
-            auto forEachContact = [&](Index i, auto&& fn) {
-                if (!contactsForMesh) return;
-                const Index begin = colOff.ptr[colBase + i];
-                const Index end   = colOff.ptr[colBase + i + 1];
-                for (Index c = begin; c < end; ++c) {
-                    bool dup = false;
-                    for (Index qi = begin; qi < c; ++qi)
-                        if (colFacet.ptr[qi].objPair.target == colFacet.ptr[c].objPair.target &&
-                            colFacet.ptr[qi].indexPair.target == colFacet.ptr[c].indexPair.target) {
-                            dup = true; break;
-                        }
-                    if (dup) continue;
-
-                    const auto& nd = colFacet.ptr[c].collisionNormalAndDistance;
-                    const Vec3 raw((PR)nd.x, (PR)nd.y, (PR)nd.z);
-                    const PR nlen = raw.norm();
-                    if (nlen < PR(1e-6)) continue;
-                    fn(raw / nlen, (PR)nd.w);
-                }
-            };
-
-            // --- (3) contacts, POST-solve and applied ONCE.
-            // Not folded into the iteration: a contact is an inequality, and
-            // PD's global step would immediately pull the vertex back toward
-            // the momentum target, so re-projecting it every sweep would
-            // fight the solve and (via v = (q-x)/h) accumulate into velocity
-            // — the launch failure PbdSystem documents at step (3)/(4). One
-            // post-solve projection is the same treatment physics.metal's
-            // integrate_cloth gives it: position only.
+            // --- (3) contacts, ONCE PER ITERATION, after every mesh's global
+            // solve. The machinery is PbdSystem step (3)'s, ported onto the
+            // PD iterate: one-sided pushes with rigid-body coupling, and
+            // two-way vertex-triangle rows (Müller 2007 eq 12/13) when the
+            // target is a live cloth — self rows included.
             //
-            // Signed distance of the CURRENT iterate: the narrow phase
-            // measured `distance` along n from x, so d(q) = d0 + n·(q - x).
-            if (contactsForMesh) {
-                for (Index i = 0; i < n; ++i) {
-                    if (mask[i] == PR(0)) continue;
-                    const Vec3 xi = vertexAt(x, i);
-                    forEachContact(i, [&](const Vec3& nrm, PR d0) {
-                        const double dx = q((int)i,0) - (double)xi.x;
-                        const double dy = q((int)i,1) - (double)xi.y;
-                        const double dz = q((int)i,2) - (double)xi.z;
-                        const double distance = (double)d0
-                            + (double)nrm.x * dx + (double)nrm.y * dy
-                            + (double)nrm.z * dz;
-                        if (distance >= (double)thickness) return;
-                        const double push = (double)thickness - distance;
-                        q((int)i,0) += (double)nrm.x * push;
-                        q((int)i,1) += (double)nrm.y * push;
-                        q((int)i,2) += (double)nrm.z * push;
+            // Re-applying every iteration is safe because each row is a real
+            // INEQUALITY re-linearized against the live iterate (the narrow
+            // phase measured `distance` along n from x, so d(q) = d0 +
+            // n·(q - x)): once separated it is a no-op, nothing accumulates.
+            // Running contacts INSIDE the loop — instead of once post-solve,
+            // as this solver first shipped — lets the next iteration's
+            // spring projections see the pushed geometry (the stretch a push
+            // creates is re-solved instead of committed), and leaves the
+            // LAST operation of the loop a contact pass, so the committed q
+            // satisfies the substep's contact planes.
+            //
+            // What this is NOT: the paper's implicit collision (Bouaziz 2014
+            // §6) puts the contact's w·I on the system diagonal, so its
+            // global solve balances contact against momentum and elasticity
+            // in one system. Here the contact never enters the matrix (see
+            // header), so each global solve pulls a penetrating vertex back
+            // toward the energy minimum and the projection re-pushes it —
+            // the alternation converges to a compromise, and the
+            // depenetration/velocity split in (4) keeps what was only
+            // overlap-undoing out of the velocity, exactly like PBD.
+            for (SolveCtx& c : ctxs) {
+                if (!c.contactsForMesh) continue;
+                for (Index i = 0; i < c.n; ++i) {
+                    forEachContact(c, i,
+                        [&](const NarrowCollision& row, const Vec3& nrm, PR d0) {
+                        const Index t = row.objPair.target;
+                        const SolveCtx* pc = twoWayTarget(t);
+
+                        if (!pc) {
+                            // ONE-SIDED, with cloth→rigid coupling. Ported
+                            // from PbdSystem step (3) — see there for the
+                            // full rationale. A pinned cloth vertex (wc == 0)
+                            // is immovable but must still be able to push a
+                            // dynamic body, so the skip is a "nobody can
+                            // move" test, not a pin test.
+                            bool coupled = false;
+                            PR wB = PR(0);
+                            if (t < numMeshes) {
+                                const auto& tm = sceneObjects.meshes[t];
+                                if (tm.behaviorType == BehaviorType::Rigid
+                                    && tm.applyGravity
+                                    && tm.rigidBodyMass > PR(0)
+                                    && tm.rigidBodyHandle
+                                       != ysim::physics::kInvalidBodyHandle
+                                    && (Index)rigidDelta.size() > t) {
+                                    coupled = true;
+                                    wB = PR(1) / tm.rigidBodyMass;
+                                }
+                            }
+                            const PR wc = invMassOf(c.m, c.mask, i);
+                            const PR wsum = wc + wB;
+                            if (wsum <= PR(0)) return;
+                            // The narrow phase measured d0 against the
+                            // frame-frozen body, so the body's own
+                            // accumulated motion this frame has to be
+                            // subtracted — otherwise every iteration re-pays
+                            // a deficit the body already absorbed and the
+                            // pair runs away.
+                            PR distance = d0
+                                + nrm.dot(qVec(c, i) - vertexAt(c.x, i));
+                            if (coupled) distance -= nrm.dot(rigidDelta[t]);
+                            if (distance >= c.thickness) return;
+                            const PR deficit = c.thickness - distance;
+                            qAdd(c, i, nrm * (deficit * (wc / wsum)));
+                            if (coupled) {
+                                // The body moves AGAINST the normal the
+                                // cloth entered along.
+                                rigidDelta[t] -= nrm * (deficit * (wB / wsum));
+                                ++rigidCoupleCount;
+                            }
+                            return;
+                        }
+
+                        // TWO-WAY vertex-triangle contact (Müller 2007
+                        // eq 12/13), re-linearized from the LIVE iterates
+                        // each iteration so the triangle may move under the
+                        // vertex. A pinned QUERY vertex is NOT skipped here —
+                        // wq = 0 simply hands the whole correction to the
+                        // triangle.
+                        if (!pc->facets) return;
+                        const Index tri = row.indexPair.target;
+                        if (tri >= pc->numFacets) return;
+                        const Index i1 = pc->facets[tri*3+0];
+                        const Index i2 = pc->facets[tri*3+1];
+                        const Index i3 = pc->facets[tri*3+2];
+                        if (i1 >= pc->n || i2 >= pc->n || i3 >= pc->n) return;
+                        // Self rows never name an incident facet (the narrow
+                        // phase excludes adjacency), but a degenerate row must
+                        // not build a constraint of a vertex against itself.
+                        if (t == c.mi && (i == i1 || i == i2 || i == i3)) return;
+
+                        const Vec3 qv = qVec(c, i);
+                        const Vec3 P1 = qVec(*pc, i1);
+                        const Vec3 P2 = qVec(*pc, i2);
+                        const Vec3 P3 = qVec(*pc, i3);
+                        const Vec3 e1 = P2 - P1, e2 = P3 - P1;
+                        const Vec3 ngeom = e1.cross(e2);
+                        const PR nlenG = ngeom.norm();
+                        if (nlenG < PR(1e-12)) return;   // degenerate triangle
+                        const Vec3 nh = ngeom / nlenG;
+
+                        // eq (13) is eq (12) with the cross-product order
+                        // flipped — i.e. a SIGN. Which one applies is the side
+                        // the vertex entered from, and the narrow phase
+                        // already oriented the row normal that way at substep
+                        // start, so read sigma off it instead of guessing from
+                        // the current (possibly already-corrected) geometry.
+                        const PR sigma = (nrm.dot(nh) >= PR(0)) ? PR(1) : PR(-1);
+                        const Vec3 sn = nh * sigma;
+                        const PR hthk = std::max(c.thickness, pc->thickness);
+                        const PR C = sn.dot(qv - P1) - hthk;
+                        // Inequality: already separated => nothing to do. This
+                        // is what makes re-projecting every iteration safe.
+                        if (C >= PR(0)) return;
+
+                        // Barycentric coordinates of qv's projection onto the
+                        // triangle plane, clamped into the triangle so a
+                        // near-edge / near-vertex contact still distributes a
+                        // convex combination (Σb = 1) rather than an
+                        // extrapolating one.
+                        PR b1, b2, b3;
+                        const PR d00 = e1.dot(e1), d01 = e1.dot(e2);
+                        const PR d11 = e2.dot(e2);
+                        const Vec3 vq = qv - P1;
+                        const PR d20 = vq.dot(e1), d21 = vq.dot(e2);
+                        const PR bden = d00*d11 - d01*d01;
+                        if (!(std::abs(bden) > PR(1e-20))) {
+                            b1 = b2 = b3 = PR(1) / PR(3);
+                        } else {
+                            b2 = (d11*d20 - d01*d21) / bden;
+                            b3 = (d00*d21 - d01*d20) / bden;
+                            b1 = PR(1) - b2 - b3;
+                            if (b1 < PR(0)) b1 = PR(0);
+                            if (b2 < PR(0)) b2 = PR(0);
+                            if (b3 < PR(0)) b3 = PR(0);
+                            const PR bs = b1 + b2 + b3;
+                            if (bs < PR(1e-12)) b1 = b2 = b3 = PR(1) / PR(3);
+                            else { b1 /= bs; b2 /= bs; b3 /= bs; }
+                        }
+
+                        const PR wq = invMassOf(c.m,  c.mask,  i);
+                        const PR w1 = invMassOf(pc->m, pc->mask, i1);
+                        const PR w2 = invMassOf(pc->m, pc->mask, i2);
+                        const PR w3 = invMassOf(pc->m, pc->mask, i3);
+                        const PR wden = wq + b1*b1*w1 + b2*b2*w2 + b3*b3*w3;
+                        if (wden < PR(1e-12)) return;   // both sides pinned
+                        const PR s = C / wden;
+
+                        // grad_q C = sigma*n, grad_pj C = -bj*sigma*n (the
+                        // normal's OWN derivative is deliberately dropped —
+                        // the standard PBD contact distribution; the
+                        // constraint VALUE still follows the paper).
+                        // Contact stiffness is 1: this is a hard contact,
+                        // matching the one-sided push.
+                        const Vec3 dq = sn * (-s * wq);
+                        qAdd(c, i, dq);
+                        vertexRef(c.cd, i) += dq;
+                        const Index ids[3] = { i1, i2, i3 };
+                        const PR    bws[3] = { b1, b2, b3 };
+                        const PR    wws[3] = { w1, w2, w3 };
+                        for (int j = 0; j < 3; ++j) {
+                            if (wws[j] <= PR(0)) continue;
+                            const Vec3 dp = sn * (s * wws[j] * bws[j]);
+                            qAdd(*pc, ids[j], dp);
+                            vertexRef(pc->cd, ids[j]) += dp;
+                        }
+                        ++twoWayContactCount;
+                        if (t == c.mi) ++selfContactCount;
                     });
                 }
             }
+        }
 
-            // --- (4) velocity update from the position delta, then commit.
-            // Logic copied from pbd_system.hpp step (4) — that header is the
-            // source of truth for WHY, and is deliberately not included or
-            // modified from here. Short version:
-            //   * pinned vertices keep x EXACTLY (never written) and lose v,
-            //     which is also what makes the soft pin above harmless;
-            //   * a non-finite iterate holds the last good position and
-            //     zeroes velocity instead of poisoning the mesh;
-            //   * DEPENETRATION IS NOT MOTION: v = (q-x)/h reports the whole
-            //     delta as velocity, including the part of a contact push
-            //     that only undid overlap the vertex was ALREADY in when the
-            //     substep began. A cloth born 0.3 m inside a box would read
-            //     ~930 m/s at subh = 1/3000 and leave the scene (measured,
-            //     AC-10). The invariant: a contact may reverse the approach
-            //     the vertex actually made this substep, but may never send
-            //     it out FASTER than it came in. freeDelta is the
-            //     unconstrained (v + a·h)·h displacement, so -freeDelta·n is
-            //     exactly the approach along that contact's normal.
-            const PR invDt = PR(1) / dt;
-            const PR velScale = PR(1) - damping;
-            for (Index i = 0; i < n; ++i) {
-                if (mask[i] == PR(0)) { vertexRef(v, i) = Vec3(); continue; }
-                const Vec3 pi((PR)q((int)i,0), (PR)q((int)i,1), (PR)q((int)i,2));
+        // --- (4) velocity update from the position delta, then commit.
+        // Logic copied from pbd_system.hpp step (4) — that header is the
+        // source of truth for WHY, and is deliberately not included or
+        // modified from here. Short version:
+        //   * pinned vertices keep x EXACTLY (never written) and lose v,
+        //     which is also what makes the soft pin above harmless;
+        //   * a non-finite iterate holds the last good position and
+        //     zeroes velocity instead of poisoning the mesh;
+        //   * DEPENETRATION IS NOT MOTION: v = (q-x)/h reports the whole
+        //     delta as velocity, including the part of a contact push
+        //     that only undid overlap the vertex was ALREADY in when the
+        //     substep began. A cloth born 0.3 m inside a box would read
+        //     ~930 m/s at subh = 1/3000 and leave the scene (measured,
+        //     AC-10). The invariant: a contact may reverse the approach
+        //     the vertex actually made this substep, but may never send
+        //     it out FASTER than it came in. freeDelta is the
+        //     unconstrained (v + a·h)·h displacement, so -freeDelta·n is
+        //     exactly the approach along that contact's normal. One-sided
+        //     rows clamp per row; two-way rows clamp once, off the
+        //     ACCUMULATED displacement they actually produced (cd) —
+        //     clamping them per row as well would remove the same
+        //     velocity twice.
+        const PR invDt = PR(1) / dt;
+        const PR velScale = PR(1) - damping;
+        for (const SolveCtx& c : ctxs) {
+            const MeshCache& mc = *c.mc;
+            for (Index i = 0; i < c.n; ++i) {
+                if (c.mask[i] == PR(0)) { vertexRef(c.v, i) = Vec3(); continue; }
+                const Vec3 pi((PR)mc.q((int)i,0), (PR)mc.q((int)i,1),
+                              (PR)mc.q((int)i,2));
                 if (!std::isfinite(pi.x) || !std::isfinite(pi.y)
                     || !std::isfinite(pi.z)) {
-                    vertexRef(v, i) = Vec3();
+                    vertexRef(c.v, i) = Vec3();
                     ++sanitizeCount;
                     continue;
                 }
-                const PR wi = invMass(i);
-                const Vec3 accel = (wi > PR(0) && ext) ? vertexAt(ext, i) * wi : Vec3();
-                const Vec3 freeDelta = (vertexAt(v, i) + accel * dt) * dt;
-                Vec3 delta = pi - vertexAt(x, i);
-                forEachContact(i, [&](const Vec3& nrm, PR) {
+                const PR wi = invMassOf(c.m, c.mask, i);
+                const Vec3 accel = (wi > PR(0) && c.ext)
+                    ? vertexAt(c.ext, i) * wi : Vec3();
+                const Vec3 freeDelta = (vertexAt(c.v, i) + accel * dt) * dt;
+                Vec3 delta = pi - vertexAt(c.x, i);
+                forEachContact(c, i,
+                    [&](const NarrowCollision& row, const Vec3& nrm, PR) {
+                    if (twoWayTarget(row.objPair.target)) return;
                     const PR dn = delta.dot(nrm);
                     if (dn <= PR(0)) return;
                     const PR approach = std::max(PR(0), -freeDelta.dot(nrm));
                     if (dn > approach) delta -= nrm * (dn - approach);
                 });
-                vertexRef(v, i) = delta * (invDt * velScale);
-                vertexRef(x, i) = pi;
+                // Same split, generalized: the two-way corrections of this
+                // vertex sum to `cd`, whose direction is the only normal
+                // that survives combining several triangles. Remove at most
+                // what the contacts actually pushed (cdLen) beyond the
+                // approach speed — anything more would eat the vertex's own
+                // motion.
+                const Vec3 cdv = vertexAt(c.cd, i);
+                const PR cdLen = cdv.norm();
+                if (cdLen > PR(1e-12)) {
+                    const Vec3 nc = cdv / cdLen;
+                    const PR dn = delta.dot(nc);
+                    const PR approach = std::max(PR(0), -freeDelta.dot(nc));
+                    if (dn > approach)
+                        delta -= nc * std::min(dn - approach, cdLen);
+                }
+                vertexRef(c.v, i) = delta * (invDt * velScale);
+                vertexRef(c.x, i) = pi;
             }
         }
     }

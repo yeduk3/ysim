@@ -3242,12 +3242,16 @@ struct Simulator {
             m.rigidLastBodyPos = now;
         }
 
-        // PBD cloth→rigid coupling: open a new accumulation window. The
-        // Bullet step + centroid snap above are the only place a Rigid body
-        // moves, so the whole frame's substeps measure their contacts against
-        // this one frozen pose — their corrections accumulate into
-        // pbd.rigidDelta and are pushed back to Bullet at frame completion.
+        // CPU-solver (PBD/PD) cloth→rigid coupling: open a new accumulation
+        // window. The Bullet step + centroid snap above are the only place a
+        // Rigid body moves, so the whole frame's substeps measure their
+        // contacts against this one frozen pose — their corrections
+        // accumulate into the active solver's rigidDelta and are pushed back
+        // to Bullet at frame completion. Each active flag arms its own
+        // solver's window; the contact paths size-check rigidDelta before
+        // indexing it, so a mid-run solver toggle is safe either way.
         if (usePbd) pbd.beginFrameRigid((Index)Scene<BE, PR>::meshes.size());
+        if (usePd)  pd.beginFrameRigid((Index)Scene<BE, PR>::meshes.size());
 
         // Kinematic bodies: prescribed BVH motion, one-way coupling. Once
         // per outer frame (like the Rigid block above): advance playback
@@ -3634,11 +3638,13 @@ struct Simulator {
             std::cout << "[step] frame " << frame << " substep "
                       << subEnd << "/" << system.subSteps << " (frame complete)\n";
 
-        // PBD cloth→rigid coupling writeback. Runs ONLY here, at frame
-        // completion (a mid-frame substep stop returned above), so the whole
-        // frame's accumulated correction lands as ONE position write between
-        // two Bullet steps — the rigid step at the top of the NEXT frame's
-        // preamble picks it up.
+        // CPU-solver (PBD/PD) cloth→rigid coupling writeback. Runs ONLY
+        // here, at frame completion (a mid-frame substep stop returned
+        // above), so the whole frame's accumulated correction lands as ONE
+        // position write between two Bullet steps — the rigid step at the
+        // top of the NEXT frame's preamble picks it up. PbdSystem and
+        // PdSystem share the rigidDelta contract, so the same writeback
+        // serves whichever solver ran this frame.
         //
         // Position-based, not impulse-based: injecting Δ/h as a velocity
         // gives Bullet an outward bounce every frame that fights gravity and
@@ -3650,15 +3656,15 @@ struct Simulator {
         // centroid snap carries them onto the new body position (the same
         // one-frame visual lag the existing snap design already has), and
         // refreshAnalyticShapes follows the centroid from there.
-        if (usePbd && !pbd.rigidDelta.empty()) {
-            const Index nm = std::min((Index)pbd.rigidDelta.size(),
+        auto applyClothRigidDeltas = [&](std::vector<tinym::vec3_base<PR>>& deltas) {
+            const Index nm = std::min((Index)deltas.size(),
                                       (Index)Scene<BE, PR>::meshes.size());
             for (Index mi = 0; mi < nm; ++mi) {
                 auto& m = Scene<BE, PR>::meshes[mi];
                 if (m.behaviorType != BehaviorType::Rigid) continue;
                 if (!m.applyGravity) continue;             // static body
                 if (m.rigidBodyHandle == ysim::physics::kInvalidBodyHandle) continue;
-                const auto& d = pbd.rigidDelta[mi];
+                const auto& d = deltas[mi];
                 const float dlen = std::sqrt((float)(d.x*d.x + d.y*d.y + d.z*d.z));
                 if (!(dlen > 1e-12f)) continue;
                 const tinym::vec3 delta((float)d.x, (float)d.y, (float)d.z);
@@ -3675,9 +3681,11 @@ struct Simulator {
                         tinym::vec3(v.x - nHat.x*vn, v.y - nHat.y*vn,
                                     v.z - nHat.z*vn));
                 }
-                pbd.rigidDelta[mi] = typename PbdSystem<BE, PR>::Vec3();
+                deltas[mi] = tinym::vec3_base<PR>();
             }
-        }
+        };
+        if (usePd  && !pd.rigidDelta.empty())  applyClothRigidDeltas(pd.rigidDelta);
+        if (usePbd && !pbd.rigidDelta.empty()) applyClothRigidDeltas(pbd.rigidDelta);
 
         system.acctime += system.h;
         frame++;
