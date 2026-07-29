@@ -205,7 +205,7 @@ void postInitPbdClothBallSelf(SimOf<BE, PR>& simulator) {
 // legitimately does nothing.
 template <typename BE, typename PR>
 void setupPbdClothXYFold(SimOf<BE, PR>& simulator, SysOf<BE, PR>& system) {
-    const PR kstretch = 1e5, kshear = 1e5, kbend = 2e5;
+    const PR kstretch = 1e5, kshear = 1e5, kbend = 5e4;
     const PR thickness = 0.01;
     simulator.addPlane(PlaneDirection::XZPlane, tinym::vec3(0, 0, 0), 24, 3.0,
                        0.1, BehaviorType::Float);                        // id 0
