@@ -59,11 +59,31 @@
 // contact set against an empty cached epoch costs nothing at all.
 //
 // TWO-WAY rows — the target is another live cloth of this solve, self rows
-// included — still run PbdSystem's vertex-triangle inequality PROJECTION
-// pass, once per local/global iteration after every mesh's global solve
-// (step (3)). Putting those in the energy needs a real off-diagonal A_i
-// block per row (the barycentric combination of four vertices), which is a
-// separate piece of work.
+// included — are in the energy TOO, as the SAME per-vertex constraint kind:
+// one vertex-triangle row becomes up to FOUR positional constraints
+// (A_i = B_i = I), one per participating vertex, whose targets p are the
+// mass-weighted split of the row's depenetration and are RE-TARGETED from
+// the live iterates of both meshes at every local step. Identity (p = own
+// iterate) whenever the row is separated, exactly like the one-sided planes,
+// so a permanently-resident row glues nothing. There is NO post-solve
+// projection pass any more: the global solve is the last operation of the
+// iteration, and every contact of the substep — one-sided and two-way — is
+// balanced against momentum and elasticity inside it.
+//
+// Be honest about what this is and is not. It is NOT the paper's §6, which
+// only ever covers obstacle (one-sided) collisions. It is NOT a merged
+// multi-mesh system, and it is NOT the exact 4-vertex constraint either:
+// that would need a real off-diagonal A_i block (the barycentric combination
+// of the four vertices) instead of four independent diagonal ones. It is the
+// §6 mechanism GENERALIZED per-vertex, with the barycentric coupling — and,
+// for a cross-cloth row, the coupling between the two separate systems —
+// carried by RE-LINEARIZATION: each iteration recomputes the split from the
+// current iterates and hands each side its own share in its own matrix.
+// Across meshes that is a Jacobi iteration (each system sees the partner's
+// PREVIOUS iterate), which converges more slowly than one merged solve would
+// but never fights it the way the old projection pass did. A SELF row
+// (target == query mesh) lands all four shares in ONE system, so there the
+// split is resolved inside a single solve.
 //
 // Cloth→rigid coupling is in neither paper: it keeps the
 // PbdSystem::rigidDelta contract and is applied ONCE per substep after the
@@ -260,6 +280,35 @@ struct PdSystem<METAL, PR> {
         PR    wB = PR(0);
     };
 
+    // One TWO-WAY vertex-triangle row of this substep, resolved once (step
+    // 1b) and re-evaluated from the live iterates at every local step. It
+    // spans up to two meshes, which is why the list hangs off PdSystem and
+    // not off MeshCache.
+    //
+    // Only the data the LIVE re-evaluation needs is stored: who the four
+    // vertices are, which contexts own them, the narrow phase's row normal
+    // (the frozen ENTRY SIDE — sigma is read off it, never off the possibly
+    // already-corrected current geometry), and the two constant-per-substep
+    // per-vertex quantities: inverse mass (the split's weights) and the
+    // constraint weight w_two that vertex's diagonal carries. Geometry —
+    // normal, barycentrics, constraint value — is NOT stored: it is exactly
+    // what has to be recomputed each iteration.
+    //
+    // A zero `w` marks a vertex that carries NO constraint (zero inverse
+    // mass: pinned or massless). Its share of the split would be zero
+    // anyway, so it is left out of both the diagonal and the RHS instead of
+    // being fed an identity constraint that only churns the epoch.
+    struct TwoWayRow {
+        int   qc = 0, pc = 0;      // ctxs indices of query / target mesh
+        Index vert = 0;            // query vertex, in qc
+        Index i1 = 0, i2 = 0, i3 = 0;  // target triangle, in pc
+        Vec3  nrm;                 // narrow-phase row normal (sigma source)
+        PR    iq = PR(0), i1w = PR(0), i2w = PR(0), i3w = PR(0);  // inv mass
+        double wq = 0.0, w1 = 0.0, w2 = 0.0, w3 = 0.0;            // w_two
+    };
+    // Cleared and rebuilt every substep by step (1b).
+    std::vector<TwoWayRow> twoWayRows;
+
     // Vertex count below which every per-vertex / per-spring sweep runs
     // serially. A GCD round trip costs tens of microseconds of queue hop and
     // worker wake-up; a few hundred spring projections finish in less than
@@ -337,13 +386,25 @@ struct PdSystem<METAL, PR> {
         // then runs only when the base itself changes.
         Eigen::SparseMatrix<double> Abase;
         // One-sided contact planes of THIS substep, and the per-vertex sum of
-        // their weights — the epoch key. `epochW` is the copy of that vector
-        // the current factorization actually holds; `contactW` empty means
-        // "no contacts", and empty == empty is the zero-cost path. A base
-        // rebuild clears epochW, which is how a change of h / mass / k (all
-        // of which move w_c) is composed into the contact epoch.
+        // the weights of EVERY constraint this mesh's vertices carry — the
+        // planes above AND this mesh's share of the two-way rows, which may
+        // have been created by a DIFFERENT mesh's query vertex. That sum is
+        // the epoch key. `epochW` is the copy of that vector the current
+        // factorization actually holds; `contactW` empty means "no contacts",
+        // and empty == empty is the zero-cost path. A base rebuild clears
+        // epochW, which is how a change of h / mass / k (all of which move
+        // w_c) is composed into the contact epoch.
         std::vector<ContactPlane> planes;
         std::vector<double> contactW, epochW;
+        // contactW carries at least one non-zero (it is sized-and-zeroed
+        // before the sweep, and only collapsed to empty afterwards if this
+        // stayed false).
+        bool hasContactW = false;
+        // False only after a contact refactor FAILED for this mesh: the
+        // substep then runs it contact-free, which means two-way rows created
+        // by another mesh must not deposit RHS terms here either — their
+        // weight is not on this diagonal any more.
+        bool contactsLive = true;
         // Per-substep solve state, kept here only so the allocations persist
         // across substeps (every value is rewritten each step). n x 3: the
         // system is scalar n x n and the three coordinates are INDEPENDENT
@@ -356,10 +417,15 @@ struct PdSystem<METAL, PR> {
         // cloth's block stays live for the whole iteration phase — the same
         // reason PbdSystem::predBlocks is per mesh.
         Eigen::MatrixXd rhsBase, rhs, q;
-        // Accumulated two-way contact displacement (flat 3N), zeroed each
-        // substep. The velocity update needs to know how much of a vertex's
-        // position delta came from contact projection so depenetration does
-        // not become velocity — PbdSystem::cDispBlocks, same idea.
+        // Contact-attributable displacement estimator for the TWO-WAY rows
+        // (flat 3N), zeroed each substep. The velocity update needs to know
+        // how much of a vertex's position delta came from contact so
+        // depenetration does not become velocity — PbdSystem::cDispBlocks,
+        // same idea. With the rows in the energy there is no direct push to
+        // sum any more; what accumulates here is the per-iteration TARGET
+        // OFFSET (p - q) each row asked this vertex for. See the estimator
+        // note in the local step's contact block for why that is the right
+        // side to err on.
         std::vector<PR> cd;
     };
     std::vector<MeshCache> cache;   // parallel to Scene::meshes
@@ -707,10 +773,25 @@ struct PdSystem<METAL, PR> {
                         (PR)c.mc->q((int)i, 1),
                         (PR)c.mc->q((int)i, 2));
         };
-        auto qAdd = [](const SolveCtx& c, Index i, const Vec3& d) {
-            c.mc->q((int)i, 0) += (double)d.x;
-            c.mc->q((int)i, 1) += (double)d.y;
-            c.mc->q((int)i, 2) += (double)d.z;
+        // Weight of ONE constraint carried by vertex i of context c: the
+        // vertex's own momentum weight m_i/h², scaled. The mass is floored
+        // exactly as the matrix diagonal floors it, so a massless vertex gets
+        // a consistent (tiny) pair of weights rather than a contact that
+        // outranks its own inertia. One-sided planes and two-way rows use the
+        // SAME family — a vertex weighs every constraint it carries by its
+        // own inertia, whichever mesh's query created it.
+        auto momentumW = [&](const SolveCtx& c, Index i) -> double {
+            const double mi3 = (double)c.m[i * 3];
+            return kContactWeightScale * (mi3 > 0.0 ? mi3 : 1e-9) * invH2;
+        };
+        // Two-way rows use the identical weight: a vertex weighs every
+        // constraint it carries by its own inertia. Measured alternatives
+        // (a per-vertex CAP that splits one momentum weight across the rows
+        // a vertex carries; global scales 0.1 / 2 / 4 / 8) all made the
+        // folded-sheet self-collision case WORSE, so there is no second knob
+        // here — kContactWeightScale is the only one, shared with the planes.
+        auto twoWayW = [&](const SolveCtx& c, Index i) -> double {
+            return momentumW(c, i);
         };
 
         // Visit every DEDUPED contact of vertex i as (row, normal, d(x)).
@@ -749,9 +830,10 @@ struct PdSystem<METAL, PR> {
         // Everything else (Float floor, analytic collider, Rigid, static
         // cloth) is ONE-SIDED: those targets have no iterate to correct, and
         // their motion is not ours to change (except the rigid-coupled share
-        // in (3b)). Sidedness is what selects the MECHANISM — one-sided rows
-        // become energy constraints in (1b), two-way rows are projected in
-        // (3) — so this predicate is the single place the two paths part.
+        // in (3b)). Both families are energy constraints now; sidedness only
+        // selects the SHAPE — a one-sided row is a half-space plane on ONE
+        // vertex, a two-way row is a mass-weighted split over FOUR — so this
+        // predicate is still the single place the two paths part.
         auto twoWayTarget = [&](Index t) -> const SolveCtx* {
             if (t >= numMeshes) return nullptr;
             const int ci = ctxOfMesh[t];
@@ -761,70 +843,134 @@ struct PdSystem<METAL, PR> {
             return &ctxs[(size_t)ci];
         };
 
-        // --- (1b) resolve this substep's ONE-SIDED contact set and bring the
-        // factorization in line with it (Bouaziz 2014 §6 constraints, §8's
-        // "keep the factorization current" done by re-factorizing rather than
-        // by rank updates).
+        // --- (1b) resolve this substep's WHOLE contact set — one-sided planes
+        // AND two-way rows — and bring every factorization in line with it
+        // (Bouaziz 2014 §6 constraints, §8's "keep the factorization current"
+        // done by re-factorizing rather than by rank updates).
         //
         // Runs AFTER the ctx loop because a row's sidedness is only decidable
         // once every live cloth of the substep is known (twoWayTarget reads
-        // ctxOfMesh). Two-way rows are skipped here entirely — they never
-        // enter the matrix; step (3) still projects them.
+        // ctxOfMesh).
         //
-        // The matrix only ever sees the per-vertex SUM of the weights of that
-        // vertex's planes, so that vector IS the epoch: two substeps whose
-        // contact sets differ only in which triangle a row named produce the
-        // same matrix and must not refactor. The planes themselves (normals,
-        // offsets) are pure RHS data and change freely without a refactor.
+        // The matrix only ever sees the per-vertex SUM of the weights of the
+        // constraints that vertex carries, so that vector IS the epoch: two
+        // substeps whose contact sets differ only in which triangle a row
+        // named produce the same matrix and must not refactor. Everything
+        // else about a constraint (normals, offsets, targets) is pure RHS
+        // data and changes freely without a refactor.
+        //
+        // THREE passes, not one, because a two-way row deposits weight in the
+        // TARGET mesh's vector as well as the query mesh's: the whole sweep
+        // has to finish before any epoch can be compared.
+        twoWayRows.clear();
         for (SolveCtx& c : ctxs) {
             MeshCache& mc = *c.mc;
             mc.planes.clear();
-            if (c.contactsForMesh) {
-                for (Index i = 0; i < c.n; ++i) {
-                    forEachContact(c, i,
-                        [&](const NarrowCollision& row, const Vec3& nrm, PR d0) {
-                        const Index t = row.objPair.target;
-                        if (twoWayTarget(t)) return;   // step (3)'s business
-                        ContactPlane pl;
-                        pl.vert   = i;
-                        pl.n      = nrm;
-                        pl.d0     = d0;
-                        pl.target = t;
-                        // Same coupling test PbdSystem::step (3) applies: only
-                        // a DYNAMIC rigid body with a live Bullet handle can
-                        // take a share of the push.
-                        if (t < numMeshes) {
-                            const auto& tm = sceneObjects.meshes[t];
-                            if (tm.behaviorType == BehaviorType::Rigid
-                                && tm.applyGravity
-                                && tm.rigidBodyMass > PR(0)
-                                && tm.rigidBodyHandle
-                                   != ysim::physics::kInvalidBodyHandle
-                                && (Index)rigidDelta.size() > t) {
-                                pl.coupled = true;
-                                pl.wB = PR(1) / tm.rigidBodyMass;
-                            }
+            mc.contactW.assign((size_t)c.n, 0.0);
+            mc.hasContactW = false;
+            mc.contactsLive = true;
+        }
+        for (size_t ci = 0; ci < ctxs.size(); ++ci) {
+            SolveCtx& c = ctxs[ci];
+            MeshCache& mc = *c.mc;
+            if (!c.contactsForMesh) continue;
+            for (Index i = 0; i < c.n; ++i) {
+                forEachContact(c, i,
+                    [&](const NarrowCollision& row, const Vec3& nrm, PR d0) {
+                    const Index t = row.objPair.target;
+                    if (const SolveCtx* pc = twoWayTarget(t)) {
+                        // ---- TWO-WAY row: up to four per-vertex constraints.
+                        // Only the STATIC guards live here (index validity,
+                        // a self row naming its own vertex, everybody pinned);
+                        // the geometric ones (degenerate triangle, degenerate
+                        // barycentric denominator) depend on the live iterate
+                        // and are re-tested every local step.
+                        if (!pc->facets) return;
+                        const Index tri = row.indexPair.target;
+                        if (tri >= pc->numFacets) return;
+                        TwoWayRow tw;
+                        tw.i1 = pc->facets[tri*3+0];
+                        tw.i2 = pc->facets[tri*3+1];
+                        tw.i3 = pc->facets[tri*3+2];
+                        if (tw.i1 >= pc->n || tw.i2 >= pc->n || tw.i3 >= pc->n)
+                            return;
+                        // Self rows never name an incident facet (the narrow
+                        // phase excludes adjacency), but a degenerate row must
+                        // not build a constraint of a vertex against itself.
+                        if (t == c.mi
+                            && (i == tw.i1 || i == tw.i2 || i == tw.i3)) return;
+                        tw.qc   = (int)ci;
+                        tw.pc   = ctxOfMesh[t];
+                        tw.vert = i;
+                        tw.nrm  = nrm;
+                        tw.iq  = invMassOf(c.m,   c.mask,   i);
+                        tw.i1w = invMassOf(pc->m, pc->mask, tw.i1);
+                        tw.i2w = invMassOf(pc->m, pc->mask, tw.i2);
+                        tw.i3w = invMassOf(pc->m, pc->mask, tw.i3);
+                        // Every side infinitely heavy: nothing this row could
+                        // ever ask for. (The live wden test still guards the
+                        // barycentric-degenerate case.)
+                        if (tw.iq <= PR(0) && tw.i1w <= PR(0)
+                            && tw.i2w <= PR(0) && tw.i3w <= PR(0)) return;
+                        // A zero-inverse-mass vertex takes no share, so it
+                        // carries no constraint — see TwoWayRow.
+                        MeshCache& pmc = *pc->mc;
+                        if (tw.iq > PR(0)) {
+                            tw.wq = twoWayW(c, i);
+                            mc.contactW[i] += tw.wq;
+                            mc.hasContactW = true;
                         }
-                        // w_c = scale · m_i/h², i.e. the momentum weight of
-                        // that same vertex. The mass is floored exactly as
-                        // the diagonal above floors it, so a massless vertex
-                        // gets a consistent (tiny) pair of weights rather than
-                        // a contact that outranks its own inertia.
-                        const double mi3 = (double)c.m[i * 3];
-                        pl.w = kContactWeightScale
-                             * (mi3 > 0.0 ? mi3 : 1e-9) * invH2;
-                        mc.planes.push_back(pl);
-                    });
-                }
+                        const Index tids[3] = { tw.i1, tw.i2, tw.i3 };
+                        const PR    tiw[3]  = { tw.i1w, tw.i2w, tw.i3w };
+                        double*     tout[3] = { &tw.w1, &tw.w2, &tw.w3 };
+                        for (int j = 0; j < 3; ++j) {
+                            if (tiw[j] <= PR(0)) continue;
+                            *tout[j] = twoWayW(*pc, tids[j]);
+                            pmc.contactW[tids[j]] += *tout[j];
+                            pmc.hasContactW = true;
+                        }
+                        twoWayRows.push_back(tw);
+                        // Counted ONCE PER ROW PER SUBSTEP, here in the
+                        // resolve — the local step visits the same row
+                        // `iterations` times and counting there would report
+                        // the iteration count, not the contact count.
+                        ++twoWayContactCount;
+                        if (t == c.mi) ++selfContactCount;
+                        return;
+                    }
+                    // ---- ONE-SIDED row: unilateral half-space plane.
+                    ContactPlane pl;
+                    pl.vert   = i;
+                    pl.n      = nrm;
+                    pl.d0     = d0;
+                    pl.target = t;
+                    // Same coupling test PbdSystem::step (3) applies: only
+                    // a DYNAMIC rigid body with a live Bullet handle can
+                    // take a share of the push.
+                    if (t < numMeshes) {
+                        const auto& tm = sceneObjects.meshes[t];
+                        if (tm.behaviorType == BehaviorType::Rigid
+                            && tm.applyGravity
+                            && tm.rigidBodyMass > PR(0)
+                            && tm.rigidBodyHandle
+                               != ysim::physics::kInvalidBodyHandle
+                            && (Index)rigidDelta.size() > t) {
+                            pl.coupled = true;
+                            pl.wB = PR(1) / tm.rigidBodyMass;
+                        }
+                    }
+                    pl.w = momentumW(c, i);
+                    mc.contactW[i] += pl.w;
+                    mc.hasContactW = true;
+                    mc.planes.push_back(pl);
+                });
             }
-
-            if (mc.planes.empty()) {
-                mc.contactW.clear();
-            } else {
-                mc.contactW.assign((size_t)c.n, 0.0);
-                for (const ContactPlane& pl : mc.planes)
-                    mc.contactW[pl.vert] += pl.w;
-            }
+        }
+        for (SolveCtx& c : ctxs) {
+            MeshCache& mc = *c.mc;
+            // Collapse to empty so that "no contacts now, none in the factor"
+            // stays the zero-cost comparison it was.
+            if (!mc.hasContactW) mc.contactW.clear();
             // No contacts now and none in the factor => the base
             // factorization is already the right one, untouched.
             if (mc.contactW == mc.epochW) continue;
@@ -854,14 +1000,31 @@ struct PdSystem<METAL, PR> {
                 mc.planes.clear();
                 mc.contactW.clear();
                 mc.epochW.clear();
+                // Two-way rows are shared with another mesh's system, so they
+                // cannot be dropped from the list here — the partner's factor
+                // still holds their weight. This flag is how the local step
+                // knows to stop depositing THIS mesh's share.
+                mc.contactsLive = false;
             }
         }
 
         // --- (2) local/global block coordinate descent (Liu 2013 §3),
-        // ITERATION-OUTER / MESH-INNER like PbdSystem step (2): sweeping all
-        // meshes per iteration is what lets a cross-cloth contact see, and be
-        // seen by, the partner's own internal constraints within the substep.
+        // ITERATION-OUTER like PbdSystem step (2): sweeping all meshes per
+        // iteration is what lets a cross-cloth contact see, and be seen by,
+        // the partner's own internal constraints within the substep.
+        //
+        // Each iteration is THREE phases, in this order, because a two-way row
+        // writes RHS rows of TWO meshes and neither may be solved before both
+        // have been assembled:
+        //   LOCAL springs   — per mesh, parallel, independent;
+        //   LOCAL contacts  — ONE serial block over every mesh's planes and
+        //                     every two-way row of the substep;
+        //   GLOBAL          — per mesh back-substitution.
+        // The global solve is therefore the LAST operation of the iteration,
+        // and there is nothing after it: every contact of the substep is an
+        // energy term the solve balances, not a push applied on top of it.
         for (int it = 0; it < iterations; ++it) {
+            // ---- LOCAL, springs.
             for (SolveCtx& c : ctxs) {
                 MeshCache& mc = *c.mc;
                 mc.rhs = mc.rhsBase;
@@ -946,22 +1109,37 @@ struct PdSystem<METAL, PR> {
                         }
                     });
                 }
+            }
 
-                // LOCAL, contacts: the projection of the unilateral half-space
-                // constraints resolved in (1b). For each plane, the auxiliary
-                // p_i is the closest point of { q : n·(q - b) >= thickness } to
-                // the live iterate — the vertex moved onto the plane when it
-                // violates it, and the vertex ITSELF (identity map) when it
-                // does not. The identity branch is the whole reason a contact
-                // may sit in the matrix permanently without gluing anything:
-                // a separated constraint contributes w·q_i to a row whose
-                // diagonal carries w, i.e. exactly nothing.
-                //
-                // Serial on purpose: several planes of one vertex write the
-                // same RHS row, and a contact set is orders of magnitude
-                // smaller than the spring set.
-                {
-                    Eigen::MatrixXd& rhs = mc.rhs;
+            // ---- LOCAL, contacts. ONE serial block for BOTH families, and
+            // serial on purpose: several constraints of one vertex write the
+            // same RHS row (a box corner's planes, a taco fold's self rows),
+            // and the contact set is orders of magnitude smaller than the
+            // spring set. It spans meshes, so it cannot live inside the
+            // per-mesh loop above.
+            //
+            // Every constraint here is the same shape: A = B = I, a target p,
+            // and the weight w already sitting on that vertex's diagonal. A
+            // constraint that is SATISFIED sets p to the vertex's own iterate
+            // — the identity map, which contributes w·q_i to a row whose
+            // diagonal carries w, i.e. exactly nothing. That branch is the
+            // whole reason a contact may sit in the matrix for the entire
+            // substep without gluing anything.
+            {
+                // Deposit w·p into vertex i of context `cc`, unless that
+                // mesh's factor lost its contact weights (refactor failure).
+                auto emit = [&](const SolveCtx& cc, Index i, double w,
+                                const Vec3& p) {
+                    if (!(w > 0.0) || !cc.mc->contactsLive) return;
+                    cc.mc->rhs((int)i, 0) += w * (double)p.x;
+                    cc.mc->rhs((int)i, 1) += w * (double)p.y;
+                    cc.mc->rhs((int)i, 2) += w * (double)p.z;
+                };
+
+                // ONE-SIDED planes: p is the closest point of
+                // { q : n·(q - b) >= thickness } to the live iterate.
+                for (SolveCtx& c : ctxs) {
+                    MeshCache& mc = *c.mc;
                     for (const ContactPlane& pl : mc.planes) {
                         const Index i = pl.vert;
                         const Vec3 qi = qVec(c, i);
@@ -973,13 +1151,150 @@ struct PdSystem<METAL, PR> {
                         Vec3 p = qi;
                         if (dist < c.thickness)
                             p += pl.n * (c.thickness - dist);
-                        rhs((int)i, 0) += pl.w * (double)p.x;
-                        rhs((int)i, 1) += pl.w * (double)p.y;
-                        rhs((int)i, 2) += pl.w * (double)p.z;
+                        emit(c, i, pl.w, p);
                     }
                 }
 
-                // GLOBAL: back-substitution against the prefactored A. This is
+                // TWO-WAY rows: the vertex-triangle inequality (Müller 2007
+                // eq 12/13) evaluated from the LIVE iterates of both meshes,
+                // then handed to the four vertices as four positional targets
+                // instead of being applied as four pushes. The four offsets
+                // are exactly the corrections the projection pass used to
+                // add — same mass-weighted split, same clamped barycentrics,
+                // same frozen entry side — so the constraint the energy holds
+                // is the one the narrow phase reported; only WHO applies it
+                // changed (the global solve, balanced against momentum and
+                // elasticity, instead of an unconditional post-solve add).
+                for (const TwoWayRow& tw : twoWayRows) {
+                    const SolveCtx& c  = ctxs[(size_t)tw.qc];
+                    const SolveCtx& pc = ctxs[(size_t)tw.pc];
+                    const Vec3 qv = qVec(c,  tw.vert);
+                    const Vec3 P1 = qVec(pc, tw.i1);
+                    const Vec3 P2 = qVec(pc, tw.i2);
+                    const Vec3 P3 = qVec(pc, tw.i3);
+                    // Offsets default to ZERO, i.e. every early-out below
+                    // lands on the identity constraint rather than skipping
+                    // the emit: the weight is on the diagonal for the whole
+                    // substep, so an omitted RHS term would not be "no
+                    // constraint", it would be a pull toward the origin.
+                    Vec3 dq, d1, d2, d3;
+                    const Vec3 e1 = P2 - P1, e2 = P3 - P1;
+                    const Vec3 ngeom = e1.cross(e2);
+                    const PR nlenG = ngeom.norm();
+                    if (nlenG >= PR(1e-12)) {       // else: degenerate triangle
+                        const Vec3 nh = ngeom / nlenG;
+                        // eq (13) is eq (12) with the cross-product order
+                        // flipped — i.e. a SIGN. Which one applies is the side
+                        // the vertex entered from, and the narrow phase
+                        // already oriented the row normal that way at substep
+                        // start, so read sigma off it instead of guessing from
+                        // the current (possibly already-corrected) geometry.
+                        const PR sigma = (tw.nrm.dot(nh) >= PR(0))
+                                       ? PR(1) : PR(-1);
+                        const Vec3 sn = nh * sigma;
+                        const PR hthk = std::max(c.thickness, pc.thickness);
+                        const PR C = sn.dot(qv - P1) - hthk;
+                        // Unilateral: already separated => IDENTITY, which is
+                        // what makes a resident row safe to re-evaluate every
+                        // iteration. Nothing accumulates.
+                        if (C < PR(0)) {
+                            // Barycentric coordinates of qv's projection onto
+                            // the triangle plane, clamped into the triangle so
+                            // a near-edge / near-vertex contact still
+                            // distributes a convex combination (Σb = 1) rather
+                            // than an extrapolating one.
+                            PR b1, b2, b3;
+                            const PR d00 = e1.dot(e1), d01 = e1.dot(e2);
+                            const PR d11 = e2.dot(e2);
+                            const Vec3 vq = qv - P1;
+                            const PR d20 = vq.dot(e1), d21 = vq.dot(e2);
+                            const PR bden = d00*d11 - d01*d01;
+                            if (!(std::abs(bden) > PR(1e-20))) {
+                                b1 = b2 = b3 = PR(1) / PR(3);
+                            } else {
+                                b2 = (d11*d20 - d01*d21) / bden;
+                                b3 = (d00*d21 - d01*d20) / bden;
+                                b1 = PR(1) - b2 - b3;
+                                if (b1 < PR(0)) b1 = PR(0);
+                                if (b2 < PR(0)) b2 = PR(0);
+                                if (b3 < PR(0)) b3 = PR(0);
+                                const PR bs = b1 + b2 + b3;
+                                if (bs < PR(1e-12)) b1 = b2 = b3 = PR(1)/PR(3);
+                                else { b1 /= bs; b2 /= bs; b3 /= bs; }
+                            }
+                            const PR wden = tw.iq + b1*b1*tw.i1w
+                                          + b2*b2*tw.i2w + b3*b3*tw.i3w;
+                            if (wden > PR(1e-12)) {
+                                // grad_q C = sigma*n, grad_pj C = -bj*sigma*n
+                                // (the normal's OWN derivative is deliberately
+                                // dropped — the standard PBD contact
+                                // distribution; the constraint VALUE still
+                                // follows the paper). Contact stiffness is 1:
+                                // this is a hard contact, matching the
+                                // one-sided target.
+                                const PR s = C / wden;
+                                dq = sn * (-s * tw.iq);
+                                d1 = sn * ( s * tw.i1w * b1);
+                                d2 = sn * ( s * tw.i2w * b2);
+                                d3 = sn * ( s * tw.i3w * b3);
+                            }
+                        }
+                    }
+                    emit(c,  tw.vert, tw.wq, qv + dq);
+                    emit(pc, tw.i1,   tw.w1, P1 + d1);
+                    emit(pc, tw.i2,   tw.w2, P2 + d2);
+                    emit(pc, tw.i3,   tw.w3, P3 + d3);
+                    // cd ESTIMATOR — see step (4) for what it is used for.
+                    // With the row in the energy there is no direct push to
+                    // sum, and the displacement the solve actually attributes
+                    // to this constraint is not separable from the rest of the
+                    // RHS. What is accumulated instead is the TARGET OFFSET
+                    // (p - q) each iteration asked for.
+                    //
+                    // cd is a SECOND-CHOICE estimator and only covers what the
+                    // per-row clamp in (4) cannot see: a vertex's share of a
+                    // row somebody ELSE queried. Where the row is the vertex's
+                    // own, (4) clamps along that row's frozen normal instead,
+                    // because summing offsets across roles cancels — a
+                    // self-fold vertex is pushed +n as a query and -n as a
+                    // triangle vertex of the neighbouring row, and the summed
+                    // direction then clamps neither (measured: 0.16 m of extra
+                    // peak height on the folded sheet).
+                    //
+                    // Why that one, of the estimators available: (4) uses cd
+                    // as a DIRECTION plus an upper bound on how much velocity
+                    // may be removed, and never removes below the vertex's own
+                    // approach speed. Under-estimating cd therefore LEAKS
+                    // depenetration into velocity — the invariant this whole
+                    // mechanism exists to protect — while over-estimating it
+                    // only degrades to the one-sided rows' behaviour (clamp
+                    // exactly to the approach speed), which is the same
+                    // treatment the plane constraints already get and is
+                    // strictly safe. Summing the per-iteration offsets
+                    // over-estimates (each iteration re-linearizes the same
+                    // penetration and the solve realizes only a fraction of
+                    // each ask), so it errs on the safe side by construction.
+                    // The final-sweep "remaining deficit" alternative errs the
+                    // wrong way: a converged row asks for ~0 and would clamp
+                    // nothing at all.
+                    // The QUERY share dq is deliberately NOT accumulated: the
+                    // query vertex's clamp reads this row's own frozen normal
+                    // in (4), and folding dq into cd would re-create the very
+                    // cancellation cd exists to avoid (dq along +n against
+                    // triangle shares along -n).
+                    if (pc.mc->contactsLive) {
+                        vertexRef(pc.cd, tw.i1) += d1;
+                        vertexRef(pc.cd, tw.i2) += d2;
+                        vertexRef(pc.cd, tw.i3) += d3;
+                    }
+                }
+            }
+
+            // ---- GLOBAL, per mesh.
+            for (SolveCtx& c : ctxs) {
+                MeshCache& mc = *c.mc;
+                const bool par = (c.n >= kParallelMinVerts);
+                // Back-substitution against the prefactored A. This is
                 // the step that makes PD implicit — every vertex sees every
                 // other through A⁻¹, which is why stiff springs do not explode
                 // the way the symplectic path does at the same substep count.
@@ -1005,137 +1320,6 @@ struct PdSystem<METAL, PR> {
                     });
                 } else {
                     mc.q = mc.factor->solve(mc.rhs);
-                }
-            }
-
-            // --- (3) TWO-WAY contacts only, ONCE PER ITERATION, after every
-            // mesh's global solve: vertex-triangle rows (Müller 2007
-            // eq 12/13) whose target is another live cloth of this substep,
-            // self rows included. One-sided rows are NOT here — they are
-            // constraints of the energy now (step (1b) + the contact block of
-            // the local step), so nothing pushes them post-solve.
-            //
-            // Re-projecting every iteration is safe because each row is a
-            // real INEQUALITY re-linearized against the live iterates: once
-            // separated it is a no-op, nothing accumulates. Running it INSIDE
-            // the loop lets the next iteration's spring projections see the
-            // pushed geometry (the stretch a push creates is re-solved
-            // instead of committed) and leaves the LAST operation of the loop
-            // a contact pass, so the committed q satisfies these rows.
-            //
-            // This is still the mechanism the paper does NOT use, and it is
-            // known to fight the global solve — the solve pulls a penetrating
-            // vertex back toward the energy minimum and the projection
-            // re-pushes it. Expressing a two-way row in the energy needs an
-            // off-diagonal A_i block (the barycentric combination of the four
-            // vertices), not the diagonal I the one-sided rows get; until
-            // that exists, the depenetration/velocity split in (4) keeps what
-            // was only overlap-undoing out of the velocity, exactly like PBD.
-            for (SolveCtx& c : ctxs) {
-                if (!c.contactsForMesh) continue;
-                for (Index i = 0; i < c.n; ++i) {
-                    forEachContact(c, i,
-                        [&](const NarrowCollision& row, const Vec3& nrm, PR) {
-                        const Index t = row.objPair.target;
-                        const SolveCtx* pc = twoWayTarget(t);
-                        if (!pc) return;   // one-sided: lives in the energy
-
-                        // TWO-WAY vertex-triangle contact (Müller 2007
-                        // eq 12/13), re-linearized from the LIVE iterates
-                        // each iteration so the triangle may move under the
-                        // vertex. A pinned QUERY vertex is NOT skipped here —
-                        // wq = 0 simply hands the whole correction to the
-                        // triangle.
-                        if (!pc->facets) return;
-                        const Index tri = row.indexPair.target;
-                        if (tri >= pc->numFacets) return;
-                        const Index i1 = pc->facets[tri*3+0];
-                        const Index i2 = pc->facets[tri*3+1];
-                        const Index i3 = pc->facets[tri*3+2];
-                        if (i1 >= pc->n || i2 >= pc->n || i3 >= pc->n) return;
-                        // Self rows never name an incident facet (the narrow
-                        // phase excludes adjacency), but a degenerate row must
-                        // not build a constraint of a vertex against itself.
-                        if (t == c.mi && (i == i1 || i == i2 || i == i3)) return;
-
-                        const Vec3 qv = qVec(c, i);
-                        const Vec3 P1 = qVec(*pc, i1);
-                        const Vec3 P2 = qVec(*pc, i2);
-                        const Vec3 P3 = qVec(*pc, i3);
-                        const Vec3 e1 = P2 - P1, e2 = P3 - P1;
-                        const Vec3 ngeom = e1.cross(e2);
-                        const PR nlenG = ngeom.norm();
-                        if (nlenG < PR(1e-12)) return;   // degenerate triangle
-                        const Vec3 nh = ngeom / nlenG;
-
-                        // eq (13) is eq (12) with the cross-product order
-                        // flipped — i.e. a SIGN. Which one applies is the side
-                        // the vertex entered from, and the narrow phase
-                        // already oriented the row normal that way at substep
-                        // start, so read sigma off it instead of guessing from
-                        // the current (possibly already-corrected) geometry.
-                        const PR sigma = (nrm.dot(nh) >= PR(0)) ? PR(1) : PR(-1);
-                        const Vec3 sn = nh * sigma;
-                        const PR hthk = std::max(c.thickness, pc->thickness);
-                        const PR C = sn.dot(qv - P1) - hthk;
-                        // Inequality: already separated => nothing to do. This
-                        // is what makes re-projecting every iteration safe.
-                        if (C >= PR(0)) return;
-
-                        // Barycentric coordinates of qv's projection onto the
-                        // triangle plane, clamped into the triangle so a
-                        // near-edge / near-vertex contact still distributes a
-                        // convex combination (Σb = 1) rather than an
-                        // extrapolating one.
-                        PR b1, b2, b3;
-                        const PR d00 = e1.dot(e1), d01 = e1.dot(e2);
-                        const PR d11 = e2.dot(e2);
-                        const Vec3 vq = qv - P1;
-                        const PR d20 = vq.dot(e1), d21 = vq.dot(e2);
-                        const PR bden = d00*d11 - d01*d01;
-                        if (!(std::abs(bden) > PR(1e-20))) {
-                            b1 = b2 = b3 = PR(1) / PR(3);
-                        } else {
-                            b2 = (d11*d20 - d01*d21) / bden;
-                            b3 = (d00*d21 - d01*d20) / bden;
-                            b1 = PR(1) - b2 - b3;
-                            if (b1 < PR(0)) b1 = PR(0);
-                            if (b2 < PR(0)) b2 = PR(0);
-                            if (b3 < PR(0)) b3 = PR(0);
-                            const PR bs = b1 + b2 + b3;
-                            if (bs < PR(1e-12)) b1 = b2 = b3 = PR(1) / PR(3);
-                            else { b1 /= bs; b2 /= bs; b3 /= bs; }
-                        }
-
-                        const PR wq = invMassOf(c.m,  c.mask,  i);
-                        const PR w1 = invMassOf(pc->m, pc->mask, i1);
-                        const PR w2 = invMassOf(pc->m, pc->mask, i2);
-                        const PR w3 = invMassOf(pc->m, pc->mask, i3);
-                        const PR wden = wq + b1*b1*w1 + b2*b2*w2 + b3*b3*w3;
-                        if (wden < PR(1e-12)) return;   // both sides pinned
-                        const PR s = C / wden;
-
-                        // grad_q C = sigma*n, grad_pj C = -bj*sigma*n (the
-                        // normal's OWN derivative is deliberately dropped —
-                        // the standard PBD contact distribution; the
-                        // constraint VALUE still follows the paper).
-                        // Contact stiffness is 1: this is a hard contact,
-                        // matching the one-sided push.
-                        const Vec3 dq = sn * (-s * wq);
-                        qAdd(c, i, dq);
-                        vertexRef(c.cd, i) += dq;
-                        const Index ids[3] = { i1, i2, i3 };
-                        const PR    bws[3] = { b1, b2, b3 };
-                        const PR    wws[3] = { w1, w2, w3 };
-                        for (int j = 0; j < 3; ++j) {
-                            if (wws[j] <= PR(0)) continue;
-                            const Vec3 dp = sn * (s * wws[j] * bws[j]);
-                            qAdd(*pc, ids[j], dp);
-                            vertexRef(pc->cd, ids[j]) += dp;
-                        }
-                        ++twoWayContactCount;
-                        if (t == c.mi) ++selfContactCount;
-                    });
                 }
             }
         }
@@ -1199,11 +1383,14 @@ struct PdSystem<METAL, PR> {
         //     the vertex actually made this substep, but may never send
         //     it out FASTER than it came in. freeDelta is the
         //     unconstrained (v + a·h)·h displacement, so -freeDelta·n is
-        //     exactly the approach along that contact's normal. One-sided
-        //     rows clamp per row; two-way rows clamp once, off the
-        //     ACCUMULATED displacement they actually produced (cd) —
-        //     clamping them per row as well would remove the same
-        //     velocity twice.
+        //     exactly the approach along that contact's normal. EVERY row
+        //     of a vertex clamps per row — one-sided planes and the two-way
+        //     rows this vertex is the QUERY of, both along the frozen row
+        //     normal. Only its TRIANGLE-vertex share of other vertices'
+        //     rows has no normal of its own to read, and that is what cd
+        //     is for. Both families are energy terms now, so neither delta
+        //     is a literal push any more; the clamp does not need it to be,
+        //     it needs a direction and a bound (see the cd estimator note).
         const PR invDt = PR(1) / dt;
         const PR velScale = PR(1) - damping;
         for (const SolveCtx& c : ctxs) {
@@ -1223,20 +1410,38 @@ struct PdSystem<METAL, PR> {
                     ? vertexAt(c.ext, i) * wi : Vec3();
                 const Vec3 freeDelta = (vertexAt(c.v, i) + accel * dt) * dt;
                 Vec3 delta = pi - vertexAt(c.x, i);
+                // EVERY row of this vertex, both families: the direction the
+                // contact could have pushed this vertex along is EXACTLY the
+                // row normal, whichever mechanism applied it, so a two-way row
+                // is clamped here as well and not left to `cd` alone. (This
+                // is not double-removal: the clamp drives delta·n down to
+                // `approach` and is idempotent for a repeated normal; only
+                // genuinely different normals compose.) Measured on the
+                // folded-sheet case, restricting the two-way rows to the cd
+                // clamp alone leaks ~0.16 m of extra peak height, because a
+                // vertex of a self-fold is the QUERY of some rows (pushed
+                // along +n) and a TRIANGLE vertex of others (pushed along -n)
+                // and its cd sum cancels to a direction that clamps neither.
+                // The sidedness predicate is deliberately NOT re-applied: a
+                // row the resolve REJECTED (bad triangle index, everybody
+                // pinned) then clamps a push nobody made, which can only
+                // remove velocity down to the approach speed and never below
+                // it — the same conservative direction the plane rows already
+                // err in when a refactor failure drops them.
                 forEachContact(c, i,
                     [&](const NarrowCollision& row, const Vec3& nrm, PR) {
-                    if (twoWayTarget(row.objPair.target)) return;
                     const PR dn = delta.dot(nrm);
                     if (dn <= PR(0)) return;
                     const PR approach = std::max(PR(0), -freeDelta.dot(nrm));
                     if (dn > approach) delta -= nrm * (dn - approach);
                 });
-                // Same split, generalized: the two-way corrections of this
-                // vertex sum to `cd`, whose direction is the only normal
-                // that survives combining several triangles. Remove at most
-                // what the contacts actually pushed (cdLen) beyond the
-                // approach speed — anything more would eat the vertex's own
-                // motion.
+                // The rows above only cover the vertex in its QUERY role
+                // (forEachContact walks ITS contact list). Its TRIANGLE-vertex
+                // share of somebody else's row is covered by `cd`, whose
+                // direction is the only normal that survives combining several
+                // triangles. Remove at most what those rows asked for (cdLen)
+                // beyond the approach speed — anything more would eat the
+                // vertex's own motion.
                 const Vec3 cdv = vertexAt(c.cd, i);
                 const PR cdLen = cdv.norm();
                 if (cdLen > PR(1e-12)) {
