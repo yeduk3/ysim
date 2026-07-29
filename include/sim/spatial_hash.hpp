@@ -1498,5 +1498,337 @@ struct MultiLevelSpatialHashing<METAL, PR> {
 };
 
 
+// ─────────────────────────────────────────────────────────────────────────
+// CpuSpatialHash — CPU uniform-grid broad phase (third sibling path).
+//
+// Why a CPU broad phase at all:
+//   * The GPU single-level SH pays 4+ commitAndWait per detect and emits
+//     SIX rows per cell-coincident face PAIR, which routinely blows past
+//     packedCollisionData.maxNumCollisions (= numPoints * 15) and silently
+//     drops real contacts.
+//   * Worse, the GPU SH leaves its broad kernel UNCOMMITTED, so the sync
+//     narrow consumer (NarrowPhase::narrow) — which early-outs on a CPU
+//     read of numBroadCollisions[0] — sees the queryBegin() reset value 0
+//     under the CPU solvers (PbdSystem::step commitAndWaits at its top,
+//     i.e. AFTER narrow already bailed). Narrow then never runs.
+// Writing the counter and the rows CPU-side removes both problems by
+// construction: no dispatch, no sync, and the count is already visible to
+// the very next CPU read.
+//
+// Output convention: VERTEX-major. One BroadCollision row per
+// (query vertex, target face) candidate, deduped — not the GPU path's 6
+// rows per face pair — so the row count stays near the true contact count
+// and the fixed buffer is not the binding constraint.
+//
+// Namespaces (mirror src/metal/spatialhashing.metal:446-478 exactly):
+//   indexPair.point    = LOCAL vertex index inside the query mesh
+//   indexPair.triangle = LOCAL face index inside the target mesh
+//   objPair            = mesh ARRAY indices (statesOffsets/facetsOffsets subs)
+//   behaviorPair       = (uint)BehaviorType of query / target
+//   shapePair          = (uint)GeneralMesh::colliderKind of query / target
+//
+// LIMITATION — CPU-solver path only. Under the GPU symplectic solver the
+// mid-frame vertex positions are still GPU-pending when this runs, so it
+// would read frame-stale `x` between syncs. It is intended for usePbd /
+// usePd, where `x` is CPU-fresh every substep. (It stays correct-but-lagged
+// under the symplectic path, not incorrect-and-silent.)
+//
+// LIMITATION — single level. cellSize is the MAX inflated face extent in
+// the scene, so one giant triangle (e.g. a 2-triangle ground plane) makes
+// the grid degenerate into near-brute-force. Tessellated colliders (the
+// addPlane(24, 3.0) idiom) are the intended input; the multi-level GPU
+// hgrid is the answer for mixed scales.
+// ─────────────────────────────────────────────────────────────────────────
+#include <unordered_map>
+#include <vector>
+#include <cmath>
+#include <chrono>
+
+template <typename PR>
+struct CpuSpatialHash {
+    // ---- Stats (per detectCollisions call + cumulative) -----------------
+    struct Stats {
+        uint32_t rows        = 0;   // rows actually written this call
+        uint32_t droppedRows = 0;   // candidates lost to maxNumCollisions
+        uint32_t targetFaces = 0;   // faces inserted into the grid
+        uint32_t queryVerts  = 0;   // vertices probed
+        uint32_t candidates  = 0;   // post-dedup, pre-precull candidates
+        uint32_t cellInserts = 0;   // face→cell insertions
+        double   cellSize    = 0.0;
+        double   ms_total    = 0.0;
+    };
+    Stats    lastStats;
+    uint64_t totalRows    = 0;
+    uint64_t totalDropped = 0;
+    uint64_t totalCalls   = 0;
+    bool     verbose      = false;
+
+    // ---- Scratch (members: reused across calls, no per-call churn) ------
+    // Face key box = face AABB inflated by `margin`. The precull below is
+    // the box form of the spec's sphere test (strictly TIGHTER, and still a
+    // conservative superset of every true within-margin contact).
+    struct FaceRec {
+        float    bmin[3];
+        float    bmax[3];
+        uint32_t obj;        // mesh array index
+        uint32_t localFace;  // face index inside that mesh
+    };
+    struct Cell {
+        uint32_t              gen = 0;   // generation stamp; != gridGen ⇒ stale
+        std::vector<uint32_t> items;     // indices into `faces`
+    };
+    std::vector<FaceRec>                faces;
+    std::unordered_map<uint64_t, Cell>  grid;
+    uint32_t                            gridGen = 0;
+    std::vector<uint32_t>               seen;    // per-vertex dedup scratch
+
+    // Exact 21-bit-per-axis cell key (biased so negatives stay in range).
+    // Coordinates beyond ±2^20 alias, which can only MERGE cells → extra
+    // candidates that the precull rejects. Never causes a miss.
+    static inline uint64_t cellKey(int32_t x, int32_t y, int32_t z) {
+        const uint64_t ux = (uint64_t)(uint32_t)(x + 0x100000) & 0x1FFFFFull;
+        const uint64_t uy = (uint64_t)(uint32_t)(y + 0x100000) & 0x1FFFFFull;
+        const uint64_t uz = (uint64_t)(uint32_t)(z + 0x100000) & 0x1FFFFFull;
+        return ux | (uy << 21) | (uz << 42);
+    }
+
+    // ---- BVH<SCENE,OBJECT> surface mirrors (all no-ops) -----------------
+    void build(Scene<METAL, PR>& /*scene*/) {}
+    void refit()                        {}   // grid rebuilt each detect
+    void enlargeTrajectory(PR /*dt*/)   {}   // swept box built inline
+    void queryBegin() {
+        Scene<METAL, PR>::packedCollisionData.numBroadCollisions[0] = 0;
+    }
+    void queryEnd()                     {}   // nothing to sync: all CPU
+    void showBox()                      {}
+    void showSceneBox()                 {}
+    void queryClickRay(const Ray& /*ray*/) {}
+
+    void detectCollisions(PR margin, bool enableSelfCollisions = true) {
+        using Clock = std::chrono::steady_clock;
+        const auto t0 = Clock::now();
+
+        auto& packedCol = Scene<METAL, PR>::packedCollisionData;
+        auto& meshes    = Scene<METAL, PR>::meshes;
+        const Index numMeshes = Scene<METAL, PR>::numMeshes;
+
+        lastStats = Stats{};
+        // 1) Reset the counter CPU-side. This IS the narrow-phase gate.
+        if (!packedCol.numBroadCollisions.ptr) return;
+        packedCol.numBroadCollisions[0] = 0;
+        if (numMeshes == 0 || !packedCol.broadCollisions.ptr) return;
+
+        const float m = (float)margin;
+
+        // 2) Collect target-face key boxes from the live state.x.
+        faces.clear();
+        float maxExtent = 0.f;
+        for (Index t = 0; t < numMeshes; ++t) {
+            auto& tm = meshes[t];
+            if (!tm.collidable) continue;
+            if (!tm.state.x.ptr || !tm.adjacency.facets.ptr) continue;
+            const Index nf = tm.adjacency.facets.size / 3;
+            if (nf == 0) continue;
+            const Index* F = tm.adjacency.facets.ptr;
+            const PR*    X = tm.state.x.ptr;
+            for (Index f = 0; f < nf; ++f) {
+                const Index i0 = F[f * 3 + 0];
+                const Index i1 = F[f * 3 + 1];
+                const Index i2 = F[f * 3 + 2];
+                FaceRec rec;
+                bool ok = true;
+                for (int a = 0; a < 3; ++a) {
+                    const float p0 = (float)X[i0 * 3 + a];
+                    const float p1 = (float)X[i1 * 3 + a];
+                    const float p2 = (float)X[i2 * 3 + a];
+                    if (!std::isfinite(p0) || !std::isfinite(p1)
+                        || !std::isfinite(p2)) { ok = false; break; }
+                    const float lo = std::min(p0, std::min(p1, p2));
+                    const float hi = std::max(p0, std::max(p1, p2));
+                    rec.bmin[a] = lo - m;
+                    rec.bmax[a] = hi + m;
+                }
+                if (!ok) continue;   // NaN vertex: drop the face, keep going
+                rec.obj       = (uint32_t)t;
+                rec.localFace = (uint32_t)f;
+                for (int a = 0; a < 3; ++a)
+                    maxExtent = std::max(maxExtent, rec.bmax[a] - rec.bmin[a]);
+                faces.push_back(rec);
+            }
+        }
+        lastStats.targetFaces = (uint32_t)faces.size();
+        if (faces.empty()) {
+            lastStats.ms_total = std::chrono::duration<double, std::milli>(
+                Clock::now() - t0).count();
+            ++totalCalls;
+            return;
+        }
+
+        // 3) cellSize = largest inflated face extent ⇒ every face spans at
+        //    most 2 cells per axis (≤8 inserts), which bounds the build.
+        float cs = maxExtent;
+        if (!(cs > 1e-5f)) cs = 1e-5f;
+        const float invCs = 1.f / cs;
+        lastStats.cellSize = (double)cs;
+
+        // 4) Insert faces. Generation stamping keeps the map's buckets and
+        //    the per-cell vectors' capacity warm across calls (map.clear()
+        //    would free every one of them).
+        if (++gridGen == 0) { grid.clear(); gridGen = 1; }
+        for (uint32_t fi = 0; fi < (uint32_t)faces.size(); ++fi) {
+            const FaceRec& fr = faces[fi];
+            int lo[3], hi[3];
+            bool sane = true;
+            for (int a = 0; a < 3; ++a) {
+                lo[a] = (int)std::floor(fr.bmin[a] * invCs);
+                hi[a] = (int)std::floor(fr.bmax[a] * invCs);
+                if (hi[a] - lo[a] > 64) { sane = false; break; }
+            }
+            if (!sane) continue;   // pathological span (shouldn't happen)
+            for (int z = lo[2]; z <= hi[2]; ++z)
+              for (int y = lo[1]; y <= hi[1]; ++y)
+                for (int x = lo[0]; x <= hi[0]; ++x) {
+                    Cell& c = grid[cellKey(x, y, z)];
+                    if (c.gen != gridGen) { c.gen = gridGen; c.items.clear(); }
+                    c.items.push_back(fi);
+                    ++lastStats.cellInserts;
+                }
+        }
+
+        // 5) Query. Skip Float / Kinematic (target-only behaviors) and any
+        //    mesh whose collidable master switch is off.
+        BroadCollision* out = packedCol.broadCollisions.ptr;
+        const Index     cap = packedCol.maxNumCollisions;
+        Index    count   = 0;
+        uint32_t dropped = 0;
+
+        for (Index q = 0; q < numMeshes; ++q) {
+            auto& qm = meshes[q];
+            if (!qm.collidable) continue;
+            if (qm.behaviorType == BehaviorType::Float
+                || qm.behaviorType == BehaviorType::Kinematic) continue;
+            if (!qm.state.x.ptr) continue;
+            const Index nv = qm.state.x.size / 3;
+            if (nv == 0) continue;
+            const PR* X  = qm.state.x.ptr;
+            // xPrev is seeded to x at Scene::pack and re-snapshotted every
+            // substep, so the swept box is the same segment the CCD narrow
+            // phase (D-013) tests — one substep lagged, by construction.
+            const PR* XP = qm.state.xPrev.ptr ? qm.state.xPrev.ptr : X;
+            const uint32_t behQ = (uint32_t)qm.behaviorType;
+            const uint32_t shpQ = (uint32_t)qm.colliderKind;
+
+            for (Index v = 0; v < nv; ++v) {
+                float vlo[3], vhi[3];
+                bool ok = true;
+                for (int a = 0; a < 3; ++a) {
+                    const float pc = (float)X[v * 3 + a];
+                    float       pp = (float)XP[v * 3 + a];
+                    if (!std::isfinite(pc)) { ok = false; break; }
+                    // Guard a garbage / teleported xPrev: a sweep longer than
+                    // a metre is a pin snap, not motion — use the point.
+                    if (!std::isfinite(pp) || std::abs(pp - pc) > 1.f) pp = pc;
+                    vlo[a] = std::min(pc, pp);
+                    vhi[a] = std::max(pc, pp);
+                }
+                if (!ok) continue;
+                ++lastStats.queryVerts;
+
+                int lo[3], hi[3];
+                bool sane = true;
+                for (int a = 0; a < 3; ++a) {
+                    lo[a] = (int)std::floor(vlo[a] * invCs);
+                    hi[a] = (int)std::floor(vhi[a] * invCs);
+                    if (hi[a] - lo[a] > 64) { sane = false; break; }
+                }
+                if (!sane) continue;
+                const bool multiCell = (lo[0] != hi[0]) || (lo[1] != hi[1])
+                                    || (lo[2] != hi[2]);
+                if (multiCell) seen.clear();
+
+                for (int z = lo[2]; z <= hi[2]; ++z)
+                  for (int y = lo[1]; y <= hi[1]; ++y)
+                    for (int x = lo[0]; x <= hi[0]; ++x) {
+                        auto it = grid.find(cellKey(x, y, z));
+                        if (it == grid.end() || it->second.gen != gridGen)
+                            continue;
+                        for (uint32_t fi : it->second.items) {
+                            // Dedup: a face straddling two probed cells must
+                            // yield ONE row. Single-cell probes can't repeat.
+                            if (multiCell) {
+                                bool dup = false;
+                                for (uint32_t s : seen)
+                                    if (s == fi) { dup = true; break; }
+                                if (dup) continue;
+                                seen.push_back(fi);
+                            }
+                            const FaceRec& fr = faces[fi];
+                            // Distance precull: swept-vertex box vs the
+                            // margin-inflated face box.
+                            if (vhi[0] < fr.bmin[0] || vlo[0] > fr.bmax[0]
+                             || vhi[1] < fr.bmin[1] || vlo[1] > fr.bmax[1]
+                             || vhi[2] < fr.bmin[2] || vlo[2] > fr.bmax[2])
+                                continue;
+                            const Index t = (Index)fr.obj;
+                            if (t == q) {
+                                // Self rows only when asked (mirrors
+                                // spatialhashing.metal:423).
+                                if (!enableSelfCollisions) continue;
+                                // Cheap early-out on the vertex's OWN face;
+                                // the narrow kernel drops the rest of ring-1
+                                // via sceneVertexAdjFacets.
+                                const Index* TF = meshes[t].adjacency.facets.ptr;
+                                const uint32_t b = fr.localFace * 3;
+                                if (TF[b] == v || TF[b + 1] == v
+                                    || TF[b + 2] == v) continue;
+                            }
+                            ++lastStats.candidates;
+                            if (count >= cap) { ++dropped; continue; }
+                            BroadCollision& row = out[count++];
+                            row.indexPair.point    = v;
+                            row.indexPair.triangle = fr.localFace;
+                            row.objPair.query      = q;
+                            row.objPair.target     = t;
+                            row.behaviorPair.query  = behQ;
+                            row.behaviorPair.target =
+                                (uint32_t)meshes[t].behaviorType;
+                            row.shapePair.query  = shpQ;
+                            row.shapePair.target =
+                                (uint32_t)meshes[t].colliderKind;
+                        }
+                    }
+            }
+        }
+
+        // 6) Publish the count CPU-side — the sync narrow phase reads this
+        //    directly and now sees a truthful non-zero value.
+        packedCol.numBroadCollisions[0] = count;
+
+        lastStats.rows        = (uint32_t)count;
+        lastStats.droppedRows = dropped;
+        lastStats.ms_total    = std::chrono::duration<double, std::milli>(
+            Clock::now() - t0).count();
+        totalRows    += lastStats.rows;
+        totalDropped += lastStats.droppedRows;
+        ++totalCalls;
+        if (verbose && dropped)
+            std::cout << "[CPSH] broad-phase overflow: dropped " << dropped
+                      << " rows (cap " << cap << ")\n";
+    }
+
+    void printLastStats(std::ostream& os, Index frame, Index substep) const {
+        os << "[F=" << frame << " S=" << substep << "] cpsh:"
+           << " tgtFaces=" << lastStats.targetFaces
+           << " qVerts="   << lastStats.queryVerts
+           << " cellIns="  << lastStats.cellInserts
+           << " cand="     << lastStats.candidates
+           << " rows="     << lastStats.rows
+           << " dropped="  << lastStats.droppedRows
+           << " cs="       << lastStats.cellSize
+           << " tot="      << lastStats.ms_total << "ms\n";
+    }
+};
+
+
 // TODO: BroadPhase, BVH
 template <typename BE, typename PR, Index MODE, Index PRIMITIVE>

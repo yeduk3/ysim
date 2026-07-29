@@ -303,6 +303,230 @@ static int runSelfTest() {
     Simulator<Backend, Precision, SymplecticSystem<Backend, Precision>> sim(system);
     sim.pause = false;  // self-test wants update() to actually step.
 
+    // ── YSIM_TEST_CPSH — CPU spatial-hash broad phase (isolated) ─────────
+    // Env-gated fast path: runs ONLY the CPSH checks and returns, so the
+    // 40-block suite stays out of the loop while this sibling is iterated
+    // on. Everything here drives the CPU PBD solver, which is the intended
+    // consumer (state.x is CPU-fresh every substep).
+    if (std::getenv("YSIM_TEST_CPSH")) {
+        using Clock = std::chrono::steady_clock;
+        const Precision cpshThickness = Precision(0.01);
+        // A/B lever for the SAME three scenes: YSIM_TEST_CPSH=bvh (or =sh)
+        // runs them on the baseline broad phase instead, so the perf lines
+        // below are directly comparable. Anything else = the CPU hash.
+        const std::string cpshMode = std::getenv("YSIM_TEST_CPSH");
+        const bool cpshUseBvh = (cpshMode == "bvh");
+        const bool cpshUseGpuSh = (cpshMode == "sh");
+
+        auto minYOfId = [&](int objId) -> double {
+            auto* m = Scene<Backend, Precision>::findById(objId);
+            if (!m || !m->state.x.ptr) return std::numeric_limits<double>::quiet_NaN();
+            const Index n = m->state.x.size / 3;
+            if (n == 0) return std::numeric_limits<double>::quiet_NaN();
+            double lo = 1e30;
+            for (Index i = 0; i < n; ++i)
+                lo = std::min(lo, (double)m->state.x.ptr[i * 3 + 1]);
+            return lo;
+        };
+        auto anyNonFinite = [&](int objId) -> bool {
+            auto* m = Scene<Backend, Precision>::findById(objId);
+            if (!m || !m->state.x.ptr) return true;
+            const Index n = m->state.x.size;
+            for (Index i = 0; i < n; ++i)
+                if (!std::isfinite((double)m->state.x.ptr[i])) return true;
+            return false;
+        };
+        // Post-initialize activation: the YSIM_BROADPHASE hook inside
+        // initialize() is a SEPARATE entry point — set the flag directly so
+        // the test never depends on the caller's environment.
+        auto armCpsh = [&](bool selfOn) {
+            sim.usePbd                = true;
+            sim.usePd                 = false;
+            sim.useCpuSpatialHashing  = !cpshUseBvh && !cpshUseGpuSh;
+            sim.useSpatialHashing     = cpshUseGpuSh;
+            sim.useMultiLevelSH       = false;
+            sim.cdSubstepPeriod       = 1;
+            sim.refitSubstepPeriod    = 1;
+            sim.enableSelfCollisions  = selfOn;
+            sim.pause                 = false;
+        };
+        auto reportPerf = [&](const char* tag, int frames, double ms) {
+            auto& bp = sim.cpuShBroadPhase;
+            std::cerr << "[CPSH perf] " << tag << ": " << frames << " frames in "
+                      << ms << " ms (" << (frames ? ms / frames : 0.0)
+                      << " ms/frame) | detects=" << bp.totalCalls
+                      << " rowsEmitted=" << bp.totalRows
+                      << " rowsDropped=" << bp.totalDropped
+                      << " lastRows=" << bp.lastStats.rows
+                      << " lastCand=" << bp.lastStats.candidates
+                      << " lastTgtFaces=" << bp.lastStats.targetFaces
+                      << " cellSize=" << bp.lastStats.cellSize
+                      << " lastDetectMs=" << bp.lastStats.ms_total << "\n";
+        };
+
+        system.subSteps = 8;
+        system.subh     = system.h / Precision(8);
+
+        // ---- CPSH-1 — inter-object: cloth falls onto a Float floor. -----
+        {
+            resetScene();
+            sim.addPlane(PlaneDirection::XZPlane, tinym::vec3(0, 0, 0), 24,
+                         Precision(3.0), Precision(0.1),
+                         BehaviorType::Float);                        // id 0
+            sim.addCloth(20, Precision(1), tinym::vec3(0.0f, 0.6f, 0.0f),
+                         1e5, 1e5, 2e5, cpshThickness);               // id 1
+            sim.initialize();
+            armCpsh(false);
+            sim.cpuShBroadPhase.totalRows = sim.cpuShBroadPhase.totalDropped =
+                sim.cpuShBroadPhase.totalCalls = 0;
+
+            const size_t narrowBefore =
+                Scene<Backend, Precision>::packedCollisionData.cumulativeNarrowCollisions;
+            const int frames = 120;
+            const auto t0 = Clock::now();
+            for (int f = 0; f < frames; ++f) {
+                sim.update();
+                MetalGlobalContext::commitAndWait();
+            }
+            const double ms = std::chrono::duration<double, std::milli>(
+                Clock::now() - t0).count();
+            sim.pause = true;
+            const size_t narrowGrew =
+                Scene<Backend, Precision>::packedCollisionData.cumulativeNarrowCollisions
+                - narrowBefore;
+            const double lowY = minYOfId(1);
+            reportPerf("CPSH-1", frames, ms);
+            std::cerr << "[CPSH perf] CPSH-1 narrowContacts=" << narrowGrew
+                      << " clothMinY=" << lowY << "\n";
+
+            const char* n1 = "CPSH-1 / CPU spatial hash: cloth rests on the "
+                             "Float floor and narrow contacts fire";
+            if (anyNonFinite(1) || !std::isfinite(lowY))
+                fail(n1, "non-finite cloth state");
+            else if (narrowGrew == 0)
+                fail(n1, "narrow phase never ran (cumulativeNarrowCollisions "
+                         "did not grow across 120 frames)");
+            else if (!(lowY > -0.05))
+                fail(n1, "cloth tunneled through the floor: min y "
+                     + std::to_string(lowY) + " <= -0.05");
+            else
+                pass(n1);
+        }
+
+        // ---- CPSH-2 — two-way cloth-cloth (no floor). --------------------
+        {
+            resetScene();
+            const Index kG = 9;
+            sim.addCloth(kG, Precision(1.0), tinym::vec3(0.0f, 0.6f, 0.0f),
+                         1e5, 1e5, 3e5, cpshThickness);               // id 0
+            {
+                auto& req = Scene<Backend, Precision>::requestsGeneralMeshes.back();
+                const float hh = 0.5f, yy = 0.6f;
+                const uint32_t vids[4] = { 0, (uint32_t)kG - 1,
+                                           (uint32_t)(kG * (kG - 1)),
+                                           (uint32_t)(kG * kG - 1) };
+                const tinym::vec3 ps[4] = { {-hh, yy, -hh}, {hh, yy, -hh},
+                                            {-hh, yy,  hh}, {hh, yy,  hh} };
+                for (int i = 0; i < 4; ++i)
+                    req.fixedVertices.push_back(FixedVertex{vids[i], ps[i]});
+            }
+            sim.addCloth(7, Precision(0.5), tinym::vec3(0.0f, 0.75f, 0.0f),
+                         1e5, 1e5, 3e5, cpshThickness);               // id 1
+            sim.initialize();
+            armCpsh(true);
+            sim.cpuShBroadPhase.totalRows = sim.cpuShBroadPhase.totalDropped =
+                sim.cpuShBroadPhase.totalCalls = 0;
+
+            uint64_t twoWayTotal = 0;
+            bool blew = false;
+            const int frames = 60;
+            const auto t0 = Clock::now();
+            for (int f = 0; f < frames; ++f) {
+                sim.update();
+                MetalGlobalContext::commitAndWait();
+                twoWayTotal += sim.pbd.twoWayContactCount;
+                if (anyNonFinite(0) || anyNonFinite(1)) { blew = true; break; }
+            }
+            const double ms = std::chrono::duration<double, std::milli>(
+                Clock::now() - t0).count();
+            sim.pause = true;
+            const double topLow = minYOfId(1);
+            reportPerf("CPSH-2", frames, ms);
+            std::cerr << "[CPSH perf] CPSH-2 twoWayTotal=" << twoWayTotal
+                      << " topMinY=" << topLow << "\n";
+
+            const char* n2 = "CPSH-2 / CPU spatial hash: two-way cloth-cloth "
+                             "rows reach the PBD contact path";
+            if (blew || !std::isfinite(topLow))
+                fail(n2, "non-finite cloth state in the two-cloth stack");
+            else if (twoWayTotal == 0)
+                fail(n2, "two-way contact path never ran "
+                         "(twoWayContactCount stayed 0 across 60 frames)");
+            else if (!(topLow > 0.30))
+                fail(n2, "top sheet fell through the pinned sheet: min y "
+                     + std::to_string(topLow) + " <= 0.30");
+            else
+                pass(n2);
+        }
+
+        // ---- CPSH-3 — self rows from the PBD-8 folded taco. --------------
+        {
+            resetScene();
+            const Index kG8 = 12;
+            sim.addCloth(kG8, Precision(0.6), tinym::vec3(0.0f, 0.8f, 0.0f),
+                         1e5, 1e5, 3e5, cpshThickness);               // id 0
+            {
+                auto& req = Scene<Backend, Precision>::requestsGeneralMeshes.back();
+                // Two diagonally-opposite corners pinned 4 mm apart: the
+                // sheet folds into a hanging taco whose halves stay in
+                // layer-on-layer contact — only q==t rows express that.
+                req.fixedVertices.push_back(
+                    FixedVertex{0u, tinym::vec3(0.0f, 0.8f, 0.0f)});
+                req.fixedVertices.push_back(
+                    FixedVertex{(uint32_t)(kG8 * kG8 - 1),
+                                tinym::vec3(0.004f, 0.8f, 0.004f)});
+            }
+            sim.initialize();
+            armCpsh(true);
+            sim.cpuShBroadPhase.totalRows = sim.cpuShBroadPhase.totalDropped =
+                sim.cpuShBroadPhase.totalCalls = 0;
+
+            uint64_t selfTotal = 0;
+            bool blew = false;
+            const int frames = 90;
+            const auto t0 = Clock::now();
+            for (int f = 0; f < frames; ++f) {
+                sim.update();
+                MetalGlobalContext::commitAndWait();
+                selfTotal += sim.pbd.selfContactCount;
+                if (anyNonFinite(0)) { blew = true; break; }
+            }
+            const double ms = std::chrono::duration<double, std::milli>(
+                Clock::now() - t0).count();
+            sim.pause = true;
+            reportPerf("CPSH-3", frames, ms);
+            std::cerr << "[CPSH perf] CPSH-3 selfTotal=" << selfTotal << "\n";
+
+            const char* n3 = "CPSH-3 / CPU spatial hash: folded sheet emits "
+                             "self rows and stays finite";
+            if (blew)
+                fail(n3, "non-finite cloth state in the folded-sheet scene");
+            else if (selfTotal == 0)
+                fail(n3, "no self rows consumed (selfContactCount stayed 0 "
+                         "across 90 frames of a folded hanging sheet)");
+            else
+                pass(n3);
+        }
+
+        sim.pause                = true;
+        sim.usePbd               = false;
+        sim.useCpuSpatialHashing = false;
+        sim.enableSelfCollisions = false;
+        if (failures == 0) std::cerr << "[self-test] CPSH checks passed\n";
+        else std::cerr << "[self-test] " << failures << " CPSH failure(s)\n";
+        return failures;
+    }
+
     // ---- Block 1: CM-002 regression — re-running pack() is safe. ---------
     buildSyntheticScene(sim);   // loads test/fixtures/synthetic.json
     sim.initialize();

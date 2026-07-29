@@ -46,6 +46,16 @@ struct Simulator {
     MultiLevelSpatialHashing<METAL, PR> mlBroadPhase;
     bool useMultiLevelSH = false;
 
+    // CPU uniform-grid spatial-hash broadphase (third sibling). Selected when
+    // useCpuSpatialHashing == true, which takes priority over BOTH GPU hashes
+    // in the substep dispatch chain. Emits VERTEX-major rows and writes
+    // numBroadCollisions[0] on the CPU, so the sync narrow phase's counter
+    // gate is truthful without any commitAndWait — see CpuSpatialHash's
+    // header comment for why the GPU SH path fails that gate under usePbd/
+    // usePd. Intended for the CPU solvers (x is CPU-fresh every substep).
+    CpuSpatialHash<PR> cpuShBroadPhase;
+    bool useCpuSpatialHashing = false;
+
     // BVH path A/B toggle (only meaningful when useSpatialHashing == false).
     //   false (default) -> baseline queryPoints (per-leaf-hit global atomicAdd)
     //   true            -> queryPointsSegmented (per-TG private + reduce)
@@ -67,6 +77,7 @@ struct Simulator {
     bool analyticColliderActive() const {
         return !useSpatialHashing
             && !useMultiLevelSH
+            && !useCpuSpatialHashing
             && !collisionPipeline.broadPhase.twoMeshExperiment
             && Scene<BE, PR>::numAnalytic > 0;
     }
@@ -2760,13 +2771,19 @@ struct Simulator {
         shBroadPhase                     = decltype(shBroadPhase){};
         mlBroadPhase                     = decltype(mlBroadPhase){};
 
-        // Broad-phase method headless hook: YSIM_BROADPHASE=sh|ml selects the
-        // single-level or multi-level spatial hash (default BVH). Tunables:
+        // Broad-phase method headless hook: YSIM_BROADPHASE=sh|ml|cpu selects
+        // the single-level GPU hash, the multi-level GPU hash, or the CPU
+        // uniform-grid hash (default BVH). Tunables:
         // YSIM_ML_LEVELS=<L>, YSIM_FLOOR_DIAG=<world-diag exclusion threshold>.
         if (const char* bp = std::getenv("YSIM_BROADPHASE")) {
             std::string s(bp);
             if (s == "sh") { useSpatialHashing = true;  useMultiLevelSH = false; }
             else if (s == "ml") { useMultiLevelSH = true; useSpatialHashing = false; }
+            else if (s == "cpu") {
+                useCpuSpatialHashing = true;
+                useSpatialHashing    = false;
+                useMultiLevelSH      = false;
+            }
         }
         if (const char* lv = std::getenv("YSIM_ML_LEVELS")) {
             int L = std::atoi(lv);
@@ -3241,7 +3258,34 @@ struct Simulator {
                 const bool doRefit = (i % refitP == 0);
                 const bool doBroad = (i % cdP    == 0);
 
-                if (useMultiLevelSH) {
+                if (useCpuSpatialHashing) {
+                    // CPU uniform-grid hash. Pure CPU: no dispatch, no
+                    // commitAndWait, and numBroadCollisions[0] is written
+                    // host-side so the sync narrow phase's counter gate is
+                    // already truthful when narrowAndSortByVertices runs.
+                    // refit() is a no-op (grid rebuilt each detect), mirroring
+                    // the two GPU hash branches below.
+                    cpuShBroadPhase.verbose = logSHPerSubstep;
+                    if (doRefit) {
+                        if (profiler) {
+                            auto scope = profiler->scoped("broad_refit");
+                            cpuShBroadPhase.refit();
+                        } else {
+                            cpuShBroadPhase.refit();
+                        }
+                    }
+                    if (doBroad) {
+                        if (profiler) {
+                            auto scope = profiler->scoped("broad_detect");
+                            cpuShBroadPhase.detectCollisions(margin, enableSelfCollisions);
+                        } else {
+                            cpuShBroadPhase.detectCollisions(margin, enableSelfCollisions);
+                        }
+                        if (logSHPerSubstep) {
+                            cpuShBroadPhase.printLastStats(std::cout, frame, i);
+                        }
+                    }
+                } else if (useMultiLevelSH) {
                     // Multi-level (hgrid) spatial hash. Same surface as the
                     // single-level path; detectCollisions rebuilds the grid and
                     // emits its own mlsh_* per-stage scopes. refit() is a no-op.
