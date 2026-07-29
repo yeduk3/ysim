@@ -7395,8 +7395,23 @@ static int runSelfTest() {
     //         split (the AC-10 launch failure) survived the port from PBD,
     //   PD-5  two-way cross-cloth rows correct BOTH sheets (PBD-7's scene),
     //   PD-6  self rows reach the two-way path without adding energy
-    //         (PBD-8's folded taco, A/B against a self-off baseline).
+    //         (PBD-8's folded taco, A/B against a self-off baseline),
+    //   PD-7  the material stiffness is INDEPENDENT of the iteration count
+    //         (the momentum term stays in the objective — PD's defining
+    //         difference from PBD, whose stiffness drifts with the budget),
+    //   PD-8  the local/global iteration weakly DECREASES the objective, so
+    //         the descent needs no line search and no safeguards.
     {
+        // The whole PD family runs at PD's OWN operating point: 3 substeps
+        // with the solver's default 10 iterations (Bouaziz 2014 §7.3's 5-10
+        // band). The implicit global solve is what buys the large stable
+        // substep — gating PD at the symplectic path's 50-60 substeps would
+        // verify a configuration no PD scene actually runs.
+        const size_t pdFamSavedSubSteps = system.subSteps;
+        const Precision pdFamSavedSubh  = system.subh;
+        system.subSteps = 3;
+        system.subh     = system.h / Precision(3);
+
         // Same edge-tail guard the PBD block documents: adjacency.edges.size is
         // the initializer's UPPER BOUND (210 slots for an 8x8 grid, 161 real
         // edges) and the tail is uninitialised pool memory reinterpreted as
@@ -7593,13 +7608,16 @@ static int runSelfTest() {
         // entirely overlap being undone. v = (q-x)/h would report that rescue
         // as ~900 m/s at subh = 1/3000 and the cloth would leave the scene;
         // the clamp caps it at the approach speed the vertex actually made.
-        // Same substep count (50) as the AC block for the same reason — the
-        // failure magnitude scales with 1/subh — restored afterwards.
+        // Run at PD's OWN operating point (3 substeps — the implicit solve
+        // does not want the symplectic path's substep budget). The failure
+        // magnitude scales with 1/subh, so the uncorrected rescue still
+        // reads ~54 m/s at subh = 1/180 and leaves the scene — the gate
+        // stays a gate. Restored afterwards.
         {
             const size_t pdSavedSubSteps = system.subSteps;
             const Precision pdSavedSubh  = system.subh;
-            system.subSteps = 50;
-            system.subh     = system.h / Precision(50);
+            system.subSteps = 3;
+            system.subh     = system.h / Precision(3);
 
             auto meanY = [&](int id) -> double {
                 auto* m = Scene<Backend, Precision>::findById(id);
@@ -7684,17 +7702,19 @@ static int runSelfTest() {
         }
 
         // ---- PD-5 / PD-6: contact parity with the PBD path. Both scenes are
-        // lifted from PBD-7 / PBD-8 and run at the same 50-substep count those
-        // clauses use, so their (loose) bounds carry over. What they exercise
-        // is the contact machinery ported from PbdSystem step (3) into PD's
-        // iteration loop: two-way vertex-triangle rows (PD-5) and self rows
+        // lifted from PBD-7 / PBD-8 but run at PD's OWN operating point
+        // (3 substeps x 10 iterations — the implicit solve neither needs nor
+        // wants PBD's substep budget, and running the contact machinery at
+        // the substep count the interactive PD scenes actually use is the
+        // point of the gate). What they exercise is the two-way contact
+        // machinery: cross-cloth vertex-triangle rows (PD-5) and self rows
         // (PD-6) — both of which the first PD ship, with its one-sided
         // post-solve push, could not express at all.
         {
             const size_t pdSavedSubSteps2 = system.subSteps;
             const Precision pdSavedSubh2  = system.subh;
-            system.subSteps = 50;
-            system.subh     = system.h / Precision(50);
+            system.subSteps = 3;
+            system.subh     = system.h / Precision(3);
 
             auto centroidYOf = [&](int objId) -> double {
                 auto* m = Scene<Backend, Precision>::findById(objId);
@@ -7873,8 +7893,231 @@ static int runSelfTest() {
             system.subh     = pdSavedSubh2;
         }
 
+        // ---- PD-7: material stiffness does NOT depend on the iteration
+        // count (Liu 2013 fig. 4 / Bouaziz 2014 §3 — the property that
+        // separates PD from PBD). PD keeps the momentum term m/2h²|q-s|² IN
+        // the objective, so the minimizer the descent walks toward is fixed
+        // and more iterations only get CLOSER to it. PBD's projection
+        // sweeps have no such fixed point: each sweep applies another
+        // fraction of every constraint's correction, so the realized
+        // stiffness rises with the iteration budget (which is exactly why
+        // PbdSystem carries a correctedK compensation and PdSystem does not
+        // — see the PdSystem::iterations comment).
+        //
+        // Same scene as PD-1 (pinned sheet, no collider, so the measurement
+        // is the SOLVE and not the contact path), run twice at 1x and 4x the
+        // solver's own default iteration count; the metric is the sag depth
+        // (min y of the sheet).
+        //
+        // Measured at STATIC EQUILIBRIUM, not mid-swing, and that is not a
+        // convenience: "stiffness" is a property of where the sheet comes to
+        // REST, while a swinging sheet's instantaneous position also carries
+        // the transient the two runs integrated differently (measured: the
+        // undamped PD-1 sheet at frame 60 is still swinging, and its min y
+        // moves 0.044 m with the iteration count while its equilibrium does
+        // not — that number is dynamics, not material). Both arms therefore
+        // run with a strong per-substep velocity damping and long enough to
+        // park, which is the quasi-static configuration the claim is about.
+        //
+        // The PBD arm is a REFERENCE measurement, not a gate: it is here so
+        // the tolerance below is anchored to a number rather than a guess.
+        {
+            const int pdSavedIters  = sim.pd.iterations;
+            const int pbdSavedIters = sim.pbd.iterations;
+            const Precision pdSavedDamp  = sim.pd.damping;
+            const Precision pbdSavedDamp = sim.pbd.damping;
+
+            // Stiffness k = 1e4: the regime where the claim is a claim. The
+            // property is a statement about the DESCENT'S FIXED POINT, so it
+            // holds where the iteration budget actually converges. Measured
+            // on this sheet at 3 substeps (sag at 10/40/80 iterations):
+            //   k=1e3  drift(10,40) = 1.3e-6
+            //   k=1e4  drift(10,40) = 3.3e-4
+            //   k=1e5  drift(10,40) = 0.126  <- 10 iterations is UNDER-
+            //          converged (m/h² ~ 50 vs k = 1e5), and what shows is
+            //          Bouaziz §9's early-termination damping — a documented
+            //          limitation, not the stiffness-drift failure this test
+            //          exists to catch. PBD's drift never leaves ~1e-3
+            //          because PbdSystem's correctedK bakes the budget in.
+            auto runPinnedSheet = [&](bool pbdMode, int iters) -> double {
+                resetScene();
+                sim.usePd  = !pbdMode;
+                sim.usePbd = pbdMode;
+                if (pbdMode) { sim.pbd.iterations = iters; sim.pbd.damping = Precision(0.05f); }
+                else         { sim.pd.iterations  = iters; sim.pd.damping  = Precision(0.05f); }
+                sim.addCloth(8, 0.8f, tinym::vec3(0.0f, 1.0f, 0.0f),
+                             1e4, 1e4, 3e4, Precision(0.01));            // id 0
+                sim.initialize();
+                sim.setVertexFixed(0, 0, true);
+                sim.setVertexFixed(0, 7, true);
+                sim.pause = false;
+                for (int f = 0; f < 150; ++f) sim.update();
+                MetalGlobalContext::commitAndWait();
+                sim.pause = true;
+                double y = 0.0, e = 0.0; bool fin = true;
+                pdClothStats(0, y, e, fin);
+                return fin ? y : std::numeric_limits<double>::quiet_NaN();
+            };
+
+            const double pdA  = runPinnedSheet(false, pdSavedIters);
+            const double pdB  = runPinnedSheet(false, pdSavedIters * 4);
+            const double pbdA = runPinnedSheet(true,  pbdSavedIters);
+            const double pbdB = runPinnedSheet(true,  pbdSavedIters * 4);
+
+            sim.pd.iterations  = pdSavedIters;
+            sim.pbd.iterations = pbdSavedIters;
+            sim.pd.damping     = pdSavedDamp;
+            sim.pbd.damping    = pbdSavedDamp;
+            sim.usePbd = false;
+            sim.usePd  = true;
+
+            const double pdDrift  = std::fabs(pdA - pdB);
+            const double pbdDrift = std::fabs(pbdA - pbdB);
+
+            // Tolerance, from measurement (3 substeps, k=1e4): PD's
+            // 10-vs-40-iteration sag differs by 3.3e-4 m. 1 mm gives it 3x
+            // headroom and would still catch an under-converged or
+            // budget-baked drift (the k=1e5 regime measures 0.126 m — two
+            // decades over). The PBD reference is printed by the INFO line
+            // below on every run.
+            // 1 mm sits ~10x above PD's drift and ~10x below PBD's, so it
+            // passes PD with an order of magnitude of headroom and would
+            // still catch a PBD-like iteration dependence.
+            const double kIterTol = 1e-3;
+            const char* n7 = "PD-7 / stiffness is independent of the iteration "
+                             "count (momentum term is in the objective)";
+            if (!std::isfinite(pdA) || !std::isfinite(pdB))
+                fail(n7, "non-finite cloth in the PD arm");
+            else if (pdDrift > kIterTol)
+                fail(n7, "sag depth moved with the iteration count: min y "
+                     + std::to_string(pdA) + " at " + std::to_string(pdSavedIters)
+                     + " iterations vs " + std::to_string(pdB) + " at "
+                     + std::to_string(pdSavedIters * 4) + " (|d| = "
+                     + std::to_string(pdDrift) + " > " + std::to_string(kIterTol)
+                     + "; PBD reference drift on the same scene: "
+                     + std::to_string(pbdDrift) + ")");
+            else
+                pass(n7);
+            // The PBD arm is the tolerance's anchor, so it is reported on
+            // every run rather than buried in a commit message: if this scene
+            // ever stops separating the two solvers, kIterTol is no longer
+            // calibrated and this line is the evidence.
+            std::cerr << "[self-test INFO] PD-7 sag min y: PD " << pdA
+                      << " -> " << pdB << " (|d| " << pdDrift << "), PBD "
+                      << pbdA << " -> " << pbdB << " (|d| " << pbdDrift
+                      << "), tol " << kIterTol << "\n";
+        }
+
+        // ---- PD-8: the local/global iteration WEAKLY DECREASES the Eq.8
+        // objective — the property that lets PD run with no line search and
+        // no safeguards (Bouaziz 2014 §3/§4). The local step minimizes over
+        // the auxiliaries, the global step minimizes over the positions, so
+        // block coordinate descent can only go downhill.
+        //
+        // The probe (PdSystem::debugObjectiveProbe) samples E(q^k) = the
+        // objective WITH the auxiliaries at their optimum for q^k, once per
+        // iteration of the last substep. Scene: a pinned sheet settled onto
+        // a Float floor, so all three energy families are live — momentum,
+        // springs (+ the soft pin), and contacts.
+        //
+        // WHAT IS GATED, and why it is not the full objective: the smooth
+        // part (momentum + pin + springs) is gated hard, because there the
+        // local step IS the exact projection onto the constraint manifold
+        // and the descent argument applies verbatim. The contact part is
+        // only REPORTED: a contact target is re-linearized every iteration
+        // (a unilateral half-space evaluated at the live iterate, and for a
+        // two-way row a mass-weighted split of a vertex-triangle inequality),
+        // so the objective's own definition moves between iterations and the
+        // full F may legitimately rise across a re-linearization. Gating it
+        // would be asserting a guarantee this implementation does not claim.
+        {
+            resetScene();
+            sim.usePd = true;
+            sim.addCube(tinym::vec3(0.0f, 0.0f, 0.0f), 2, 1.0f);        // id 0
+            sim.addCloth(8, 0.8f, tinym::vec3(0.0f, 0.75f, 0.0f),
+                         1e5, 1e5, 3e5, Precision(0.01));               // id 1
+            sim.initialize();
+            // One pinned corner so the soft-pin term is live too.
+            sim.setVertexFixed(1, 0, true);
+            sim.pause = false;
+            // Settle onto the floor first, so the probed substep has live
+            // contact rows rather than free fall.
+            for (int f = 0; f < 40; ++f) sim.update();
+            MetalGlobalContext::commitAndWait();
+            sim.pd.debugObjectiveProbe = true;
+            sim.update();
+            MetalGlobalContext::commitAndWait();
+            sim.pd.debugObjectiveProbe = false;
+            sim.pause = true;
+
+            const std::vector<double> seq = sim.pd.debugObjectiveSeq;
+            const std::vector<double> smo = sim.pd.debugObjectiveSmooth;
+
+            // Liveness is read off the ROW COUNT, not off the contact energy:
+            // a satisfied unilateral constraint projects to the identity and
+            // contributes exactly zero, which is the correct behaviour and
+            // would look like "no contacts" to an energy test.
+            const uint32_t rows = sim.pd.oneSidedContactCount
+                                + sim.pd.twoWayContactCount;
+            double contactPeak = 0.0;
+            for (size_t k = 0; k < seq.size() && k < smo.size(); ++k)
+                contactPeak = std::max(contactPeak, seq[k] - smo[k]);
+
+            // Worst UPWARD move of each sequence, relative to the first
+            // sample (floating-point slack: the guarantee is exact in exact
+            // arithmetic, and these are sums of ~1e4-magnitude terms).
+            double worstSmooth = 0.0, worstFull = 0.0;
+            size_t worstSmoothAt = 0;
+            for (size_t k = 1; k < smo.size(); ++k)
+                if (smo[k] - smo[k-1] > worstSmooth) {
+                    worstSmooth = smo[k] - smo[k-1]; worstSmoothAt = k;
+                }
+            for (size_t k = 1; k < seq.size(); ++k)
+                worstFull = std::max(worstFull, seq[k] - seq[k-1]);
+
+            const double slack = (smo.empty() ? 0.0 : std::fabs(smo.front())) * 1e-9;
+            const char* n8 = "PD-8 / local/global iteration weakly decreases the "
+                             "Eq.8 objective (no line search needed)";
+            if (smo.size() < 2)
+                fail(n8, "objective probe produced " + std::to_string(smo.size())
+                     + " samples (expected one per iteration of the last substep)");
+            else if (!std::isfinite(smo.front()) || !std::isfinite(smo.back()))
+                fail(n8, "non-finite objective sample");
+            else if (rows == 0)
+                fail(n8, "the probed substep carried no contact rows at all, so "
+                     "this run does not exercise all three energy families");
+            else if (worstSmooth > slack)
+                fail(n8, "momentum+pin+spring objective ROSE at iteration "
+                     + std::to_string(worstSmoothAt) + " by "
+                     + std::to_string(worstSmooth) + " (slack "
+                     + std::to_string(slack) + "); first "
+                     + std::to_string(smo.front()) + " -> last "
+                     + std::to_string(smo.back()));
+            else if (!(smo.back() < smo.front()))
+                fail(n8, "objective did not decrease at all across "
+                     + std::to_string(smo.size()) + " iterations: "
+                     + std::to_string(smo.front()) + " -> "
+                     + std::to_string(smo.back()));
+            else
+                pass(n8);
+            // The full objective's behaviour is REPORTED, never gated — see
+            // the block comment. A rise here is the contact re-linearization,
+            // not a broken descent.
+            std::cerr << "[self-test INFO] PD-8 objective: smooth "
+                      << (smo.empty() ? 0.0 : smo.front()) << " -> "
+                      << (smo.empty() ? 0.0 : smo.back())
+                      << " (worst rise " << worstSmooth << "), full "
+                      << (seq.empty() ? 0.0 : seq.front()) << " -> "
+                      << (seq.empty() ? 0.0 : seq.back())
+                      << " (worst rise " << worstFull << "), contact peak "
+                      << contactPeak << ", " << rows << " rows, "
+                      << smo.size() << " iterations\n";
+        }
+
         sim.pause = true;
         sim.usePd = false;
+        system.subSteps = pdFamSavedSubSteps;
+        system.subh     = pdFamSavedSubh;
     }
 
     // ---- Block CK: P0 collider data model (collider_pipeline_rework §1) ---

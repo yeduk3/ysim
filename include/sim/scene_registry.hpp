@@ -290,25 +290,33 @@ void postInitPbdClothStack(SimOf<BE, PR>& simulator) {
 // only comparable if the scene is byte-identical, so `--scene pbd_cloth` vs
 // `--scene pd_cloth` is a one-flag A/B.
 template <typename BE, typename PR>
-void setupPdCloth(SimOf<BE, PR>& simulator, SysOf<BE, PR>& /*system*/) {
+void setupPdCloth(SimOf<BE, PR>& simulator, SysOf<BE, PR>& system) {
     const PR kstretch = 1e5, kshear = 1e5, kbend = 2e5;
     const PR mass = 0.1, thickness = 0.01;
     simulator.addPlane(PlaneDirection::XZPlane, tinym::vec3(0, 0, 0), 24, 3.0,
                        0.1, BehaviorType::Float);
     simulator.addCloth(20, 1, tinym::vec3(0, 0.6, 0), kstretch, kshear, kbend,
                        thickness, mass);
+    // PD is an implicit solve: the global step is unconditionally stable and
+    // the momentum term keeps stiffness iteration-independent, so it does NOT
+    // want the 60-substep budget the symplectic default carries. 3 substeps x
+    // 10 iterations is the paper's operating point (Bouaziz 2014 §7.3).
+    system.subSteps = 3;
+    system.subh     = system.h / PR(3);
     simulator.mlBroadPhase.floorExcludeDiag = 1e9f;   // exclude NOTHING
 }
 
 template <typename BE, typename PR>
 void postInitPdCloth(SimOf<BE, PR>& simulator) {
     simulator.usePd = true;
-    // PD projects contacts from the CONTACT SET once per substep (post-solve),
-    // so it needs a fresh one every substep for the same reason PBD does — a
-    // held broad phase would let the cloth drift through.
+    // Contacts are resolved per substep from the narrow-phase rows (in-energy
+    // unilateral constraints), so the broad phase must be fresh every substep
+    // for the same reason PBD's is — a held set would let the cloth drift
+    // through.
     simulator.cdSubstepPeriod    = 1;
     simulator.refitSubstepPeriod = 1;
-    std::cout << "[Main] --scene pd_cloth: CPU Projective Dynamics solver active\n";
+    std::cout << "[Main] --scene pd_cloth: CPU Projective Dynamics solver, "
+                 "subSteps=3, PD iterations=10\n";
 }
 
 // ---- P2 analytic-collider scenes (collider_pipeline_rework.md §5-P2) -----

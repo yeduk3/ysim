@@ -132,6 +132,12 @@ struct PdSystem<METAL, PR> {
     // top of step(); read by the self-tests. Same contract as PbdSystem's.
     uint32_t twoWayContactCount = 0;
     uint32_t selfContactCount   = 0;
+    // One-sided (half-space plane) rows resolved this step(), the other half
+    // of the substep's contact set. Counted for the same reason the two-way
+    // ones are: a test that wants to know the contact path RAN cannot read
+    // that off the contact ENERGY, which is legitimately zero whenever every
+    // plane is satisfied (the unilateral identity branch).
+    uint32_t oneSidedContactCount = 0;
     // Number of one-sided contact rows that fed a coupled rigid body this
     // step(). Reset at the top of step() like the counters above.
     uint32_t rigidCoupleCount   = 0;
@@ -144,6 +150,45 @@ struct PdSystem<METAL, PR> {
     // they are counted by nothing, because they are already gated on scalars
     // the user changed deliberately.
     uint32_t contactRefactorCount = 0;
+
+    // ── DEBUG: Eq.8 objective probe (off by default, near-zero cost) ──────
+    // When true, step() records the value of the objective the local/global
+    // descent minimizes, ONE SAMPLE PER ITERATION, for the substep it is
+    // currently running — so after a step() the vectors describe the LAST
+    // substep. Off, the whole mechanism is a handful of `if (false)`
+    // branches per substep phase; nothing is allocated and nothing is
+    // computed. Exists for the self-test (PD-8) and for a live GUI probe.
+    //
+    // The objective is exactly the quadratic the global solve minimizes for
+    // a FIXED auxiliary set (Bouaziz 2014 Eq. 8, plus this implementation's
+    // soft pin, which is a real energy term of the same system):
+    //
+    //   F(q; d, p) = Σ_i (m_i/2h²)|q_i - s_i|²          momentum
+    //              + Σ_pinned (wPin/2)|q_i - x_i|²      soft pin
+    //              + Σ_springs (k/2)|q_a - q_b - d|²    elasticity
+    //              + Σ_contacts (w/2)|q_i - p_i|²       contacts
+    //
+    // and it is sampled at the point of the iteration where the LOCAL step
+    // has just re-projected d and p FROM the current iterate — i.e. what is
+    // recorded for iterate q^k is E(q^k) = F(q^k; d*(q^k), p*(q^k)), the
+    // objective with the auxiliaries at their optimum. That is the sequence
+    // the paper's no-line-search argument is about: local step minimizes F
+    // over (d, p), global step minimizes F over q, so E(q^k) is weakly
+    // decreasing with no safeguards. Sampling F with the PREVIOUS
+    // iteration's auxiliaries instead would only measure the global solve's
+    // half of the descent and would hide a diverging local step.
+    //
+    // `debugObjectiveSeq` is the full F. `debugObjectiveSmooth` is the
+    // momentum + pin + spring part only — the sub-objective whose local step
+    // IS an exact projection onto a convex set. The contact part is not:
+    // a two-way row's target is a linearized mass-weighted split of a
+    // vertex-triangle inequality (and, across meshes, a Jacobi read of the
+    // partner's previous iterate), so contact re-targeting can in principle
+    // raise F between iterations. Both are recorded so a test can gate the
+    // part that is actually guaranteed and REPORT the rest.
+    bool debugObjectiveProbe = false;
+    std::vector<double> debugObjectiveSeq;      // momentum+pin+spring+contact
+    std::vector<double> debugObjectiveSmooth;   // momentum+pin+spring
 
     // Weight of one unilateral contact constraint, as a multiple of the
     // vertex's own momentum weight m_i/h². 1.0 means a violated contact
@@ -417,6 +462,11 @@ struct PdSystem<METAL, PR> {
         // cloth's block stays live for the whole iteration phase — the same
         // reason PbdSystem::predBlocks is per mesh.
         Eigen::MatrixXd rhsBase, rhs, q;
+        // Momentum target s of THIS substep, kept only for the objective
+        // probe (the solve itself needs it folded into rhsBase, not raw).
+        // Written by a single gated assignment in step (1) and never resized
+        // when the probe is off, so an unprobed run never allocates it.
+        Eigen::MatrixXd sMom;
         // Contact-attributable displacement estimator for the TWO-WAY rows
         // (flat 3N), zeroed each substep. The velocity update needs to know
         // how much of a vertex's position delta came from contact so
@@ -567,9 +617,16 @@ struct PdSystem<METAL, PR> {
         // CPU reads them. Same reason PbdSystem::step opens with it.
         MetalGlobalContext::commitAndWait();
 
-        twoWayContactCount = 0;
-        selfContactCount   = 0;
-        rigidCoupleCount   = 0;
+        twoWayContactCount   = 0;
+        selfContactCount     = 0;
+        oneSidedContactCount = 0;
+        rigidCoupleCount     = 0;
+        // Cleared per SUBSTEP (step() is one substep), which is what makes
+        // the vectors describe the last substep of the last update().
+        if (debugObjectiveProbe) {
+            debugObjectiveSeq.clear();
+            debugObjectiveSmooth.clear();
+        }
 
         auto& off      = Scene<METAL, PR>::packedMeshData.statesOffsets;
         auto& colFacet = Scene<METAL, PR>::packedCollisionData.vertColFacets;
@@ -742,6 +799,10 @@ struct PdSystem<METAL, PR> {
                     mc.rhsBase((int)i, 2) += kPinWeight * (double)xi.z;
                 }
             }
+
+            // q still holds the momentum target s verbatim here (the warm
+            // start IS s), so the probe's copy is one gated assignment.
+            if (debugObjectiveProbe) mc.sMom = mc.q;
 
             SolveCtx c;
             c.mi   = mi;
@@ -963,6 +1024,7 @@ struct PdSystem<METAL, PR> {
                     mc.contactW[i] += pl.w;
                     mc.hasContactW = true;
                     mc.planes.push_back(pl);
+                    ++oneSidedContactCount;
                 });
             }
         }
@@ -1024,6 +1086,12 @@ struct PdSystem<METAL, PR> {
         // and there is nothing after it: every contact of the substep is an
         // energy term the solve balances, not a push applied on top of it.
         for (int it = 0; it < iterations; ++it) {
+            // Objective accumulators for THIS iteration; every term is added
+            // where the local step produces the auxiliary it belongs to, so
+            // the probe never re-derives a projection and can never disagree
+            // with the one the solve actually used. See debugObjectiveProbe.
+            double probeSmooth = 0.0, probeContact = 0.0;
+
             // ---- LOCAL, springs.
             for (SolveCtx& c : ctxs) {
                 MeshCache& mc = *c.mc;
@@ -1109,6 +1177,45 @@ struct PdSystem<METAL, PR> {
                         }
                     });
                 }
+
+                // PROBE (off => one predictable branch per mesh per
+                // iteration): momentum + soft pin + spring energy of this
+                // mesh, at the CURRENT iterate and with the d pass 1 just
+                // projected from it. Serial and double-precision on purpose —
+                // it is a diagnostic, and a parallel reduction would make the
+                // reported value schedule-dependent.
+                if (debugObjectiveProbe) {
+                    const Eigen::MatrixXd& q = mc.q;
+                    for (Index i = 0; i < c.n; ++i) {
+                        const double mi3 = (double)c.m[i * 3];
+                        const double wm = (mi3 > 0.0 ? mi3 : 1e-9) * invH2;
+                        const Vec3 xi = vertexAt(c.x, i);
+                        const double xv[3] = { (double)xi.x, (double)xi.y,
+                                               (double)xi.z };
+                        for (int a = 0; a < 3; ++a) {
+                            const double dm = q((int)i, a) - mc.sMom((int)i, a);
+                            probeSmooth += 0.5 * wm * dm * dm;
+                            if (c.mask[i] == PR(0)) {
+                                const double dp = q((int)i, a) - xv[a];
+                                probeSmooth += 0.5 * kPinWeight * dp * dp;
+                            }
+                        }
+                    }
+                    const double* dIn = mc.springD.data();
+                    for (size_t si = 0; si < numSprings; ++si) {
+                        const Spring& s = mc.springs[si];
+                        const double k = s.bend ? c.kB : c.kS;
+                        if (!(k > 0.0)) continue;
+                        const double* d = dIn + si * 3;
+                        double acc = 0.0;
+                        for (int a = 0; a < 3; ++a) {
+                            const double t = q((int)s.a, a) - q((int)s.b, a)
+                                           - d[a];
+                            acc += t * t;
+                        }
+                        probeSmooth += 0.5 * k * acc;
+                    }
+                }
             }
 
             // ---- LOCAL, contacts. ONE serial block for BOTH families, and
@@ -1134,6 +1241,16 @@ struct PdSystem<METAL, PR> {
                     cc.mc->rhs((int)i, 0) += w * (double)p.x;
                     cc.mc->rhs((int)i, 1) += w * (double)p.y;
                     cc.mc->rhs((int)i, 2) += w * (double)p.z;
+                    // PROBE: (w/2)|q_i - p_i|², accumulated HERE and not in a
+                    // second pass, so exactly the constraints that reached the
+                    // RHS (weight > 0, contacts live) are the ones counted.
+                    if (debugObjectiveProbe) {
+                        const Eigen::MatrixXd& q = cc.mc->q;
+                        const double ex = (double)p.x - q((int)i, 0);
+                        const double ey = (double)p.y - q((int)i, 1);
+                        const double ez = (double)p.z - q((int)i, 2);
+                        probeContact += 0.5 * w * (ex*ex + ey*ey + ez*ez);
+                    }
                 };
 
                 // ONE-SIDED planes: p is the closest point of
@@ -1288,6 +1405,15 @@ struct PdSystem<METAL, PR> {
                         vertexRef(pc.cd, tw.i3) += d3;
                     }
                 }
+            }
+
+            // PROBE: one sample per iteration, taken between the local and
+            // global steps — i.e. E(q^it) with the auxiliaries at their
+            // optimum for q^it. The global solve that follows can only
+            // lower it.
+            if (debugObjectiveProbe) {
+                debugObjectiveSmooth.push_back(probeSmooth);
+                debugObjectiveSeq.push_back(probeSmooth + probeContact);
             }
 
             // ---- GLOBAL, per mesh.

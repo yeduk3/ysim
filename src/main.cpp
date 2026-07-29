@@ -2378,6 +2378,37 @@ int main(int argc, char** argv) {
                         if (ImGui::SliderFloat("##pdDamping", &pdDamping, 0.0f, 0.2f))
                             simulator.pd.damping = (Precision)pdDamping;
                     }
+                    // Contact constraint weight, as a multiple of the vertex's
+                    // own momentum weight m/h². Logarithmic because the useful
+                    // range spans two decades and the interesting end is the
+                    // low one; a change only moves the contact epoch, so the
+                    // cost of dragging this is one factorize per substep it
+                    // moves in (watch the refactor counter below).
+                    ImGui::Dummy({0, 12});
+                    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.420f, 0.463f, 0.518f, 1.0f));
+                    ImGui::TextUnformatted("PD 접촉 가중치");
+                    ImGui::PopStyleColor();
+                    ImGui::Dummy({0, 4});
+                    ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - P);
+                    {
+                        float pdCw = (float)simulator.pd.kContactWeightScale;
+                        if (ImGui::SliderFloat("##pdContactW", &pdCw, 0.1f, 8.0f,
+                                               "%.2f", ImGuiSliderFlags_Logarithmic))
+                            simulator.pd.kContactWeightScale = (double)pdCw;
+                    }
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("PD 접촉 가중치, x m/h² — 값이 크면 locking 위험");
+                    // Debug read-out: the contact-epoch refactor counter is
+                    // MONOTONIC, so what it shows live is churn — a number
+                    // that climbs by ~1 per substep means the contact set is
+                    // reshaping every substep and the factorization is being
+                    // paid for in full.
+                    ImGui::Dummy({0, 8});
+                    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.420f, 0.463f, 0.518f, 1.0f));
+                    ImGui::TextUnformatted("PD 재분해 횟수");
+                    ImGui::SameLine(ImGui::GetContentRegionAvail().x - P - 18);
+                    ImGui::Text("%u", simulator.pd.contactRefactorCount);
+                    ImGui::PopStyleColor();
                 }
 
                 if (simulator.usePbd) {
