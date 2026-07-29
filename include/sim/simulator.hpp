@@ -56,6 +56,29 @@ struct Simulator {
     CpuSpatialHash<PR> cpuShBroadPhase;
     bool useCpuSpatialHashing = false;
 
+    // HYBRID mode: keep the BVH as the main broad phase (so the analytic
+    // markers it alone emits keep flowing) but source the SELF-collision
+    // rows from cpuShBroadPhase instead of the BVH's per-object
+    // checkSelfCollisions. Lets a normal BVH scene turn self-collision on
+    // and pay only the CPU hash's cheap vertex-major rows.
+    //
+    // Ordering is load-bearing (see CpuSpatialHash::detectSelfCollisions):
+    // the CPU self pass runs FIRST and owns the counter reset, then the BVH
+    // detect runs with self OFF and resetCounter == false so its device
+    // atomics append after the CPU rows. Reversing that would race the
+    // still-pending GPU atomics under the async sync tiers.
+    //
+    // Inactive (silently) under twoMeshExperiment / clusterVFPipeline —
+    // those paths own their own broad loop. Same CPU-solver caveat as the
+    // full CPU path, and one more: the CPU self pass writes the counter
+    // host-side, which only orders against GPU work that is already
+    // COMPLETE. usePbd/usePd commitAndWait at the top of every substep, so
+    // that holds there; under the GPU symplectic solver on the None/PerFrame
+    // async tiers a previous substep's query kernels may still be in flight
+    // and would race this write (and x itself is GPU-pending). Intended for
+    // the CPU solvers / InFrame.
+    bool useCpuShSelf = false;
+
     // BVH path A/B toggle (only meaningful when useSpatialHashing == false).
     //   false (default) -> baseline queryPoints (per-leaf-hit global atomicAdd)
     //   true            -> queryPointsSegmented (per-TG private + reduce)
@@ -2785,6 +2808,11 @@ struct Simulator {
                 useMultiLevelSH      = false;
             }
         }
+        // Hybrid hook: YSIM_CPUSH_SELF=1 keeps the BVH broad phase but
+        // sources self-collision rows from the CPU hash.
+        if (const char* hs = std::getenv("YSIM_CPUSH_SELF")) {
+            if (std::atoi(hs) != 0) useCpuShSelf = true;
+        }
         if (const char* lv = std::getenv("YSIM_ML_LEVELS")) {
             int L = std::atoi(lv);
             if (L >= 1) mlBroadPhase.numLevels = L;
@@ -3376,11 +3404,33 @@ struct Simulator {
                     }
                     if (doBroad) {
                         auto& bp = collisionPipeline.broadPhase;
+                        // Hybrid self-collision source (useCpuShSelf): only on
+                        // the two PLAIN BVH paths — the two-mesh / cluster-VF
+                        // experiments own their own broad loop and stay
+                        // untouched (hybrid silently inactive there).
+                        const bool hybridSelf =
+                            useCpuShSelf && enableSelfCollisions
+                            && !bp.twoMeshExperiment && !bp.clusterVFPipeline;
                         auto runDetect = [&]() {
                             if (bp.twoMeshExperiment && bp.clusterVFPipeline)
                                 bp.detectCollisionsCluster(margin);
                             else if (bp.twoMeshExperiment)
                                 bp.detectCollisionsTwoMesh(margin, enableSelfCollisions);
+                            else if (hybridSelf) {
+                                // ORDER IS LOAD-BEARING: CPU self rows first
+                                // (this call owns the counter reset), then the
+                                // BVH detect with self OFF and resetCounter ==
+                                // false so its device atomics append after
+                                // them. A CPU append AFTER the BVH encode would
+                                // race the still-pending GPU atomics.
+                                cpuShBroadPhase.detectSelfCollisions(margin);
+                                if (useSegmentedBVHQuery)
+                                    bp.detectCollisionsSegmented(margin, /*self*/false,
+                                        analyticColliderActive(), /*resetCounter*/false);
+                                else
+                                    bp.detectCollisions(margin, /*self*/false,
+                                        analyticColliderActive(), /*resetCounter*/false);
+                            }
                             else if (useSegmentedBVHQuery)
                                 bp.detectCollisionsSegmented(margin, enableSelfCollisions, analyticColliderActive());
                             else

@@ -1604,26 +1604,20 @@ struct CpuSpatialHash {
     void showSceneBox()                 {}
     void queryClickRay(const Ray& /*ray*/) {}
 
-    void detectCollisions(PR margin, bool enableSelfCollisions = true) {
-        using Clock = std::chrono::steady_clock;
-        const auto t0 = Clock::now();
+    // ---- shared guts (used by BOTH the full and the self-only pass) -----
+    static constexpr Index kAllMeshes = ~Index(0);
 
-        auto& packedCol = Scene<METAL, PR>::packedCollisionData;
-        auto& meshes    = Scene<METAL, PR>::meshes;
+    // Fill `faces` with the margin-inflated face boxes of every collidable
+    // mesh (onlyMesh == kAllMeshes) or of exactly one mesh. Returns the
+    // largest axis extent over the collected boxes (0 if none).
+    float collectFaceBoxes(float m, Index onlyMesh) {
+        auto& meshes = Scene<METAL, PR>::meshes;
         const Index numMeshes = Scene<METAL, PR>::numMeshes;
-
-        lastStats = Stats{};
-        // 1) Reset the counter CPU-side. This IS the narrow-phase gate.
-        if (!packedCol.numBroadCollisions.ptr) return;
-        packedCol.numBroadCollisions[0] = 0;
-        if (numMeshes == 0 || !packedCol.broadCollisions.ptr) return;
-
-        const float m = (float)margin;
-
-        // 2) Collect target-face key boxes from the live state.x.
         faces.clear();
         float maxExtent = 0.f;
-        for (Index t = 0; t < numMeshes; ++t) {
+        const Index tBegin = (onlyMesh == kAllMeshes) ? Index(0) : onlyMesh;
+        const Index tEnd   = (onlyMesh == kAllMeshes) ? numMeshes : onlyMesh + 1;
+        for (Index t = tBegin; t < tEnd && t < numMeshes; ++t) {
             auto& tm = meshes[t];
             if (!tm.collidable) continue;
             if (!tm.state.x.ptr || !tm.adjacency.facets.ptr) continue;
@@ -1656,24 +1650,14 @@ struct CpuSpatialHash {
                 faces.push_back(rec);
             }
         }
-        lastStats.targetFaces = (uint32_t)faces.size();
-        if (faces.empty()) {
-            lastStats.ms_total = std::chrono::duration<double, std::milli>(
-                Clock::now() - t0).count();
-            ++totalCalls;
-            return;
-        }
+        lastStats.targetFaces += (uint32_t)faces.size();
+        return maxExtent;
+    }
 
-        // 3) cellSize = largest inflated face extent ⇒ every face spans at
-        //    most 2 cells per axis (≤8 inserts), which bounds the build.
-        float cs = maxExtent;
-        if (!(cs > 1e-5f)) cs = 1e-5f;
-        const float invCs = 1.f / cs;
-        lastStats.cellSize = (double)cs;
-
-        // 4) Insert faces. Generation stamping keeps the map's buckets and
-        //    the per-cell vectors' capacity warm across calls (map.clear()
-        //    would free every one of them).
+    // Insert the current `faces` into the generation-stamped grid. Stamping
+    // keeps the map's buckets and each cell vector's capacity warm across
+    // calls (map.clear() would free every one of them).
+    void rebuildGridFromFaces(float invCs) {
         if (++gridGen == 0) { grid.clear(); gridGen = 1; }
         for (uint32_t fi = 0; fi < (uint32_t)faces.size(); ++fi) {
             const FaceRec& fr = faces[fi];
@@ -1694,6 +1678,143 @@ struct CpuSpatialHash {
                     ++lastStats.cellInserts;
                 }
         }
+    }
+
+    // Probe one query mesh's vertices against the current grid and APPEND
+    // rows at [count, cap). `selfOnly` keeps q == t rows only (hybrid pass).
+    void probeMeshVertices(Index q, float invCs, bool enableSelfCollisions,
+                           bool selfOnly, BroadCollision* out, Index cap,
+                           Index& count, uint32_t& dropped) {
+        auto& meshes = Scene<METAL, PR>::meshes;
+        auto& qm = meshes[q];
+        if (!qm.state.x.ptr) return;
+        const Index nv = qm.state.x.size / 3;
+        if (nv == 0) return;
+        const PR* X  = qm.state.x.ptr;
+        // xPrev is seeded to x at Scene::pack and re-snapshotted every
+        // substep, so the swept box is the same segment the CCD narrow
+        // phase (D-013) tests — one substep lagged, by construction.
+        const PR* XP = qm.state.xPrev.ptr ? qm.state.xPrev.ptr : X;
+        const uint32_t behQ = (uint32_t)qm.behaviorType;
+        const uint32_t shpQ = (uint32_t)qm.colliderKind;
+
+        for (Index v = 0; v < nv; ++v) {
+            float vlo[3], vhi[3];
+            bool ok = true;
+            for (int a = 0; a < 3; ++a) {
+                const float pc = (float)X[v * 3 + a];
+                float       pp = (float)XP[v * 3 + a];
+                if (!std::isfinite(pc)) { ok = false; break; }
+                // Guard a garbage / teleported xPrev: a sweep longer than
+                // a metre is a pin snap, not motion — use the point.
+                if (!std::isfinite(pp) || std::abs(pp - pc) > 1.f) pp = pc;
+                vlo[a] = std::min(pc, pp);
+                vhi[a] = std::max(pc, pp);
+            }
+            if (!ok) continue;
+            ++lastStats.queryVerts;
+
+            int lo[3], hi[3];
+            bool sane = true;
+            for (int a = 0; a < 3; ++a) {
+                lo[a] = (int)std::floor(vlo[a] * invCs);
+                hi[a] = (int)std::floor(vhi[a] * invCs);
+                if (hi[a] - lo[a] > 64) { sane = false; break; }
+            }
+            if (!sane) continue;
+            const bool multiCell = (lo[0] != hi[0]) || (lo[1] != hi[1])
+                                || (lo[2] != hi[2]);
+            if (multiCell) seen.clear();
+
+            for (int z = lo[2]; z <= hi[2]; ++z)
+              for (int y = lo[1]; y <= hi[1]; ++y)
+                for (int x = lo[0]; x <= hi[0]; ++x) {
+                    auto it = grid.find(cellKey(x, y, z));
+                    if (it == grid.end() || it->second.gen != gridGen)
+                        continue;
+                    for (uint32_t fi : it->second.items) {
+                        // Dedup: a face straddling two probed cells must
+                        // yield ONE row. Single-cell probes can't repeat.
+                        if (multiCell) {
+                            bool dup = false;
+                            for (uint32_t s : seen)
+                                if (s == fi) { dup = true; break; }
+                            if (dup) continue;
+                            seen.push_back(fi);
+                        }
+                        const FaceRec& fr = faces[fi];
+                        // Distance precull: swept-vertex box vs the
+                        // margin-inflated face box.
+                        if (vhi[0] < fr.bmin[0] || vlo[0] > fr.bmax[0]
+                         || vhi[1] < fr.bmin[1] || vlo[1] > fr.bmax[1]
+                         || vhi[2] < fr.bmin[2] || vlo[2] > fr.bmax[2])
+                            continue;
+                        const Index t = (Index)fr.obj;
+                        if (selfOnly && t != q) continue;
+                        if (t == q) {
+                            // Self rows only when asked (mirrors
+                            // spatialhashing.metal:423).
+                            if (!enableSelfCollisions) continue;
+                            // Cheap early-out on the vertex's OWN face;
+                            // the narrow kernel drops the rest of ring-1
+                            // via sceneVertexAdjFacets.
+                            const Index* TF = meshes[t].adjacency.facets.ptr;
+                            const uint32_t b = fr.localFace * 3;
+                            if (TF[b] == v || TF[b + 1] == v
+                                || TF[b + 2] == v) continue;
+                        }
+                        ++lastStats.candidates;
+                        if (count >= cap) { ++dropped; continue; }
+                        BroadCollision& row = out[count++];
+                        row.indexPair.point    = v;
+                        row.indexPair.triangle = fr.localFace;
+                        row.objPair.query      = q;
+                        row.objPair.target     = t;
+                        row.behaviorPair.query  = behQ;
+                        row.behaviorPair.target =
+                            (uint32_t)meshes[t].behaviorType;
+                        row.shapePair.query  = shpQ;
+                        row.shapePair.target =
+                            (uint32_t)meshes[t].colliderKind;
+                    }
+                }
+        }
+    }
+
+    // cellSize = largest inflated face extent ⇒ every face spans at most 2
+    // cells per axis (≤8 inserts), which bounds the grid build.
+    static inline float cellSizeFrom(float maxExtent) {
+        return (maxExtent > 1e-5f) ? maxExtent : 1e-5f;
+    }
+
+    void detectCollisions(PR margin, bool enableSelfCollisions = true) {
+        using Clock = std::chrono::steady_clock;
+        const auto t0 = Clock::now();
+
+        auto& packedCol = Scene<METAL, PR>::packedCollisionData;
+        auto& meshes    = Scene<METAL, PR>::meshes;
+        const Index numMeshes = Scene<METAL, PR>::numMeshes;
+
+        lastStats = Stats{};
+        // 1) Reset the counter CPU-side. This IS the narrow-phase gate.
+        if (!packedCol.numBroadCollisions.ptr) return;
+        packedCol.numBroadCollisions[0] = 0;
+        if (numMeshes == 0 || !packedCol.broadCollisions.ptr) return;
+
+        // 2) Collect target-face key boxes from the live state.x.
+        const float maxExtent = collectFaceBoxes((float)margin, kAllMeshes);
+        if (faces.empty()) {
+            lastStats.ms_total = std::chrono::duration<double, std::milli>(
+                Clock::now() - t0).count();
+            ++totalCalls;
+            return;
+        }
+
+        // 3) + 4) Grid.
+        const float cs = cellSizeFrom(maxExtent);
+        const float invCs = 1.f / cs;
+        lastStats.cellSize = (double)cs;
+        rebuildGridFromFaces(invCs);
 
         // 5) Query. Skip Float / Kinematic (target-only behaviors) and any
         //    mesh whose collidable master switch is off.
@@ -1707,107 +1828,77 @@ struct CpuSpatialHash {
             if (!qm.collidable) continue;
             if (qm.behaviorType == BehaviorType::Float
                 || qm.behaviorType == BehaviorType::Kinematic) continue;
-            if (!qm.state.x.ptr) continue;
-            const Index nv = qm.state.x.size / 3;
-            if (nv == 0) continue;
-            const PR* X  = qm.state.x.ptr;
-            // xPrev is seeded to x at Scene::pack and re-snapshotted every
-            // substep, so the swept box is the same segment the CCD narrow
-            // phase (D-013) tests — one substep lagged, by construction.
-            const PR* XP = qm.state.xPrev.ptr ? qm.state.xPrev.ptr : X;
-            const uint32_t behQ = (uint32_t)qm.behaviorType;
-            const uint32_t shpQ = (uint32_t)qm.colliderKind;
-
-            for (Index v = 0; v < nv; ++v) {
-                float vlo[3], vhi[3];
-                bool ok = true;
-                for (int a = 0; a < 3; ++a) {
-                    const float pc = (float)X[v * 3 + a];
-                    float       pp = (float)XP[v * 3 + a];
-                    if (!std::isfinite(pc)) { ok = false; break; }
-                    // Guard a garbage / teleported xPrev: a sweep longer than
-                    // a metre is a pin snap, not motion — use the point.
-                    if (!std::isfinite(pp) || std::abs(pp - pc) > 1.f) pp = pc;
-                    vlo[a] = std::min(pc, pp);
-                    vhi[a] = std::max(pc, pp);
-                }
-                if (!ok) continue;
-                ++lastStats.queryVerts;
-
-                int lo[3], hi[3];
-                bool sane = true;
-                for (int a = 0; a < 3; ++a) {
-                    lo[a] = (int)std::floor(vlo[a] * invCs);
-                    hi[a] = (int)std::floor(vhi[a] * invCs);
-                    if (hi[a] - lo[a] > 64) { sane = false; break; }
-                }
-                if (!sane) continue;
-                const bool multiCell = (lo[0] != hi[0]) || (lo[1] != hi[1])
-                                    || (lo[2] != hi[2]);
-                if (multiCell) seen.clear();
-
-                for (int z = lo[2]; z <= hi[2]; ++z)
-                  for (int y = lo[1]; y <= hi[1]; ++y)
-                    for (int x = lo[0]; x <= hi[0]; ++x) {
-                        auto it = grid.find(cellKey(x, y, z));
-                        if (it == grid.end() || it->second.gen != gridGen)
-                            continue;
-                        for (uint32_t fi : it->second.items) {
-                            // Dedup: a face straddling two probed cells must
-                            // yield ONE row. Single-cell probes can't repeat.
-                            if (multiCell) {
-                                bool dup = false;
-                                for (uint32_t s : seen)
-                                    if (s == fi) { dup = true; break; }
-                                if (dup) continue;
-                                seen.push_back(fi);
-                            }
-                            const FaceRec& fr = faces[fi];
-                            // Distance precull: swept-vertex box vs the
-                            // margin-inflated face box.
-                            if (vhi[0] < fr.bmin[0] || vlo[0] > fr.bmax[0]
-                             || vhi[1] < fr.bmin[1] || vlo[1] > fr.bmax[1]
-                             || vhi[2] < fr.bmin[2] || vlo[2] > fr.bmax[2])
-                                continue;
-                            const Index t = (Index)fr.obj;
-                            if (t == q) {
-                                // Self rows only when asked (mirrors
-                                // spatialhashing.metal:423).
-                                if (!enableSelfCollisions) continue;
-                                // Cheap early-out on the vertex's OWN face;
-                                // the narrow kernel drops the rest of ring-1
-                                // via sceneVertexAdjFacets.
-                                const Index* TF = meshes[t].adjacency.facets.ptr;
-                                const uint32_t b = fr.localFace * 3;
-                                if (TF[b] == v || TF[b + 1] == v
-                                    || TF[b + 2] == v) continue;
-                            }
-                            ++lastStats.candidates;
-                            if (count >= cap) { ++dropped; continue; }
-                            BroadCollision& row = out[count++];
-                            row.indexPair.point    = v;
-                            row.indexPair.triangle = fr.localFace;
-                            row.objPair.query      = q;
-                            row.objPair.target     = t;
-                            row.behaviorPair.query  = behQ;
-                            row.behaviorPair.target =
-                                (uint32_t)meshes[t].behaviorType;
-                            row.shapePair.query  = shpQ;
-                            row.shapePair.target =
-                                (uint32_t)meshes[t].colliderKind;
-                        }
-                    }
-            }
+            probeMeshVertices(q, invCs, enableSelfCollisions, /*selfOnly*/false,
+                              out, cap, count, dropped);
         }
 
         // 6) Publish the count CPU-side — the sync narrow phase reads this
         //    directly and now sees a truthful non-zero value.
         packedCol.numBroadCollisions[0] = count;
+        finishStats(t0, count, dropped, cap);
+    }
 
+    // ── Hybrid SELF pass (Simulator::useCpuShSelf) ───────────────────────
+    // Emits ONLY q == t rows, for cloth meshes, starting from row 0 — it
+    // OWNS the counter reset. The caller must run this BEFORE the BVH
+    // detect and then call that detect with self disabled and
+    // resetCounter == false, so the BVH's GPU atomics append after these
+    // rows. The reverse order would race: the BVH's device atomics are
+    // still pending when the CPU would write.
+    //
+    // Same CPU-solver caveat as detectCollisions: `x` is read host-side, so
+    // under the GPU symplectic solver mid-frame positions are GPU-pending
+    // and this reads frame-stale x between syncs. Intended for usePbd/usePd.
+    void detectSelfCollisions(PR margin) {
+        using Clock = std::chrono::steady_clock;
+        const auto t0 = Clock::now();
+
+        auto& packedCol = Scene<METAL, PR>::packedCollisionData;
+        auto& meshes    = Scene<METAL, PR>::meshes;
+        const Index numMeshes = Scene<METAL, PR>::numMeshes;
+
+        lastStats = Stats{};
+        if (!packedCol.numBroadCollisions.ptr) return;
+        packedCol.numBroadCollisions[0] = 0;
+        if (numMeshes == 0 || !packedCol.broadCollisions.ptr) return;
+
+        BroadCollision* out = packedCol.broadCollisions.ptr;
+        const Index     cap = packedCol.maxNumCollisions;
+        Index    count   = 0;
+        uint32_t dropped = 0;
+
+        for (Index q = 0; q < numMeshes; ++q) {
+            auto& qm = meshes[q];
+            if (!qm.collidable) continue;
+            // Self rows on a rigid / float / kinematic body are meaningless
+            // row volume — cloth only.
+            if (qm.behaviorType != BehaviorType::TriangularCloth
+                && qm.behaviorType != BehaviorType::FastGridCloth) continue;
+            if (!qm.state.x.ptr || !qm.adjacency.facets.ptr) continue;
+            if (qm.adjacency.facets.size < 3) continue;
+
+            // One grid per mesh: only that mesh's own faces are candidates,
+            // and its own face size sets the cell size.
+            const float maxExtent = collectFaceBoxes((float)margin, q);
+            if (faces.empty()) continue;
+            const float cs = cellSizeFrom(maxExtent);
+            lastStats.cellSize = (double)cs;
+            const float invCs = 1.f / cs;
+            rebuildGridFromFaces(invCs);
+            probeMeshVertices(q, invCs, /*enableSelfCollisions*/true,
+                              /*selfOnly*/true, out, cap, count, dropped);
+        }
+
+        packedCol.numBroadCollisions[0] = count;
+        finishStats(t0, count, dropped, cap);
+    }
+
+    void finishStats(std::chrono::steady_clock::time_point t0,
+                     Index count, uint32_t dropped, Index cap) {
         lastStats.rows        = (uint32_t)count;
         lastStats.droppedRows = dropped;
         lastStats.ms_total    = std::chrono::duration<double, std::milli>(
-            Clock::now() - t0).count();
+            std::chrono::steady_clock::now() - t0).count();
         totalRows    += lastStats.rows;
         totalDropped += lastStats.droppedRows;
         ++totalCalls;

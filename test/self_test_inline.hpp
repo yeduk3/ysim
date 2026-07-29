@@ -317,6 +317,7 @@ static int runSelfTest() {
         const std::string cpshMode = std::getenv("YSIM_TEST_CPSH");
         const bool cpshUseBvh = (cpshMode == "bvh");
         const bool cpshUseGpuSh = (cpshMode == "sh");
+        const bool cpshBvhSelf  = (cpshMode == "bvhself");
 
         auto minYOfId = [&](int objId) -> double {
             auto* m = Scene<Backend, Precision>::findById(objId);
@@ -347,7 +348,25 @@ static int runSelfTest() {
             sim.useMultiLevelSH       = false;
             sim.cdSubstepPeriod       = 1;
             sim.refitSubstepPeriod    = 1;
+            sim.useCpuShSelf          = false;
             sim.enableSelfCollisions  = selfOn;
+            sim.pause                 = false;
+        };
+        // Hybrid arming: broad phase stays the DEFAULT BVH, only the self
+        // rows come from the CPU hash. Set after initialize() for the same
+        // reason as armCpsh — the env hook is a separate entry point.
+        auto armHybrid = [&]() {
+            sim.usePbd                = true;
+            sim.usePd                 = false;
+            sim.useCpuSpatialHashing  = false;
+            sim.useSpatialHashing     = false;
+            sim.useMultiLevelSH       = false;
+            // YSIM_TEST_CPSH=bvhself runs CPSH-4/5 on the BVH's OWN
+            // checkSelfCollisions instead, for a like-for-like cost compare.
+            sim.useCpuShSelf          = !cpshBvhSelf;
+            sim.cdSubstepPeriod       = 1;
+            sim.refitSubstepPeriod    = 1;
+            sim.enableSelfCollisions  = true;
             sim.pause                 = false;
         };
         auto reportPerf = [&](const char* tag, int frames, double ms) {
@@ -518,7 +537,166 @@ static int runSelfTest() {
                 pass(n3);
         }
 
+        // ---- CPSH-4 — HYBRID: BVH broad + CPU-hash self rows. ------------
+        // Same folded taco as CPSH-3, but the broad phase stays the default
+        // BVH; only the q==t rows come from the CPU hash.
+        {
+            resetScene();
+            const Index kG8 = 12;
+            sim.addCloth(kG8, Precision(0.6), tinym::vec3(0.0f, 0.8f, 0.0f),
+                         1e5, 1e5, 3e5, cpshThickness);               // id 0
+            {
+                auto& req = Scene<Backend, Precision>::requestsGeneralMeshes.back();
+                req.fixedVertices.push_back(
+                    FixedVertex{0u, tinym::vec3(0.0f, 0.8f, 0.0f)});
+                req.fixedVertices.push_back(
+                    FixedVertex{(uint32_t)(kG8 * kG8 - 1),
+                                tinym::vec3(0.004f, 0.8f, 0.004f)});
+            }
+            sim.initialize();
+            armHybrid();
+            sim.cpuShBroadPhase.totalRows = sim.cpuShBroadPhase.totalDropped =
+                sim.cpuShBroadPhase.totalCalls = 0;
+
+            uint64_t selfTotal = 0;
+            bool blew = false;
+            const int frames = 90;
+            const auto t0 = Clock::now();
+            for (int f = 0; f < frames; ++f) {
+                sim.update();
+                MetalGlobalContext::commitAndWait();
+                selfTotal += sim.pbd.selfContactCount;
+                if (anyNonFinite(0)) { blew = true; break; }
+            }
+            const double ms = std::chrono::duration<double, std::milli>(
+                Clock::now() - t0).count();
+            sim.pause = true;
+            reportPerf("CPSH-4", frames, ms);
+            std::cerr << "[CPSH perf] CPSH-4 selfTotal=" << selfTotal << "\n";
+
+            const char* n4 = "CPSH-4 / hybrid: BVH broad + CPU-hash self rows "
+                             "feed the PBD self-contact path";
+            if (blew)
+                fail(n4, "non-finite cloth state in the folded-sheet scene");
+            else if (selfTotal == 0)
+                fail(n4, "no self rows consumed (selfContactCount stayed 0 "
+                         "across 90 frames with useCpuShSelf on)");
+            else
+                pass(n4);
+        }
+
+        // ---- CPSH-5 — hybrid keeps inter-object + analytic intact. -------
+        // pbd_cloth_ball replica (scene_registry.hpp:93): Float floor +
+        // corner-pinned cloth + Rigid ball whose default collider is an
+        // analytic Sphere. Runs twice — with and without the ball — so the
+        // deflection clause is an A/B against the cloth's own ball-free sag
+        // (the absolute-dip clause alone cannot separate sag from contact).
+        {
+            const Index kG5 = 20;
+            auto centerYOf = [&](int objId, Index n1D) -> double {
+                auto* m = Scene<Backend, Precision>::findById(objId);
+                if (!m || !m->state.x.ptr) return std::numeric_limits<double>::quiet_NaN();
+                const Index c = (n1D / 2) * n1D + (n1D / 2);
+                if (c * 3 + 1 >= m->state.x.size)
+                    return std::numeric_limits<double>::quiet_NaN();
+                return (double)m->state.x.ptr[c * 3 + 1];
+            };
+            auto centroidYOf = [&](int objId) -> double {
+                auto* m = Scene<Backend, Precision>::findById(objId);
+                if (!m || !m->state.x.ptr) return std::numeric_limits<double>::quiet_NaN();
+                const Index n = m->state.x.size / 3;
+                if (n == 0) return std::numeric_limits<double>::quiet_NaN();
+                double acc = 0.0;
+                for (Index i = 0; i < n; ++i) acc += (double)m->state.x.ptr[i * 3 + 1];
+                return acc / (double)n;
+            };
+            // Builds floor(id 0) + pinned cloth(id 1) [+ Rigid ball(id 2)].
+            auto buildBallScene = [&](bool withBall) {
+                resetScene();
+                sim.addPlane(PlaneDirection::XZPlane, tinym::vec3(0, 0, 0), 24,
+                             Precision(3.0), Precision(0.1),
+                             BehaviorType::Float);                    // id 0
+                sim.addCloth(kG5, Precision(1), tinym::vec3(0.0f, 0.6f, 0.0f),
+                             1e5, 1e5, 2e5, cpshThickness);           // id 1
+                {
+                    auto& req = Scene<Backend, Precision>::requestsGeneralMeshes.back();
+                    const float hh = 0.5f, yy = 0.6f;
+                    const uint32_t vids[4] = { 0, (uint32_t)kG5 - 1,
+                                               (uint32_t)(kG5 * (kG5 - 1)),
+                                               (uint32_t)(kG5 * kG5 - 1) };
+                    const tinym::vec3 ps[4] = { {-hh, yy, -hh}, {hh, yy, -hh},
+                                                {-hh, yy,  hh}, {hh, yy,  hh} };
+                    for (int i = 0; i < 4; ++i)
+                        req.fixedVertices.push_back(FixedVertex{vids[i], ps[i]});
+                }
+                if (withBall)
+                    sim.addSphere(tinym::vec3(0.0f, 1.0f, 0.0f), 16, 0.5f,
+                                  0.1f, BehaviorType::Rigid);         // id 2
+                sim.initialize();
+                armHybrid();
+            };
+
+            // Ball-free baseline: how far the pinned sheet sags on its own.
+            buildBallScene(false);
+            double baseCenterMin = 1e30;
+            for (int f = 0; f < 90; ++f) {
+                sim.update();
+                MetalGlobalContext::commitAndWait();
+                const double cy = centerYOf(1, kG5);
+                if (std::isfinite(cy)) baseCenterMin = std::min(baseCenterMin, cy);
+            }
+            sim.pause = true;
+
+            buildBallScene(true);
+            sim.cpuShBroadPhase.totalRows = sim.cpuShBroadPhase.totalDropped =
+                sim.cpuShBroadPhase.totalCalls = 0;
+            double dropCenterMin = 1e30, clothLowest = 1e30;
+            bool blew = false;
+            const int frames = 90;
+            const auto t0 = Clock::now();
+            for (int f = 0; f < frames; ++f) {
+                sim.update();
+                MetalGlobalContext::commitAndWait();
+                if (anyNonFinite(1) || anyNonFinite(2)) { blew = true; break; }
+                const double cy = centerYOf(1, kG5);
+                if (std::isfinite(cy)) dropCenterMin = std::min(dropCenterMin, cy);
+                clothLowest = std::min(clothLowest, minYOfId(1));
+            }
+            const double ms = std::chrono::duration<double, std::milli>(
+                Clock::now() - t0).count();
+            sim.pause = true;
+            const double ballY = centroidYOf(2);
+            reportPerf("CPSH-5", frames, ms);
+            std::cerr << "[CPSH perf] CPSH-5 clothMinY=" << clothLowest
+                      << " centerMin(ball)=" << dropCenterMin
+                      << " centerMin(no ball)=" << baseCenterMin
+                      << " ballCentroidY=" << ballY
+                      << " numAnalytic=" << (long long)Scene<Backend, Precision>::numAnalytic
+                      << "\n";
+
+            const char* n5 = "CPSH-5 / hybrid: floor contact + analytic ball "
+                             "deflection survive with CPU-hash self rows on";
+            if (blew || !std::isfinite(clothLowest) || !std::isfinite(dropCenterMin)
+                || !std::isfinite(baseCenterMin))
+                fail(n5, "non-finite state in the floor+cloth+ball scene");
+            else if (!(clothLowest > -0.05))
+                fail(n5, "cloth tunneled through the floor: min y "
+                     + std::to_string(clothLowest) + " <= -0.05 (BVH "
+                     "inter-object path broken by the hybrid?)");
+            else if (!(dropCenterMin < 0.6 - 0.03))
+                fail(n5, "cloth center never deflected: min y "
+                     + std::to_string(dropCenterMin) + " >= 0.57");
+            else if (!(dropCenterMin < baseCenterMin - 0.02))
+                fail(n5, "deflection is just the cloth's own sag: with-ball "
+                     + std::to_string(dropCenterMin) + " vs ball-free "
+                     + std::to_string(baseCenterMin)
+                     + " (analytic markers not flowing under the hybrid?)");
+            else
+                pass(n5);
+        }
+
         sim.pause                = true;
+        sim.useCpuShSelf         = false;
         sim.usePbd               = false;
         sim.useCpuSpatialHashing = false;
         sim.enableSelfCollisions = false;
