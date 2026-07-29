@@ -645,8 +645,24 @@ struct Simulator {
         // Apply Gravity=false → Bullet static body (mass=0): it never
         // falls, never receives impulses, but still serves as a
         // collider that dynamic bodies bounce off — i.e. "Float-like"
-        // per user request. Apply Gravity=true → dynamic (mass=1).
-        init.mass     = mesh.applyGravity ? 1.0f : 0.0f;
+        // per user request. Apply Gravity=true → dynamic, with the mesh's
+        // OWN total mass.
+        //
+        // Mass unification: ysim is the source of truth. The authoring
+        // "mass" parameter is PER VERTEX (MeshState::memoryAllocation fills
+        // all 3N entries of state.m with params.mass), so the body's total
+        // mass is Σ over vertices of m[vi*3]. This replaces a hardcoded
+        // 1.0 kg — free fall is mass-independent, so no existing scene's
+        // Bullet trajectory changes; what DOES change is wind, whose
+        // applyForce now produces a mass-dependent acceleration (accepted:
+        // that is the physically correct behavior).
+        PR totalMass = PR(1);
+        if (mesh.state.m.ptr && nv > 0) {
+            totalMass = PR(0);
+            for (Index vi = 0; vi < nv; ++vi) totalMass += mesh.state.m.ptr[vi*3];
+        }
+        init.mass          = mesh.applyGravity ? (float)totalMass : 0.0f;
+        mesh.rigidBodyMass = mesh.applyGravity ? totalMass : PR(0);
         init.shape.type = inferRigidShapeType(mesh);
         const float halfExtent = (float)inferRigidRadius(mesh);
         if (init.shape.type == ysim::physics::RigidShapeType::Box) {
@@ -1996,6 +2012,53 @@ struct Simulator {
         collisionPipeline.broadPhase.refitIncludingAnalytic();
     }
 
+    // Set the named mesh's PER-VERTEX mass. ysim is the single source of
+    // truth for mass (the Bullet body's mass is derived from it, see
+    // ensureRigidBackendBody), so this one edit drives the whole engine.
+    //
+    // Persistence mirrors scaleObject: the live state.m is rewritten in
+    // place AND the initializer params carry the new value, so Scene::pack
+    // (which fills state.m from req.initializer->getParams()->mass) and the
+    // JSON round-trip (primitive.mass / import.mass, both read off the same
+    // params) reproduce the edit. state.v is unchanged.
+    void setObjectMass(int meshId, PR perVertexMass) {
+        auto* mesh = Scene<BE, PR>::findById(meshId);
+        if (!mesh) return;
+        // A zero / negative mass gives an infinite inverse mass and NaNs
+        // the solver; clamp the same way scaleObject clamps its factors.
+        if (!(perVertexMass > PR(1e-6))) perVertexMass = PR(1e-6);
+
+        // The fill convention is "every one of the 3N scalars holds the
+        // per-vertex mass" (MeshState::memoryAllocation / Scene::pack).
+        if (mesh->state.m.ptr)
+            std::fill(mesh->state.m.ptr,
+                      mesh->state.m.ptr + mesh->state.m.size, perVertexMass);
+
+        for (auto& req : Scene<BE, PR>::requestsGeneralMeshes) {
+            if (req.id == meshId) {
+                if (req.initializer)
+                    req.initializer->getParams()->mass = perVertexMass;
+                break;
+            }
+        }
+        if (mesh->initializer) mesh->initializer->getParams()->mass = perVertexMass;
+
+        // Bullet cannot change a body's mass in place, so the slot is
+        // recycled. NOTE: the recycle resets the body's linear/angular
+        // velocity to zero — accepted for an authoring edit (the same
+        // recycle already happens on the Apply Gravity toggle).
+        if (!Scene<BE, PR>::meshes.empty()
+            && mesh->behaviorType == BehaviorType::Rigid
+            && mesh->rigidBodyHandle != ysim::physics::kInvalidBodyHandle) {
+            // Array index from pointer arithmetic — the same D-039 idiom
+            // changeBehavior uses to reach ensureRigidBackendBody.
+            recreateRigidBackendBody((int)(mesh - &Scene<BE, PR>::meshes[0]));
+        }
+
+        scene_log::logObject("질량 변경: obj " + std::to_string(meshId) + " → "
+                             + std::to_string((double)perVertexMass));
+    }
+
     // ── Point-selection vertex ops ────────────────────────────────────
     // Render-vertex (gl_VertexID over the bound MeshGL buffer = preview
     // renderXPtr) → physics-vertex index. For grid/sphere/file the two
@@ -3076,6 +3139,13 @@ struct Simulator {
             m.rigidLastBodyPos = now;
         }
 
+        // PBD cloth→rigid coupling: open a new accumulation window. The
+        // Bullet step + centroid snap above are the only place a Rigid body
+        // moves, so the whole frame's substeps measure their contacts against
+        // this one frozen pose — their corrections accumulate into
+        // pbd.rigidDelta and are pushed back to Bullet at frame completion.
+        if (usePbd) pbd.beginFrameRigid((Index)Scene<BE, PR>::meshes.size());
+
         // Kinematic bodies: prescribed BVH motion, one-way coupling. Once
         // per outer frame (like the Rigid block above): advance playback
         // by the frame step h — motion time IS simulation time, so the
@@ -3396,6 +3466,51 @@ struct Simulator {
         if (stepOneSubstep)
             std::cout << "[step] frame " << frame << " substep "
                       << subEnd << "/" << system.subSteps << " (frame complete)\n";
+
+        // PBD cloth→rigid coupling writeback. Runs ONLY here, at frame
+        // completion (a mid-frame substep stop returned above), so the whole
+        // frame's accumulated correction lands as ONE position write between
+        // two Bullet steps — the rigid step at the top of the NEXT frame's
+        // preamble picks it up.
+        //
+        // Position-based, not impulse-based: injecting Δ/h as a velocity
+        // gives Bullet an outward bounce every frame that fights gravity and
+        // makes a resting ball jitter upward. Instead the body is teleported
+        // by Δ and only the APPROACH component of its velocity is cancelled
+        // (restitution 0) — a resting contact then simply holds.
+        //
+        // The mesh verts are deliberately NOT moved here: the next frame's
+        // centroid snap carries them onto the new body position (the same
+        // one-frame visual lag the existing snap design already has), and
+        // refreshAnalyticShapes follows the centroid from there.
+        if (usePbd && !pbd.rigidDelta.empty()) {
+            const Index nm = std::min((Index)pbd.rigidDelta.size(),
+                                      (Index)Scene<BE, PR>::meshes.size());
+            for (Index mi = 0; mi < nm; ++mi) {
+                auto& m = Scene<BE, PR>::meshes[mi];
+                if (m.behaviorType != BehaviorType::Rigid) continue;
+                if (!m.applyGravity) continue;             // static body
+                if (m.rigidBodyHandle == ysim::physics::kInvalidBodyHandle) continue;
+                const auto& d = pbd.rigidDelta[mi];
+                const float dlen = std::sqrt((float)(d.x*d.x + d.y*d.y + d.z*d.z));
+                if (!(dlen > 1e-12f)) continue;
+                const tinym::vec3 delta((float)d.x, (float)d.y, (float)d.z);
+                const tinym::vec3 p = rigid_.getPosition(m.rigidBodyHandle);
+                rigid_.setPosition(m.rigidBodyHandle,
+                                   tinym::vec3(p.x + delta.x, p.y + delta.y,
+                                               p.z + delta.z));
+                const tinym::vec3 nHat(delta.x / dlen, delta.y / dlen,
+                                       delta.z / dlen);
+                const tinym::vec3 v = rigid_.getLinearVelocity(m.rigidBodyHandle);
+                const float vn = v.x*nHat.x + v.y*nHat.y + v.z*nHat.z;
+                if (vn < 0.0f) {
+                    rigid_.setLinearVelocity(m.rigidBodyHandle,
+                        tinym::vec3(v.x - nHat.x*vn, v.y - nHat.y*vn,
+                                    v.z - nHat.z*vn));
+                }
+                pbd.rigidDelta[mi] = typename PbdSystem<BE, PR>::Vec3();
+            }
+        }
 
         system.acctime += system.h;
         frame++;

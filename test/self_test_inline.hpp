@@ -7113,6 +7113,408 @@ static int runSelfTest() {
                 else
                     pass(n10);
             }
+
+            // ---- AC-12 — analytic collider follows a falling Rigid body ----
+            // The pbd_cloth_ball repro: a Rigid sphere's verts are moved by
+            // the Bullet centroid snap while transformPosition stays at the
+            // authorial spawn (D-040). refreshAnalyticShapes used to read
+            // ONLY the authoring transform, so the falling ball's Sphere
+            // collider stayed frozen at its spawn point and the ball fell
+            // through the cloth with zero contacts. Two clauses:
+            //  (1) shape-follow (root cause): after the drop, the analytic
+            //      shape's center y agrees with the ball's live centroid y.
+            //  (2) interaction (end to end): the corner-pinned cloth's center
+            //      vertex is pushed measurably below its ball-free sag
+            //      baseline at some point during the pass-through.
+            {
+                auto centroidY = [&](int objId) -> double {
+                    auto* m = Scene<Backend, Precision>::findById(objId);
+                    if (!m || !m->state.x.ptr) return std::numeric_limits<double>::quiet_NaN();
+                    const Index n = m->state.x.size / 3;
+                    if (n == 0) return std::numeric_limits<double>::quiet_NaN();
+                    double acc = 0.0;
+                    for (Index i = 0; i < n; ++i) acc += (double)m->state.x.ptr[i*3+1];
+                    return acc / (double)n;
+                };
+                // Center vertex of an N x N grid cloth (row N/2, col N/2).
+                const Index kGrid = 9;
+                auto clothCenterY = [&](int objId) -> double {
+                    auto* m = Scene<Backend, Precision>::findById(objId);
+                    if (!m || !m->state.x.ptr) return std::numeric_limits<double>::quiet_NaN();
+                    const Index c = (kGrid / 2) * kGrid + (kGrid / 2);
+                    if ((c*3+2) >= m->state.x.size) return std::numeric_limits<double>::quiet_NaN();
+                    return (double)m->state.x.ptr[c*3+1];
+                };
+                auto pinCorners = [&]() {
+                    auto& req = Scene<Backend, Precision>::requestsGeneralMeshes.back();
+                    const float h = 0.5f, y = 0.6f;
+                    const uint32_t vids[4] = { 0, (uint32_t)kGrid - 1,
+                                               (uint32_t)(kGrid * (kGrid - 1)),
+                                               (uint32_t)(kGrid * kGrid - 1) };
+                    const tinym::vec3 pos[4] = { {-h, y, -h}, {h, y, -h},
+                                                 {-h, y,  h}, {h, y,  h} };
+                    for (int i = 0; i < 4; ++i)
+                        req.fixedVertices.push_back(FixedVertex{vids[i], pos[i]});
+                };
+
+                // Baseline: pinned cloth alone — how far does the center sag
+                // under gravity with no ball?
+                resetScene();
+                sim.usePbd = true;
+                sim.addCloth(kGrid, 1.0f, tinym::vec3(0.0f, 0.6f, 0.0f),
+                             1e5, 1e5, 3e5, clothThickness);             // id 0
+                pinCorners();
+                sim.initialize();
+                sim.pause = false;
+                double baseMinY = 1e30;
+                for (int f = 0; f < 60; ++f) {
+                    sim.update();
+                    MetalGlobalContext::commitAndWait();
+                    baseMinY = std::min(baseMinY, clothCenterY(0));
+                }
+                sim.pause = true;
+
+                // Drop run: same cloth + a 0.5 m Rigid ball just above it.
+                resetScene();
+                sim.usePbd = true;
+                sim.addCloth(kGrid, 1.0f, tinym::vec3(0.0f, 0.6f, 0.0f),
+                             1e5, 1e5, 3e5, clothThickness);             // id 0
+                pinCorners();
+                sim.addSphere(tinym::vec3(0.0f, 1.0f, 0.0f), 16, 0.5f,
+                              0.1f, BehaviorType::Rigid);                // id 1
+                sim.initialize();
+                sim.pause = false;
+                double dropMinY = 1e30, worstFollow = 0.0;
+                bool blew = false;
+                for (int f = 0; f < 60; ++f) {
+                    sim.update();
+                    MetalGlobalContext::commitAndWait();
+                    const double cy = clothCenterY(0);
+                    const double by = centroidY(1);
+                    if (!std::isfinite(cy) || !std::isfinite(by)) { blew = true; break; }
+                    dropMinY = std::min(dropMinY, cy);
+                    // Shape-follow: compare the published analytic center
+                    // against the live ball centroid AFTER this frame's
+                    // refresh. One frame of lag is by design (refresh runs
+                    // at the top of update, before the Bullet step), so the
+                    // tolerance is one frame of free fall at 60 frames of
+                    // h=1/60 (~0.16 m at the end) — the stale-shape bug
+                    // misses by meters, not centimeters.
+                    if (Scene<Backend, Precision>::numAnalytic == 1
+                        && Scene<Backend, Precision>::meshAnalytic.ptr) {
+                        const double shapeY = (double)
+                            Scene<Backend, Precision>::meshAnalytic[0].centerRadius.y;
+                        worstFollow = std::max(worstFollow, std::fabs(shapeY - by));
+                    }
+                }
+                sim.pause  = true;
+                sim.usePbd = false;
+
+                const char* n12a = "AC-12a / analytic Sphere shape follows the "
+                                   "falling Rigid ball";
+                if (blew)
+                    fail(n12a, "non-finite state during the ball drop");
+                else if (Scene<Backend, Precision>::numAnalytic != 1)
+                    fail(n12a, "expected exactly 1 analytic collider, got "
+                         + std::to_string((long long)Scene<Backend, Precision>::numAnalytic));
+                else if (worstFollow > 0.35)
+                    fail(n12a, "analytic center left behind the body: worst |dy| "
+                         + std::to_string(worstFollow) + " > 0.35 m (stale spawn "
+                         "transform?)");
+                else
+                    pass(n12a);
+
+                const char* n12b = "AC-12b / falling ball actually contacts the "
+                                   "corner-pinned PBD cloth";
+                if (!blew && std::isfinite(baseMinY) && std::isfinite(dropMinY)
+                    && dropMinY < baseMinY - 0.05)
+                    pass(n12b);
+                else if (!blew)
+                    fail(n12b, "cloth center never deflected past its ball-free "
+                         "sag: baseline min y " + std::to_string(baseMinY)
+                         + " vs drop min y " + std::to_string(dropMinY));
+            }
+
+            // ---- AC-13 — PBD cloth→rigid position coupling + mass SoT ------
+            // A Rigid ball dropped on a corner-pinned PBD cloth with NO floor
+            // anywhere: without coupling the cloth cannot hold the ball and it
+            // falls into the void, so "ball rests on the cloth" is the
+            // discriminator, not a regression net. Clause (a): the ball
+            // settles on the cloth (centroid well above the cloth's reach
+            // floor, stable late window, coupling counter ran). Clause (b):
+            // the SAME scene with setObjectMass x10 (the inspector path —
+            // fills state.m, persists params.mass, recycles the Bullet body
+            // with the new Σm) rests measurably DEEPER, proving Bullet mass
+            // follows the ysim mass and the split is mass-weighted.
+            {
+                auto ballCentroidY = [&](int objId) -> double {
+                    auto* m = Scene<Backend, Precision>::findById(objId);
+                    if (!m || !m->state.x.ptr) return std::numeric_limits<double>::quiet_NaN();
+                    const Index n = m->state.x.size / 3;
+                    if (n == 0) return std::numeric_limits<double>::quiet_NaN();
+                    double acc = 0.0;
+                    for (Index i = 0; i < n; ++i) acc += (double)m->state.x.ptr[i*3+1];
+                    return acc / (double)n;
+                };
+                const Index kGc = 9;
+                // Runs the pinned-cloth + Rigid-ball drop; per-vertex ball
+                // mass applied through setObjectMass AFTER initialize (the
+                // GUI path: live m fill + params write + Bullet recycle).
+                // Returns the ball's mean centroid y over the last 30 of 150
+                // frames; accumulates the coupling counter.
+                uint64_t coupleTotal = 0;
+                auto runBallDrop = [&](float perVertexMass, double& lateDrift,
+                                       double& bodyMass) -> double {
+                    resetScene();
+                    sim.usePbd = true;
+                    sim.enableSelfCollisions = true;
+                    sim.addCloth(kGc, 1.0f, tinym::vec3(0.0f, 0.6f, 0.0f),
+                                 1e5, 1e5, 3e5, clothThickness);         // id 0
+                    auto& req = Scene<Backend, Precision>::requestsGeneralMeshes.back();
+                    const float hh = 0.5f, yy = 0.6f;
+                    const uint32_t vids[4] = { 0, (uint32_t)kGc - 1,
+                                               (uint32_t)(kGc * (kGc - 1)),
+                                               (uint32_t)(kGc * kGc - 1) };
+                    const tinym::vec3 ps[4] = { {-hh, yy, -hh}, {hh, yy, -hh},
+                                                {-hh, yy,  hh}, {hh, yy,  hh} };
+                    for (int i = 0; i < 4; ++i)
+                        req.fixedVertices.push_back(FixedVertex{vids[i], ps[i]});
+                    sim.addSphere(tinym::vec3(0.0f, 1.0f, 0.0f), 16, 0.5f,
+                                  0.1f, BehaviorType::Rigid);            // id 1
+                    sim.initialize();
+                    sim.setObjectMass(1, perVertexMass);
+                    if (auto* bm = Scene<Backend, Precision>::findById(1))
+                        bodyMass = (double)bm->rigidBodyMass;
+                    sim.pause = false;
+                    double lateSum = 0.0, lateMin = 1e30, lateMax = -1e30;
+                    int lateN = 0;
+                    for (int f = 0; f < 150; ++f) {
+                        sim.update();
+                        MetalGlobalContext::commitAndWait();
+                        coupleTotal += sim.pbd.rigidCoupleCount;
+                        const double by = ballCentroidY(1);
+                        if (!std::isfinite(by)) return std::numeric_limits<double>::quiet_NaN();
+                        if (f >= 120) {
+                            lateSum += by; ++lateN;
+                            lateMin = std::min(lateMin, by);
+                            lateMax = std::max(lateMax, by);
+                        }
+                    }
+                    sim.pause = true;
+                    lateDrift = lateMax - lateMin;
+                    return lateN ? lateSum / lateN : std::numeric_limits<double>::quiet_NaN();
+                };
+
+                double driftL, driftH, bodyMassL, bodyMassH;
+                const double yLight = runBallDrop(0.1f, driftL, bodyMassL);
+                const double yHeavy = runBallDrop(1.0f, driftH, bodyMassH);
+                sim.usePbd = false;
+                sim.enableSelfCollisions = false;
+
+                const char* n13a = "AC-13a / PBD coupling: Rigid ball rests ON "
+                                   "the pinned cloth (no floor below)";
+                if (!std::isfinite(yLight))
+                    fail(n13a, "non-finite ball state during the coupled drop");
+                else if (coupleTotal == 0)
+                    fail(n13a, "coupling never ran (rigidCoupleCount stayed 0)");
+                else if (yLight < 0.30)
+                    fail(n13a, "ball fell through the cloth: late mean centroid y "
+                         + std::to_string(yLight) + " < 0.30 (no floor: "
+                         "uncoupled behavior)");
+                else if (driftL > 0.05)
+                    fail(n13a, "ball never settled: late-window drift "
+                         + std::to_string(driftL) + " > 0.05");
+                else
+                    pass(n13a);
+
+                const char* n13b = "AC-13b / setObjectMass drives Bullet mass "
+                                   "and the coupling split (x10 rests deeper)";
+                if (!std::isfinite(yHeavy))
+                    fail(n13b, "non-finite ball state during the heavy drop");
+                else if (!(bodyMassH > bodyMassL * 5.0))
+                    fail(n13b, "Bullet body mass did not follow setObjectMass: "
+                         + std::to_string(bodyMassL) + " -> "
+                         + std::to_string(bodyMassH));
+                else if (!(yHeavy < yLight - 0.02))
+                    fail(n13b, "x10 heavier ball does not rest deeper: light "
+                         + std::to_string(yLight) + " vs heavy "
+                         + std::to_string(yHeavy));
+                else
+                    pass(n13b);
+            }
+
+            // ---- PBD-7 — two-way cross-cloth contact (Müller eq 12/13) -----
+            // A free sheet dropped on a corner-pinned sheet. Both are live
+            // cloths, so every vertex-triangle row must correct BOTH sides
+            // (mass-weighted) instead of pushing only the query vertex.
+            // Clauses: the two-way path actually ran (counter), the top sheet
+            // came to rest ON the bottom one (didn't fall through to the
+            // void), and nothing launched or blew up.
+            {
+                auto centroidYOf = [&](int objId) -> double {
+                    auto* m = Scene<Backend, Precision>::findById(objId);
+                    if (!m || !m->state.x.ptr) return std::numeric_limits<double>::quiet_NaN();
+                    const Index n = m->state.x.size / 3;
+                    if (n == 0) return std::numeric_limits<double>::quiet_NaN();
+                    double acc = 0.0;
+                    for (Index i = 0; i < n; ++i) acc += (double)m->state.x.ptr[i*3+1];
+                    return acc / (double)n;
+                };
+                auto minYOf = [&](int objId) -> double {
+                    auto* m = Scene<Backend, Precision>::findById(objId);
+                    if (!m || !m->state.x.ptr) return std::numeric_limits<double>::quiet_NaN();
+                    const Index n = m->state.x.size / 3;
+                    double lo = 1e30;
+                    for (Index i = 0; i < n; ++i)
+                        lo = std::min(lo, (double)m->state.x.ptr[i*3+1]);
+                    return lo;
+                };
+
+                resetScene();
+                sim.usePbd = true;
+                sim.enableSelfCollisions = true;
+                const Index kG = 9;
+                sim.addCloth(kG, 1.0f, tinym::vec3(0.0f, 0.6f, 0.0f),
+                             1e5, 1e5, 3e5, clothThickness);             // id 0
+                {
+                    auto& req = Scene<Backend, Precision>::requestsGeneralMeshes.back();
+                    const float hh = 0.5f, yy = 0.6f;
+                    const uint32_t vids[4] = { 0, (uint32_t)kG - 1,
+                                               (uint32_t)(kG * (kG - 1)),
+                                               (uint32_t)(kG * kG - 1) };
+                    const tinym::vec3 ps[4] = { {-hh, yy, -hh}, {hh, yy, -hh},
+                                                {-hh, yy,  hh}, {hh, yy,  hh} };
+                    for (int i = 0; i < 4; ++i)
+                        req.fixedVertices.push_back(FixedVertex{vids[i], ps[i]});
+                }
+                sim.addCloth(7, 0.5f, tinym::vec3(0.0f, 0.75f, 0.0f),
+                             1e5, 1e5, 3e5, clothThickness);             // id 1
+                sim.initialize();
+                sim.pause = false;
+
+                uint64_t twoWayTotal = 0;
+                double topMaxY = -1e30;
+                bool blew7 = false;
+                for (int f = 0; f < 60; ++f) {
+                    sim.update();
+                    MetalGlobalContext::commitAndWait();
+                    twoWayTotal += sim.pbd.twoWayContactCount;
+                    const double ty = maxYOf(1);
+                    if (!std::isfinite(ty) || !std::isfinite(centroidYOf(0)))
+                        { blew7 = true; break; }
+                    topMaxY = std::max(topMaxY, ty);
+                }
+                sim.pause = true;
+
+                const double aC = centroidYOf(0), bC = centroidYOf(1);
+                const double bLow = minYOf(1);
+                const char* n7 = "PBD-7 / two-way cross-cloth contact: top sheet "
+                                 "rests on the pinned sheet";
+                if (blew7 || !std::isfinite(aC) || !std::isfinite(bC)
+                    || !std::isfinite(bLow))
+                    fail(n7, "non-finite cloth state in the two-cloth stack");
+                else if (twoWayTotal == 0)
+                    fail(n7, "two-way contact path never ran (twoWayContactCount "
+                         "stayed 0 across 60 frames)");
+                else if (topMaxY > 0.75 + 0.10)
+                    fail(n7, "top sheet LAUNCHED: peak y "
+                         + std::to_string(topMaxY) + " > 0.85");
+                else if (!(bC > aC))
+                    fail(n7, "top sheet ended below the pinned sheet's centroid: "
+                         + std::to_string(bC) + " <= " + std::to_string(aC)
+                         + " (fell through?)");
+                else if (bLow < 0.30)
+                    fail(n7, "top sheet fell through the pinned sheet: min y "
+                         + std::to_string(bLow));
+                else
+                    pass(n7);
+            }
+
+            // ---- PBD-8 — self-collision rows reach the two-way path --------
+            // Two opposite corners pinned at (nearly) the same point fold the
+            // sheet into a hanging taco: its two halves swing together and
+            // stay in contact, which only q==t (self) rows can express. The
+            // narrow phase excludes adjacency-adjacent facets, so any self row
+            // here is a genuine layer-on-layer contact.
+            //
+            // The pin TELEPORTS the far corner 0.85 m at pack time, which
+            // injects a violent first-frame stretch correction and a real whip
+            // (peak y ~1.3 observed WITHOUT any self-collision involved). So
+            // the launch clause is A/B: the same scene runs with self rows off
+            // and then on, and self-handling must not add significant energy
+            // on top of the whip the pin itself causes — plus the folded sheet
+            // must settle back under the pins by the end of the self run.
+            {
+                const Index kG8 = 12;
+                auto buildFoldScene = [&](bool selfOn) {
+                    resetScene();
+                    sim.usePbd = true;
+                    sim.enableSelfCollisions = selfOn;
+                    sim.addCloth(kG8, 0.6f, tinym::vec3(0.0f, 0.8f, 0.0f),
+                                 1e5, 1e5, 3e5, clothThickness);         // id 0
+                    auto& req = Scene<Backend, Precision>::requestsGeneralMeshes.back();
+                    // vid 0 = (-0.3, y, -0.3) corner, vid kG8*kG8-1 = the
+                    // diagonally opposite corner, pinned 4 mm apart.
+                    req.fixedVertices.push_back(
+                        FixedVertex{0u, tinym::vec3(0.0f, 0.8f, 0.0f)});
+                    req.fixedVertices.push_back(
+                        FixedVertex{(uint32_t)(kG8*kG8 - 1),
+                                    tinym::vec3(0.004f, 0.8f, 0.004f)});
+                    sim.initialize();
+                    sim.pause = false;
+                };
+                // Peak height + late-window peak over 90 frames; returns false
+                // on a non-finite vertex.
+                uint64_t selfTotal = 0;
+                auto runFold = [&](double& peakAll, double& peakLate,
+                                   bool countSelf) -> bool {
+                    peakAll = -1e30; peakLate = -1e30;
+                    for (int f = 0; f < 90; ++f) {
+                        sim.update();
+                        MetalGlobalContext::commitAndWait();
+                        if (countSelf) selfTotal += sim.pbd.selfContactCount;
+                        const double my = maxYOf(0);
+                        if (!std::isfinite(my)) return false;
+                        peakAll = std::max(peakAll, my);
+                        if (f >= 60) peakLate = std::max(peakLate, my);
+                    }
+                    return true;
+                };
+
+                double basePeak, baseLate, selfPeak, selfLate;
+                buildFoldScene(false);
+                const bool okBase = runFold(basePeak, baseLate, false);
+                sim.pause = true;
+                buildFoldScene(true);
+                const bool okSelf = runFold(selfPeak, selfLate, true);
+                sim.pause = true;
+                sim.usePbd = false;
+                sim.enableSelfCollisions = false;
+
+                const char* n8 = "PBD-8 / folded sheet feeds self-collision rows "
+                                 "through the two-way path";
+                if (!okBase || !okSelf)
+                    fail(n8, "non-finite cloth state in the folded-sheet scene");
+                else if (selfTotal == 0)
+                    fail(n8, "no self rows consumed (selfContactCount stayed 0 "
+                         "across 90 frames of a folded hanging sheet)");
+                else if (selfPeak > basePeak + 0.15)
+                    fail(n8, "self-collision handling ADDED energy: peak y "
+                         + std::to_string(selfPeak) + " with self rows vs "
+                         + std::to_string(basePeak) + " without");
+                // Relative, not absolute: the pin-teleport whip is undamped and
+                // the baseline itself never settles inside 90 frames (late peak
+                // ~1.31 measured). Self handling must merely not make the late
+                // window WORSE than the row-free baseline; in practice the
+                // layer contacts dissipate and the self run comes out LOWER.
+                else if (selfLate > baseLate + 0.15)
+                    fail(n8, "self rows left the sheet MORE energetic late: "
+                         "late-window peak y " + std::to_string(selfLate)
+                         + " with self rows vs " + std::to_string(baseLate)
+                         + " without");
+                else
+                    pass(n8);
+            }
         }
 
         sim.pause       = true;

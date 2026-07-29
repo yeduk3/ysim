@@ -78,7 +78,98 @@ void postInitPbdCloth(SimOf<BE, PR>& simulator) {
     // substep — a held broad phase would let the cloth drift through.
     simulator.cdSubstepPeriod    = 1;
     simulator.refitSubstepPeriod = 1;
+    // PBD consumes self rows via the two-way contact path.
+    simulator.enableSelfCollisions = true;
     std::cout << "[Main] --scene pbd_cloth: CPU PBD solver active\n";
+}
+
+// "pbd_cloth_ball": the pbd_cloth sheet pinned at its four corners, with a
+// 0.5 m Rigid ball dropped from just above the center. Repro scene for the
+// stale-analytic-collider bug (a falling Rigid's Sphere collider used to
+// stay frozen at its spawn transform, so the ball fell through the cloth
+// with zero contacts). Corners are pinned through the request's
+// fixedVertices — the pack-surviving source of truth Scene::pack re-applies
+// after the initializer regenerates the grid.
+template <typename BE, typename PR>
+void setupPbdClothBall(SimOf<BE, PR>& simulator, SysOf<BE, PR>& /*system*/) {
+    const PR kstretch = 1e5, kshear = 1e5, kbend = 2e5;
+    const PR mass = 0.1, thickness = 0.01;
+    const Index n = 20;
+    const PR size = 1, y = 0.6;
+    simulator.addPlane(PlaneDirection::XZPlane, tinym::vec3(0, 0, 0), 24, 3.0,
+                       0.1, BehaviorType::Float);                        // id 0
+    simulator.addCloth(n, size, tinym::vec3(0, (float)y, 0), kstretch, kshear,
+                       kbend, thickness, mass);                          // id 1
+    {
+        auto& req = Scene<BE, PR>::requestsGeneralMeshes.back();
+        const float h = (float)(size / 2);
+        const uint32_t vids[4] = { 0, (uint32_t)n - 1,
+                                   (uint32_t)(n * (n - 1)),
+                                   (uint32_t)(n * n - 1) };
+        const tinym::vec3 pos[4] = { { -h, (float)y, -h }, { h, (float)y, -h },
+                                     { -h, (float)y,  h }, { h, (float)y,  h } };
+        for (int i = 0; i < 4; ++i)
+            req.fixedVertices.push_back(FixedVertex{ vids[i], pos[i] });
+    }
+    // Rigid → Bullet drives the fall; the Sphere analytic collider must
+    // follow the body (refreshAnalyticShapes reads the live centroid).
+    simulator.addSphere(tinym::vec3(0, 1.0, 0), 16, 0.5, PR(0.1),
+                        BehaviorType::Rigid);                            // id 2
+    simulator.mlBroadPhase.floorExcludeDiag = 1e9f;   // exclude NOTHING
+}
+
+template <typename BE, typename PR>
+void postInitPbdClothBall(SimOf<BE, PR>& simulator) {
+    simulator.usePbd = true;
+    simulator.cdSubstepPeriod    = 1;   // same rationale as postInitPbdCloth
+    simulator.refitSubstepPeriod = 1;
+    // PBD consumes self rows via the two-way contact path.
+    simulator.enableSelfCollisions = true;
+    std::cout << "[Main] --scene pbd_cloth_ball: CPU PBD solver, corner-pinned "
+                 "cloth, Rigid ball drop\n";
+}
+
+// "pbd_cloth_stack": two PBD cloths, one corner-pinned sheet (id 1) with a
+// smaller free sheet (id 2) dropped onto it, over a Float floor. The
+// cross-cloth contacts are the two-way path's reason to exist: both meshes
+// are live cloths, so every vertex-triangle row corrects BOTH sides
+// (Müller 2007 eq 12/13) instead of pushing only the query vertex.
+template <typename BE, typename PR>
+void setupPbdClothStack(SimOf<BE, PR>& simulator, SysOf<BE, PR>& /*system*/) {
+    const PR kstretch = 1e5, kshear = 1e5, kbend = 2e5;
+    const PR mass = 0.1, thickness = 0.01;
+    const Index n = 20;
+    const PR size = 1, y = 0.6;
+    simulator.addPlane(PlaneDirection::XZPlane, tinym::vec3(0, 0, 0), 24, 3.0,
+                       0.1, BehaviorType::Float);                        // id 0
+    simulator.addCloth(n, size, tinym::vec3(0, (float)y, 0), kstretch, kshear,
+                       kbend, thickness, mass);                          // id 1
+    {
+        auto& req = Scene<BE, PR>::requestsGeneralMeshes.back();
+        const float h = (float)(size / 2);
+        const uint32_t vids[4] = { 0, (uint32_t)n - 1,
+                                   (uint32_t)(n * (n - 1)),
+                                   (uint32_t)(n * n - 1) };
+        const tinym::vec3 pos[4] = { { -h, (float)y, -h }, { h, (float)y, -h },
+                                     { -h, (float)y,  h }, { h, (float)y,  h } };
+        for (int i = 0; i < 4; ++i)
+            req.fixedVertices.push_back(FixedVertex{ vids[i], pos[i] });
+    }
+    // Free sheet, dropped onto the pinned one.
+    simulator.addCloth(12, 0.5, tinym::vec3(0, 0.75, 0), kstretch, kshear,
+                       kbend, thickness, mass);                          // id 2
+    simulator.mlBroadPhase.floorExcludeDiag = 1e9f;   // exclude NOTHING
+}
+
+template <typename BE, typename PR>
+void postInitPbdClothStack(SimOf<BE, PR>& simulator) {
+    simulator.usePbd = true;
+    simulator.cdSubstepPeriod    = 1;   // same rationale as postInitPbdCloth
+    simulator.refitSubstepPeriod = 1;
+    // PBD consumes self rows via the two-way contact path.
+    simulator.enableSelfCollisions = true;
+    std::cout << "[Main] --scene pbd_cloth_stack: CPU PBD solver, two stacked "
+                 "cloths, two-way contacts\n";
 }
 
 // ---- P2 analytic-collider scenes (collider_pipeline_rework.md §5-P2) -----
@@ -192,6 +283,10 @@ inline const std::vector<Entry<BE, PR>>& registry() {
           &setupDemoUniform<BE, PR>, &postInitDemoUniform<BE, PR> },
         { "pbd_cloth", "demo_uniform geometry solved by the CPU PBD system",
           &setupPbdCloth<BE, PR>, &postInitPbdCloth<BE, PR> },
+        { "pbd_cloth_ball", "corner-pinned PBD cloth + a 0.5 m Rigid ball drop",
+          &setupPbdClothBall<BE, PR>, &postInitPbdClothBall<BE, PR> },
+        { "pbd_cloth_stack", "two PBD cloths stacked; cross-cloth two-way contacts",
+          &setupPbdClothStack<BE, PR>, &postInitPbdClothStack<BE, PR> },
         { "analytic_sphere", "cloth dropped on a Sphere analytic collider",
           &setupAnalyticSphere<BE, PR>, nullptr },
         { "analytic_box", "cloth dropped on a Box analytic collider",

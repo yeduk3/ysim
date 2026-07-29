@@ -59,6 +59,14 @@ public:
                       tinym::vec3 at_world_point);
     void setLinearVelocity(BodyHandle handle, tinym::vec3 v);
     void setAngularVelocity(BodyHandle handle, tinym::vec3 w);
+    // Teleport the body's centre of mass to `p`, keeping its CURRENT
+    // rotation. Used by the PBD cloth→rigid coupling writeback: the cloth
+    // solver accumulates a positional correction for the body over a frame
+    // and pushes it here (position-based, so it is a position write, not an
+    // impulse). Also wakes the body — a deactivated (sleeping) island is
+    // skipped by the next stepSimulation and the write would be ignored.
+    // Out-of-range handles are no-ops (CM-012).
+    void setPosition(BodyHandle handle, tinym::vec3 p);
 
     void setGravity(tinym::vec3 gravity);
     // Per-body gravity override. Used by the per-mesh Apply Gravity

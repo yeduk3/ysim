@@ -1206,6 +1206,19 @@ int main(int argc, char** argv) {
                 target.on_scale = [&simulator](int id, tinym::vec3 s) {
                     simulator.scaleObject(id, s);
                 };
+                // 질량 — per-vertex mass, shown for EVERY behavior (the
+                // cloth solvers and the Bullet body both derive from it).
+                // state.m is METAL shared storage and Precision == float,
+                // so &m.ptr[0] is a live float the widget can drag; the
+                // committed edit goes through Simulator::setObjectMass,
+                // which refills all 3N entries + the initializer params.
+                if (selectedMesh->state.m.ptr && selectedMesh->state.m.size > 0) {
+                    target.mass_per_vertex = &selectedMesh->state.m.ptr[0];
+                    target.mass_num_points = (int)(selectedMesh->state.x.size / 3);
+                    target.on_mass = [&simulator](int id, float v) {
+                        simulator.setObjectMass(id, (Precision)v);
+                    };
+                }
                 // "팽팽함" — only meaningful for cloth behaviors; left
                 // null otherwise so the slider stays hidden.
                 if (selectedMesh->behaviorType == BehaviorType::TriangularCloth

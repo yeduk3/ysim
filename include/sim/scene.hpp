@@ -99,6 +99,14 @@ struct GeneralMesh {
     // Cached last backend body position so each frame's Δpos = current - last
     // can be applied to state.x / state.xPrev / transformPosition.
     tinym::vec3 rigidLastBodyPos = {};
+    // TOTAL mass the Bullet body was created with (Σ state.m over this
+    // mesh's vertices — ysim is the source of truth for mass, see
+    // ensureRigidBackendBody). 0 for a static body (applyGravity == false)
+    // and for meshes with no backend body. The PBD cloth→rigid coupling
+    // reads it as the body's inverse-mass weight, so it must stay in sync
+    // with whatever mass the body actually has: every path that changes the
+    // Bullet mass goes through recreateRigidBackendBody.
+    PR rigidBodyMass = PR(0);
 
     // Render-side GL state lives in MeshRenderState, keyed by id (D-011).
     // GeneralMesh no longer owns OpenGL handles, so initialize() is safe to
@@ -615,8 +623,10 @@ struct Scene {
     // caller (Simulator::update) refreshes once per FRAME while the CCD
     // segment is per SUBSTEP, which makes the derived rotation margin
     // conservative (frame delta ≥ substep delta) — never optimistic.
-    // v1 reads the authoring transform (colliders are static; Bullet-
-    // driven motion reconciliation is the c-4 / A9 unification).
+    // v1 reads the authoring transform for non-Rigid colliders (static);
+    // Rigid-tagged colliders follow their live vertex centroid so a
+    // Bullet-driven body carries its analytic shape with it (full c-4 /
+    // A9 motion reconciliation — rotation propagation — still pending).
     // `fitExtents` is false only for the pack-time seeding call, where the
     // mesh initializers have not run yet (see analyticLocalHalf).
     static void refreshAnalyticShapes(bool fitExtents = true) {
@@ -627,7 +637,27 @@ struct Scene {
             if (!isAnalyticCollider(m.colliderKind)) continue;
             if (k >= numAnalytic) break;
 
-            const tinym::vec3 c = m.transformPosition;
+            // Rigid bodies live in state.x (Simulator's D-040 centroid snap
+            // keeps the verts on the Bullet body) while transformPosition
+            // deliberately stays at the authorial spawn. Reading only the
+            // authoring transform left a FALLING Rigid's analytic collider
+            // frozen at its spawn point — the rendered ball dropped straight
+            // through cloth with zero contacts. Follow the live centroid for
+            // Rigid; everything else keeps the authoring transform (v1:
+            // static colliders).
+            tinym::vec3 c = m.transformPosition;
+            if (m.behaviorType == BehaviorType::Rigid
+                && m.state.x.ptr && m.state.x.size >= 3) {
+                const Index nv = m.state.x.size / 3;
+                double sx = 0.0, sy = 0.0, sz = 0.0;
+                for (Index vi = 0; vi < nv; ++vi) {
+                    sx += (double)m.state.x.ptr[vi*3+0];
+                    sy += (double)m.state.x.ptr[vi*3+1];
+                    sz += (double)m.state.x.ptr[vi*3+2];
+                }
+                c = tinym::vec3((float)(sx / nv), (float)(sy / nv),
+                                (float)(sz / nv));
+            }
             const tinym::vec4 rot(m.rotationQuat.w, m.rotationQuat.x,
                                   m.rotationQuat.y, m.rotationQuat.z);
             if (fitExtents && k < (Index)analyticHalfFitted.size()

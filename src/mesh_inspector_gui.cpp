@@ -1070,6 +1070,28 @@ void drawMeshInspectorWindow(MeshInspectorWindowState& st, const MeshInspectorTa
         }
     }
 
+    // ─── 질량 Mass ───────────────────────────────────────────────────
+    // Per-vertex mass (the authoring convention: every entry of MeshState::m
+    // holds this value), with the derived total shown underneath. Committed
+    // on edit-finished rather than per drag frame — setObjectMass recycles
+    // the Bullet body, which is not something to do 60x a second.
+    if(t.mass_per_vertex&&t.on_mass){
+        ImGui::Dummy({0,kP});ImGui::Indent(kP);
+        ImGui::PushStyleColor(ImGuiCol_Text,kG60);ImGui::TextUnformatted("질량");ImGui::PopStyleColor();
+        ImGui::SameLine(kP+60);
+        ImGui::SetNextItemWidth(CW()-60);
+        ImGui::PushID("mass");
+        ImGui::DragFloat("##m",t.mass_per_vertex,0.001f,1e-6f,1e6f,"%.4g");
+        if(ImGui::IsItemDeactivatedAfterEdit())t.on_mass(t.mesh_id,*t.mass_per_vertex);
+        ImGui::PopID();
+        ImGui::Dummy({0,4});
+        ImGui::PushStyleColor(ImGuiCol_Text,kG60);
+        ImGui::Text("총질량 = %.4g x %d = %.4g",*t.mass_per_vertex,t.mass_num_points,
+                    (*t.mass_per_vertex)*(float)t.mass_num_points);
+        ImGui::PopStyleColor();
+        ImGui::Unindent(kP);ImGui::Dummy({0,kP});
+    }
+
     // ─── 팽팽함 ──────────────────────────────────────────────────────
     if(t.cloth_stiffness_scale&&t.on_cloth_stiffness_scale){
         float sc=*t.cloth_stiffness_scale;float k=(sc>0)?std::log10(sc):0;if(k<-2)k=-2;if(k>2)k=2;

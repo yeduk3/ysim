@@ -175,6 +175,17 @@ struct MeshInspectorTarget {
     // Both must be set together to enable the InputFloat3 row.
     tinym::vec3* scale = nullptr;
     std::function<void(int, tinym::vec3)> on_scale;
+    // 질량 — PER-VERTEX mass, shown for every mesh type (cloth uses it in
+    // the PBD/force solvers; a Rigid mesh's Bullet body derives its total
+    // mass from the same numbers). The pointer reads the live value out of
+    // MeshState::m; mass_num_points is the mesh's vertex count so the widget
+    // can display the derived total (per-vertex × numPoints). Pointer and
+    // callback must both be set to enable the row; the callback routes
+    // through Simulator::setObjectMass, which rewrites state.m AND the
+    // initializer params so the edit survives Scene::pack and save/load.
+    float* mass_per_vertex = nullptr;
+    int mass_num_points = 0;
+    std::function<void(int, float)> on_mass;
     // "팽팽함" — cloth-only uniform stiffness multiplier. Non-null only
     // when the selected mesh is a cloth behavior; the slider is hidden
     // otherwise. Reads the live value via the pointer; commits through
