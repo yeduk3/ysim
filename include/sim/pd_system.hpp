@@ -47,12 +47,21 @@
 // global solve — see step (3) below for why that is safe and what it
 // trades away.
 //
+// Parallelism (Liu 2013 §3.3 / §8): the local step is embarrassingly
+// parallel over springs, and the global step's three coordinate columns are
+// independent back-substitutions against ONE factor. Both are dispatched
+// over GCD here — Apple Clang has no OpenMP. See kParallelMinVerts for why
+// small meshes still run the identical code serially.
+//
 // ponytail: one commitAndWait per substep, same cost the PBD path pays. The
-// factorization is amortized but the solve is CPU-serial; port the local
-// step + a Jacobi/Chebyshev global step to Metal if PD earns its keep.
+// factorization is amortized and the sweeps are multi-core, but a single
+// back-substitution is still inherently sequential; port the local step + a
+// Jacobi/Chebyshev global step to Metal if PD earns its keep.
 
 #include <Eigen/Sparse>
+#include <dispatch/dispatch.h>
 #include <memory>
+#include <thread>
 #include <unordered_map>
 
 template <typename BE, typename PR>
@@ -181,12 +190,69 @@ struct PdSystem<METAL, PR> {
     struct Spring { Index a, b; double rest; bool bend; };
     static constexpr Index kConsumed = (Index)-1;
 
+    // One incident spring of a vertex, as stored in the CSR adjacency below.
+    // `sign` is +1 where the vertex is that spring's endpoint a and -1 where
+    // it is b — exactly the two signs the RHS assembly applies.
+    struct Incident { Index spring; int32_t sign; };
+
+    // Vertex count below which every per-vertex / per-spring sweep runs
+    // serially. A GCD round trip costs tens of microseconds of queue hop and
+    // worker wake-up; a few hundred spring projections finish in less than
+    // that, so parallelising a small sheet is a pure loss. The self-test
+    // meshes are all far under this — they exercise the SERIAL schedule,
+    // which is the reason both schedules must run the SAME lambda rather than
+    // two copies of the loop that can drift apart.
+    static constexpr Index kParallelMinVerts = 1024;
+
+    // Run `body(begin, end)` over the half-open range [0, count).
+    //
+    // dispatch_apply is SYNCHRONOUS: it returns only after every chunk has
+    // completed, so a captured reference can never outlive the call and the
+    // substep keeps its sequential ordering across phases.
+    //
+    // Chunked, NOT one dispatch per element: per-element bookkeeping costs
+    // more than a spring projection costs to compute. `body` must touch only
+    // state OWNED by the range it is handed — both call sites below are
+    // written so that each index has exactly one writer.
+    template <typename F>
+    static void forRange(bool parallel, size_t count, F&& body) {
+        if (count == 0) return;
+        if (!parallel) { body(size_t(0), count); return; }
+        // ~2 chunks per core so a straggler chunk can be absorbed, floored at
+        // a chunk size that is worth a worker's wake-up.
+        static const size_t kChunks =
+            (size_t)std::max(1u, 2u * std::thread::hardware_concurrency());
+        const size_t chunk = std::max<size_t>((count + kChunks - 1) / kChunks,
+                                              256);
+        const size_t blocks = (count + chunk - 1) / chunk;
+        // Captured by POINTER: a block capturing a C++ lambda by value would
+        // copy it, and the copy semantics of a capture-by-reference lambda are
+        // a needless thing to reason about when the callee outlives the call.
+        auto* fn = &body;
+        dispatch_apply(blocks, DISPATCH_APPLY_AUTO, ^(size_t bi) {
+            const size_t b = bi * chunk;
+            (*fn)(b, std::min(count, b + chunk));
+        });
+    }
+
     // Per-mesh cached topology + prefactored global matrix, parallel to
     // Scene::meshes (same shape as PbdSystem::bendCache).
     struct MeshCache {
         int    lifetimeId = -2;   // -1 is a legal mesh value, so seed elsewhere
         Index  numPoints = 0, numFacets = 0, numEdges = 0;
         std::vector<Spring> springs;
+        // Vertex -> incident springs, CSR: the entries of vertex i are
+        // adjEntries[adjOffsets[i] .. adjOffsets[i+1]). Built once WITH
+        // `springs` (same topology trigger) because it is a pure function of
+        // them. Exists so the local step's RHS assembly can be a GATHER — one
+        // writer per row — instead of the scatter a serial loop can afford;
+        // see the two LOCAL passes in step (2).
+        std::vector<Index>    adjOffsets;   // n + 1
+        std::vector<Incident> adjEntries;   // 2 * springs.size()
+        // Projected auxiliary variables d_i of the local step, flat 3 per
+        // spring. Lives here so the allocation survives substeps; every entry
+        // is rewritten by pass 1 of every iteration, so it carries no state.
+        std::vector<double> springD;
         // Matrix-invalidating scalars, compared verbatim each substep.
         double h = 0.0, kS = -1.0, kB = -1.0;
         // Copies of the two per-vertex arrays that enter the matrix. The pin
@@ -205,8 +271,9 @@ struct PdSystem<METAL, PR> {
         // system is scalar n x n and the three coordinates are INDEPENDENT
         // (a spring's energy is isotropic, so the same L couples x, y and
         // z), which is the whole reason one factorization serves all of
-        // them. Eigen solves the three columns in one back-substitution
-        // call. `q` must be PER MESH (not a shared scratch): a two-way
+        // them — and the reason the three columns can be back-substituted
+        // CONCURRENTLY, one per coordinate axis. `q` must be PER MESH
+        // (not a shared scratch): a two-way
         // contact writes into the PARTNER mesh's iterate, so every active
         // cloth's block stays live for the whole iteration phase — the same
         // reason PbdSystem::predBlocks is per mesh.
@@ -323,6 +390,32 @@ struct PdSystem<METAL, PR> {
         }
     }
 
+    // Transpose the spring list into the per-vertex CSR adjacency the local
+    // step gathers over. Counting sort, two passes, no map: buildSprings has
+    // already guaranteed a < n, b < n and a != b for every spring, so every
+    // entry lands in range and no vertex sees the same spring twice.
+    //
+    // Why this exists at all: the RHS contribution of a spring is +k·d on
+    // endpoint a and -k·d on endpoint b. A parallel loop over SPRINGS would
+    // have two threads writing the same vertex row (a race), and per-thread
+    // RHS copies would cost an n x 3 reduction per iteration. Inverting the
+    // relation makes the assembly a loop over VERTICES with a single writer
+    // per row, which needs no atomics and no reduction.
+    static void buildIncidence(const std::vector<Spring>& springs, Index n,
+                               std::vector<Index>& offsets,
+                               std::vector<Incident>& entries) {
+        offsets.assign((size_t)n + 1, 0);
+        for (const auto& s : springs) { ++offsets[s.a + 1]; ++offsets[s.b + 1]; }
+        for (Index i = 0; i < n; ++i) offsets[i + 1] += offsets[i];
+        entries.resize(springs.size() * 2);
+        std::vector<Index> cursor(offsets.begin(), offsets.end() - 1);
+        for (size_t si = 0; si < springs.size(); ++si) {
+            const Spring& s = springs[si];
+            entries[cursor[s.a]++] = Incident{ (Index)si, +1 };
+            entries[cursor[s.b]++] = Incident{ (Index)si, -1 };
+        }
+    }
+
     void step(Scene<METAL, PR>& sceneObjects, PR dt) {
         if (dt <= PR(0)) return;
         // Flush + wait: x, and the narrow-phase contact arrays this substep's
@@ -384,8 +477,15 @@ struct PdSystem<METAL, PR> {
             // silently re-sampled from a deformed configuration mid-run.
             bool refactor = false;
             if (mc.lifetimeId != mesh.lifetimeId || mc.numPoints != n
-                || mc.numFacets != numFacets || mc.numEdges != numEdges) {
+                || mc.numFacets != numFacets || mc.numEdges != numEdges
+                || mc.adjOffsets.size() != (size_t)n + 1) {
                 buildSprings(mesh, n, mc.springs);
+                // The gather adjacency is a function of the spring list only,
+                // so it is rebuilt exactly when the springs are. Stiffness
+                // edits refactor the MATRIX but never reach here — and must
+                // not, for the same reason `rest` must not be re-measured.
+                buildIncidence(mc.springs, n, mc.adjOffsets, mc.adjEntries);
+                mc.springD.assign(mc.springs.size() * 3, 0.0);
                 mc.lifetimeId = mesh.lifetimeId;
                 mc.numPoints  = n;
                 mc.numFacets  = numFacets;
@@ -580,38 +680,115 @@ struct PdSystem<METAL, PR> {
             for (SolveCtx& c : ctxs) {
                 MeshCache& mc = *c.mc;
                 mc.rhs = mc.rhsBase;
-                // LOCAL: each spring's auxiliary variable d is the closest
-                // point of its constraint manifold (the sphere of radius
-                // `rest`) to the current edge vector — i.e. the edge
-                // direction scaled to rest length. Closed form, per spring,
-                // embarrassingly parallel.
-                for (const auto& s : mc.springs) {
-                    const double k = s.bend ? c.kB : c.kS;
-                    if (!(k > 0.0)) continue;
-                    const int a = (int)s.a, b = (int)s.b;
-                    double ex = mc.q(a,0) - mc.q(b,0);
-                    double ey = mc.q(a,1) - mc.q(b,1);
-                    double ez = mc.q(a,2) - mc.q(b,2);
-                    const double len = std::sqrt(ex*ex + ey*ey + ez*ez);
-                    // Coincident endpoints: the direction is undefined. Leave
-                    // d equal to the (zero) edge vector so the constraint
-                    // contributes NOTHING this iteration. Projecting onto an
-                    // arbitrary direction would inject a full rest-length
-                    // impulse along a random axis; pulling to coincide would
-                    // be worse still.
-                    if (len > 1e-9) {
-                        const double sc = s.rest / len;
-                        ex *= sc; ey *= sc; ez *= sc;
-                    }
-                    mc.rhs(a,0) += k * ex; mc.rhs(a,1) += k * ey; mc.rhs(a,2) += k * ez;
-                    mc.rhs(b,0) -= k * ex; mc.rhs(b,1) -= k * ey; mc.rhs(b,2) -= k * ez;
+                // Everything below runs on ONE schedule decision: a mesh
+                // small enough that dispatch would dominate keeps the serial
+                // walk, through the same lambdas.
+                const bool par = (c.n >= kParallelMinVerts);
+                const size_t numSprings = mc.springs.size();
+
+                // LOCAL pass 1, parallel over SPRINGS: each spring's
+                // auxiliary variable d is the closest point of its constraint
+                // manifold (the sphere of radius `rest`) to the current edge
+                // vector — i.e. the edge direction scaled to rest length.
+                // Closed form and independent per spring; spring i reads only
+                // the (frozen) iterate and owns springD[3i .. 3i+2], so the
+                // pass is write-disjoint with no synchronisation at all.
+                //
+                // d is computed for EVERY spring, including the k == 0 ones
+                // the assembly skips: a branch here would only trade an
+                // arithmetic op for a mispredict, and the stale slot is never
+                // read.
+                {
+                    const Spring* sp = mc.springs.data();
+                    const Eigen::MatrixXd& q = mc.q;
+                    double* dOut = mc.springD.data();
+                    forRange(par, numSprings, [&](size_t begin, size_t end) {
+                        for (size_t si = begin; si < end; ++si) {
+                            const Spring& s = sp[si];
+                            const int a = (int)s.a, b = (int)s.b;
+                            double ex = q(a,0) - q(b,0);
+                            double ey = q(a,1) - q(b,1);
+                            double ez = q(a,2) - q(b,2);
+                            const double len = std::sqrt(ex*ex + ey*ey + ez*ez);
+                            // Coincident endpoints: the direction is
+                            // undefined. Leave d equal to the (zero) edge
+                            // vector so the constraint contributes NOTHING
+                            // this iteration. Projecting onto an arbitrary
+                            // direction would inject a full rest-length
+                            // impulse along a random axis; pulling to coincide
+                            // would be worse still.
+                            if (len > 1e-9) {
+                                const double sc = s.rest / len;
+                                ex *= sc; ey *= sc; ez *= sc;
+                            }
+                            double* d = dOut + si * 3;
+                            d[0] = ex; d[1] = ey; d[2] = ez;
+                        }
+                    });
                 }
-                // GLOBAL: one back-substitution against the prefactored A,
-                // three RHS columns at once. This is the step that makes PD
-                // implicit — every vertex sees every other through A⁻¹, which
-                // is why stiff springs do not explode the way the symplectic
-                // path does at the same substep count.
-                mc.q = mc.factor->solve(mc.rhs);
+
+                // LOCAL pass 2, parallel over VERTICES: assemble the spring
+                // part of the RHS by GATHER. Vertex i sums sign * k * d over
+                // its incident springs — the same +k·d on endpoint a / -k·d
+                // on endpoint b the scatter applied, re-associated so that
+                // row i has exactly one writer.
+                //
+                // The summation ORDER differs from the scatter's (a row now
+                // accumulates in incidence order rather than spring order), so
+                // results differ in the last bits. That is the accepted price
+                // of dropping the race; nothing here depends on bit equality.
+                {
+                    const Index*    offs = mc.adjOffsets.data();
+                    const Incident* ent  = mc.adjEntries.data();
+                    const Spring*   sp   = mc.springs.data();
+                    const double*   dIn  = mc.springD.data();
+                    Eigen::MatrixXd& rhs = mc.rhs;
+                    const double kS = c.kS, kB = c.kB;
+                    forRange(par, (size_t)c.n, [&](size_t begin, size_t end) {
+                        for (size_t i = begin; i < end; ++i) {
+                            double gx = 0.0, gy = 0.0, gz = 0.0;
+                            for (Index e = offs[i]; e < offs[i+1]; ++e) {
+                                const Incident in = ent[e];
+                                const double k = sp[in.spring].bend ? kB : kS;
+                                if (!(k > 0.0)) continue;
+                                const double w = k * (double)in.sign;
+                                const double* d = dIn + (size_t)in.spring * 3;
+                                gx += w * d[0]; gy += w * d[1]; gz += w * d[2];
+                            }
+                            rhs((int)i,0) += gx;
+                            rhs((int)i,1) += gy;
+                            rhs((int)i,2) += gz;
+                        }
+                    });
+                }
+
+                // GLOBAL: back-substitution against the prefactored A. This is
+                // the step that makes PD implicit — every vertex sees every
+                // other through A⁻¹, which is why stiff springs do not explode
+                // the way the symplectic path does at the same substep count.
+                //
+                // The three coordinate columns share A but are otherwise
+                // independent, so they are solved as three CONCURRENT
+                // per-axis back-substitutions (Liu 2013 §8). SimplicialLDLT
+                // is safe to share across them: solve() is const, its only
+                // mutable member (m_info) is written by compute()/factorize()
+                // and merely read here, and each call allocates its own
+                // temporaries — there is no shared scratch to collide over.
+                // q is column-major, so the three destination columns are
+                // disjoint contiguous spans.
+                //
+                // Below the gate the three columns go in ONE call, which is
+                // what this always did: for a small system the extra solve
+                // set-up costs more than the axes save.
+                if (par) {
+                    MeshCache* mcp = &mc;
+                    dispatch_apply(3, DISPATCH_APPLY_AUTO, ^(size_t ax) {
+                        const Eigen::Index col = (Eigen::Index)ax;
+                        mcp->q.col(col) = mcp->factor->solve(mcp->rhs.col(col));
+                    });
+                } else {
+                    mc.q = mc.factor->solve(mc.rhs);
+                }
             }
 
             // --- (3) contacts, ONCE PER ITERATION, after every mesh's global
