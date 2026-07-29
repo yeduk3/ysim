@@ -252,7 +252,14 @@ int main(int argc, char** argv) {
 
     //ByteMemoryPool<METAL> pool(50*1024*1024*sizeof(Precision));
     Precision h = 1/Precision(60);
-    Index subSteps = 1;
+    // 60 is the long-standing interactive default. 73c2d95 (a motion-blend
+    // commit) left this at a debug value of 1, which silently broke every
+    // falling-cloth contact: at 1 substep the per-frame drop (~5 cm at
+    // floor impact) jumps past the mesh-mesh narrow phase's proximity band
+    // (radius + thickness ~ 2 cm), so no contact row ever fires — the
+    // symplectic solver blows up and PBD tunnels straight through the
+    // floor with no recovery. Measured: substeps >= 2 rests, 1 free-falls.
+    Index subSteps = 60;
     SymplecticSystem<Backend, Precision> system(h, subSteps);
     Simulator<Backend, Precision, SymplecticSystem<Backend, Precision>> simulator(system);
     std::cout << "[Main] simulator created" << std::endl;
