@@ -1018,6 +1018,276 @@ static int runSelfTest() {
                 pass(n7);
         }
 
+        // ---- CPSH-8 — instrumented A/B of the user's XY-fold scene. ------
+        // Replica of scene_registry's pbd_cloth_xyfold (vertical sheet,
+        // subSteps 3, PBD iterations 8) run twice: per-object 자기 충돌 OFF
+        // then ON. This is a DIAGNOSTIC, not a behavior gate — it exists to
+        // answer why the toggle makes no visible difference. The competing
+        // hypotheses:
+        //   H1  the scene never self-touches. Buckling into smooth curves
+        //       keeps opposing faces further apart than thickness+radius, so
+        //       zero self rows is CORRECT and "no difference" is expected.
+        //   H2  self contacts do fire, but the response is sub-thickness and
+        //       therefore invisible at thickness 0.01.
+        // m1 (min layer gap) is what separates them: it measures whether any
+        // two topologically-distant parts of the sheet ever end up stacked.
+        {
+            const Index kG8s = 20;
+            // m1: bucket cloth vertices into ~2 cm (x,z) cells; inside a
+            // bucket, consider only vertex pairs whose GRID-index distance
+            // (|Δrow| + |Δcol|) >= 4 — that excludes neighbours and the local
+            // curvature of a fold, leaving genuine layer-over-layer pairs.
+            // Returns the smallest |Δy| over all such pairs, or +inf when the
+            // sheet never stacks on itself at all.
+            // `cell` and `minGrid` are parameters because the spec's 2 cm cell
+            // is FINER than this mesh's vertex spacing (1.0 m / 19 = 5.3 cm):
+            // at 2 cm two topologically-distant vertices can only share a
+            // bucket when they are almost exactly stacked, so an `inf` there
+            // is ambiguous between "never stacks" and "cell too small". The
+            // 6 cm variant (≈ one vertex spacing) removes that ambiguity.
+            // `pairs` returns how many candidate pairs the metric even saw.
+            auto layerGap = [&](int objId, Index n1D, double cell, long minGrid,
+                                long long& pairs) -> double {
+                pairs = 0;
+                auto* m = Scene<Backend, Precision>::findById(objId);
+                if (!m || !m->state.x.ptr) return std::numeric_limits<double>::quiet_NaN();
+                const Index n = m->state.x.size / 3;
+                std::map<std::pair<long long, long long>, std::vector<Index>> buckets;
+                for (Index i = 0; i < n; ++i) {
+                    const double px = (double)m->state.x.ptr[i*3+0];
+                    const double pz = (double)m->state.x.ptr[i*3+2];
+                    if (!std::isfinite(px) || !std::isfinite(pz)) continue;
+                    buckets[{ (long long)std::floor(px / cell),
+                              (long long)std::floor(pz / cell) }].push_back(i);
+                }
+                double best = std::numeric_limits<double>::infinity();
+                for (auto& kv : buckets) {
+                    auto& ids = kv.second;
+                    if (ids.size() < 2) continue;
+                    for (size_t a = 0; a < ids.size(); ++a)
+                        for (size_t b = a + 1; b < ids.size(); ++b) {
+                            const Index ia = ids[a], ib = ids[b];
+                            const long ra = (long)(ia / n1D), ca = (long)(ia % n1D);
+                            const long rb = (long)(ib / n1D), cb = (long)(ib % n1D);
+                            if (std::labs(ra - rb) + std::labs(ca - cb) < minGrid) continue;
+                            ++pairs;
+                            const double dy =
+                                std::fabs((double)m->state.x.ptr[ia*3+1]
+                                        - (double)m->state.x.ptr[ib*3+1]);
+                            if (std::isfinite(dy)) best = std::min(best, dy);
+                        }
+                }
+                return best;
+            };
+            auto maxYOfId = [&](int objId) -> double {
+                auto* m = Scene<Backend, Precision>::findById(objId);
+                if (!m || !m->state.x.ptr) return std::numeric_limits<double>::quiet_NaN();
+                const Index n = m->state.x.size / 3;
+                double hi = -1e30;
+                for (Index i = 0; i < n; ++i)
+                    hi = std::max(hi, (double)m->state.x.ptr[i*3+1]);
+                return hi;
+            };
+
+            struct XYRun {
+                uint64_t selfContacts = 0, selfRows = 0, selfPassRuns = 0;
+                int      firstContactFrame = -1, lastContactFrame = -1;
+                double   m1 = 0, m1coarse = 0, m1local = 0, m2 = 0, ms = 0;
+                long long pairs2 = 0, pairsCoarse = 0, pairsLocal = 0;
+                bool     blew = false;
+            };
+            auto runXY = [&](bool tick) -> XYRun {
+                XYRun r;
+                resetScene();
+                sim.addPlane(PlaneDirection::XZPlane, tinym::vec3(0, 0, 0), 24,
+                             Precision(3.0), Precision(0.1),
+                             BehaviorType::Float);                    // id 0
+                sim.addPlane(PlaneDirection::XYPlane,
+                             tinym::vec3(0.0f, 0.55f, 0.0f), kG8s,
+                             Precision(1.0), Precision(0.1),
+                             BehaviorType::Float);                    // id 1
+                {
+                    auto& req = Scene<Backend, Precision>::requestsGeneralMeshes.back();
+                    req.behaviorType   = BehaviorType::TriangularCloth;
+                    req.behaviorParams = ClothBehaviorParams<Precision>{
+                        Precision(1e5), Precision(1e5), Precision(2e5),
+                        cpshThickness };
+                    req.selfCollide = tick;   // ← the experimental variable
+                }
+                sim.initialize();
+                sim.usePbd = true; sim.usePd = false;
+                sim.useCpuSpatialHashing = false;
+                sim.useSpatialHashing = false; sim.useMultiLevelSH = false;
+                sim.useCpuShSelf = true;
+                sim.cdSubstepPeriod = 1; sim.refitSubstepPeriod = 1;
+                sim.enableSelfCollisions = false;   // global OFF, per spec
+                sim.pbd.iterations = 8;
+                system.subSteps = 3; system.subh = system.h / Precision(3);
+                sim.pause = false;
+                sim.cpuShBroadPhase.totalRows  = 0;
+                sim.cpuShBroadPhase.totalCalls = 0;
+                const auto t0 = Clock::now();
+                for (int f = 0; f < 240; ++f) {
+                    sim.update();
+                    MetalGlobalContext::commitAndWait();
+                    const uint32_t sc = sim.pbd.selfContactCount;
+                    r.selfContacts += sc;
+                    if (sc > 0) {
+                        if (r.firstContactFrame < 0) r.firstContactFrame = f;
+                        r.lastContactFrame = f;
+                    }
+                    if (anyNonFinite(1)) { r.blew = true; break; }
+                }
+                r.ms = std::chrono::duration<double, std::milli>(
+                    Clock::now() - t0).count();
+                sim.pause = true;
+                r.selfRows     = sim.cpuShBroadPhase.totalRows;
+                r.selfPassRuns = sim.cpuShBroadPhase.totalCalls;
+                r.m1       = layerGap(1, kG8s, 0.02, 4, r.pairs2);
+                r.m1coarse = layerGap(1, kG8s, 0.06, 4, r.pairsCoarse);
+                r.m1local  = layerGap(1, kG8s, 0.06, 2, r.pairsLocal);
+                r.m2 = maxYOfId(1);
+                return r;
+            };
+
+            const XYRun A = runXY(false);
+            const XYRun B = runXY(true);
+
+            // Metric self-check: the layer metric is only believable if it
+            // returns FINITE on geometry that provably stacks. Re-run the
+            // CPSH-6b folded taco (two opposite corners pinned 4 mm apart →
+            // the sheet hangs as two layers in contact) and measure it with
+            // the same code. A finite number here means an `inf` above is a
+            // real absence of layering, not a dead metric.
+            double checkGap = std::numeric_limits<double>::quiet_NaN();
+            long long checkPairs = 0;
+            {
+                resetScene();
+                const Index kT = 12;
+                sim.addCloth(kT, Precision(0.6), tinym::vec3(0.0f, 0.8f, 0.0f),
+                             1e5, 1e5, 3e5, cpshThickness);           // id 0
+                {
+                    auto& req = Scene<Backend, Precision>::requestsGeneralMeshes.back();
+                    req.fixedVertices.push_back(
+                        FixedVertex{0u, tinym::vec3(0.0f, 0.8f, 0.0f)});
+                    req.fixedVertices.push_back(
+                        FixedVertex{(uint32_t)(kT * kT - 1),
+                                    tinym::vec3(0.004f, 0.8f, 0.004f)});
+                    req.selfCollide = true;
+                }
+                sim.initialize();
+                sim.usePbd = true; sim.useCpuShSelf = true;
+                sim.useCpuSpatialHashing = false;
+                sim.cdSubstepPeriod = 1; sim.refitSubstepPeriod = 1;
+                sim.enableSelfCollisions = false;
+                system.subSteps = 8; system.subh = system.h / Precision(8);
+                sim.pause = false;
+                for (int f = 0; f < 90; ++f) {
+                    sim.update();
+                    MetalGlobalContext::commitAndWait();
+                }
+                sim.pause = true;
+                checkGap = layerGap(0, kT, 0.06, 4, checkPairs);
+            }
+            auto fmtGap = [](double g) {
+                return std::isfinite(g) ? std::to_string(g) : std::string("inf");
+            };
+            auto dump = [&](const char* tag, const XYRun& r) {
+                std::cerr << "[CPSH-8] " << tag << " selfContacts="
+                          << r.selfContacts << " selfRows=" << r.selfRows
+                          << " selfPassRuns=" << r.selfPassRuns
+                          << " contactFrames=[" << r.firstContactFrame << ","
+                          << r.lastContactFrame << "]/240"
+                          << " wall=" << r.ms << " ms\n";
+                std::cerr << "[CPSH-8]     m1_layerGap(cell2cm,grid>=4)="
+                          << fmtGap(r.m1) << " over " << r.pairs2 << " pairs"
+                          << " | (cell6cm,grid>=4)=" << fmtGap(r.m1coarse)
+                          << " over " << r.pairsCoarse << " pairs"
+                          << " | (cell6cm,grid>=2)=" << fmtGap(r.m1local)
+                          << " over " << r.pairsLocal << " pairs"
+                          << " | m2_maxY=" << r.m2 << "\n";
+            };
+            dump("run A (자기 충돌 OFF):", A);
+            dump("run B (자기 충돌 ON ):", B);
+            std::cerr << "[CPSH-8 metric-check] folded taco (known to stack): "
+                         "m1(cell6cm,grid>=4)=" << fmtGap(checkGap) << " over "
+                      << checkPairs << " pairs — "
+                      << (std::isfinite(checkGap)
+                            ? "metric CAN see layering, so `inf` above is real"
+                            : "METRIC IS BLIND; treat the inf above as unproven")
+                      << "\n";
+
+            const char* n8 = "CPSH-8 / XY-fold scene: instrumented "
+                             "self-collision A/B (diagnostic)";
+            if (A.blew || B.blew || !std::isfinite(A.m2) || !std::isfinite(B.m2))
+                fail(n8, "non-finite cloth state in the XY-fold scene");
+            else if (B.selfContacts == 0
+                     && (!std::isfinite(A.m1) || A.m1 > 0.02)) {
+                std::cerr << "[CPSH-8 verdict] scene never self-touches — "
+                             "toggle difference is not expected (H1). "
+                             "closest topologically-distant layer pair in run A "
+                             "is " << fmtGap(A.m1) << " m apart vs thickness "
+                          << (double)cpshThickness << " m\n";
+                pass(n8);
+            }
+            else if (B.selfContacts > 0) {
+                const bool noLayers = !std::isfinite(A.m1coarse)
+                                   && !std::isfinite(B.m1coarse);
+                if (noLayers) {
+                    // Contacts fired, yet at NO cell size does a
+                    // topologically-distant vertex pair ever end up stacked.
+                    // The contacts are transient LOCAL crumple during the
+                    // topple, not layer-on-layer, so there is nothing for the
+                    // toggle to change in the settled pose.
+                    std::cerr << "[CPSH-8 verdict] self contacts fire ("
+                              << B.selfContacts << " over frames ["
+                              << B.firstContactFrame << ","
+                              << B.lastContactFrame << "]) but they are "
+                                 "TRANSIENT LOCAL CRUMPLE, not layer stacking: "
+                                 "no topologically-distant pair (grid>=4) shares "
+                                 "a bucket at 2 cm OR 6 cm in either run. The "
+                                 "sheet topples flat (maxY A=" << A.m2 << " B="
+                              << B.m2 << ", thickness "
+                              << (double)cpshThickness << ") instead of folding "
+                                 "onto itself — H1 holds for the settled pose\n";
+                    pass(n8);
+                } else {
+                    const double d = std::fabs(B.m1coarse - A.m1coarse);
+                    if (std::isfinite(d) && d < (double)cpshThickness / 2)
+                        std::cerr << "[CPSH-8 verdict] self contacts fire but "
+                                     "response is visually sub-thickness (H2): "
+                                     "m1(6cm) A=" << fmtGap(A.m1coarse)
+                                  << " B=" << fmtGap(B.m1coarse)
+                                  << " |diff|=" << d << " < thickness/2\n";
+                    else
+                        std::cerr << "[CPSH-8 verdict] self contacts fire AND "
+                                     "move the geometry: m1(6cm) A="
+                                  << fmtGap(A.m1coarse) << " B="
+                                  << fmtGap(B.m1coarse) << " |diff|=" << d
+                                  << "; m2 A=" << A.m2 << " B=" << B.m2 << "\n";
+                    // Self rows must not make layering WORSE (B closer than A).
+                    if (std::isfinite(A.m1coarse) && std::isfinite(B.m1coarse)
+                        && !(B.m1coarse >= A.m1coarse - 1e-4))
+                        fail(n8, "self rows made layer overlap WORSE: m1 B "
+                             + fmtGap(B.m1coarse) + " < m1 A "
+                             + fmtGap(A.m1coarse) + " - 1e-4");
+                    else
+                        pass(n8);
+                }
+            }
+            else {
+                // B has no contacts yet the sheet DOES stack within 2 cm —
+                // that is the interesting failure mode, so say so loudly and
+                // still pass (this block is a diagnostic, not a gate).
+                std::cerr << "[CPSH-8 verdict] sheet stacks (m1 A="
+                          << fmtGap(A.m1) << " <= 0.02) but run B produced ZERO "
+                             "self contacts — neither H1 nor H2; the self path "
+                             "is not reaching this geometry\n";
+                pass(n8);
+            }
+            system.subSteps = 8; system.subh = system.h / Precision(8);
+        }
+
         sim.pause                = true;
         sim.useCpuShSelf         = false;
         sim.usePbd               = false;
