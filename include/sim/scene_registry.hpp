@@ -319,6 +319,72 @@ void postInitPdCloth(SimOf<BE, PR>& simulator) {
                  "subSteps=3, PD iterations=10\n";
 }
 
+// "pd_cloth_ball" / "pd_cloth_stack" / "pd_cloth_xyfold": the three PBD
+// contact scenes solved by PD instead — geometry comes from the SAME setup
+// function (byte-identical A/B, the pd_cloth principle), the wrapper only
+// moves the System to PD's operating point (3 substeps; the implicit global
+// solve is what buys the large stable substep). What each one showcases in
+// the PD contact machinery:
+//   ball   — one-sided in-energy planes against a falling Rigid's analytic
+//            Sphere, incl. the rigidDelta cloth→body coupling;
+//   stack  — cross-cloth two-way rows, each side's share landing in its own
+//            prefactored system (PD-5's scene, interactively);
+//   xyfold — the self-collision toggle test bed: per-object 자기 충돌 pill
+//            feeds self rows through the same two-way path (PD-6's physics).
+template <typename BE, typename PR>
+void setupPdClothBall(SimOf<BE, PR>& simulator, SysOf<BE, PR>& system) {
+    setupPbdClothBall<BE, PR>(simulator, system);
+    system.subSteps = 3;
+    system.subh     = system.h / PR(3);
+}
+
+template <typename BE, typename PR>
+void postInitPdClothBall(SimOf<BE, PR>& simulator) {
+    simulator.usePd = true;
+    simulator.cdSubstepPeriod    = 1;   // same rationale as postInitPdCloth
+    simulator.refitSubstepPeriod = 1;
+    simulator.enableSelfCollisions = true;
+    std::cout << "[Main] --scene pd_cloth_ball: CPU PD solver, corner-pinned "
+                 "cloth, Rigid ball drop, subSteps=3\n";
+}
+
+template <typename BE, typename PR>
+void setupPdClothStack(SimOf<BE, PR>& simulator, SysOf<BE, PR>& system) {
+    setupPbdClothStack<BE, PR>(simulator, system);
+    system.subSteps = 3;
+    system.subh     = system.h / PR(3);
+}
+
+template <typename BE, typename PR>
+void postInitPdClothStack(SimOf<BE, PR>& simulator) {
+    simulator.usePd = true;
+    simulator.cdSubstepPeriod    = 1;
+    simulator.refitSubstepPeriod = 1;
+    simulator.enableSelfCollisions = true;
+    std::cout << "[Main] --scene pd_cloth_stack: CPU PD solver, two stacked "
+                 "cloths, two-way in-energy contacts, subSteps=3\n";
+}
+
+template <typename BE, typename PR>
+void setupPdClothXYFold(SimOf<BE, PR>& simulator, SysOf<BE, PR>& system) {
+    // Already sets subSteps = 3 itself — the PBD scene runs at the same
+    // interactive settings, so the wrapper adds nothing.
+    setupPbdClothXYFold<BE, PR>(simulator, system);
+}
+
+template <typename BE, typename PR>
+void postInitPdClothXYFold(SimOf<BE, PR>& simulator) {
+    simulator.usePd = true;
+    simulator.cdSubstepPeriod    = 1;
+    simulator.refitSubstepPeriod = 1;
+    // Global self OFF, exactly like the PBD scene: the per-object 자기 충돌
+    // pill is the experimental variable.
+    simulator.enableSelfCollisions = false;
+    std::cout << "[Main] --scene pd_cloth_xyfold: CPU PD solver, vertical "
+                 "(XY) sheet, subSteps=3, global self OFF — flip the mesh's "
+                 "자기 충돌 pill to A/B it\n";
+}
+
 // ---- P2 analytic-collider scenes (collider_pipeline_rework.md §5-P2) -----
 // One cloth dropped onto one analytic primitive, plus a "zoo" that drapes a
 // single sheet over three primitives standing on a Plane floor. The
@@ -442,6 +508,15 @@ inline const std::vector<Entry<BE, PR>>& registry() {
           &setupPbdClothStack<BE, PR>, &postInitPbdClothStack<BE, PR> },
         { "pd_cloth", "pbd_cloth geometry solved by the CPU PD (Liu 2013) system",
           &setupPdCloth<BE, PR>, &postInitPdCloth<BE, PR> },
+        { "pd_cloth_ball", "pbd_cloth_ball geometry under PD; one-sided "
+                           "in-energy contacts + rigid coupling",
+          &setupPdClothBall<BE, PR>, &postInitPdClothBall<BE, PR> },
+        { "pd_cloth_stack", "pbd_cloth_stack geometry under PD; cross-cloth "
+                            "two-way in-energy contacts",
+          &setupPdClothStack<BE, PR>, &postInitPdClothStack<BE, PR> },
+        { "pd_cloth_xyfold", "pbd_cloth_xyfold geometry under PD; self-collision "
+                             "toggle test bed (subSteps 3, PD iters 10)",
+          &setupPdClothXYFold<BE, PR>, &postInitPdClothXYFold<BE, PR> },
         { "analytic_sphere", "cloth dropped on a Sphere analytic collider",
           &setupAnalyticSphere<BE, PR>, nullptr },
         { "analytic_box", "cloth dropped on a Box analytic collider",
