@@ -9271,7 +9271,11 @@ static int runSelfTest() {
     //          bend cache and the contact rows are both rebuilt around holes
     //          mid-run, which is where a stale index would blow up),
     //   PBT-4  the pbd_cloth_flag registry scene builds and runs with tearing
-    //          actually enabled.
+    //          actually enabled,
+    //   PBT-5  the PER-MESH ClothBehaviorParams::tearable opt-out gates the
+    //          pass on its own, under an unchanged global tearEnabled — and
+    //          flipping it back on resumes tearing (i.e. it is a live gate,
+    //          not a one-way latch baked in at build time).
     //
     // Load model: a scene-global wind of 80 N per PARTICLE (mass 0.1 each, so
     // ~8x its own weight) against a sheet whose left column is pinned. Fixed
@@ -9544,6 +9548,80 @@ static int runSelfTest() {
                           << "at frame " << firstTearFrame << ", pinned="
                           << pinned << "\n";
             }
+        }
+
+        // ---- PBT-5 ------------------------------------------------------
+        // Per-mesh opt-out. Same scene and same wind PBT-1 tears in 20 frames,
+        // with the GLOBAL gate left ON throughout — the only variable is the
+        // fabric's own flag, so a pass cannot be explained by the load or by
+        // tearEnabled. Both halves are asserted: off => nothing tears, then
+        // on => it tears, which is what separates a working gate from a
+        // silently-broken tear pass.
+        {
+            // Writes BOTH copies, exactly as the inspector callback does: the
+            // live mesh drives this step, the request mirror is what survives
+            // the next Scene::pack.
+            auto setTearable = [&](int id, bool v) {
+                if (auto* m = Scene<Backend, Precision>::findById(id))
+                    if (auto* p = std::get_if<ClothBehaviorParams<Precision>>(
+                            &m->behaviorParams))
+                        p->tearable = v;
+                if (auto* r = sim.findRequest(id))
+                    if (auto* p = std::get_if<ClothBehaviorParams<Precision>>(
+                            &r->behaviorParams))
+                        p->tearable = v;
+            };
+            auto tearableOn = [&](int id) -> bool {
+                auto* m = Scene<Backend, Precision>::findById(id);
+                if (!m) return false;
+                auto* p = std::get_if<ClothBehaviorParams<Precision>>(
+                    &m->behaviorParams);
+                return p && p->tearable;
+            };
+
+            buildTearScene(Precision(1.15), 4);
+            sim.pbd.resetTearing();      // counters start from a clean slate
+            setTearable(0, false);
+            const bool wroteOff = !tearableOn(0);
+            bool finite = true;
+            for (int f = 0; f < 20; ++f) {
+                sim.update();
+                MetalGlobalContext::commitAndWait();
+                if (!pbtFinite(0)) { finite = false; break; }
+            }
+            const uint32_t offCount = sim.pbd.tearCount;
+
+            // Flip it back on IN PLACE — no rebuild, no re-initialize.
+            setTearable(0, true);
+            for (int f = 0; f < 20 && finite; ++f) {
+                sim.update();
+                MetalGlobalContext::commitAndWait();
+                if (!pbtFinite(0)) { finite = false; break; }
+            }
+            const uint32_t onCount = sim.pbd.tearCount;
+            sim.pause = true;
+
+            const char* n5 = "PBT-5 / per-mesh tearable gates the tear pass while "
+                             "the global toggle stays on";
+            if (!finite)
+                fail(n5, "non-finite cloth during the per-mesh gate run");
+            else if (!wroteOff)
+                fail(n5, "could not write tearable=false onto the cloth "
+                         "(no ClothBehaviorParams on mesh id 0)");
+            else if (!sim.pbd.tearEnabled)
+                fail(n5, "the global tearEnabled went down — the clause would "
+                         "prove nothing");
+            else if (offCount != 0)
+                fail(n5, "tearable=false but " + std::to_string(offCount)
+                     + " edges tore in 20 frames");
+            else if (onCount == 0)
+                fail(n5, "tearable=true again but nothing tore in the next 20 "
+                         "frames — the gate is a one-way latch, or the load "
+                         "no longer reaches the ratio");
+            else
+                pass(n5);
+            std::cerr << "[PBT info] PBT-5 tearCount off=" << offCount
+                      << " on=" << onCount << "\n";
         }
 
         sim.pause  = true;

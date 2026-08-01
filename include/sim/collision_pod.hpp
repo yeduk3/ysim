@@ -332,6 +332,17 @@ template <typename PR>
 struct ClothBehaviorParams {
     PR stretch, shear, bend;
     PR thickness;
+    // PBD tearing opt-OUT for THIS cloth. The global PbdSystem::tearEnabled
+    // stays the master gate; this only decides whether a mesh participates
+    // once tearing is on scene-wide, so a scene can hang one tearable rag
+    // next to an indestructible curtain. Default true so every pre-existing
+    // scene (and the PBT self-tests) behaves exactly as before.
+    // PER MESH because it is a fabric property, not a solver setting.
+    // Turning it off stops FURTHER tearing only — holes already torn stay
+    // torn (the tear state is still maintained). Default member initializer
+    // keeps the aggregate init sites ({stretch, shear, bend, thickness})
+    // compiling unchanged.
+    bool tearable = true;
 };
 
 // FastGridCloth rest lengths are PER DIRECTION (6 values), not 3 scalars.

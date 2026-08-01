@@ -1263,6 +1263,19 @@ int main(int argc, char** argv) {
                     target.on_cloth_shear = [setT](int id, float v){ setT(id, &ClothBehaviorParams<Precision>::shear, v); };
                     target.cloth_bend = &cp->bend;
                     target.on_cloth_bend = [setT](int id, float v){ setT(id, &ClothBehaviorParams<Precision>::bend, v); };
+                    // Per-mesh PBD tear opt-out. setT is typed for the
+                    // Precision members, so the mesh+request mirror is
+                    // written inline here instead — same two writes, just
+                    // for a bool field.
+                    target.cloth_tearable = &cp->tearable;
+                    target.on_cloth_tearable = [&simulator](int id, bool v){
+                        if (auto* m = Scene<Backend, Precision>::findById(id))
+                            if (auto* p = std::get_if<ClothBehaviorParams<Precision>>(&m->behaviorParams))
+                                p->tearable = v;
+                        if (auto* r = simulator.findRequest(id))
+                            if (auto* p = std::get_if<ClothBehaviorParams<Precision>>(&r->behaviorParams))
+                                p->tearable = v;
+                    };
                 } else if (auto* fp = std::get_if<FastGridClothBehaviorParams<Precision>>(
                         &selectedMesh->behaviorParams)) {
                     auto setF = [&simulator](int id, Precision FastGridClothBehaviorParams<Precision>::* mem, float v) {

@@ -203,6 +203,11 @@ struct MeshInspectorTarget {
     std::function<void(int, float)> on_cloth_shear;
     float* cloth_bend = nullptr;
     std::function<void(int, float)> on_cloth_bend;
+    // Per-mesh PBD tear opt-out (ClothBehaviorParams::tearable). Checkbox
+    // row; the global solver-panel 찢어짐 활성화 toggle is still the master
+    // gate — this only opts one cloth in or out.
+    bool* cloth_tearable = nullptr;
+    std::function<void(int, bool)> on_cloth_tearable;
     // "두께" — cloth-only contact thickness (metres). This is the distance
     // the contact response resolves to, so it is the knob that decides how
     // far apart two colliding cloth layers park. Reads the live

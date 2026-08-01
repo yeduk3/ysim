@@ -4246,6 +4246,7 @@ struct Simulator {
                     o.behavior.params["shear"]   = p.shear;
                     o.behavior.params["bend"]    = p.bend;
                     o.behavior.params["thickness"] = p.thickness;
+                    o.behavior.params["tearable"] = p.tearable;
                 } else if constexpr (std::is_same_v<P, FastGridClothBehaviorParams<PR>>) {
                     o.behavior.params["particle_num_1d"] = p.particleNum1D;
                     o.behavior.params["stretch_rest_x"] = p.stretchRestX;
@@ -4434,6 +4435,9 @@ struct Simulator {
                 p.shear    = o.behavior.params.value("shear",    PR(0));
                 p.bend     = o.behavior.params.value("bend",     PR(0));
                 p.thickness = o.behavior.params.value("thickness", PR(0));
+                // Absent in pre-field scene files => tearable, i.e. exactly
+                // the default the field ships with.
+                p.tearable = o.behavior.params.value("tearable", true);
                 bparams = p;
             } else if (o.behavior.type == "FastGridCloth") {
                 btype = BehaviorType::FastGridCloth;

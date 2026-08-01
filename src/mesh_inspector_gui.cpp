@@ -1140,6 +1140,23 @@ void drawMeshInspectorWindow(MeshInspectorWindowState& st, const MeshInspectorTa
             ImGui::TextUnformatted("접촉이 밀어내는 거리 (m) — 겹친 천이 벌어지는 간격");
             ImGui::PopTextWrapPos();ImGui::PopStyleColor();
         }
+        // ─── 찢어짐 허용 (per-mesh PBD tear opt-out) ──────────────────
+        // A fabric property, so it sits with the other cloth material rows
+        // rather than in the solver panel — but it is only a GATE: the
+        // global 찢어짐 활성화 toggle still has to be on. Caption says so,
+        // and says what turning it off does NOT do (un-tear).
+        if(t.cloth_tearable&&t.on_cloth_tearable){
+            ImGui::Dummy({0,12});
+            ImGui::PushStyleColor(ImGuiCol_Text,kG60);ImGui::TextUnformatted("찢어짐 허용");ImGui::PopStyleColor();
+            ImGui::SameLine(kP+CW()-42);
+            if(PillToggle("##tearable",t.cloth_tearable))
+                t.on_cloth_tearable(t.mesh_id,*t.cloth_tearable);
+            ImGui::Dummy({0,4});
+            ImGui::PushStyleColor(ImGuiCol_Text,kG40);
+            ImGui::PushTextWrapPos(ImGui::GetCursorPosX()+CW());
+            ImGui::TextUnformatted("PBD 전용 — 전역 '찢어짐 활성화' 아래의 개별 천 스위치. 끄면 더 찢어지지 않을 뿐, 이미 뚫린 구멍은 그대로 남습니다");
+            ImGui::PopTextWrapPos();ImGui::PopStyleColor();
+        }
         ImGui::Unindent(kP);ImGui::Dummy({0,kP});
     }
 

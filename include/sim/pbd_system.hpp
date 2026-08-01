@@ -189,6 +189,22 @@ struct PbdSystem<METAL, PR> {
         return PR(0);
     }
 
+    // Per-mesh tear opt-out, read live off the behavior params (no cached
+    // copy: the inspector edits the mesh's params in place and the flag has
+    // to take effect on the very next step).
+    //
+    // Only ClothBehaviorParams carries the flag, and only TriangularCloth
+    // uses that struct. Every OTHER behavior — FastGridCloth included — is
+    // treated as NOT tearable: it has no per-mesh flag to express the
+    // choice, and tearing was only ever validated on TriangularCloth
+    // topology (real edge->facet adjacency + facet degeneration). Silently
+    // tearing a behavior that cannot opt out would be the wrong default.
+    static bool tearableOf(const BehaviorParams<PR>& bp) {
+        if (auto* c = std::get_if<ClothBehaviorParams<PR>>(&bp))
+            return c->tearable;
+        return false;
+    }
+
     // Per-mesh spring constants, the SAME fields the force kernels read
     // (including the "팽팽함" clothStiffnessScale multiplier the symplectic
     // path applies at upload time).
@@ -629,6 +645,13 @@ struct PbdSystem<METAL, PR> {
         if (tearEnabled && maxTearsPerStep > 0) {
             for (const SolveCtx& c : ctxs) {
                 if (!c.edgeAlive || !c.restLen || !c.edges) continue;
+                // PER-MESH opt-out. Gates DETECTION ONLY — the tear state of
+                // this mesh keeps being allocated, healed and honoured by the
+                // projection sweeps above/below, so a cloth torn earlier and
+                // then switched off keeps its holes and merely stops ripping
+                // further.
+                if (!tearableOf(sceneObjects.meshes[c.mi].behaviorParams))
+                    continue;
                 TearState& ts = tearStates[c.mi];
                 Index* F = sceneObjects.meshes[c.mi].adjacency.facets.ptr;
                 if (!F) continue;
