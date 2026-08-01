@@ -9255,6 +9255,307 @@ static int runSelfTest() {
         system.subh     = acSavedSubh;
     }
 
+    // ---- Block PBT: PBD cloth TEARING (PbdSystem milestone 1 + phase 2) ---
+    // The tear pass breaks an edge whose PREDICTED length exceeds
+    // tearRatio * rest and degenerates the 1-2 facets that used it to
+    // (v0,v0,v0). The clauses separate the four things that can independently
+    // be wrong:
+    //   PBT-1  the pass fires at all, the degeneration lands in
+    //          adjacency.facets AND in the render-side copy (preview.facets —
+    //          the renderer never reads adjacency, so a solver-only tear is
+    //          an INVISIBLE tear), and edgeAlive is monotonic (a dead edge
+    //          must never come back: the geometry it constrained is gone),
+    //   PBT-2  the torn-dirty flag is sticky-once — exactly one consumer sees
+    //          each tear event,
+    //   PBT-3  sustained tearing under load does not produce NaN/Inf (the
+    //          bend cache and the contact rows are both rebuilt around holes
+    //          mid-run, which is where a stale index would blow up),
+    //   PBT-4  the pbd_cloth_flag registry scene builds and runs with tearing
+    //          actually enabled.
+    //
+    // Load model: a scene-global wind of 80 N per PARTICLE (mass 0.1 each, so
+    // ~8x its own weight) against a sheet whose left column is pinned. Fixed
+    // particles are NOT advanced by the prediction (pbd_system.hpp step (1)),
+    // so the very first substep predicts an 0.0247 m gap across a 0.1143 m
+    // rest edge — strain 1.22, over the 1.15 ratio these clauses set. That is
+    // deliberately a first-substep tear: a clause that needed 30 frames of
+    // whipping to trigger would be measuring the whip, not the tear rule.
+    {
+        const size_t pbtSavedSubSteps = system.subSteps;
+        const Precision pbtSavedSubh  = system.subh;
+        // Same operating point the PBD/PD scenes run at. subh is what the
+        // predicted overstretch is measured over, so it is part of the setup.
+        system.subSteps = 3;
+        system.subh     = system.h / Precision(3);
+
+        constexpr Index kPbtN = 8;              // 8x8 grid, rest edge 0.1143
+        constexpr float kPbtSize = 0.8f;
+
+        // Degenerate == the (v0,v0,v0) collapse the tear pass writes. Counted
+        // over the mesh's OWN facet range, not the packed scene-wide array.
+        auto degenerateFacets = [&](const Index* F, Index numFacets) -> Index {
+            Index d = 0;
+            if (!F) return 0;
+            for (Index f = 0; f < numFacets; ++f)
+                if (F[f*3+1] == F[f*3+0] && F[f*3+2] == F[f*3+0]) ++d;
+            return d;
+        };
+        auto pbtFinite = [&](int id) -> bool {
+            auto* m = Scene<Backend, Precision>::findById(id);
+            if (!m || !m->state.x.ptr) return false;
+            const Index n = m->state.x.size / 3;
+            for (Index i = 0; i < n * 3; ++i)
+                if (!std::isfinite((double)m->state.x.ptr[i])) return false;
+            return true;
+        };
+        // Left column (col 0 of every row) pinned + a hard cross-wind.
+        // addCloth lays the grid on XZ with vid = row*n + col and x growing
+        // with col, so the wind blows straight away from the pinned edge.
+        auto buildTearScene = [&](Precision tearRatio, int budget) {
+            resetScene();
+            sim.usePbd = true;
+            sim.usePd  = false;
+            sim.addCloth(kPbtN, kPbtSize, tinym::vec3(0.0f, 1.0f, 0.0f));  // id 0
+            sim.initialize();
+            for (Index row = 0; row < kPbtN; ++row)
+                sim.setVertexFixed(0, (int)(row * kPbtN), true);
+            Scene<Backend, Precision>::environment.wind =
+                tinym::vec3(80.0f, 0.0f, 0.0f);
+            sim.pbd.tearEnabled     = true;
+            sim.pbd.tearRatio       = tearRatio;
+            sim.pbd.maxTearsPerStep = budget;
+            sim.pause = false;
+        };
+
+        // ---- PBT-1 ------------------------------------------------------
+        {
+            buildTearScene(Precision(1.15), 4);
+            const auto* cloth0 = Scene<Backend, Precision>::findById(0);
+            const Index numFacets = cloth0
+                ? (Index)(cloth0->adjacency.facets.size / 3) : 0;
+
+            // edgeAlive snapshot per step; a 0 -> 1 transition is a resurrected
+            // edge, which the design forbids outright.
+            std::vector<uint8_t> prevAlive;
+            bool aliveMonotonic = true;
+            uint32_t maxPerStep = 0;
+            bool finite = true;
+            for (int f = 0; f < 20; ++f) {
+                sim.update();
+                MetalGlobalContext::commitAndWait();
+                maxPerStep = std::max(maxPerStep, sim.pbd.tearsThisStep);
+                if (!pbtFinite(0)) { finite = false; break; }
+                if (!sim.pbd.tearStates.empty()) {
+                    const auto& cur = sim.pbd.tearStates[0].edgeAlive;
+                    if (!prevAlive.empty() && prevAlive.size() == cur.size())
+                        for (size_t e = 0; e < cur.size(); ++e)
+                            if (!prevAlive[e] && cur[e]) aliveMonotonic = false;
+                    prevAlive = cur;
+                }
+            }
+            sim.pause = true;
+
+            auto* cloth = Scene<Backend, Precision>::findById(0);
+            const Index deadPhys = cloth
+                ? degenerateFacets(cloth->adjacency.facets.ptr, numFacets) : 0;
+            // The render-side mirror: MeshGL is bound to preview.facets, not
+            // to adjacency.facets, so this is the clause that says the rip is
+            // actually VISIBLE.
+            Index deadPreview = 0;
+            bool  previewFound = false, previewMatches = false;
+            for (auto& req : Scene<Backend, Precision>::requestsGeneralMeshes) {
+                if (req.id != 0) continue;
+                previewFound = true;
+                deadPreview = degenerateFacets(
+                    (const Index*)req.preview.facets.data(), numFacets);
+                previewMatches = cloth && cloth->adjacency.facets.ptr
+                    && req.preview.facets.size()
+                           == (size_t)cloth->adjacency.facets.size
+                    && std::memcmp(req.preview.facets.data(),
+                                   cloth->adjacency.facets.ptr,
+                                   req.preview.facets.size() * sizeof(uint32_t)) == 0;
+                break;
+            }
+
+            const char* n1 = "PBT-1 / overstretched edges tear, degenerate their "
+                             "facets in BOTH the solver and the render copy, and "
+                             "never come back";
+            if (!finite)
+                fail(n1, "non-finite cloth while tearing");
+            else if (sim.pbd.tearCount == 0)
+                fail(n1, "no edge tore in 20 frames under an 80 N/particle wind "
+                         "at ratio 1.15 — the tear pass never fired");
+            else if (maxPerStep == 0)
+                fail(n1, "tearCount moved but tearsThisStep was never non-zero "
+                         "(the per-step counter is dead)");
+            else if (maxPerStep > 4)
+                fail(n1, "tearsThisStep reached " + std::to_string(maxPerStep)
+                     + " > the maxTearsPerStep budget of 4");
+            else if (deadPhys == 0)
+                fail(n1, "tearCount = " + std::to_string(sim.pbd.tearCount)
+                     + " but no facet in adjacency.facets is degenerate");
+            else if (!previewFound)
+                fail(n1, "no request found for mesh id 0 (cannot check the "
+                         "render-side topology copy)");
+            else if (deadPreview != deadPhys || !previewMatches)
+                fail(n1, "render copy out of sync: preview.facets has "
+                     + std::to_string(deadPreview) + " degenerate facets vs "
+                     + std::to_string(deadPhys) + " in adjacency.facets "
+                     "(the tear would be invisible)");
+            else if (!aliveMonotonic)
+                fail(n1, "a dead edge came back alive");
+            else
+                pass(n1);
+            std::cerr << "[PBT info] PBT-1 tearCount=" << sim.pbd.tearCount
+                      << " maxTearsThisStep=" << maxPerStep
+                      << " degenerateFacets=" << deadPhys << "/" << numFacets
+                      << "\n";
+        }
+
+        // ---- PBT-2 ------------------------------------------------------
+        // Sticky-once. Note the first sub-clause: Simulator::update is ITSELF
+        // the phase-2 consumer (syncTornRenderTopology), so after a torn frame
+        // the flag must already be down — that is the wiring check. The
+        // raise-and-consume pair below then pins the contract itself without
+        // depending on which frame happened to tear.
+        {
+            buildTearScene(Precision(1.15), 4);
+            bool tore = false;
+            for (int f = 0; f < 20 && !tore; ++f) {
+                sim.update();
+                MetalGlobalContext::commitAndWait();
+                tore = sim.pbd.tearCount > 0;
+            }
+            sim.pause = true;
+            const bool consumedByUpdate = !sim.pbd.tornDirty(0);
+            sim.pbd.tearStates[0].facetsDirty = true;   // raise by hand
+            const bool first  = sim.pbd.consumeTornDirty(0);
+            const bool second = sim.pbd.consumeTornDirty(0);
+
+            const char* n2 = "PBT-2 / consumeTornDirty reports a tear exactly once";
+            if (!tore)
+                fail(n2, "no tear happened, nothing to consume");
+            else if (!consumedByUpdate)
+                fail(n2, "the flag was still raised after update() — the render "
+                         "propagation is not consuming it");
+            else if (!first)
+                fail(n2, "consumeTornDirty returned false on a raised flag");
+            else if (second)
+                fail(n2, "consumeTornDirty returned true twice for one tear");
+            else
+                pass(n2);
+        }
+
+        // ---- PBT-3 ------------------------------------------------------
+        // 60 frames x 3 substeps of continuous tearing. The bend cache is
+        // rebuilt every time a hole appears and the contact rows are re-derived
+        // from a facet array full of degenerate triangles, so this is where a
+        // stale index or a divide-by-zero-area would surface.
+        {
+            buildTearScene(Precision(1.15), 4);
+            bool finite = true;
+            int  blewAt = -1;
+            for (int f = 0; f < 60; ++f) {
+                sim.update();
+                MetalGlobalContext::commitAndWait();
+                if (!pbtFinite(0)) { finite = false; blewAt = f; break; }
+            }
+            sim.pause = true;
+            const char* n3 = "PBT-3 / 60 frames of sustained tearing stay finite";
+            if (!finite)
+                fail(n3, "non-finite vertex at frame " + std::to_string(blewAt));
+            else if (sim.pbd.sanitizeCount != 0)
+                fail(n3, "sanitize guard fired "
+                     + std::to_string(sim.pbd.sanitizeCount) + " times");
+            else
+                pass(n3);
+            std::cerr << "[PBT info] PBT-3 tearCount=" << sim.pbd.tearCount
+                      << " after 60 frames\n";
+        }
+
+        // ---- PBT-4 ------------------------------------------------------
+        // The registry scene, driven exactly as `--scene pbd_cloth_flag` does
+        // (setup + initialize + postInit). It asserts the tear actually
+        // HAPPENS, because "the wind can tear it" is the whole point of the
+        // scene and a scene that silently stopped tearing would still pass
+        // every other clause here. 120 frames is 1.5x the measured margin
+        // (first tear lands between frame 50 and 100; 24 tears by frame 100 —
+        // the sweep behind the wind magnitude is in scene_registry.hpp).
+        // Deterministic: the jiggle RNG is seeded from the mesh id.
+        {
+            const auto* entry =
+                scene_registry::find<Backend, Precision>("pbd_cloth_flag");
+            const char* n4 = "PBT-4 / pbd_cloth_flag scene builds, runs, and has "
+                             "tearing enabled";
+            if (!entry) {
+                fail(n4, "scene name not in the registry");
+            } else {
+                resetScene();
+                sim.usePbd = false;
+                sim.usePd  = false;
+                sim.pbd.tearEnabled = false;
+                entry->setup(sim, system);
+                sim.initialize();
+                if (entry->postInit) entry->postInit(sim);
+                // The flag is the second request (id 1); id 0 is the floor.
+                auto* flag = Scene<Backend, Precision>::findById(1);
+                const bool isCloth = flag
+                    && flag->behaviorType == BehaviorType::TriangularCloth;
+                Index pinned = 0;
+                if (flag && flag->constraints.fixedParticles.ptr) {
+                    const Index n = flag->state.x.size / 3;
+                    for (Index i = 0; i < n; ++i)
+                        if (flag->constraints.fixedParticles.ptr[i] == Precision(0))
+                            ++pinned;
+                }
+                bool finite = true;
+                int  firstTearFrame = -1;
+                sim.pause = false;
+                for (int f = 0; f < 120; ++f) {
+                    sim.update();
+                    MetalGlobalContext::commitAndWait();
+                    if (firstTearFrame < 0 && sim.pbd.tearCount > 0)
+                        firstTearFrame = f;
+                    if (!pbtFinite(1)) { finite = false; break; }
+                }
+                sim.pause = true;
+
+                if (!flag)
+                    fail(n4, "no mesh id 1 after setup + initialize");
+                else if (!isCloth)
+                    fail(n4, "mesh id 1 is not cloth-tagged — the params retag "
+                             "did not survive pack");
+                else if (!sim.usePbd)
+                    fail(n4, "postInit did not select the PBD solver");
+                else if (!sim.pbd.tearEnabled)
+                    fail(n4, "postInit did not enable tearing");
+                else if (pinned != 20)
+                    fail(n4, "expected the full 20-vertex left column pinned, got "
+                         + std::to_string(pinned));
+                else if (!finite)
+                    fail(n4, "non-finite flag vertex inside 120 frames");
+                else if (sim.pbd.tearCount == 0)
+                    fail(n4, "the flag never tore in 120 frames — the scene's "
+                             "wind no longer reaches its tearRatio");
+                else
+                    pass(n4);
+                std::cerr << "[PBT info] PBT-4 flag tearCount="
+                          << sim.pbd.tearCount << " after 120 frames, first tear "
+                          << "at frame " << firstTearFrame << ", pinned="
+                          << pinned << "\n";
+            }
+        }
+
+        sim.pause  = true;
+        sim.usePbd = false;
+        sim.pbd.tearEnabled = false;
+        sim.pbd.resetTearing();
+        sim.enableSelfCollisions = false;
+        Scene<Backend, Precision>::environment.wind = tinym::vec3(0.0f, 0.0f, 0.0f);
+        system.subSteps = pbtSavedSubSteps;
+        system.subh     = pbtSavedSubh;
+    }
+
     if (failures == 0) {
         std::cerr << "[self-test] all checks passed\n";
         return 0;

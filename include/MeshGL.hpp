@@ -139,6 +139,23 @@ struct MeshGL<CPU> {
         glBufferSubData(GL_ARRAY_BUFFER, 0, vertexNum * sizeof(float) * 3, normalPtr);
     }
 
+    // PBD tearing (phase 2): re-upload the INDEX buffer from the same
+    // facetPtr the ctor bound (preview.facets — a heap vector whose data()
+    // is stable, since a tear only overwrites index VALUES in place and
+    // never resizes). Kept GL_STATIC_DRAW on purpose: glBufferSubData on a
+    // static-hinted buffer is legal, and a torn frame is rare (a handful of
+    // frames in a whole run) — hinting DYNAMIC would pessimize the common
+    // case where the topology never changes at all.
+    //
+    // Must be called from the GL thread. Simulator::update only marks the
+    // mesh dirty (CPU-side); the upload happens in uploadMeshes().
+    void updateFacetBuffer() {
+        glBindVertexArray(vao);
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, facetBuffer);
+        glBufferSubData(GL_ELEMENT_ARRAY_BUFFER, 0,
+                        facetNum * sizeof(unsigned int) * 3, facetPtr);
+    }
+
     // D-028: PBR preview signature. Takes the 5 D-005 material primitives
     // rather than a Material struct to avoid coupling this header to
     // main.cpp's Material type (same convention as MeshInspectorTarget's

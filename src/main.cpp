@@ -2422,6 +2422,67 @@ int main(int argc, char** argv) {
                         && simulator.pbd.iterations < 1) {
                         simulator.pbd.iterations = 1;
                     }
+
+                    // ---- Tearing (PbdSystem milestone 1). Default OFF, so a
+                    // scene that does not ask for it is byte-identical to
+                    // before. All three knobs are live: the tear pass reads
+                    // them at the top of every substep, nothing is cached and
+                    // nothing needs a re-init.
+                    ImGui::Dummy({0, 12});
+                    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.420f, 0.463f, 0.518f, 1.0f));
+                    ImGui::TextUnformatted("찢어짐 Tearing");
+                    ImGui::PopStyleColor();
+                    ImGui::Dummy({0, 4});
+                    {
+                        bool tear = simulator.pbd.tearEnabled;
+                        if (ImGui::Checkbox("찢어짐 활성화", &tear))
+                            simulator.pbd.tearEnabled = tear;
+                    }
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("끄면 새 찢어짐만 멈춘다 — 이미 뚫린 "
+                                          "구멍은 되돌아오지 않는다 (씬 리셋만이 "
+                                          "복구 경로)");
+                    // Ratio is measured on the PREDICTED edge length before the
+                    // projection sweeps (post-solve strain is always tiny), so
+                    // 1.0 would tear instantly and the slider starts above it.
+                    ImGui::Dummy({0, 8});
+                    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.420f, 0.463f, 0.518f, 1.0f));
+                    ImGui::TextUnformatted("찢어짐 한계 (rest 대비)");
+                    ImGui::PopStyleColor();
+                    ImGui::Dummy({0, 4});
+                    ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - P);
+                    {
+                        float tr = (float)simulator.pbd.tearRatio;
+                        if (ImGui::SliderFloat("##pbdTearRatio", &tr, 1.05f, 3.0f,
+                                               "%.2f x"))
+                            simulator.pbd.tearRatio = (Precision)tr;
+                    }
+                    // Per mesh, per step. The cap is what makes a rip PROPAGATE
+                    // instead of shattering the sheet: the worst edges break
+                    // first and the rest re-strain next step.
+                    ImGui::Dummy({0, 8});
+                    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.420f, 0.463f, 0.518f, 1.0f));
+                    ImGui::TextUnformatted("스텝당 최대 찢어짐");
+                    ImGui::PopStyleColor();
+                    ImGui::Dummy({0, 4});
+                    ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - P);
+                    ImGui::SliderInt("##pbdTearBudget", &simulator.pbd.maxTearsPerStep,
+                                     1, 32);
+                    // 누적 is per scene run (Simulator::initialize resets it);
+                    // 이번 스텝 is the LAST substep only, so it flickers back to
+                    // 0 between rips — that is the counter's scope, not a bug.
+                    ImGui::Dummy({0, 8});
+                    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.420f, 0.463f, 0.518f, 1.0f));
+                    {
+                        const float col = ImGui::GetContentRegionAvail().x - P - 18;
+                        ImGui::TextUnformatted("찢어진 엣지 (누적)");
+                        ImGui::SameLine(col);
+                        ImGui::Text("%u", simulator.pbd.tearCount);
+                        ImGui::TextUnformatted("찢어진 엣지 (이번 스텝)");
+                        ImGui::SameLine(col);
+                        ImGui::Text("%u", simulator.pbd.tearsThisStep);
+                    }
+                    ImGui::PopStyleColor();
                 }
 
                 ImGui::Unindent(P);
