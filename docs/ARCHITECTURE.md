@@ -2,7 +2,10 @@
 
 > Owner: **Planner**. Generators read this to know boundaries; Estimators read this to detect violations.
 > Updated: 2026-07-22 (main.cpp split into `include/sim/` fragment headers + tests/benches removed; supersedes the 2026-07-12 v2 rewrite).
-> Companion docs: [VISION.md](VISION.md) (why), [COLLISION_PIPELINE.md](COLLISION_PIPELINE.md) (collision detail), [ROADMAP.md](ROADMAP.md) (when).
+> Companion docs: [VISION.md](VISION.md) (why),
+> [COLLISION_PIPELINE.md](COLLISION_PIPELINE.md) (collision detail),
+> [PD continuum cloth와 coupled contact 변경 설계](design/pd-continuum-cloth-contact.md)
+> (PD cloth/contact target), [ROADMAP.md](ROADMAP.md) (when).
 
 ## 1. System purpose
 

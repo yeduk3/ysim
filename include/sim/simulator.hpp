@@ -2819,6 +2819,14 @@ struct Simulator {
         std::cout << "[Simulator Init] Memory pool allocated" << std::endl;
 
         Scene<BE, PR>::pack();
+        // PBD tearing: pack just regenerated every mesh's topology from its
+        // initializer, so every hole is gone from the physics side. Forget the
+        // tears (counters included — the GUI's cumulative count is per scene
+        // run) and force-mirror the fresh facets into the render copies, which
+        // pack does NOT touch and would otherwise keep showing rips the solver
+        // no longer believes in. No-op for an untorn scene (identical memcpy).
+        pbd.resetTearing();
+        syncTornRenderTopology(/*forceAll=*/true);
         // D-042 R-2: `renderState.clear()` call retired here — MeshGL is now
         // bound to PreviewState heap pointers (R-1's std::vector buffers),
         // which are stable across Scene::pack reallocations. The pre-R-2
@@ -3252,6 +3260,12 @@ struct Simulator {
         // indexing it, so a mid-run solver toggle is safe either way.
         if (usePbd) pbd.beginFrameRigid((Index)Scene<BE, PR>::meshes.size());
         if (usePd)  pd.beginFrameRigid((Index)Scene<BE, PR>::meshes.size());
+        // Same window, different quantity: PD's residual-penetration
+        // diagnostics are per FRAME (design doc §6.3), while step() is one
+        // substep — a resting contact fires rows in some substeps and not
+        // others, so a per-substep number would read 0 for most frames of a
+        // continuously active contact.
+        if (usePd)  pd.beginFrameContactStats();
 
         // Kinematic bodies: prescribed BVH motion, one-way coupling. Once
         // per outer frame (like the Rigid block above): advance playback
@@ -3698,6 +3712,13 @@ struct Simulator {
             if (frame >= tgt) pause = true;
         }
 
+        // PBD tearing phase 2: mirror any facet degeneration the solver did
+        // this frame into the render-side topology copy. MUST run BEFORE
+        // syncPreviewFromState — the normal recomputation below walks
+        // preview.facets, so a stale (whole) copy would keep shading the
+        // triangles the rip just removed.
+        syncTornRenderTopology();
+
         // S3-4: preview is a pure projection of the packed state. The
         // post-update sync is now one call; uploadMeshes() also calls
         // it every render frame so a paused / just-edited scene shows
@@ -3706,6 +3727,65 @@ struct Simulator {
 
         //collisionPipeline.broadPhase.build(sceneObjects.squareClothes[0].x, sceneObjects.squareClothes[0].facet);
         //std::cout << "[Simulator Update] Finished update" << std::endl;
+    }
+
+    // ── PBD tearing → renderer propagation (phase 2) ──────────────────────
+    // PbdSystem tears by DEGENERATING facets in mesh.adjacency.facets
+    // ((v0,v1,v2) -> (v0,v0,v0)), which removes the triangle from the GPU
+    // narrow phase. Rendering, however, never reads adjacency.facets: MeshGL
+    // is bound (registerPreviewBindingFor -> PreviewState::renderFacetsPtr)
+    // to the PreviewState's own heap COPY of the topology. So without this
+    // mirror the rip is invisible.
+    //
+    // Data flow, one arrow per hop:
+    //   pbd.step()  ->  adjacency.facets degenerated + TearState::facetsDirty
+    //   update()    ->  syncTornRenderTopology() [CPU only, no GL]:
+    //                     consumeTornDirty(mi) -> memcpy adjacency.facets
+    //                     into req.preview.facets, queue mesh.id in
+    //                     tornRenderMeshIds_
+    //   uploadMeshes() [GL thread] -> drains the queue, MeshGL::
+    //                     updateFacetBuffer() re-uploads the element buffer
+    // The split exists because update() must stay GL-free (D-011) — the
+    // --self-test harness runs it with no context at all.
+    //
+    // The whole facet RANGE is memcpy'd rather than the individual torn
+    // slots: the two buffers are the same length and the same layout, so one
+    // memcpy is both simpler and cheaper than replaying a tear list, and it
+    // is self-correcting if the two ever drift for any other reason.
+    //
+    // `forceAll` skips the dirty check and re-mirrors every mesh — used by
+    // initialize(), where Scene::pack has just REGENERATED whole topology
+    // from the initializer. PbdSystem's own heal check rebuilds its tear
+    // state there but cannot reach this render copy, so without the force a
+    // reset cloth would be whole in the solver and still shredded on screen.
+    std::vector<int> tornRenderMeshIds_;   // mesh ids awaiting a GL re-upload
+
+    void syncTornRenderTopology(bool forceAll = false) {
+        const Index numMeshes = (Index)Scene<BE, PR>::meshes.size();
+        for (Index mi = 0; mi < numMeshes; ++mi) {
+            auto& mesh = Scene<BE, PR>::meshes[mi];
+            if (!forceAll && !(usePbd && pbd.consumeTornDirty(mi))) continue;
+            const Index* F = mesh.adjacency.facets.ptr;
+            if (!F) continue;
+            const size_t nIdx = (size_t)mesh.adjacency.facets.size;
+            for (auto& req : Scene<BE, PR>::requestsGeneralMeshes) {
+                if (req.id != mesh.id) continue;
+                // hasRender() meshes (currently only primitive::cube) carry a
+                // SEPARATE unwelded render topology whose facet indices do not
+                // map 1:1 onto the physics ones — out of scope, and cloth is
+                // never a cube.
+                if (req.preview.hasRender()) break;
+                if (req.preview.facets.size() != nIdx) break;
+                static_assert(sizeof(Index) == sizeof(uint32_t),
+                              "preview.facets is uint32_t; adjacency Index must match");
+                std::memcpy(req.preview.facets.data(), F, nIdx * sizeof(uint32_t));
+                if (std::find(tornRenderMeshIds_.begin(),
+                              tornRenderMeshIds_.end(), mesh.id)
+                        == tornRenderMeshIds_.end())
+                    tornRenderMeshIds_.push_back(mesh.id);
+                break;
+            }
+        }
     }
 
     // S3-4: project the packed state into each request's PreviewState
@@ -3749,6 +3829,16 @@ struct Simulator {
             for(auto& mesh : scene.meshes)
                 renderState.getOrCreate(mesh).updateBuffer();
         }
+        // PBD tearing phase 2: index-buffer re-upload for the meshes whose
+        // topology changed since the last render frame. Separate from the
+        // per-frame vertex/normal upload above because it is RARE — the queue
+        // is empty on every frame nothing tore. GL-thread only (this whole
+        // method is).
+        for (int id : tornRenderMeshIds_) {
+            auto* mesh = Scene<BE, PR>::findById(id);
+            if (mesh) renderState.getOrCreate(*mesh).updateFacetBuffer();
+        }
+        tornRenderMeshIds_.clear();
     }
 
     void draw(Program& shader) {
@@ -4162,6 +4252,11 @@ struct Simulator {
                     o.behavior.params["shear"]   = p.shear;
                     o.behavior.params["bend"]    = p.bend;
                     o.behavior.params["thickness"] = p.thickness;
+                    // PD strain-limiting band (per-fabric; 1/1 = corotated).
+                    o.behavior.params["sigma_min"] = p.sigmaMin;
+                    o.behavior.params["sigma_max"] = p.sigmaMax;
+                    // Per-mesh PBD tear opt-out (global tearEnabled still gates).
+                    o.behavior.params["tearable"] = p.tearable;
                 } else if constexpr (std::is_same_v<P, FastGridClothBehaviorParams<PR>>) {
                     o.behavior.params["particle_num_1d"] = p.particleNum1D;
                     o.behavior.params["stretch_rest_x"] = p.stretchRestX;
@@ -4350,6 +4445,13 @@ struct Simulator {
                 p.shear    = o.behavior.params.value("shear",    PR(0));
                 p.bend     = o.behavior.params.value("bend",     PR(0));
                 p.thickness = o.behavior.params.value("thickness", PR(0));
+                // Absent in pre-band scene files => corotated default, which
+                // is what those scenes ran under.
+                p.sigmaMin = o.behavior.params.value("sigma_min", PR(1));
+                p.sigmaMax = o.behavior.params.value("sigma_max", PR(1));
+                // Absent in pre-field scene files => tearable, i.e. exactly
+                // what those scenes ran under (global gate only).
+                p.tearable = o.behavior.params.value("tearable", true);
                 bparams = p;
             } else if (o.behavior.type == "FastGridCloth") {
                 btype = BehaviorType::FastGridCloth;

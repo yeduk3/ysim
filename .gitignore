@@ -21,5 +21,7 @@ uml/
 docs/references/**/*.pdf
 docs/references/**/*.html
 docs/*
+!docs/design/
+docs/design/*
+!docs/design/pd-continuum-cloth-contact.md
 assets/BVH/
-

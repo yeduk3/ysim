@@ -1263,6 +1263,33 @@ int main(int argc, char** argv) {
                     target.on_cloth_shear = [setT](int id, float v){ setT(id, &ClothBehaviorParams<Precision>::shear, v); };
                     target.cloth_bend = &cp->bend;
                     target.on_cloth_bend = [setT](int id, float v){ setT(id, &ClothBehaviorParams<Precision>::bend, v); };
+                    // PD strain-limiting band [σmin, σmax] — a fabric
+                    // property, so it lives here with the other cloth
+                    // material fields and NOT in the solver panel. Rendered
+                    // whatever the active solver is (the field is honest
+                    // about that in its caption: only the PD path consumes
+                    // it); TriangularCloth only, FastGridCloth has no strain
+                    // elements. setT mirrors mesh + request like the
+                    // stiffness fields, so the edit survives Scene::pack.
+                    target.cloth_sigma_min = &cp->sigmaMin;
+                    target.cloth_sigma_max = &cp->sigmaMax;
+                    target.on_cloth_sigma = [setT](int id, float lo, float hi){
+                        setT(id, &ClothBehaviorParams<Precision>::sigmaMin, lo);
+                        setT(id, &ClothBehaviorParams<Precision>::sigmaMax, hi);
+                    };
+                    // Per-mesh PBD tear opt-out. setT is typed for the
+                    // Precision members, so the mesh+request mirror is
+                    // written inline here instead — same two writes, just
+                    // for a bool field.
+                    target.cloth_tearable = &cp->tearable;
+                    target.on_cloth_tearable = [&simulator](int id, bool v){
+                        if (auto* m = Scene<Backend, Precision>::findById(id))
+                            if (auto* p = std::get_if<ClothBehaviorParams<Precision>>(&m->behaviorParams))
+                                p->tearable = v;
+                        if (auto* r = simulator.findRequest(id))
+                            if (auto* p = std::get_if<ClothBehaviorParams<Precision>>(&r->behaviorParams))
+                                p->tearable = v;
+                    };
                 } else if (auto* fp = std::get_if<FastGridClothBehaviorParams<Precision>>(
                         &selectedMesh->behaviorParams)) {
                     auto setF = [&simulator](int id, Precision FastGridClothBehaviorParams<Precision>::* mem, float v) {
@@ -2378,36 +2405,154 @@ int main(int argc, char** argv) {
                         if (ImGui::SliderFloat("##pdDamping", &pdDamping, 0.0f, 0.2f))
                             simulator.pd.damping = (Precision)pdDamping;
                     }
-                    // Contact constraint weight, as a multiple of the vertex's
-                    // own momentum weight m/h². Logarithmic because the useful
-                    // range spans two decades and the interesting end is the
-                    // low one; a change only moves the contact epoch, so the
-                    // cost of dragging this is one factorize per substep it
-                    // moves in (watch the refactor counter below).
+                    // The strain-limiting band moved to the PER-OBJECT mesh
+                    // inspector ("스트레인 한계" row): it is a fabric property
+                    // (ClothBehaviorParams::sigmaMin/sigmaMax), not a solver
+                    // setting, so it lives with stretch/bend/thickness and is
+                    // set per cloth. The PD path reads it per mesh each
+                    // substep.
+                    // Contact STIFFNESS scale s_c (design doc §6.1): the
+                    // constraint weight is w_c = s_c · m_eff/h², so this is
+                    // measured in units of the participating inertia and one
+                    // value means the same thing on meshes of different mass.
+                    // Logarithmic because the useful range spans two decades
+                    // and the interesting end is the low one.
                     ImGui::Dummy({0, 12});
                     ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.420f, 0.463f, 0.518f, 1.0f));
-                    ImGui::TextUnformatted("PD 접촉 가중치");
+                    ImGui::TextUnformatted("PD 접촉 강성");
                     ImGui::PopStyleColor();
                     ImGui::Dummy({0, 4});
                     ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - P);
                     {
-                        float pdCw = (float)simulator.pd.kContactWeightScale;
-                        if (ImGui::SliderFloat("##pdContactW", &pdCw, 0.1f, 8.0f,
-                                               "%.2f", ImGuiSliderFlags_Logarithmic))
+                        // Written on EDIT COMPLETION, not per drag frame
+                        // (design doc §6.3). s_c enters the contact epoch key,
+                        // so every distinct value a drag passes through costs
+                        // one numeric refactor per active mesh on the next
+                        // substep — a 60-frame drag across the range would buy
+                        // ~60 refactors nobody asked to see. The mirror is
+                        // re-synced from the solver whenever the widget is not
+                        // being held, so the number stays live under the
+                        // cursor while dragging AND still tracks a value
+                        // changed from anywhere else (scene load, self-test).
+                        static bool  pdCwHeld = false;
+                        static float pdCw = 1.0f;
+                        if (!pdCwHeld) pdCw = (float)simulator.pd.kContactWeightScale;
+                        ImGui::SliderFloat("##pdContactW", &pdCw, 0.1f, 8.0f,
+                                           "%.2f", ImGuiSliderFlags_Logarithmic);
+                        pdCwHeld = ImGui::IsItemActive();
+                        if (ImGui::IsItemDeactivatedAfterEdit())
                             simulator.pd.kContactWeightScale = (double)pdCw;
                     }
                     if (ImGui::IsItemHovered())
-                        ImGui::SetTooltip("PD 접촉 가중치, x m/h² — 값이 크면 locking 위험");
+                        ImGui::SetTooltip("x m_eff/h² — 높은 값은 locking/조건수 "
+                                          "악화 위험");
+                    // ---- Contact diagnostics (design doc §6.3). Two DIFFERENT
+                    // failures live here and must not be read as one: a
+                    // contact that was never DETECTED shows up as a count that
+                    // is too low, and a contact that was detected but not
+                    // resolved shows up as residual penetration. Raising the
+                    // stiffness above only ever addresses the second one
+                    // (§6.2).
+                    ImGui::Dummy({0, 12});
+                    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.420f, 0.463f, 0.518f, 1.0f));
+                    // "마지막 substep" is not a hedge, it is the contract: the
+                    // counters are reset by step(), which is ONE substep, and
+                    // a resting contact legitimately carries rows in some
+                    // substeps and none in others. The penetration read-out
+                    // below is per FRAME instead (§6.3) and does not flicker
+                    // with them — the two are deliberately different scopes.
+                    ImGui::TextUnformatted("PD 활성 접촉 수 (마지막 substep)");
+                    ImGui::PopStyleColor();
+                    ImGui::Dummy({0, 4});
+                    {
+                        const float col = ImGui::GetContentRegionAvail().x - P - 18;
+                        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.420f, 0.463f, 0.518f, 1.0f));
+                        ImGui::TextUnformatted("  단면(one-sided)");
+                        ImGui::SameLine(col);
+                        ImGui::Text("%u", simulator.pd.oneSidedContactCount);
+                        ImGui::TextUnformatted("  정점-삼각형");
+                        ImGui::SameLine(col);
+                        ImGui::Text("%u", simulator.pd.twoWayContactCount);
+                        // Subset of the line above, not a separate family.
+                        ImGui::TextUnformatted("    자기충돌");
+                        ImGui::SameLine(col);
+                        ImGui::Text("%u", simulator.pd.selfContactCount);
+                        ImGui::TextUnformatted("  엣지-엣지");
+                        ImGui::SameLine(col);
+                        ImGui::Text("%u", simulator.pd.edgeEdgeContactCount);
+                        ImGui::PopStyleColor();
+                    }
+                    // Edge-edge DETECTION gate (design doc §5.5). Default ON;
+                    // this is here so the A/B that shows what the family buys
+                    // — the same one PD-20 runs headless — can be done live,
+                    // and because §6.2's "vertex–triangle만 있고 edge–edge
+                    // 검출이 없음" is a failure mode a user has to be able to
+                    // reproduce to recognise. Costs one numeric refactor on
+                    // the next substep and never a solver re-init, exactly
+                    // like the stiffness above: it only moves the epoch key.
+                    {
+                        bool ee = simulator.pd.edgeContactsEnabled;
+                        if (ImGui::Checkbox("엣지-엣지 접촉", &ee))
+                            simulator.pd.edgeContactsEnabled = ee;
+                    }
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("두 edge가 스치듯 지나가는 접촉 "
+                                          "(정점-삼각형만으로는 검출되지 않음). "
+                                          "근접 기반 — swept/CCD는 아님");
+                    // Residual penetration at the committed iterate, in mm.
+                    // Measured over the active rows only — it says nothing
+                    // about pairs the narrow phase never reported.
+                    ImGui::Dummy({0, 8});
+                    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.420f, 0.463f, 0.518f, 1.0f));
+                    {
+                        const float col = ImGui::GetContentRegionAvail().x - P - 18;
+                        ImGui::TextUnformatted("PD 최대 침투");
+                        ImGui::SameLine(col);
+                        ImGui::Text("%.2f mm",
+                                    simulator.pd.maxPenetrationDepth * 1000.0);
+                        ImGui::TextUnformatted("PD 평균 침투");
+                        ImGui::SameLine(col);
+                        ImGui::Text("%.2f mm",
+                                    simulator.pd.meanPenetrationDepth * 1000.0);
+                    }
+                    ImGui::PopStyleColor();
                     // Debug read-out: the contact-epoch refactor counter is
                     // MONOTONIC, so what it shows live is churn — a number
                     // that climbs by ~1 per substep means the contact set is
                     // reshaping every substep and the factorization is being
-                    // paid for in full.
+                    // paid for in full. The failure counter beside it should
+                    // never leave 0; if it moves, a mesh silently ran a
+                    // substep contact-free.
                     ImGui::Dummy({0, 8});
                     ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.420f, 0.463f, 0.518f, 1.0f));
-                    ImGui::TextUnformatted("PD 재분해 횟수");
-                    ImGui::SameLine(ImGui::GetContentRegionAvail().x - P - 18);
-                    ImGui::Text("%u", simulator.pd.contactRefactorCount);
+                    {
+                        const float col = ImGui::GetContentRegionAvail().x - P - 18;
+                        ImGui::TextUnformatted("PD 재분해 횟수");
+                        ImGui::SameLine(col);
+                        ImGui::Text("%u", simulator.pd.contactRefactorCount);
+                        ImGui::TextUnformatted("PD 재분해 실패");
+                        ImGui::SameLine(col);
+                        ImGui::Text("%u", simulator.pd.contactFactorFailCount);
+                        // Cross-mesh entries of the merged matrix (design doc
+                        // §5.4): non-zero exactly when two different cloths
+                        // are coupled inside ONE solve. 0 with a live
+                        // 정점-삼각형 count above means every row is a self /
+                        // single-cloth one, which is correct — those couple
+                        // inside one block.
+                        ImGui::TextUnformatted("PD 교차 mesh 결합 항");
+                        ImGui::SameLine(col);
+                        ImGui::Text("%u", simulator.pd.crossBlockEntryCount);
+                        // Edge-edge rows the per-substep cap discarded, since
+                        // start-up. MONOTONIC — like the refactor counters
+                        // beside it, what matters is whether it ever moves:
+                        // a non-zero means the edge set outgrew its budget and
+                        // the shallowest proximities went unconstrained, which
+                        // is a DETECTION loss and therefore not something the
+                        // stiffness slider above can fix (§6.2).
+                        ImGui::TextUnformatted("PD 엣지 행 초과 폐기");
+                        ImGui::SameLine(col);
+                        ImGui::Text("%u", simulator.pd.droppedEdgeRowCount);
+                    }
                     ImGui::PopStyleColor();
                 }
 
@@ -2422,6 +2567,67 @@ int main(int argc, char** argv) {
                         && simulator.pbd.iterations < 1) {
                         simulator.pbd.iterations = 1;
                     }
+
+                    // ---- Tearing (PbdSystem milestone 1). Default OFF, so a
+                    // scene that does not ask for it is byte-identical to
+                    // before. All three knobs are live: the tear pass reads
+                    // them at the top of every substep, nothing is cached and
+                    // nothing needs a re-init.
+                    ImGui::Dummy({0, 12});
+                    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.420f, 0.463f, 0.518f, 1.0f));
+                    ImGui::TextUnformatted("찢어짐 Tearing");
+                    ImGui::PopStyleColor();
+                    ImGui::Dummy({0, 4});
+                    {
+                        bool tear = simulator.pbd.tearEnabled;
+                        if (ImGui::Checkbox("찢어짐 활성화", &tear))
+                            simulator.pbd.tearEnabled = tear;
+                    }
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("끄면 새 찢어짐만 멈춘다 — 이미 뚫린 "
+                                          "구멍은 되돌아오지 않는다 (씬 리셋만이 "
+                                          "복구 경로)");
+                    // Ratio is measured on the PREDICTED edge length before the
+                    // projection sweeps (post-solve strain is always tiny), so
+                    // 1.0 would tear instantly and the slider starts above it.
+                    ImGui::Dummy({0, 8});
+                    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.420f, 0.463f, 0.518f, 1.0f));
+                    ImGui::TextUnformatted("찢어짐 한계 (rest 대비)");
+                    ImGui::PopStyleColor();
+                    ImGui::Dummy({0, 4});
+                    ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - P);
+                    {
+                        float tr = (float)simulator.pbd.tearRatio;
+                        if (ImGui::SliderFloat("##pbdTearRatio", &tr, 1.05f, 3.0f,
+                                               "%.2f x"))
+                            simulator.pbd.tearRatio = (Precision)tr;
+                    }
+                    // Per mesh, per step. The cap is what makes a rip PROPAGATE
+                    // instead of shattering the sheet: the worst edges break
+                    // first and the rest re-strain next step.
+                    ImGui::Dummy({0, 8});
+                    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.420f, 0.463f, 0.518f, 1.0f));
+                    ImGui::TextUnformatted("스텝당 최대 찢어짐");
+                    ImGui::PopStyleColor();
+                    ImGui::Dummy({0, 4});
+                    ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - P);
+                    ImGui::SliderInt("##pbdTearBudget", &simulator.pbd.maxTearsPerStep,
+                                     1, 32);
+                    // 누적 is per scene run (Simulator::initialize resets it);
+                    // 이번 스텝 is the LAST substep only, so it flickers back to
+                    // 0 between rips — that is the counter's scope, not a bug.
+                    ImGui::Dummy({0, 8});
+                    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.420f, 0.463f, 0.518f, 1.0f));
+                    {
+                        const float col = ImGui::GetContentRegionAvail().x - P - 18;
+                        ImGui::TextUnformatted("찢어진 엣지 (누적)");
+                        ImGui::SameLine(col);
+                        ImGui::Text("%u", simulator.pbd.tearCount);
+                        ImGui::TextUnformatted("찢어진 엣지 (이번 스텝)");
+                        ImGui::SameLine(col);
+                        ImGui::Text("%u", simulator.pbd.tearsThisStep);
+                    }
+                    ImGui::PopStyleColor();
                 }
 
                 ImGui::Unindent(P);
