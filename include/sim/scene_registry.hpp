@@ -285,6 +285,113 @@ void postInitPbdClothStack(SimOf<BE, PR>& simulator) {
                  "cloths, two-way contacts\n";
 }
 
+// "pbd_cloth_flag": a wide VERTICAL sheet pinned along its whole LEFT edge,
+// flying in a steady cross-wind — the tearing showcase (PbdSystem milestone
+// 1 + the phase-2 render propagation). Everything here exists to make a rip
+// reachable without touching a single env var:
+//   * pinned along the full left COLUMN, not four corners: a flag has one
+//     anchored edge, and a full column is what concentrates the load into the
+//     edges just right of the pins (where the rip starts);
+//   * wind mostly along +Z, i.e. through the sheet's own plane normal, with a
+//     lift (+Y) and a lateral (+X) component so it flutters instead of
+//     bulging into one static shape;
+//   * tearRatio pulled down to 1.30 from the 1.4 default, because the wind
+//     alone must be able to break it — the point of the scene is that it
+//     tears on its own, not after a GUI drag.
+// The sheet is a SQUARE 20x20 grid stretched 2.5x in x by the initializer's
+// per-axis scale (the same field the inspector's scale path writes), so the
+// vertex count stays exactly pbd_cloth's 400. The cells are therefore 2.5:1
+// rectangles; Scene::pack measures rest lengths from the TRANSFORMED geometry
+// so nothing is pre-stressed, the horizontal edges are simply longer (and so
+// tear later) than the vertical ones.
+template <typename BE, typename PR>
+void setupPbdClothFlag(SimOf<BE, PR>& simulator, SysOf<BE, PR>& system) {
+    const PR kstretch = 1e5, kshear = 1e5, kbend = 5e4;
+    const PR mass = 0.1, thickness = 0.01;
+    const Index n = 20;
+    const PR size = 1, y = 1.2;
+    const float aspect = 2.5f;   // flag is 2.5 m x 1 m after the x scale
+    simulator.addGround(PlaneDirection::XZPlane, tinym::vec3(0, 0, 0), 8.0);
+    Scene<BE, PR>::requestsGeneralMeshes.back().checkerboard = true;  // id 0
+    // Vertical (XY) sheet. addPlane hands addGeneralMesh a Float behavior, so
+    // the request is retagged to cloth here — the same idiom
+    // setupPbdClothXYFold uses. Without the params swap thicknessOf /
+    // springConstantsOf would read 0.
+    simulator.addPlane(PlaneDirection::XYPlane, tinym::vec3(0, (float)y, 0), n,
+                       size, mass, BehaviorType::Float);              // id 1
+    {
+        auto& req = Scene<BE, PR>::requestsGeneralMeshes.back();
+        req.behaviorType   = BehaviorType::TriangularCloth;
+        req.behaviorParams = ClothBehaviorParams<PR>{ kstretch, kshear,
+                                                      kbend, thickness };
+        // Per-axis stretch. BOTH copies are written for the same reason
+        // Simulator::scaleObject writes both: the initializer params drive the
+        // geometry Scene::pack bakes, the request mirror is what the inspector
+        // displays and what the next scale delta composes against.
+        const tinym::vec3 s(aspect, 1.0f, 1.0f);
+        req.scale = s;
+        if (req.initializer) req.initializer->getParams()->scale = s;
+        // Pin the ENTIRE left column (col 0 of every row). MeshGridInitializer
+        // lays an XY grid out as vid = row*n + col with
+        //   px = col*length - size/2   (x, then scaled by `aspect` about the
+        //                               center, which is the scale pivot)
+        //   py = -row*length + size/2  (y)
+        // so col 0 is x = -size/2 and the pinned position must be given in the
+        // SCALED frame or the pack would yank the sheet at t=0.
+        const float length = (float)size / (float)(n - 1);
+        const float half   = (float)size / 2.0f;
+        for (Index row = 0; row < n; ++row) {
+            const uint32_t vid = (uint32_t)(row * n);
+            const tinym::vec3 p(-half * aspect,
+                                (float)y + (half - (float)row * length),
+                                0.0f);
+            req.fixedVertices.push_back(FixedVertex{ vid, p });
+        }
+    }
+    // Steady cross-wind. Scene-global (SceneEnvironment::wind) and applied as
+    // a per-PARTICLE force with no mass scaling (see
+    // Simulator::applyEnvironmentForces), so with the 0.1 per-particle mass
+    // here 0.981 would exactly cancel gravity — this is ~5.4x a particle's
+    // own weight, i.e. a gale, not a breeze. Only wind-susceptible (cloth)
+    // behaviors see it, so the floor is unaffected.
+    //
+    // The magnitude is MEASURED, not guessed. PBD only sees overstretch in
+    // the PREDICTION, which needs a real velocity DIFFERENCE across an edge —
+    // a quasi-static flag has none no matter how hard it is pushed. Sweep at
+    // subSteps=3 / ratio 1.30, tearCount after 150 frames:
+    //   |w| 2.4 -> 0 (steady state, never tears even at ratio 1.10)
+    //   |w| 4.0 -> 3        |w| 5.2 -> 27        |w| 6.4 -> 19
+    // 5.2 is the first magnitude that opens a visible rip inside ~1.5 s.
+    // Note the engine's wind is a constant body force with NO drag term, so a
+    // fully detached scrap keeps accelerating and blows out of frame — that is
+    // the force model, not the tear rule.
+    Scene<BE, PR>::environment.wind = tinym::vec3(0.75f, 1.90f, 5.00f);
+    // Same operating point as the other CPU-solver scenes: the substep budget
+    // is what the tear pass measures its PREDICTED overstretch against, so it
+    // is part of the scene definition, not a detail.
+    system.subSteps = 3;
+    system.subh     = system.h / PR(3);
+    simulator.mlBroadPhase.floorExcludeDiag = 1e9f;   // exclude NOTHING
+}
+
+template <typename BE, typename PR>
+void postInitPbdClothFlag(SimOf<BE, PR>& simulator) {
+    simulator.usePbd = true;
+    simulator.cdSubstepPeriod    = 1;   // same rationale as postInitPbdCloth
+    simulator.refitSubstepPeriod = 1;
+    simulator.enableSelfCollisions = true;
+    simulator.pbd.iterations = 8;
+    // The scene's reason to exist. Budget 3/step (not the 4 default): a
+    // smaller budget makes the rip PROPAGATE along the strained row instead
+    // of opening several holes at once.
+    simulator.pbd.tearEnabled     = true;
+    simulator.pbd.tearRatio       = PR(1.30);
+    simulator.pbd.maxTearsPerStep = 3;
+    std::cout << "[Main] --scene pbd_cloth_flag: CPU PBD solver, left-edge "
+                 "pinned 2.5x1 m flag in a cross-wind, TEARING ON "
+                 "(ratio 1.30, budget 3/step, subSteps=3)\n";
+}
+
 // "pd_cloth": the pbd_cloth scene solved by the CPU Projective Dynamics
 // sibling instead. Identical geometry on purpose — the two CPU solvers are
 // only comparable if the scene is byte-identical, so `--scene pbd_cloth` vs
@@ -506,6 +613,9 @@ inline const std::vector<Entry<BE, PR>>& registry() {
           &setupPbdClothXYFold<BE, PR>, &postInitPbdClothXYFold<BE, PR> },
         { "pbd_cloth_stack", "two PBD cloths stacked; cross-cloth two-way contacts",
           &setupPbdClothStack<BE, PR>, &postInitPbdClothStack<BE, PR> },
+        { "pbd_cloth_flag", "left-edge pinned 2.5x1 m PBD flag in a cross-wind; "
+                            "TEARING enabled (ratio 1.30, budget 3/step)",
+          &setupPbdClothFlag<BE, PR>, &postInitPbdClothFlag<BE, PR> },
         { "pd_cloth", "pbd_cloth geometry solved by the CPU PD (Liu 2013) system",
           &setupPdCloth<BE, PR>, &postInitPdCloth<BE, PR> },
         { "pd_cloth_ball", "pbd_cloth_ball geometry under PD; one-sided "

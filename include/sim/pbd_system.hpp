@@ -23,6 +23,7 @@
 // projection loop to a Metal kernel if PBD earns its keep.
 
 #include <unordered_map>
+#include <algorithm>
 
 template <typename BE, typename PR>
 struct PbdSystem {};
@@ -51,6 +52,27 @@ struct PbdSystem<METAL, PR> {
     PR stretchRef = PR(1e5);
     PR bendRef    = PR(1e6);
 
+    // ── Tearing (milestone 1: hole tearing via facet degeneration) ────────
+    // Default OFF so every existing scene is byte-identical to before.
+    bool tearEnabled = false;
+    // Break an edge once its PREDICTED length exceeds tearRatio * rest.
+    // Measured on `p` BEFORE the projection sweeps: PBD re-satisfies the
+    // distance constraint every iteration, so post-solve strain is tiny even
+    // under a load that would physically rip the sheet. The overstretch only
+    // exists in the prediction, which is exactly where we look.
+    PR tearRatio = PR(1.4);
+    // Cap on tears per mesh per step. Without it, the first gust that
+    // overstretches a whole row breaks every edge of that row in one step and
+    // the cloth shatters instead of ripping. Tearing the WORST edges first and
+    // letting the rest re-strain next step is what produces a propagating tear.
+    int maxTearsPerStep = 4;
+
+    // Cumulative / per-step tear counters (read by the GUI and the tests).
+    // `tearsThisStep` counts PRIMARY tears only — the dangling edges killed by
+    // the secondary rule are bookkeeping, not new rips.
+    uint32_t tearCount     = 0;
+    uint32_t tearsThisStep = 0;
+
     // Predicted positions, one flat 3N block PER MESH, indexed by the
     // Scene::meshes ARRAY INDEX. A two-way contact writes into the PARTNER
     // mesh's predicted positions, so a single reused buffer no longer works:
@@ -74,8 +96,72 @@ struct PbdSystem<METAL, PR> {
         int   lifetimeId = -2;   // -1 is a legal mesh value, so seed elsewhere
         Index numPoints = 0, numFacets = 0;
         std::vector<BendQuad> quads;
+        // Set by the tear pass. The topology key above CANNOT catch a tear:
+        // degeneration rewrites facet INDICES in place, so numFacets (and
+        // numPoints, and lifetimeId) are all unchanged. Without this flag the
+        // solver would keep projecting bend quads that span a hole.
+        bool  dirty = false;
     };
     std::vector<BendCache> bendCache;   // parallel to Scene::meshes
+
+    // ── Tear bookkeeping, one per mesh (parallel to Scene::meshes) ────────
+    // Everything here is derived from the mesh's own topology and is rebuilt
+    // whenever that topology is (re)realized. `edgeAlive` is MONOTONIC: a dead
+    // edge never comes back, because the geometry it constrained is gone. The
+    // only way back to a whole cloth is a full rebuild (scene reset), which
+    // resetTearing() / the heal check below handle.
+    static constexpr Index kNoFacet = (Index)-1;
+    struct TearState {
+        int   lifetimeId = -2;   // same seeding convention as BendCache
+        Index numPoints = 0, numFacets = 0;
+        // Per EDGE SLOT (size == numEdges, the padded upper bound). Padded /
+        // out-of-range slots are seeded dead so an "alive" slot is always a
+        // real edge.
+        std::vector<uint8_t> edgeAlive;
+        // The 1-2 facets incident to each edge slot, kNoFacet when absent.
+        // A manifold interior edge has both; a boundary edge has only f0; a
+        // padded slot has neither.
+        std::vector<Index> edgeFacet0, edgeFacet1;
+        std::vector<uint8_t> facetAlive;   // size == numFacets
+        // Consumed by the NEXT step's BendCache check (bend quads spanning a
+        // hole must be dropped) — kept separate from facetsDirty so the two
+        // consumers cannot steal each other's edge.
+        bool bendDirty   = false;
+        // Consumed by phase 2 (render propagation): "this mesh's facet index
+        // buffer changed this step". Cleared by consumeTornDirty().
+        bool facetsDirty = false;
+    };
+    std::vector<TearState> tearStates;   // parallel to Scene::meshes
+
+    // Phase-2 hook: did mesh `mi` change its facet indices since the last
+    // call? Clears the flag, so exactly one consumer sees each tear event.
+    bool consumeTornDirty(Index mi) {
+        if (mi >= (Index)tearStates.size()) return false;
+        const bool d = tearStates[mi].facetsDirty;
+        tearStates[mi].facetsDirty = false;
+        return d;
+    }
+    // Non-consuming peek (tests / debug HUD).
+    bool tornDirty(Index mi) const {
+        return mi < (Index)tearStates.size() && tearStates[mi].facetsDirty;
+    }
+    // Which facets of mesh `mi` are still live, nullptr when the mesh has no
+    // tear state yet. Phase 2 can walk this instead of re-deriving degeneracy
+    // from the index buffer.
+    const std::vector<uint8_t>* facetAliveOf(Index mi) const {
+        if (mi >= (Index)tearStates.size()) return nullptr;
+        const auto& fa = tearStates[mi].facetAlive;
+        return fa.empty() ? nullptr : &fa;
+    }
+    // Forget every tear. Does NOT restore the facet indices — only a topology
+    // rebuild (Scene::pack) can do that; this just stops the solver from
+    // believing in holes that no longer exist.
+    void resetTearing() {
+        tearStates.clear();
+        for (auto& bc : bendCache) bc.dirty = true;
+        tearCount = 0;
+        tearsThisStep = 0;
+    }
 
     // Anomaly (NaN/Inf) counter for the frame; Simulator reads nothing from
     // this today — the guard's job is to keep a blown-up vertex from
@@ -101,6 +187,22 @@ struct PbdSystem<METAL, PR> {
         if (auto* c = std::get_if<ClothBehaviorParams<PR>>(&bp)) return c->thickness;
         if (auto* g = std::get_if<FastGridClothBehaviorParams<PR>>(&bp)) return g->thickness;
         return PR(0);
+    }
+
+    // Per-mesh tear opt-out, read live off the behavior params (no cached
+    // copy: the inspector edits the mesh's params in place and the flag has
+    // to take effect on the very next step).
+    //
+    // Only ClothBehaviorParams carries the flag, and only TriangularCloth
+    // uses that struct. Every OTHER behavior — FastGridCloth included — is
+    // treated as NOT tearable: it has no per-mesh flag to express the
+    // choice, and tearing was only ever validated on TriangularCloth
+    // topology (real edge->facet adjacency + facet degeneration). Silently
+    // tearing a behavior that cannot opt out would be the wrong default.
+    static bool tearableOf(const BehaviorParams<PR>& bp) {
+        if (auto* c = std::get_if<ClothBehaviorParams<PR>>(&bp))
+            return c->tearable;
+        return false;
     }
 
     // Per-mesh spring constants, the SAME fields the force kernels read
@@ -182,6 +284,14 @@ struct PbdSystem<METAL, PR> {
         return true;
     }
 
+    // Undirected edge key: (min,max) packed into 64 bits. The ONE convention
+    // shared by buildBendQuads, the tear edge->facet map and the phi0 carry-
+    // over below — they must agree or a rebuilt quad looks like a new one.
+    static uint64_t edgeKey(Index a, Index b) {
+        return a < b ? (((uint64_t)a << 32) | (uint32_t)b)
+                     : (((uint64_t)b << 32) | (uint32_t)a);
+    }
+
     // Derive one quad per interior edge from the facet list, and measure
     // phi0 from the CURRENT positions. Called when the cached topology no
     // longer matches the mesh, so phi0 is the pose at that moment — the
@@ -201,11 +311,16 @@ struct PbdSystem<METAL, PR> {
 
         for (Index f = 0; f < numFacets; ++f) {
             const Index v[3] = { facets[f*3+0], facets[f*3+1], facets[f*3+2] };
+            // TEARING: a torn facet is degenerated in place to (v0,v0,v0).
+            // dihedral() would already reject the quad it produces (both
+            // cross products are zero), but the (v0,v0) self-key would still
+            // be inserted into firstOpp and then marked kConsumed — dead
+            // weight, and a trap for anyone who later reuses this map. Drop
+            // any duplicate-index facet up front instead.
+            if (v[0] == v[1] || v[1] == v[2] || v[0] == v[2]) continue;
             for (int e = 0; e < 3; ++e) {
                 const Index a = v[e], b = v[(e+1)%3], o = v[(e+2)%3];
-                const uint64_t key = a < b
-                    ? ((uint64_t)a << 32) | (uint32_t)b
-                    : ((uint64_t)b << 32) | (uint32_t)a;
+                const uint64_t key = edgeKey(a, b);
                 auto it = firstOpp.find(key);
                 if (it == firstOpp.end()) { firstOpp.emplace(key, o); continue; }
                 // Second incident face closes the quad. A third (non-manifold
@@ -219,6 +334,111 @@ struct PbdSystem<METAL, PR> {
                 it->second = kConsumed;
             }
         }
+    }
+
+    // Re-derive the quad TOPOLOGY after a tear while keeping every surviving
+    // quad's ORIGINAL phi0.
+    //
+    // A plain buildBendQuads() re-run would re-measure phi0 from the live
+    // pose, i.e. bake the cloth's current drape in as its rest shape — and
+    // since a tear propagates over many steps, that re-bake would happen
+    // every frame the cloth is ripping, progressively freezing the whole
+    // sheet. A quad is uniquely identified by its SHARED EDGE (p1,p2), so the
+    // carry-over is a single lookup: same shared edge => same constraint =>
+    // same rest angle. Quads that are genuinely new (there are none today —
+    // tearing only removes) fall back to the freshly measured angle.
+    static void rebuildBendQuadsPreservingPhi0(const GeneralMesh<METAL, PR>& mesh,
+                                               BendCache& bc) {
+        std::unordered_map<uint64_t, PR> oldPhi;
+        oldPhi.reserve(bc.quads.size() * 2);
+        for (const auto& q : bc.quads) oldPhi.emplace(edgeKey(q.p1, q.p2), q.phi0);
+        buildBendQuads(mesh, bc.quads);
+        for (auto& q : bc.quads) {
+            auto it = oldPhi.find(edgeKey(q.p1, q.p2));
+            if (it != oldPhi.end()) q.phi0 = it->second;
+        }
+    }
+
+    // Build (or validate) mesh `mi`'s tear bookkeeping. Returns nullptr when
+    // the mesh has no usable edge/facet topology.
+    //
+    // Invalidation has TWO triggers, because tearing deliberately keeps every
+    // cheap topology key constant:
+    //   (a) the usual lifetimeId / numPoints / numFacets key — a genuinely
+    //       different mesh in this slot;
+    //   (b) a HEAL check: every facet we recorded as dead must still be
+    //       degenerate in the live index buffer. Scene::pack() regenerates
+    //       adjacency from the initializer on reset but does NOT change
+    //       lifetimeId (it is the stable identity, by design), so (a) alone
+    //       would leave a reset cloth whole on screen and shredded in the
+    //       solver. One un-degenerated dead facet is proof the topology was
+    //       rebuilt underneath us; drop everything and start over.
+    TearState* ensureTearState(const GeneralMesh<METAL, PR>& mesh, Index mi,
+                               Index n, Index numFacets) {
+        if (mi >= (Index)tearStates.size()) return nullptr;
+        TearState& ts = tearStates[mi];
+        const Index* F = mesh.adjacency.facets.ptr;
+        const Index* E = mesh.adjacency.edges.ptr;
+        if (!F || !E || numFacets == 0) return nullptr;
+        const Index numEdges = (Index)mesh.adjacency.edges.size / 2;
+        if (numEdges == 0) return nullptr;
+
+        bool stale = ts.lifetimeId != mesh.lifetimeId
+                  || ts.numPoints != n
+                  || ts.numFacets != numFacets
+                  || (Index)ts.edgeAlive.size() != numEdges;
+        if (!stale) {
+            for (Index f = 0; f < numFacets; ++f) {
+                if (ts.facetAlive[f]) continue;
+                const Index v0 = F[f*3+0];
+                if (F[f*3+1] != v0 || F[f*3+2] != v0) { stale = true; break; }
+            }
+        }
+        if (!stale) return &ts;
+
+        ts.lifetimeId = mesh.lifetimeId;
+        ts.numPoints  = n;
+        ts.numFacets  = numFacets;
+        ts.facetAlive.assign((size_t)numFacets, 1);
+        ts.edgeAlive.assign((size_t)numEdges, 0);   // seed DEAD, revive below
+        ts.edgeFacet0.assign((size_t)numEdges, kNoFacet);
+        ts.edgeFacet1.assign((size_t)numEdges, kNoFacet);
+        ts.bendDirty = false;
+        ts.facetsDirty = false;
+
+        // edge (min,max) -> the 1-2 facets that use it. Built from facets, the
+        // same source buildBendQuads walks, so the two agree on what an
+        // interior edge is.
+        std::unordered_map<uint64_t, std::pair<Index, Index>> ef;
+        ef.reserve((size_t)numFacets * 3);
+        for (Index f = 0; f < numFacets; ++f) {
+            const Index v[3] = { F[f*3+0], F[f*3+1], F[f*3+2] };
+            if (v[0] == v[1] || v[1] == v[2] || v[0] == v[2]) continue;
+            if (v[0] >= n || v[1] >= n || v[2] >= n) continue;
+            for (int e = 0; e < 3; ++e) {
+                const uint64_t key = edgeKey(v[e], v[(e+1)%3]);
+                auto it = ef.find(key);
+                if (it == ef.end()) ef.emplace(key, std::make_pair(f, kNoFacet));
+                else if (it->second.second == kNoFacet) it->second.second = f;
+                // A third incident face (non-manifold) is ignored: it would
+                // survive the tear as an orphan, which is strictly safer than
+                // silently overwriting one of the two we already know about.
+            }
+        }
+
+        for (Index e = 0; e < numEdges; ++e) {
+            const Index a = E[e*2], b = E[e*2+1];
+            // `numEdges` is the PADDED upper bound; the tail is uninitialised
+            // pool memory reinterpreted as indices (see the projection loop).
+            // Those slots stay dead, so "alive" implies "real edge".
+            if (a >= n || b >= n || a == b) continue;
+            auto it = ef.find(edgeKey(a, b));
+            if (it == ef.end()) continue;   // edge with no facet: not tearable
+            ts.edgeFacet0[e] = it->second.first;
+            ts.edgeFacet1[e] = it->second.second;
+            ts.edgeAlive[e] = 1;
+        }
+        return &ts;
     }
 
     // Iteration-count-corrected stiffness: applying k' = 1-(1-k)^(1/n) once
@@ -258,6 +478,11 @@ struct PbdSystem<METAL, PR> {
         const Index* edges = nullptr;
         const PR* restLen = nullptr;
         Index numEdges = 0;
+        // tearStates[mi].edgeAlive.data(), or nullptr when this mesh has no
+        // tear state (tearing off, or no usable topology). The projection
+        // loop treats nullptr as "everything alive", so the untorn path costs
+        // one null test per mesh per sweep and nothing else.
+        const uint8_t* edgeAlive = nullptr;
         const Index* facets = nullptr;
         Index numFacets = 0;
         const BendCache* bend = nullptr;
@@ -266,6 +491,12 @@ struct PbdSystem<METAL, PR> {
     };
     std::vector<SolveCtx> ctxs;      // one per ACTIVE cloth mesh
     std::vector<int> ctxOfMesh;      // mesh array index -> ctxs index, -1 = none
+
+    // Overstretched edge candidates of ONE mesh, worst-first. A member (not a
+    // local) so the steady state — tearing enabled, nothing overstretched —
+    // never allocates.
+    struct TearCand { PR strain; Index edge; };
+    std::vector<TearCand> tearCands;
 
     void step(Scene<METAL, PR>& sceneObjects, PR dt) {
         if (dt <= PR(0)) return;
@@ -277,6 +508,7 @@ struct PbdSystem<METAL, PR> {
         twoWayContactCount = 0;
         selfContactCount   = 0;
         rigidCoupleCount   = 0;
+        tearsThisStep      = 0;
 
         auto& off      = Scene<METAL, PR>::packedMeshData.statesOffsets;
         auto& colFacet = Scene<METAL, PR>::packedCollisionData.vertColFacets;
@@ -290,6 +522,9 @@ struct PbdSystem<METAL, PR> {
         if ((Index)bendCache.size() != numMeshes) bendCache.resize(numMeshes);
         if ((Index)predBlocks.size()  < numMeshes) predBlocks.resize(numMeshes);
         if ((Index)cDispBlocks.size() < numMeshes) cDispBlocks.resize(numMeshes);
+        // Sized once here so every TearState's vector data() stays valid for
+        // the whole step — SolveCtx caches edgeAlive.data().
+        if ((Index)tearStates.size() != numMeshes) tearStates.resize(numMeshes);
         ctxs.clear();
         ctxOfMesh.assign((size_t)numMeshes, -1);
 
@@ -329,12 +564,32 @@ struct PbdSystem<METAL, PR> {
 
             const Index numFacets = (Index)mesh.adjacency.facets.size / 3;
             BendCache& bc = bendCache[mi];
+            // Tear state must be settled BEFORE the bend decision: a heal
+            // (Scene::pack regenerated the topology) has to poison the bend
+            // cache too, otherwise the quads keep the holes the mesh no
+            // longer has.
+            // Maintained while tearing is ON, and also while an OLD tear
+            // state is still populated: turning the toggle off must stop NEW
+            // tears, not stitch the existing holes back up (the facets stay
+            // degenerate either way, so resurrecting their edges would leave
+            // a rubber band across a visible rip). resetTearing() is the only
+            // way back.
+            const bool haveTearState = !tearStates[mi].facetAlive.empty();
+            TearState* ts = (tearEnabled || haveTearState)
+                ? ensureTearState(mesh, mi, n, numFacets) : nullptr;
+            if (ts && ts->bendDirty) { bc.dirty = true; ts->bendDirty = false; }
             if (bc.lifetimeId != mesh.lifetimeId || bc.numPoints != n
                 || bc.numFacets != numFacets) {
                 buildBendQuads(mesh, bc.quads);
                 bc.lifetimeId = mesh.lifetimeId;
                 bc.numPoints = n;
                 bc.numFacets = numFacets;
+                bc.dirty = false;
+            } else if (bc.dirty) {
+                // Torn since the last step: same counts, different facets.
+                // Preserve phi0 (see rebuildBendQuadsPreservingPhi0).
+                rebuildBendQuadsPreservingPhi0(mesh, bc);
+                bc.dirty = false;
             }
 
             SolveCtx c;
@@ -353,6 +608,8 @@ struct PbdSystem<METAL, PR> {
             c.edges    = mesh.adjacency.edges.ptr;
             c.restLen  = mesh.adjacency.restEdgeLengths.ptr;
             c.numEdges = c.edges ? (Index)mesh.adjacency.edges.size / 2 : 0;
+            c.edgeAlive = (ts && (Index)ts->edgeAlive.size() == c.numEdges)
+                ? ts->edgeAlive.data() : nullptr;
             c.facets    = mesh.adjacency.facets.ptr;
             c.numFacets = numFacets;
             c.bend = &bc;
@@ -374,6 +631,113 @@ struct PbdSystem<METAL, PR> {
             ctxs.push_back(c);
         }
         if (ctxs.empty()) return;
+
+        // --- (1b) TEARING. Runs on the PREDICTED positions, after every mesh
+        // has been predicted and BEFORE the first projection sweep. Order is
+        // the whole point: once the sweeps run, the distance constraints have
+        // already pulled every edge back to (near) rest, so post-solve strain
+        // measures the solver's residual, not the load. The prediction is the
+        // only place the overstretch is visible.
+        //
+        // The budget is PER MESH, not per scene: two independent cloths under
+        // independent loads should not throttle each other, and a per-scene
+        // cap would make tear speed depend on how many other cloths exist.
+        if (tearEnabled && maxTearsPerStep > 0) {
+            for (const SolveCtx& c : ctxs) {
+                if (!c.edgeAlive || !c.restLen || !c.edges) continue;
+                // PER-MESH opt-out. Gates DETECTION ONLY — the tear state of
+                // this mesh keeps being allocated, healed and honoured by the
+                // projection sweeps above/below, so a cloth torn earlier and
+                // then switched off keeps its holes and merely stops ripping
+                // further.
+                if (!tearableOf(sceneObjects.meshes[c.mi].behaviorParams))
+                    continue;
+                TearState& ts = tearStates[c.mi];
+                Index* F = sceneObjects.meshes[c.mi].adjacency.facets.ptr;
+                if (!F) continue;
+
+                // Candidates, worst-first. Reused across meshes/steps so the
+                // common (nothing overstretched) path allocates nothing.
+                tearCands.clear();
+                for (Index e = 0; e < c.numEdges; ++e) {
+                    if (!ts.edgeAlive[e]) continue;
+                    const Index ea = c.edges[e*2], eb = c.edges[e*2+1];
+                    if (ea >= c.n || eb >= c.n || ea == eb) continue;
+                    const PR rest = c.restLen[e];
+                    if (!(rest > PR(1e-9))) continue;
+                    // Both ends pinned: breaking it moves nothing (the
+                    // projection is already a no-op there) and it is the
+                    // pinned row the user hung the cloth from. Leave it.
+                    if (invMassOf(c.m, c.mask, ea) <= PR(0)
+                     && invMassOf(c.m, c.mask, eb) <= PR(0)) continue;
+                    const PR len = (vertexAt(c.p, eb) - vertexAt(c.p, ea)).norm();
+                    if (!std::isfinite(len)) continue;   // blown-up vertex
+                    const PR strain = len / rest;
+                    if (strain > tearRatio)
+                        tearCands.push_back(TearCand{ strain, e });
+                }
+                if (tearCands.empty()) continue;
+
+                const size_t budget = std::min((size_t)maxTearsPerStep,
+                                               tearCands.size());
+                std::partial_sort(tearCands.begin(),
+                                  tearCands.begin() + (ptrdiff_t)budget,
+                                  tearCands.end(),
+                                  [](const TearCand& a, const TearCand& b) {
+                                      return a.strain > b.strain;
+                                  });
+
+                // Local, NOT ts.facetsDirty: that flag is sticky until phase 2
+                // consumes it, so reusing it here would re-run the secondary
+                // sweep on steps where nothing broke.
+                bool tore = false;
+                for (size_t k = 0; k < budget; ++k) {
+                    const Index e = tearCands[k].edge;
+                    if (!ts.edgeAlive[e]) continue;   // killed as a dangler
+                    ts.edgeAlive[e] = 0;
+                    // Degenerate every facet that used this edge. Collapsing
+                    // to (v0,v0,v0) is what removes the triangle from the GPU
+                    // narrow phase (cross(v0,v1) == 0 => early return in
+                    // narrow_pt_tri) and, after phase 2, from rendering —
+                    // without resizing any shared buffer or shifting a single
+                    // index, which is why it is safe to do mid-step on the
+                    // Metal-shared facet array.
+                    const Index fs[2] = { ts.edgeFacet0[e], ts.edgeFacet1[e] };
+                    for (int j = 0; j < 2; ++j) {
+                        const Index f = fs[j];
+                        if (f == kNoFacet || f >= ts.numFacets) continue;
+                        if (!ts.facetAlive[f]) continue;
+                        ts.facetAlive[f] = 0;
+                        const Index v0 = F[f*3+0];
+                        F[f*3+1] = v0;
+                        F[f*3+2] = v0;
+                    }
+                    ts.bendDirty = true;
+                    ts.facetsDirty = true;
+                    tore = true;
+                    ++tearsThisStep;
+                    ++tearCount;
+                }
+
+                // Secondary rule: an edge whose incident facets are ALL dead
+                // now spans open air. Left alive it would keep pulling the
+                // two lips of the hole together — a rubber band across a rip.
+                // These are bookkeeping, not new tears, so they do NOT spend
+                // budget and cannot cascade (their facets are already dead).
+                if (tore) {
+                    for (Index e = 0; e < c.numEdges; ++e) {
+                        if (!ts.edgeAlive[e]) continue;
+                        const Index f0 = ts.edgeFacet0[e];
+                        if (f0 == kNoFacet || f0 >= ts.numFacets) continue;
+                        if (ts.facetAlive[f0]) continue;
+                        const Index f1 = ts.edgeFacet1[e];
+                        if (f1 != kNoFacet && f1 < ts.numFacets
+                            && ts.facetAlive[f1]) continue;
+                        ts.edgeAlive[e] = 0;
+                    }
+                }
+            }
+        }
 
         // Standard PBD distance constraint C = |p_b - p_a| - rest.
         auto projectDistance = [&](const SolveCtx& c, Index a, Index b,
@@ -511,6 +875,11 @@ struct PbdSystem<METAL, PR> {
                         // (mesh_state.hpp `inRange`). Without this the solver
                         // reads x/m far outside the mesh and segfaults.
                         if (ea >= c.n || eb >= c.n) continue;
+                        // TEARING: a broken edge has no cloth left to
+                        // constrain. Skipping it here is what actually opens
+                        // the hole — degenerating the facets alone would leave
+                        // the two lips stitched by the stretch constraint.
+                        if (c.edgeAlive && !c.edgeAlive[e]) continue;
                         projectDistance(c, ea, eb, c.restLen[e], c.kS);
                     }
                 }
@@ -607,6 +976,14 @@ struct PbdSystem<METAL, PR> {
                         const Index i2 = pc->facets[tri*3+1];
                         const Index i3 = pc->facets[tri*3+2];
                         if (i1 >= pc->n || i2 >= pc->n || i3 >= pc->n) return;
+                        // TEARING: contact rows for THIS substep were built by
+                        // the narrow phase before step() ran, so a row can name
+                        // a facet the tear pass degenerated a few lines ago.
+                        // The nlenG guard below already catches it (a
+                        // (v,v,v) triangle has a zero cross product), but a
+                        // duplicate-index test is cheaper, exact, and says
+                        // out loud that a torn facet has no contact.
+                        if (i1 == i2 || i2 == i3 || i1 == i3) return;
                         // Self rows never name an incident facet (the narrow
                         // phase excludes adjacency), but a degenerate row must
                         // not build a constraint of a vertex against itself.

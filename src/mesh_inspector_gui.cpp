@@ -1140,6 +1140,49 @@ void drawMeshInspectorWindow(MeshInspectorWindowState& st, const MeshInspectorTa
             ImGui::TextUnformatted("접촉이 밀어내는 거리 (m) — 겹친 천이 벌어지는 간격");
             ImGui::PopTextWrapPos();ImGui::PopStyleColor();
         }
+        // ─── 스트레인 한계 (PD strain-limiting band [σmin, σmax]) ─────
+        // Per-fabric material property; only the PD solver consumes it
+        // (SVD singular-value clamp), which the caption states so the row
+        // is not misread as live under the other solvers. Linear two-handle
+        // slider over one narrow band — same reasoning as 두께's DragFloat.
+        if(t.cloth_sigma_min&&t.cloth_sigma_max&&t.on_cloth_sigma){
+            ImGui::Dummy({0,12});
+            ImGui::PushStyleColor(ImGuiCol_Text,kG60);ImGui::TextUnformatted("스트레인 한계");ImGui::PopStyleColor();
+            ImGui::Dummy({0,4});
+            ImGui::SetNextItemWidth(CW());
+            ImGui::PushID("strainband");
+            float band[2]={*t.cloth_sigma_min,*t.cloth_sigma_max};
+            if(ImGui::SliderFloat2("##sb",band,0.01f,2.00f,"%.3f")){
+                // Keep min <= max whichever handle moved, so the SVD clamp
+                // can never invert into an empty interval.
+                if(band[0]>band[1])band[1]=band[0];
+                *t.cloth_sigma_min=band[0];*t.cloth_sigma_max=band[1];
+                t.on_cloth_sigma(t.mesh_id,band[0],band[1]);
+            }
+            ImGui::PopID();
+            ImGui::Dummy({0,4});
+            ImGui::PushStyleColor(ImGuiCol_Text,kG40);
+            ImGui::PushTextWrapPos(ImGui::GetCursorPosX()+CW());
+            ImGui::TextUnformatted("PD 전용 — 허용 특이값 [σmin, σmax]. 1.0/1.0 = corotated, 넓히면 면내 여유가 생기지만 접촉 관통 위험");
+            ImGui::PopTextWrapPos();ImGui::PopStyleColor();
+        }
+        // ─── 찢어짐 허용 (per-mesh PBD tear opt-out) ──────────────────
+        // A fabric property, so it sits with the other cloth material rows
+        // rather than in the solver panel — but it is only a GATE: the
+        // global 찢어짐 활성화 toggle still has to be on. Caption says so,
+        // and says what turning it off does NOT do (un-tear).
+        if(t.cloth_tearable&&t.on_cloth_tearable){
+            ImGui::Dummy({0,12});
+            ImGui::PushStyleColor(ImGuiCol_Text,kG60);ImGui::TextUnformatted("찢어짐 허용");ImGui::PopStyleColor();
+            ImGui::SameLine(kP+CW()-42);
+            if(PillToggle("##tearable",t.cloth_tearable))
+                t.on_cloth_tearable(t.mesh_id,*t.cloth_tearable);
+            ImGui::Dummy({0,4});
+            ImGui::PushStyleColor(ImGuiCol_Text,kG40);
+            ImGui::PushTextWrapPos(ImGui::GetCursorPosX()+CW());
+            ImGui::TextUnformatted("PBD 전용 — 전역 '찢어짐 활성화' 아래의 개별 천 스위치. 끄면 더 찢어지지 않을 뿐, 이미 뚫린 구멍은 그대로 남습니다");
+            ImGui::PopTextWrapPos();ImGui::PopStyleColor();
+        }
         ImGui::Unindent(kP);ImGui::Dummy({0,kP});
     }
 

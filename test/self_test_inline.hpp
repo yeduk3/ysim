@@ -7400,7 +7400,42 @@ static int runSelfTest() {
     //         (the momentum term stays in the objective — PD's defining
     //         difference from PBD, whose stiffness drifts with the budget),
     //   PD-8  the local/global iteration weakly DECREASES the objective, so
-    //         the descent needs no line search and no safeguards.
+    //         the descent needs no line search and no safeguards,
+    //   PD-9  the continuum triangle strain energy is rigid-motion invariant,
+    //   PD-10 its local step clamps the singular values it claims to,
+    //   PD-11 the global system with the dense 3x3 strain blocks is still
+    //         SPD/factorizable and its contact-free descent is monotone,
+    //   PD-12 the cotangent bending element's REST DATA is right (flat rest
+    //         ⇒ no interior curvature and no residual force; rigid-motion
+    //         invariant energy),
+    //   PD-13 it survives the geometry §9.2 names (boundary vertices, obtuse
+    //         triangles, degenerate one-rings) and a live contact scene
+    //         without NaN/Inf, and the sheet still sags without collapsing,
+    //   PD-14 a KNOWN curvature (cylinder arc) is reported and recovered,
+    //   PD-15 residual penetration does not grow when the contact stiffness
+    //         scale s_c is raised (the property that makes it a stiffness),
+    //   PD-16 s_c changed MID-RUN reaches the matrix with no re-init — the
+    //         epoch refactors and the factorized weight follows it,
+    //   PD-17 a cross-cloth contact really assembles A_cᵀA_c ACROSS the two
+    //         meshes' blocks of one merged system, and both sheets react,
+    //   PD-18 a separated coupled row exerts no attraction,
+    //   PD-19 §5.5's EDGE-EDGE rows are detected and really coupled, in a
+    //         configuration where no vertex-triangle pair exists at all,
+    //   PD-20 and they stop a grazing contact that would otherwise tunnel.
+    //
+    // RESTORE HISTORY, kept because it explains why several clauses read as
+    // re-authored rather than grown: this whole file was lost to an accidental
+    // `git checkout` during the §5.5 slice, on a working tree that had never
+    // been committed. PD-9..11 came back from a scratch snapshot, PD-12..14
+    // and PD-15/16 were re-authored by the slices that originally wrote them,
+    // PD-17..18 verbatim. The solver code was never affected — only its
+    // verification — and PD-15/16's restored numbers were re-measured against
+    // the CURRENT (coupled-contact) solver rather than copied forward.
+    //
+    // PD-9..11 are the design doc's §9.1 strain verification and PD-12..14 its
+    // §9.2 bending one; PD-1..8 predate both and now run against the CONTINUUM
+    // material — strain in-plane, cotangent mean curvature in bending, no
+    // springs at all — which is why several of their numbers moved.
     {
         // The whole PD family runs at PD's OWN operating point: 3 substeps
         // with the solver's default 10 iterations (Bouaziz 2014 §7.3's 5-10
@@ -8020,16 +8055,33 @@ static int runSelfTest() {
         // a Float floor, so all three energy families are live — momentum,
         // springs (+ the soft pin), and contacts.
         //
-        // WHAT IS GATED, and why it is not the full objective: the smooth
-        // part (momentum + pin + springs) is gated hard, because there the
-        // local step IS the exact projection onto the constraint manifold
-        // and the descent argument applies verbatim. The contact part is
-        // only REPORTED: a contact target is re-linearized every iteration
-        // (a unilateral half-space evaluated at the live iterate, and for a
-        // two-way row a mass-weighted split of a vertex-triangle inequality),
-        // so the objective's own definition moves between iterations and the
-        // full F may legitimately rise across a re-linearization. Gating it
-        // would be asserting a guarantee this implementation does not claim.
+        // WHAT IS GATED — and this FLIPPED when the continuum strain element
+        // replaced the stretch springs (docs/design/pd-continuum-cloth-
+        // contact.md §3). It used to gate the SMOOTH part (momentum + pin +
+        // springs) alone, on the argument that its local step is an exact
+        // projection. That argument is wrong as a MONOTONICITY claim and only
+        // held by luck: block coordinate descent decreases the objective the
+        // global solve minimizes, which is smooth + contact TOGETHER. A
+        // single global solve is free to raise one term while lowering the
+        // other by more, and with the strain element the smooth part is ~3x
+        // smaller than the spring model's was (0.39 vs 1.09 on this scene),
+        // so the contact term's share of the trade is no longer in the noise:
+        // measured, smooth rises by up to 1.5e-3 of its own value at some
+        // iteration while the FULL objective's worst rise stays exactly 0.
+        //
+        // So the FULL objective is what is gated now, and the smooth part is
+        // only REPORTED. That is legitimate HERE, and the clause checks why:
+        // every row of this scene is ONE-SIDED (the cube is a Float obstacle),
+        // i.e. an exact projection onto a fixed half-space, so the whole
+        // objective really is a block coordinate descent with no moving
+        // definition. A scene with TWO-WAY rows would not qualify — there the
+        // target is a re-linearized mass-weighted split (and, across meshes, a
+        // Jacobi read of the partner's previous iterate) whose own definition
+        // moves between iterations — which is why the two-way count is
+        // asserted to be zero rather than assumed.
+        //
+        // The strain element's OWN descent, free of contacts entirely, is
+        // gated separately and much more sharply by PD-11.
         {
             resetScene();
             sim.usePd = true;
@@ -8075,44 +8127,2119 @@ static int runSelfTest() {
             for (size_t k = 1; k < seq.size(); ++k)
                 worstFull = std::max(worstFull, seq[k] - seq[k-1]);
 
-            const double slack = (smo.empty() ? 0.0 : std::fabs(smo.front())) * 1e-9;
+            double worstFullAt = 0.0;
+            for (size_t k = 1; k < seq.size(); ++k)
+                if (seq[k] - seq[k-1] >= worstFull) worstFullAt = (double)k;
+            const double slack = (seq.empty() ? 0.0 : std::fabs(seq.front())) * 1e-9;
             const char* n8 = "PD-8 / local/global iteration weakly decreases the "
                              "Eq.8 objective (no line search needed)";
-            if (smo.size() < 2)
-                fail(n8, "objective probe produced " + std::to_string(smo.size())
+            if (seq.size() < 2 || smo.size() < 2)
+                fail(n8, "objective probe produced " + std::to_string(seq.size())
                      + " samples (expected one per iteration of the last substep)");
-            else if (!std::isfinite(smo.front()) || !std::isfinite(smo.back()))
+            else if (!std::isfinite(seq.front()) || !std::isfinite(seq.back()))
                 fail(n8, "non-finite objective sample");
             else if (rows == 0)
                 fail(n8, "the probed substep carried no contact rows at all, so "
                      "this run does not exercise all three energy families");
-            else if (worstSmooth > slack)
-                fail(n8, "momentum+pin+spring objective ROSE at iteration "
-                     + std::to_string(worstSmoothAt) + " by "
-                     + std::to_string(worstSmooth) + " (slack "
+            // The gate's own premise: only with exactly-projected (one-sided)
+            // rows is the FULL objective a genuine block coordinate descent.
+            else if (sim.pd.twoWayContactCount != 0)
+                fail(n8, "the probed substep carried "
+                     + std::to_string(sim.pd.twoWayContactCount)
+                     + " TWO-WAY rows, whose targets are re-linearized — the "
+                       "full-objective gate below does not apply to them");
+            else if (worstFull > slack)
+                fail(n8, "full objective ROSE at iteration "
+                     + std::to_string(worstFullAt) + " by "
+                     + std::to_string(worstFull) + " (slack "
                      + std::to_string(slack) + "); first "
-                     + std::to_string(smo.front()) + " -> last "
-                     + std::to_string(smo.back()));
-            else if (!(smo.back() < smo.front()))
+                     + std::to_string(seq.front()) + " -> last "
+                     + std::to_string(seq.back()));
+            else if (!(seq.back() < seq.front()))
                 fail(n8, "objective did not decrease at all across "
-                     + std::to_string(smo.size()) + " iterations: "
-                     + std::to_string(smo.front()) + " -> "
-                     + std::to_string(smo.back()));
+                     + std::to_string(seq.size()) + " iterations: "
+                     + std::to_string(seq.front()) + " -> "
+                     + std::to_string(seq.back()));
             else
                 pass(n8);
-            // The full objective's behaviour is REPORTED, never gated — see
-            // the block comment. A rise here is the contact re-linearization,
-            // not a broken descent.
+            // The smooth part's behaviour is REPORTED, never gated — see the
+            // block comment. A rise there is energy traded to the contact
+            // term inside one global solve, not a broken descent.
             std::cerr << "[self-test INFO] PD-8 objective: smooth "
                       << (smo.empty() ? 0.0 : smo.front()) << " -> "
                       << (smo.empty() ? 0.0 : smo.back())
-                      << " (worst rise " << worstSmooth << "), full "
+                      << " (worst rise " << worstSmooth << " at it "
+                      << worstSmoothAt << "), full "
                       << (seq.empty() ? 0.0 : seq.front()) << " -> "
                       << (seq.empty() ? 0.0 : seq.back())
                       << " (worst rise " << worstFull << "), contact peak "
                       << contactPeak << ", " << rows << " rows, "
                       << smo.size() << " iterations\n";
         }
+
+        // ---- PD-9 / PD-10 / PD-11: the continuum triangle strain element
+        // (docs/design/pd-continuum-cloth-contact.md §3, verification §9.1).
+        // TriangularCloth's in-plane material is no longer an edge spring set
+        // but a per-triangle potential (w_s A_t/2)|F_t - P_t|² with
+        // F_t = D_s D_m⁻¹ and P_t the SVD projection onto the admissible
+        // singular values. The three clauses isolate what that can get wrong:
+        //   PD-9   the ENERGY is frame-invariant (rest data + F are built
+        //          correctly: a rigid motion must cost nothing, a stretch
+        //          must cost something),
+        //   PD-10  the LOCAL projection clamps the singular values it says it
+        //          clamps — analytically on a known F, and end-to-end through
+        //          the mesh's rest cache on a known uniform stretch,
+        //   PD-11  the GLOBAL system is still SPD/factorizable with the dense
+        //          3x3 strain blocks in it, the descent is monotone with NO
+        //          contacts in the way, and the sheet still hangs.
+        //
+        // A shared helper: put a cloth in a known pose and read the cached
+        // strain energy back. `sim.pd.cache` is parallel to Scene::meshes, so
+        // a single-cloth scene is always index 0.
+        {
+            // Write `pos` (3N doubles) into mesh id `mid`'s live x array.
+            auto writePositions = [&](int mid, const std::vector<double>& pos) {
+                auto* m = Scene<Backend, Precision>::findById(mid);
+                if (!m || !m->state.x.ptr) return;
+                const Index n = m->state.x.size / 3;
+                for (Index i = 0; i < n * 3 && i < (Index)pos.size(); ++i)
+                    m->state.x.ptr[i] = (Precision)pos[i];
+            };
+            auto readPositions = [&](int mid) {
+                std::vector<double> out;
+                auto* m = Scene<Backend, Precision>::findById(mid);
+                if (!m || !m->state.x.ptr) return out;
+                const Index n = m->state.x.size / 3;
+                out.resize((size_t)n * 3);
+                for (Index i = 0; i < n * 3; ++i)
+                    out[i] = (double)m->state.x.ptr[i];
+                return out;
+            };
+            // A pinned-EVERYWHERE sheet: one update() builds the strain rest
+            // cache from the pose the mesh is in, and PdSystem step (4) never
+            // writes a pinned vertex, so x afterwards is EXACTLY the pose the
+            // cache was built from. That is what makes "rest energy == 0" an
+            // assertion about the rest data rather than about gravity.
+            auto buildFrozenSheet = [&](Index k, float size, float kstretch) {
+                resetScene();
+                sim.usePd = true;
+                sim.addCloth(k, size, tinym::vec3(0.0f, 1.0f, 0.0f),
+                             kstretch, kstretch, kstretch * 3.0f,
+                             Precision(0.01));                            // id 0
+                sim.initialize();
+                auto* m = Scene<Backend, Precision>::findById(0);
+                const Index n = m ? m->state.x.size / 3 : 0;
+                for (Index i = 0; i < n; ++i) sim.setVertexFixed(0, i, true);
+                sim.pause = false;
+                sim.update();
+                MetalGlobalContext::commitAndWait();
+                sim.pause = true;
+                return n;
+            };
+
+            // ---- PD-9 — rigid-motion invariance (§9.1 clause 1). ----------
+            {
+                const Index n = buildFrozenSheet(5, 0.5f, 1e5f);
+                // MeshCache holds a unique_ptr (the factorization), so it is
+                // move-only — read the fields out rather than binding a
+                // reference through a ternary that would need a copy.
+                const bool haveCache = !sim.pd.cache.empty();
+                const size_t tris = haveCache
+                                  ? sim.pd.cache[0].strainTris.size() : 0;
+                const uint32_t degen = haveCache
+                                     ? sim.pd.cache[0].degenerateTriCount : 0u;
+                const double ws = haveCache ? sim.pd.cache[0].kS : 0.0;
+                const double area = sim.pd.strainRestArea(0);
+                const std::vector<double> rest = readPositions(0);
+
+                auto* cloth = Scene<Backend, Precision>::findById(0);
+                const double eRest = cloth
+                    ? sim.pd.strainEnergyAt(0, cloth->state.x.ptr) : -1.0;
+
+                // Rigid: a 37° rotation about a non-axis direction plus a
+                // translation. Both singular values of F stay exactly 1, so
+                // the projection is the identity and the energy must vanish —
+                // this is the clause that fails if D_m, G_t or the F
+                // assembly picks up a frame-dependent term.
+                std::vector<double> moved = rest;
+                {
+                    const double ang = 0.6458;             // ~37°
+                    double ax = 1.0, ay = 2.0, az = 3.0;
+                    const double an = std::sqrt(ax*ax + ay*ay + az*az);
+                    ax /= an; ay /= an; az /= an;
+                    const double c = std::cos(ang), s = std::sin(ang), t = 1.0 - c;
+                    const double R[3][3] = {
+                        { t*ax*ax + c,    t*ax*ay - s*az, t*ax*az + s*ay },
+                        { t*ax*ay + s*az, t*ay*ay + c,    t*ay*az - s*ax },
+                        { t*ax*az - s*ay, t*ay*az + s*ax, t*az*az + c    },
+                    };
+                    const double T[3] = { 0.31, -0.77, 1.13 };
+                    for (Index i = 0; i < n; ++i)
+                        for (int r = 0; r < 3; ++r)
+                            moved[(size_t)i*3+r] =
+                                R[r][0]*rest[(size_t)i*3+0]
+                              + R[r][1]*rest[(size_t)i*3+1]
+                              + R[r][2]*rest[(size_t)i*3+2] + T[r];
+                }
+                writePositions(0, moved);
+                const double eRigid = cloth
+                    ? sim.pd.strainEnergyAt(0, cloth->state.x.ptr) : -1.0;
+
+                // Non-triviality: a 20% uniform scale is NOT rigid, so the
+                // same measurement must come back large. Without this the two
+                // clauses above would pass on an energy that is identically
+                // zero (e.g. an empty triangle list).
+                std::vector<double> scaled = rest;
+                for (double& v : scaled) v *= 1.20;
+                writePositions(0, scaled);
+                const double eScaled = cloth
+                    ? sim.pd.strainEnergyAt(0, cloth->state.x.ptr) : -1.0;
+
+                // Absolute tolerance, scaled by the energy the element CAN
+                // carry (w_s·A): float positions carry ~6e-8 m of roundoff and
+                // G_t ~ 1/L amplifies that to ~5e-7 in F, i.e. ~1e-13·w_s·A of
+                // energy. 1e-6·w_s·A gives seven decades of headroom and still
+                // sits four decades below the stretched reference.
+                const double tol = 1e-6 * ws * area;
+                const char* n9 = "PD-9 / triangle strain energy is invariant "
+                                 "under rigid motion (and non-zero under stretch)";
+                if (tris == 0)
+                    fail(n9, "no strain triangles were cached for the cloth — "
+                             "the continuum path never built its rest data");
+                else if (degen != 0)
+                    fail(n9, std::to_string(degen) + " degenerate triangles in a "
+                             "regular grid — the rest cache is rejecting valid "
+                             "geometry");
+                else if (!(ws > 0.0) || !(area > 0.0))
+                    fail(n9, "cached w_s = " + std::to_string(ws) + ", rest area "
+                         + std::to_string(area));
+                else if (!std::isfinite(eRest) || eRest > tol)
+                    fail(n9, "rest-pose strain energy " + std::to_string(eRest)
+                         + " > tol " + std::to_string(tol)
+                         + " — the cached rest frame is not the pose it was "
+                           "built from");
+                else if (!std::isfinite(eRigid) || eRigid > tol)
+                    fail(n9, "strain energy after a rigid rotation+translation: "
+                         + std::to_string(eRigid) + " > tol "
+                         + std::to_string(tol));
+                else if (!(eScaled > 1e-3 * ws * area))
+                    fail(n9, "a 20% uniform stretch cost only "
+                         + std::to_string(eScaled)
+                         + " — the energy is (near) identically zero, so the "
+                           "invariance clauses above prove nothing");
+                else
+                    pass(n9);
+                std::cerr << "[self-test INFO] PD-9 strain energy: rest "
+                          << eRest << ", rigid " << eRigid << ", 1.2x scale "
+                          << eScaled << " (tol " << tol << ", " << tris
+                          << " triangles, w_s " << ws << ", area " << area
+                          << ")\n";
+            }
+
+            // ---- PD-10 — known-F singular value clamp (§9.1 clause 2). ----
+            {
+                const char* n10 = "PD-10 / local projection clamps the singular "
+                                  "values of a known F";
+                // (a) ANALYTIC: F = U·diag(s1,s2)·Vᵀ for an explicit thin U
+                // (3x2, orthonormal columns) and a 2x2 rotation V, so the
+                // expected P is known in closed form and not just its singular
+                // values. Exercised at a band the DEFAULT does not use
+                // (ClothBehaviorParams::sigmaMin/sigmaMax default to 1/1 —
+                // see the tunneling calibration in pd_system.hpp §3.3 block),
+                // which is the only way the clamp's interval arithmetic gets
+                // tested at all.
+                const double smin = 0.95, smax = 1.05;
+                Eigen::Matrix<double, 3, 2> U;
+                {
+                    // Two orthonormal columns of an arbitrary non-axis frame.
+                    Eigen::Vector3d u0(1.0, 1.0, 1.0);
+                    Eigen::Vector3d u1(1.0, -1.0, 0.0);
+                    u0.normalize();
+                    u1 = (u1 - u0 * u0.dot(u1)).normalized();
+                    U.col(0) = u0; U.col(1) = u1;
+                }
+                Eigen::Matrix2d V;
+                {
+                    const double a = 0.7;
+                    V << std::cos(a), -std::sin(a), std::sin(a), std::cos(a);
+                }
+                auto clampOne = [&](double s1, double s2,
+                                    double& e1, double& e2, double& perr) {
+                    Eigen::Vector2d sv(s1, s2);
+                    const Eigen::Matrix<double, 3, 2> Fm =
+                        U * sv.asDiagonal() * V.transpose();
+                    double F[6], P[6];
+                    for (int ax = 0; ax < 3; ++ax)
+                        for (int r = 0; r < 2; ++r) F[ax*2+r] = Fm(ax, r);
+                    for (int z = 0; z < 6; ++z) P[z] = 0.0;
+                    const bool ok = decltype(sim.pd)::projectStrain(F, smin, smax, P);
+                    Eigen::Matrix<double, 3, 2> Pm;
+                    for (int ax = 0; ax < 3; ++ax)
+                        for (int r = 0; r < 2; ++r) Pm(ax, r) = P[ax*2+r];
+                    Eigen::Vector2d cs(std::min(std::max(s1, smin), smax),
+                                       std::min(std::max(s2, smin), smax));
+                    const Eigen::Matrix<double, 3, 2> expect =
+                        U * cs.asDiagonal() * V.transpose();
+                    perr = ok ? (Pm - expect).norm() : 1e30;
+                    Eigen::JacobiSVD<Eigen::Matrix<double, 3, 2>,
+                                     Eigen::ComputeThinU | Eigen::ComputeThinV>
+                        svd(Pm);
+                    e1 = svd.singularValues()[0];
+                    e2 = svd.singularValues()[1];
+                };
+                double a1 = 0, a2 = 0, aErr = 0;   // both outside the band
+                double b1 = 0, b2 = 0, bErr = 0;   // both inside  the band
+                double c1 = 0, c2 = 0, cErr = 0;   // one of each
+                clampOne(1.40, 0.50, a1, a2, aErr);
+                clampOne(1.02, 0.98, b1, b2, bErr);
+                clampOne(1.30, 1.00, c1, c2, cErr);
+
+                // (b) END-TO-END through the mesh rest cache: a uniform 3D
+                // scale by s makes every triangle's D_s exactly s·D_s_rest, so
+                // BOTH singular values of F are exactly s and the total energy
+                // has a closed form:
+                //   Σ_t (w_s A_t/2)·|F - P|²  with |F - P|² = 2(s - clamp(s))²
+                //   = w_s·(Σ_t A_t)·(s - clamp(s))².
+                // This is the clause that catches a wrong D_m, a wrong G_t or
+                // a wrong A_t — none of which the analytic half can see.
+                const Index n = buildFrozenSheet(6, 0.6f, 1e5f);
+                (void)n;
+                const double ws = sim.pd.cache.empty() ? 0.0 : sim.pd.cache[0].kS;
+                const double area = sim.pd.strainRestArea(0);
+                const std::vector<double> rest = readPositions(0);
+                auto* cloth = Scene<Backend, Precision>::findById(0);
+                // The band is PER MESH now (ClothBehaviorParams::sigmaMin/
+                // sigmaMax → MeshCache::sigMin/sigMax, copied each substep).
+                // strainEnergyAt reads the CACHE copy, and no step() runs
+                // between here and the energy calls, so write the cache
+                // directly — this clause gates the projection/energy math,
+                // not the param-copy plumbing (PD-9 exercises that path by
+                // stepping with the mesh's own band).
+                const double savedMin = sim.pd.cache.empty()
+                    ? 1.0 : sim.pd.cache[0].sigMin;
+                const double savedMax = sim.pd.cache.empty()
+                    ? 1.0 : sim.pd.cache[0].sigMax;
+                if (!sim.pd.cache.empty()) {
+                    sim.pd.cache[0].sigMin = smin;
+                    sim.pd.cache[0].sigMax = smax;
+                }
+                auto energyAtScale = [&](double s) {
+                    std::vector<double> p = rest;
+                    for (double& v : p) v *= s;
+                    writePositions(0, p);
+                    return cloth ? sim.pd.strainEnergyAt(0, cloth->state.x.ptr)
+                                 : -1.0;
+                };
+                const double eIn   = energyAtScale(1.02);   // inside the band
+                const double eOut  = energyAtScale(1.20);   // above it
+                const double eDown = energyAtScale(0.80);   // below it
+                if (!sim.pd.cache.empty()) {
+                    sim.pd.cache[0].sigMin = savedMin;
+                    sim.pd.cache[0].sigMax = savedMax;
+                }
+                const double eOutExpect  = ws * area * (1.20 - smax) * (1.20 - smax);
+                const double eDownExpect = ws * area * (0.80 - smin) * (0.80 - smin);
+
+                // Analytic tolerance is pure double roundoff; the mesh one
+                // carries float position storage (~1e-7 relative) squared into
+                // an energy, so 1e-4 relative is the honest bound there.
+                if (aErr > 1e-12 || bErr > 1e-12 || cErr > 1e-12)
+                    fail(n10, "projected P is not U·clamp(Σ)·Vᵀ: |dP| = "
+                         + std::to_string(aErr) + " / " + std::to_string(bErr)
+                         + " / " + std::to_string(cErr));
+                else if (std::fabs(a1 - smax) > 1e-9 || std::fabs(a2 - smin) > 1e-9)
+                    fail(n10, "F = diag(1.40, 0.50) projected to singular values "
+                         + std::to_string(a1) + ", " + std::to_string(a2)
+                         + " (expected " + std::to_string(smax) + ", "
+                         + std::to_string(smin) + ")");
+                else if (std::fabs(b1 - 1.02) > 1e-9 || std::fabs(b2 - 0.98) > 1e-9)
+                    fail(n10, "F = diag(1.02, 0.98) is INSIDE the band but was "
+                         "changed to " + std::to_string(b1) + ", "
+                         + std::to_string(b2));
+                else if (std::fabs(c1 - smax) > 1e-9 || std::fabs(c2 - 1.00) > 1e-9)
+                    fail(n10, "F = diag(1.30, 1.00) projected to "
+                         + std::to_string(c1) + ", " + std::to_string(c2)
+                         + " (expected " + std::to_string(smax) + ", 1.0)");
+                else if (!(ws > 0.0) || !(area > 0.0))
+                    fail(n10, "no strain rest cache for the end-to-end arm");
+                else if (!std::isfinite(eIn) || eIn > 1e-6 * ws * area)
+                    fail(n10, "a uniform 1.02x stretch is inside [0.95, 1.05] "
+                              "and must cost nothing, but cost "
+                         + std::to_string(eIn));
+                else if (!std::isfinite(eOut)
+                         || std::fabs(eOut - eOutExpect) > 1e-4 * eOutExpect)
+                    fail(n10, "uniform 1.20x stretch energy " + std::to_string(eOut)
+                         + " != w_s*A*(1.20-1.05)^2 = "
+                         + std::to_string(eOutExpect));
+                else if (!std::isfinite(eDown)
+                         || std::fabs(eDown - eDownExpect) > 1e-4 * eDownExpect)
+                    fail(n10, "uniform 0.80x compression energy "
+                         + std::to_string(eDown)
+                         + " != w_s*A*(0.80-0.95)^2 = "
+                         + std::to_string(eDownExpect));
+                else
+                    pass(n10);
+                std::cerr << "[self-test INFO] PD-10 clamp: (1.40,0.50)->("
+                          << a1 << "," << a2 << ") (1.02,0.98)->(" << b1 << ","
+                          << b2 << ") (1.30,1.00)->(" << c1 << "," << c2
+                          << "); mesh 1.02x " << eIn << ", 1.20x " << eOut
+                          << " vs " << eOutExpect << ", 0.80x " << eDown
+                          << " vs " << eDownExpect << "\n";
+            }
+
+            // ---- PD-11 — SPD global system + contact-free descent (§9.1
+            // clauses 3 and 5) + the end-to-end regression that the sheet
+            // still hangs. Same scene as PD-1 (pinned sheet, NO collider), so
+            // the strain elements are the only thing in the matrix besides the
+            // mass, the bend springs and the pins — and the objective probe
+            // therefore measures the continuum descent with nothing
+            // re-linearized in the way of it. That is the sharp version of
+            // PD-8's claim: with no contacts, smooth == full and BOTH must be
+            // weakly decreasing.
+            {
+                resetScene();
+                sim.usePd = true;
+                sim.pd.sanitizeCount = 0;
+                sim.addCloth(8, 0.8f, tinym::vec3(0.0f, 1.0f, 0.0f));      // id 0
+                sim.initialize();
+                sim.setVertexFixed(0, 0, true);
+                sim.setVertexFixed(0, 7, true);
+
+                std::vector<Index> pins;
+                std::vector<double> pinPos;
+                {
+                    auto* cloth = Scene<Backend, Precision>::findById(0);
+                    const Index n = cloth ? cloth->state.x.size / 3 : 0;
+                    for (Index i = 0; i < n; ++i)
+                        if (cloth->constraints.fixedParticles.ptr[i] == Precision(0)) {
+                            pins.push_back(i);
+                            for (int c = 0; c < 3; ++c)
+                                pinPos.push_back((double)cloth->state.x.ptr[i*3+c]);
+                        }
+                }
+                double y0 = 0, e0 = 0; bool fin0 = true;
+                pdClothStats(0, y0, e0, fin0);
+
+                sim.pause = false;
+                for (int f = 0; f < 59; ++f) sim.update();
+                MetalGlobalContext::commitAndWait();
+                sim.pd.debugObjectiveProbe = true;
+                sim.update();
+                MetalGlobalContext::commitAndWait();
+                sim.pd.debugObjectiveProbe = false;
+                sim.pause = true;
+
+                double y1 = 0, e1 = 0; bool fin1 = true;
+                pdClothStats(0, y1, e1, fin1);
+                double pinDrift = 0.0;
+                {
+                    auto* cloth = Scene<Backend, Precision>::findById(0);
+                    if (!cloth || pins.empty()) pinDrift = 1e30;
+                    else for (size_t p = 0; p < pins.size(); ++p)
+                        for (int c = 0; c < 3; ++c)
+                            pinDrift = std::max(pinDrift,
+                                std::fabs((double)cloth->state.x.ptr[pins[p]*3+c]
+                                          - pinPos[p*3+c]));
+                }
+
+                const bool haveCache = !sim.pd.cache.empty();
+                const bool valid = haveCache && sim.pd.cache[0].valid
+                                 && sim.pd.cache[0].factor
+                                 && sim.pd.cache[0].factor->info() == Eigen::Success;
+                const size_t tris = haveCache ? sim.pd.cache[0].strainTris.size() : 0;
+                const size_t springs = haveCache ? sim.pd.cache[0].springs.size() : 0;
+                size_t stretchSprings = 0;
+                if (haveCache)
+                    for (const auto& s : sim.pd.cache[0].springs)
+                        if (!s.bend) ++stretchSprings;
+
+                const std::vector<double> seq = sim.pd.debugObjectiveSeq;
+                double worst = 0.0; size_t worstAt = 0;
+                for (size_t k = 1; k < seq.size(); ++k)
+                    if (seq[k] - seq[k-1] > worst) { worst = seq[k] - seq[k-1]; worstAt = k; }
+                const double slack = (seq.empty() ? 0.0 : std::fabs(seq.front())) * 1e-9;
+                const uint32_t contactRows = sim.pd.oneSidedContactCount
+                                           + sim.pd.twoWayContactCount;
+
+                const char* n11 = "PD-11 / strain-only global system is SPD, its "
+                                  "descent is monotone, and the sheet still hangs";
+                if (!haveCache || tris == 0)
+                    fail(n11, "the cloth carried no strain elements at all");
+                // §3.5 + §4: the two continuum elements REPLACE the whole
+                // spring set — the edge stretch springs (double-counting the
+                // in-plane material, and making the PD-7 stiffness claim
+                // about a model nobody configured) AND the opposite-vertex
+                // bend springs (double-counting bending on top of the
+                // cotangent element). TriangularCloth's PD path must build
+                // NO Spring at all.
+                else if (springs != 0)
+                    fail(n11, std::to_string(springs) + " springs survive on "
+                           "the TriangularCloth PD path ("
+                         + std::to_string(stretchSprings) + " stretch, "
+                         + std::to_string(springs - stretchSprings)
+                         + " bend) — §3.5 and §4 remove both families");
+                else if (!valid)
+                    fail(n11, "SimplicialLDLT did not report Success on the "
+                              "matrix with the dense 3x3 strain blocks in it");
+                else if (!fin1 || sim.pd.sanitizeCount != 0)
+                    fail(n11, "non-finite cloth / sanitize guard fired "
+                         + std::to_string(sim.pd.sanitizeCount) + " times");
+                else if (pinDrift > 1e-6)
+                    fail(n11, "pinned vertex moved by " + std::to_string(pinDrift)
+                         + " m");
+                else if (!(y1 < y0 - 1e-3))
+                    fail(n11, "min y did not drop (" + std::to_string(y0) + " -> "
+                         + std::to_string(y1) + ") — the sheet stopped sagging");
+                else if (contactRows != 0)
+                    fail(n11, "the probed substep carried "
+                         + std::to_string(contactRows)
+                         + " contact rows, so this is not the contact-free "
+                           "descent measurement it claims to be");
+                else if (seq.size() < 2)
+                    fail(n11, "objective probe produced " + std::to_string(seq.size())
+                         + " samples");
+                else if (worst > slack)
+                    fail(n11, "contact-free objective ROSE at iteration "
+                         + std::to_string(worstAt) + " by " + std::to_string(worst)
+                         + " (slack " + std::to_string(slack) + ") — the strain "
+                           "element's matrix block and its RHS disagree");
+                else if (!(seq.back() < seq.front()))
+                    fail(n11, "objective did not decrease at all: "
+                         + std::to_string(seq.front()) + " -> "
+                         + std::to_string(seq.back()));
+                else
+                    pass(n11);
+                std::cerr << "[self-test INFO] PD-11: " << tris << " triangles, "
+                          << springs << " springs (" << stretchSprings
+                          << " stretch), sag " << y0 << " -> " << y1
+                          << ", objective " << (seq.empty() ? 0.0 : seq.front())
+                          << " -> " << (seq.empty() ? 0.0 : seq.back())
+                          << " (worst rise " << worst << ")\n";
+            }
+
+            // ---- PD-12 / PD-13 / PD-14: the cotangent mean-curvature
+            // bending element (docs/design/pd-continuum-cloth-contact.md §4,
+            // verification §9.2). TriangularCloth's bending is no longer an
+            // opposite-vertex distance spring but a per-vertex potential
+            // (w_b A_i/2)|L_i q - p_i|² with L_i the area-normalized
+            // Laplace-Beltrami row and p_i the projection of L_i q onto the
+            // sphere of the REST curvature's radius. The clauses isolate what
+            // that can get wrong:
+            //   PD-12  the REST DATA is right — a flat rest has zero interior
+            //          curvature and therefore no residual force, and the
+            //          energy is invariant under a rigid motion while a real
+            //          bend costs something,
+            //   PD-13  no NaN/Inf out of the geometry the doc names (boundary
+            //          vertices, obtuse triangles, degenerate one-rings) nor
+            //          out of a live contact scene, and the sheet still
+            //          behaves (sags, holds pins, does not collapse),
+            //   PD-14  a known curvature is RECOVERED: a cylinder-arc rest
+            //          ribbon reports |v_i⁰| = 1/R, and after being unrolled
+            //          flat the projection pulls |L_i q| back toward it.
+
+            // ---- PD-12 — flat rest + rigid invariance (§9.2 clauses 1, 2).
+            {
+                const char* n12 = "PD-12 / bending rest data: a flat rest sheet "
+                                  "carries no curvature and no residual force, "
+                                  "and the energy is rigid-motion invariant";
+                const Index kG = 7;
+                resetScene();
+                sim.usePd = true;
+                sim.pd.sanitizeCount = 0;
+                sim.addCloth(kG, 0.7f, tinym::vec3(0.0f, 1.0f, 0.0f),
+                             1e5, 1e5, 3e5, Precision(0.01));           // id 0
+                sim.initialize();
+                // EXACTLY flat. MeshGridInitializer jiggles the out-of-plane
+                // coordinate by up to 1e-4 m (D-018's seeded jiggle), which is
+                // small but NOT zero: L_i divides by A_i ~ 1e-2 m², so 1e-4 m
+                // of noise is ~1e-2 of curvature and the "flat rest has zero
+                // v_i⁰" clause would be measuring the jiggle. Written BEFORE
+                // the first update(), i.e. before the rest cache is built.
+                {
+                    auto* m = Scene<Backend, Precision>::findById(0);
+                    const Index n = m ? m->state.x.size / 3 : 0;
+                    for (Index i = 0; i < n; ++i)
+                        m->state.x.ptr[i*3+1] = Precision(1.0);
+                }
+
+                // GRAVITY OFF for the residual-force clause: with no external
+                // force, no pin and a rest-pose start, the momentum target is
+                // s = x, so ANY motion at all is a residual internal force —
+                // which is exactly what "a flat rest cloth has no residual
+                // bending force" asserts. Restored below.
+                const tinym::vec3 savedG =
+                    Scene<Backend, Precision>::environment.gravity;
+                Scene<Backend, Precision>::environment.gravity =
+                    tinym::vec3(0.0f, 0.0f, 0.0f);
+
+                sim.pause = false;
+                sim.update();                       // builds the rest cache
+                MetalGlobalContext::commitAndWait();
+                const std::vector<double> flat0 = readPositions(0);
+                for (int f = 0; f < 12; ++f) sim.update();
+                MetalGlobalContext::commitAndWait();
+                sim.pause = true;
+                const std::vector<double> flat1 = readPositions(0);
+                Scene<Backend, Precision>::environment.gravity = savedG;
+
+                double maxDrift = 0.0;
+                bool driftFinite = flat0.size() == flat1.size() && !flat0.empty();
+                for (size_t i = 0; i < flat0.size() && i < flat1.size(); ++i) {
+                    if (!std::isfinite(flat1[i])) { driftFinite = false; break; }
+                    maxDrift = std::max(maxDrift, std::fabs(flat1[i] - flat0[i]));
+                }
+
+                // Interior curvature only: on a FLAT patch the interior rows
+                // annihilate the plane exactly, but a BOUNDARY row does not —
+                // its one-ring is a half disc, so L_i x is a real in-plane
+                // vector pointing into the sheet. That is correct cotangent
+                // behaviour (and why the boundary is where a bending model
+                // has to be judged by stability, PD-13, rather than by zero).
+                double v0Interior = 0.0, v0Boundary = 0.0;
+                size_t bendRows = 0;
+                uint32_t bendDegen = 0;
+                double areaScale = 0.0;
+                if (!sim.pd.cache.empty()) {
+                    const auto& bc = sim.pd.cache[0].bend;
+                    bendDegen = bc.degenerate;
+                    areaScale = bc.areaScale;
+                    for (Index i = 0; i < (Index)bc.area.size(); ++i) {
+                        if (bc.area[i] > 0.0) ++bendRows;
+                        const Index r = i / kG, c = i % kG;
+                        const bool interior = r > 0 && c > 0
+                                           && r + 1 < kG && c + 1 < kG;
+                        if (interior) v0Interior = std::max(v0Interior, bc.v0len[i]);
+                        else          v0Boundary = std::max(v0Boundary, bc.v0len[i]);
+                    }
+                }
+
+                // Energy clauses, on the same (now settled, still flat) mesh.
+                auto* cloth = Scene<Backend, Precision>::findById(0);
+                const std::vector<double> rest = readPositions(0);
+                const double eRest = cloth
+                    ? sim.pd.bendEnergyAt(0, cloth->state.x.ptr) : -1.0;
+
+                // Rigid: a 37° rotation about a non-axis direction plus a
+                // translation. |L_i q| is unchanged and p_i rotates with it,
+                // so the energy must stay put — the clause that fails if the
+                // rest curvature or the projection picked up a frame.
+                std::vector<double> moved = rest;
+                {
+                    const double ang = 0.6458;
+                    double ax = 1.0, ay = 2.0, az = 3.0;
+                    const double an = std::sqrt(ax*ax + ay*ay + az*az);
+                    ax /= an; ay /= an; az /= an;
+                    const double c = std::cos(ang), s = std::sin(ang), t = 1.0 - c;
+                    const double R[3][3] = {
+                        { t*ax*ax + c,    t*ax*ay - s*az, t*ax*az + s*ay },
+                        { t*ax*ay + s*az, t*ay*ay + c,    t*ay*az - s*ax },
+                        { t*ax*az - s*ay, t*ay*az + s*ax, t*az*az + c    },
+                    };
+                    const double T[3] = { 0.31, -0.77, 1.13 };
+                    for (size_t i = 0; i * 3 + 2 < rest.size(); ++i)
+                        for (int r = 0; r < 3; ++r)
+                            moved[i*3+r] = R[r][0]*rest[i*3+0]
+                                         + R[r][1]*rest[i*3+1]
+                                         + R[r][2]*rest[i*3+2] + T[r];
+                }
+                writePositions(0, moved);
+                const double eRigid = cloth
+                    ? sim.pd.bendEnergyAt(0, cloth->state.x.ptr) : -1.0;
+
+                // Non-triviality: a parabolic bend y += a·x² is NOT rigid and
+                // must cost real energy. Without it every clause above would
+                // pass on an energy that is identically zero.
+                std::vector<double> bent = rest;
+                for (size_t i = 0; i * 3 + 2 < rest.size(); ++i)
+                    bent[i*3+1] += 0.5 * rest[i*3+0] * rest[i*3+0];
+                writePositions(0, bent);
+                const double eBent = cloth
+                    ? sim.pd.bendEnergyAt(0, cloth->state.x.ptr) : -1.0;
+
+                // Scale: w_b·(Σ_i A_i) is the energy a unit curvature error
+                // over the whole sheet would cost, so it is the natural unit
+                // for "zero" here. cache[0].kB is the mesh's kbend BEFORE the
+                // areaScale conversion; w_b is the converted one.
+                const double wb = sim.pd.cache.empty()
+                                ? 0.0 : sim.pd.cache[0].kB * areaScale;
+                double bendArea = 0.0;
+                if (!sim.pd.cache.empty())
+                    for (double a : sim.pd.cache[0].bend.area) bendArea += a;
+                const double eTol = 1e-6 * wb * bendArea;
+
+                if (bendRows == 0)
+                    fail(n12, "no bending rows were cached for the cloth — the "
+                              "cotangent path never built its rest data");
+                else if (bendDegen != 0)
+                    fail(n12, std::to_string(bendDegen) + " degenerate bending "
+                              "rows in a regular grid — the rest cache is "
+                              "rejecting valid geometry");
+                else if (!(wb > 0.0) || !(bendArea > 0.0))
+                    fail(n12, "cached w_b = " + std::to_string(wb)
+                         + ", mixed area " + std::to_string(bendArea));
+                // 1e-6 1/m of curvature: the positions are float, so a
+                // 0.7 m sheet carries ~5e-8 m of roundoff, and L_i amplifies
+                // it by 1/A_i ~ 1e2. Three decades of headroom over that,
+                // eight below the bent reference printed by the INFO line.
+                else if (!(v0Interior < 1e-6))
+                    fail(n12, "flat rest sheet has interior rest curvature "
+                         + std::to_string(v0Interior) + " 1/m (expected 0)");
+                else if (!driftFinite)
+                    fail(n12, "non-finite vertex after 12 gravity-free frames");
+                else if (sim.pd.sanitizeCount != 0)
+                    fail(n12, "sanitize guard fired "
+                         + std::to_string(sim.pd.sanitizeCount) + " times");
+                // 1e-6 m over 12 frames of a scene whose only forces are the
+                // elements themselves. A residual bending force at the rest
+                // pose would show up here as a drift many decades larger (the
+                // element's weight is ~1e3 against a ~1e-3 kg vertex).
+                else if (maxDrift > 1e-6)
+                    fail(n12, "flat rest sheet MOVED by "
+                         + std::to_string(maxDrift)
+                         + " m over 12 gravity-free frames — the bending "
+                           "element has a residual force at its own rest pose");
+                else if (!std::isfinite(eRest) || eRest > eTol)
+                    fail(n12, "rest-pose bending energy " + std::to_string(eRest)
+                         + " > tol " + std::to_string(eTol));
+                else if (!std::isfinite(eRigid) || std::fabs(eRigid - eRest) > eTol)
+                    fail(n12, "bending energy moved under a rigid "
+                              "rotation+translation: " + std::to_string(eRest)
+                         + " -> " + std::to_string(eRigid) + " (tol "
+                         + std::to_string(eTol) + ")");
+                else if (!(eBent > 1e-3 * wb * bendArea))
+                    fail(n12, "a parabolic bend cost only "
+                         + std::to_string(eBent)
+                         + " — the energy is (near) identically zero, so the "
+                           "invariance clauses above prove nothing");
+                else
+                    pass(n12);
+                std::cerr << "[self-test INFO] PD-12 bending: " << bendRows
+                          << " rows, w_b " << wb << " (kbend x area scale "
+                          << areaScale << "), mixed area " << bendArea
+                          << ", |v0| interior " << v0Interior << " boundary "
+                          << v0Boundary << ", energy rest " << eRest
+                          << " rigid " << eRigid << " bent " << eBent
+                          << " (tol " << eTol << "), flat drift " << maxDrift
+                          << " m\n";
+            }
+
+            // ---- PD-13 — the §9.2 NaN/Inf gate: boundary vertices, obtuse
+            // triangles and degenerate one-rings in the REST CACHE, and a
+            // live contact scene end to end.
+            {
+                const char* n13 = "PD-13 / bending survives obtuse/degenerate "
+                                  "geometry and a live contact scene without "
+                                  "NaN/Inf";
+                // (a) REST CACHE arms. buildBendRows is static and takes the
+                // mesh, so the pathological poses can be fed to it DIRECTLY
+                // instead of being simulated into existence — which is the
+                // only way to reach the obtuse branch of the mixed-area rule
+                // at all: the engine's grid is split into RIGHT triangles, so
+                // every other clause in this file exercises the Voronoi
+                // branch only.
+                const Index kG = 6;
+                const Index n = buildFrozenSheet(kG, 0.6f, 1e5f);
+                auto* cloth = Scene<Backend, Precision>::findById(0);
+                const std::vector<double> flat = readPositions(0);
+
+                using PdT = decltype(sim.pd);
+                auto probeRows = [&](const std::vector<double>& pose,
+                                     size_t& rows, uint32_t& degen,
+                                     bool& finite) {
+                    writePositions(0, pose);
+                    PdT::BendCache bc;
+                    if (cloth) PdT::buildBendRows(*cloth, n, bc);
+                    rows = 0; degen = bc.degenerate; finite = true;
+                    for (Index i = 0; i < (Index)bc.area.size(); ++i) {
+                        if (!std::isfinite(bc.area[i])
+                            || !std::isfinite(bc.v0len[i])) finite = false;
+                        if (bc.area[i] > 0.0) ++rows;
+                    }
+                    for (const auto& e : bc.rowEntries)
+                        if (!std::isfinite(e.c)) finite = false;
+                    for (double v : bc.v0) if (!std::isfinite(v)) finite = false;
+                    if (!std::isfinite(bc.areaScale)) finite = false;
+                    // Every live row must sum to zero — the property the
+                    // whole element rests on (translation invariance), and
+                    // the one a clamped cotangent could quietly break.
+                    for (Index i = 0; i < (Index)bc.area.size(); ++i) {
+                        if (!(bc.area[i] > 0.0)) continue;
+                        double s = 0.0;
+                        for (Index k = bc.rowOffsets[i]; k < bc.rowOffsets[i+1]; ++k)
+                            s += bc.rowEntries[k].c;
+                        if (std::fabs(s) > 1e-6 * (1.0 / std::max(1e-12, bc.areaScale)))
+                            finite = false;
+                    }
+                };
+
+                // Strong shear: x += 3z turns every right triangle of the
+                // grid into a very obtuse one, so the mixed-area rule takes
+                // its OTHER branch for every facet.
+                std::vector<double> sheared = flat;
+                for (size_t i = 0; i * 3 + 2 < sheared.size(); ++i)
+                    sheared[i*3+0] += 3.0 * sheared[i*3+2];
+                // Slivers: flattening one axis by 1e-9 drives two angles of
+                // every triangle to ~0/π, i.e. straight into the cotangent
+                // clamp.
+                std::vector<double> sliver = flat;
+                for (size_t i = 0; i * 3 + 2 < sliver.size(); ++i)
+                    sliver[i*3+2] *= 1e-9;
+                // Fully collapsed: every triangle degenerate, every one-ring
+                // gone. The cache must come back EMPTY, not NaN.
+                std::vector<double> collapsed(flat.size(), 0.0);
+
+                size_t rFlat = 0, rShear = 0, rSliver = 0, rDead = 0;
+                uint32_t dFlat = 0, dShear = 0, dSliver = 0, dDead = 0;
+                bool fFlat = true, fShear = true, fSliver = true, fDead = true;
+                probeRows(flat,      rFlat,   dFlat,   fFlat);
+                probeRows(sheared,   rShear,  dShear,  fShear);
+                probeRows(sliver,    rSliver, dSliver, fSliver);
+                probeRows(collapsed, rDead,   dDead,   fDead);
+
+                // (b) LIVE arm: a pinned sheet settling onto a Float cube, so
+                // gravity, contacts and the boundary rows are all in play at
+                // once. PD-1's sag band is the template — the sheet has to
+                // move and stay put, not just stay finite.
+                resetScene();
+                sim.usePd = true;
+                sim.pd.sanitizeCount = 0;
+                sim.addCube(tinym::vec3(0.0f, 0.0f, 0.0f), 2, 1.0f);     // id 0
+                sim.addCloth(8, 0.8f, tinym::vec3(0.0f, 0.75f, 0.0f),
+                             1e5, 1e5, 3e5, Precision(0.01));            // id 1
+                sim.initialize();
+                sim.setVertexFixed(1, 0, true);
+                sim.setVertexFixed(1, 7, true);
+                std::vector<Index> pins;
+                std::vector<double> pinPos;
+                {
+                    auto* c2 = Scene<Backend, Precision>::findById(1);
+                    const Index cn = c2 ? c2->state.x.size / 3 : 0;
+                    for (Index i = 0; i < cn; ++i)
+                        if (c2->constraints.fixedParticles.ptr[i] == Precision(0)) {
+                            pins.push_back(i);
+                            for (int c = 0; c < 3; ++c)
+                                pinPos.push_back((double)c2->state.x.ptr[i*3+c]);
+                        }
+                }
+                double liveY0 = 0, liveE0 = 0; bool liveFin0 = true;
+                pdClothStats(1, liveY0, liveE0, liveFin0);
+                sim.pause = false;
+                double peakSpeed = 0.0;
+                bool liveFinite = true;
+                for (int f = 0; f < 60; ++f) {
+                    sim.update();
+                    MetalGlobalContext::commitAndWait();
+                    const double ms = pdMaxSpeed(1);
+                    if (!std::isfinite(ms)) { liveFinite = false; break; }
+                    peakSpeed = std::max(peakSpeed, ms);
+                }
+                sim.pause = true;
+                double liveY1 = 0, liveE1 = 0; bool liveFin1 = true;
+                pdClothStats(1, liveY1, liveE1, liveFin1);
+                double livePinDrift = 0.0;
+                {
+                    auto* c2 = Scene<Backend, Precision>::findById(1);
+                    if (!c2 || pins.empty()) livePinDrift = 1e30;
+                    else for (size_t p = 0; p < pins.size(); ++p)
+                        for (int c = 0; c < 3; ++c)
+                            livePinDrift = std::max(livePinDrift,
+                                std::fabs((double)c2->state.x.ptr[pins[p]*3+c]
+                                          - pinPos[p*3+c]));
+                }
+
+                if (!fFlat || !fShear || !fSliver || !fDead)
+                    fail(n13, "non-finite (or non-zero-sum) bending rows: flat "
+                         + std::to_string((int)fFlat) + " sheared "
+                         + std::to_string((int)fShear) + " sliver "
+                         + std::to_string((int)fSliver) + " collapsed "
+                         + std::to_string((int)fDead));
+                else if (rShear == 0 || dShear != 0)
+                    fail(n13, "the all-obtuse sheet produced " + std::to_string(rShear)
+                         + " rows and " + std::to_string(dShear)
+                         + " degenerate vertices — a sheared but perfectly "
+                           "valid mesh must still carry a full constraint set");
+                else if (rSliver == 0)
+                    fail(n13, "the sliver sheet produced no bending rows at all");
+                else if (rDead != 0 || dDead == 0)
+                    fail(n13, "the COLLAPSED sheet produced " + std::to_string(rDead)
+                         + " live rows / " + std::to_string(dDead)
+                         + " skipped (expected 0 live, all skipped)");
+                else if (!liveFinite || !liveFin1)
+                    fail(n13, "non-finite cloth in the live contact scene");
+                else if (sim.pd.sanitizeCount != 0)
+                    fail(n13, "sanitize guard fired "
+                         + std::to_string(sim.pd.sanitizeCount)
+                         + " times in the live contact scene");
+                else if (livePinDrift > 1e-6)
+                    fail(n13, "pinned vertex moved by "
+                         + std::to_string(livePinDrift) + " m");
+                else if (!(liveY1 < liveY0 - 1e-3))
+                    fail(n13, "the sheet did not sag at all (" + std::to_string(liveY0)
+                         + " -> " + std::to_string(liveY1)
+                         + ") — bending locked it rigid");
+                // "Sags but does not collapse": the cube's top face is at
+                // y = 0.5 and the contact thickness is 0.01, so a sheet that
+                // kept its shape cannot end below the face by more than the
+                // solver's residual penetration. A collapse (or a tunnel)
+                // shows up here as a min y far under it.
+                else if (liveY1 < 0.5 - 0.05)
+                    fail(n13, "sheet ended at min y " + std::to_string(liveY1)
+                         + " — below the cube's top face, i.e. it collapsed "
+                           "through the contact rows");
+                else if (peakSpeed > 6.0)
+                    fail(n13, "peak |v| " + std::to_string(peakSpeed)
+                         + " m/s — the bending element is injecting energy");
+                else
+                    pass(n13);
+                std::cerr << "[self-test INFO] PD-13 rows: flat " << rFlat
+                          << "/" << dFlat << " sheared " << rShear << "/"
+                          << dShear << " sliver " << rSliver << "/" << dSliver
+                          << " collapsed " << rDead << "/" << dDead
+                          << " (live/skipped); live scene sag " << liveY0
+                          << " -> " << liveY1 << ", peak |v| " << peakSpeed
+                          << " m/s, pin drift " << livePinDrift << " m\n";
+            }
+
+            // ---- PD-14 — known curvature (§9.2 clause 3). A ribbon bent
+            // into a partial cylinder of radius R has mean-curvature vector
+            // magnitude exactly 1/R, so the cached |v_i⁰| of its interior is
+            // a NUMBER this element either reproduces or does not. Then the
+            // ribbon is UNROLLED flat — an isometry, so the strain element
+            // costs (almost) nothing and the recovery that follows is the
+            // bending element's alone — and the curvature has to come back.
+            {
+                const char* n14 = "PD-14 / a cylinder-arc rest ribbon reports "
+                                  "|v0| = 1/R and recovers it after being "
+                                  "unrolled flat";
+                const Index kG = 9;
+                const float  sz = 0.6f;
+                const double R  = 0.5;          // arc radius, 1/R = 2.0 1/m
+                resetScene();
+                sim.usePd = true;
+                sim.pd.sanitizeCount = 0;
+                sim.addCloth(kG, sz, tinym::vec3(0.0f, 1.0f, 0.0f),
+                             1e5, 1e5, 3e5, Precision(0.01));           // id 0
+                sim.initialize();
+
+                // The grid is laid out x = col*L - size/2 (arc direction) and
+                // z = row*L - size/2 (the cylinder's axis). Rolling it maps
+                // the x coordinate to ARC LENGTH, so the two poses below are
+                // isometric to each other and differ ONLY in curvature.
+                auto* cloth = Scene<Backend, Precision>::findById(0);
+                const std::vector<double> flatPose = readPositions(0);
+                std::vector<double> arcPose = flatPose;
+                for (size_t i = 0; i * 3 + 2 < arcPose.size(); ++i) {
+                    const double s = flatPose[i*3+0];      // arc length from 0
+                    arcPose[i*3+0] = R * std::sin(s / R);
+                    arcPose[i*3+1] = 1.0 + R * (std::cos(s / R) - 1.0);
+                }
+                // Flat pose with the jiggle removed, so "unrolled" really is
+                // the isometric image of the arc and not the arc plus noise.
+                std::vector<double> unrolled = flatPose;
+                for (size_t i = 0; i * 3 + 2 < unrolled.size(); ++i)
+                    unrolled[i*3+1] = 1.0;
+
+                // Gravity off throughout: this clause is about the element's
+                // own restoring behaviour, and a hanging ribbon would measure
+                // the balance of gravity against it instead.
+                const tinym::vec3 savedG =
+                    Scene<Backend, Precision>::environment.gravity;
+                Scene<Backend, Precision>::environment.gravity =
+                    tinym::vec3(0.0f, 0.0f, 0.0f);
+
+                writePositions(0, arcPose);
+                sim.pause = false;
+                sim.update();                   // rest cache built ON THE ARC
+                MetalGlobalContext::commitAndWait();
+
+                // |v_i⁰| over the interior. The discrete value is
+                // (2/(R dθ²))(1 - cos dθ) = (1/R)(1 - dθ²/12 + ...), i.e.
+                // 0.2% low at this resolution — the tolerance below is the
+                // discretization, not slop.
+                double v0Min = 1e30, v0Max = 0.0;
+                size_t interiorRows = 0;
+                if (!sim.pd.cache.empty()) {
+                    const auto& bc = sim.pd.cache[0].bend;
+                    for (Index i = 0; i < (Index)bc.area.size(); ++i) {
+                        const Index r = i / kG, c = i % kG;
+                        if (!(r > 0 && c > 0 && r + 1 < kG && c + 1 < kG)) continue;
+                        if (!(bc.area[i] > 0.0)) continue;
+                        v0Min = std::min(v0Min, bc.v0len[i]);
+                        v0Max = std::max(v0Max, bc.v0len[i]);
+                        ++interiorRows;
+                    }
+                }
+
+                // Live interior curvature |L_i q| at an arbitrary pose, read
+                // through the SAME cached rows the solver uses.
+                auto liveCurvature = [&]() -> double {
+                    if (sim.pd.cache.empty() || !cloth) return -1.0;
+                    const auto& bc = sim.pd.cache[0].bend;
+                    double acc = 0.0; size_t cnt = 0;
+                    for (Index i = 0; i < (Index)bc.area.size(); ++i) {
+                        const Index r = i / kG, c = i % kG;
+                        if (!(r > 0 && c > 0 && r + 1 < kG && c + 1 < kG)) continue;
+                        if (!(bc.area[i] > 0.0)) continue;
+                        double v[3] = { 0.0, 0.0, 0.0 };
+                        for (Index k = bc.rowOffsets[i]; k < bc.rowOffsets[i+1]; ++k) {
+                            const Index col = bc.rowEntries[k].col;
+                            const double w = bc.rowEntries[k].c;
+                            for (int ax = 0; ax < 3; ++ax)
+                                v[ax] += w * (double)cloth->state.x.ptr[col*3+ax];
+                        }
+                        acc += std::sqrt(v[0]*v[0] + v[1]*v[1] + v[2]*v[2]);
+                        ++cnt;
+                    }
+                    return cnt ? acc / (double)cnt : -1.0;
+                };
+
+                // Unroll: same edge lengths, zero curvature. Velocity is zero
+                // (the arc pose was at rest), so the frames that follow are a
+                // pure relaxation of the elements.
+                writePositions(0, unrolled);
+                {
+                    auto* m = Scene<Backend, Precision>::findById(0);
+                    const Index cn = m ? m->state.v.size / 3 : 0;
+                    for (Index i = 0; i < cn * 3; ++i) m->state.v.ptr[i] = Precision(0);
+                }
+                const double curvFlat = liveCurvature();
+                bool recoverFinite = true;
+                for (int f = 0; f < 40; ++f) {
+                    sim.update();
+                    MetalGlobalContext::commitAndWait();
+                }
+                sim.pause = true;
+                Scene<Backend, Precision>::environment.gravity = savedG;
+                const double curvBack = liveCurvature();
+                {
+                    const std::vector<double> p = readPositions(0);
+                    for (double v : p) if (!std::isfinite(v)) recoverFinite = false;
+                }
+
+                const double kExpect = 1.0 / R;
+                if (interiorRows == 0)
+                    fail(n14, "the arc ribbon cached no interior bending rows");
+                else if (!std::isfinite(v0Min) || !std::isfinite(v0Max))
+                    fail(n14, "non-finite rest curvature on the arc");
+                // 3%: the leading discretization error is dθ²/12 = 0.2% at
+                // kG = 9 over 1.2 rad, and the cotangent weights of the
+                // curved (non-planar) quads add another fraction of a
+                // percent. A wrong sign convention, a missing area
+                // normalization or a doubled boundary term all miss by
+                // decades, not by 3%.
+                else if (std::fabs(v0Min - kExpect) > 0.03 * kExpect
+                         || std::fabs(v0Max - kExpect) > 0.03 * kExpect)
+                    fail(n14, "interior rest curvature [" + std::to_string(v0Min)
+                         + ", " + std::to_string(v0Max) + "] 1/m does not match "
+                           "1/R = " + std::to_string(kExpect));
+                else if (!recoverFinite || sim.pd.sanitizeCount != 0)
+                    fail(n14, "non-finite cloth / sanitize guard fired "
+                         + std::to_string(sim.pd.sanitizeCount)
+                         + " times during the recovery");
+                else if (!(curvFlat < 0.1 * kExpect))
+                    fail(n14, "the unrolled pose was not flat: interior "
+                              "curvature " + std::to_string(curvFlat));
+                // The projection targets the sphere |p| = |v0|, so the RHS
+                // pulls |L q| back UP toward 1/R. Half of it inside 40 frames
+                // is a loose gate on a quantity that starts at ~0 and whose
+                // fixed point is 1/R — what it forbids is the sign error
+                // (staying flat, or curving further) that a mixed-up
+                // convention would produce.
+                else if (!(curvBack > 0.5 * kExpect))
+                    fail(n14, "curvature did not recover: interior |L q| "
+                         + std::to_string(curvFlat) + " -> "
+                         + std::to_string(curvBack) + " 1/m, target "
+                         + std::to_string(kExpect));
+                else
+                    pass(n14);
+                std::cerr << "[self-test INFO] PD-14: " << interiorRows
+                          << " interior rows, |v0| in [" << v0Min << ", "
+                          << v0Max << "] vs 1/R = " << kExpect
+                          << "; unrolled |L q| " << curvFlat << " -> "
+                          << curvBack << " after 40 frames\n";
+            }
+        }
+
+
+        // ---- PD-15 / PD-16 — contact STIFFNESS s_c (design doc §6.1, the
+        // first two clauses of §9.3). Both run the same scene: a free 8x8
+        // sheet released 5 mm above its contact band over a Float floor, i.e.
+        // ONE-SIDED half-space rows only, which is the family whose weight
+        // this slice defines exactly (w_c = s_c·m_eff/h² with m_eff = m_i).
+        //
+        //   PD-15  raising s_c must not INCREASE the residual penetration the
+        //          contact solve leaves — the property that makes the slider
+        //          a stiffness at all,
+        //   PD-16  changing s_c mid-run must reach the solver without a
+        //          rebuild: the epoch notices (a refactor happens) and the new
+        //          value takes effect.
+        //
+        // WHY THE SHEET IS RELEASED IN CONTACT rather than DROPPED (measured,
+        // not a preference): dropped from 0.35 m — and from 0.12 m — the
+        // s_c = 0.25 run TUNNELS (min y -10 m, and no contact row is ever
+        // reported again). That is not a broken measurement, it is design doc
+        // §6.2 in action: a finite penalty CAN be too weak for a given impact,
+        // and once the sheet is through, what is being measured is a detection
+        // failure, about which §9.3 clause 1 says nothing ("접촉이 검출된
+        // 경우"). The clause is about the residual at a contact that EXISTS,
+        // so the scene holds the contact at every scale under test and the
+        // guard below refuses to report anything if it does not. Gravity
+        // against the contact rows is then the whole load, which is exactly
+        // the balance s_c sets.
+        //
+        // MEASURED QUANTITY, stated because there is a choice: the gate is the
+        // MEAN of PdSystem::maxPenetrationDepth over the last 180 frames, and
+        // only over those of them that HAVE an active contact row. A single
+        // frame's sample is dominated by wherever an undamped sheet happens to
+        // be in its breathing cycle (the per-frame series spans a factor of
+        // several at fixed s_c); and a frame whose last substep carries no row
+        // reports 0 because there was nothing to measure, not because the
+        // contact was perfectly resolved — averaging those in would let the
+        // separation DUTY CYCLE, which is not what this clause is about, move
+        // the number.
+        //
+        // The window is 180 frames wide because the duty cycle is LOW: the
+        // narrow phase reports a row only once a vertex is actually past the
+        // floor's surface, and the constraint's target is `thickness` ABOVE it,
+        // so the settled sheet floats just clear of the surface and dips back
+        // in intermittently — only ~40% of frames carry a row anywhere in the
+        // frame, and only ~15% carry one in their LAST substep. 180 frames is
+        // what turns that into a two-dozen sample count; a 60-frame window
+        // gave 7-10, which is a mean thin enough to move from run to run.
+        //
+        // COUPLED-CONTACT REWORK (§5.3/§5.5 slices, written after these two):
+        // both scenes are cloth-vs-Float, so every row here is a ONE-SIDED
+        // plane — the family the coupled A_c rework did not touch. The plane
+        // weights still live in MeshCache::contactW/epochW and still enter the
+        // (now merged) system as diagonal entries, which is why the epochW
+        // probe in PD-16 still reads what it read before. Edge-edge detection
+        // (edgeContactsEnabled) needs two cloth contexts and a Float mesh is
+        // not one, so it cannot fire here either.
+        {
+            // Simulator::update AUTO-PAUSES at `targetFrames` (300 by
+            // default), and PD-16 runs ~480 frames in ONE scene — the whole
+            // point of it is that nothing is rebuilt across the change. Hit
+            // that ceiling and the sim silently freezes: every later frame
+            // reads back bit-identical state, which looks exactly like a
+            // contact that stopped firing. Raised for the block, restored
+            // after it.
+            const int pdStiffSavedTarget = sim.targetFrames;
+            sim.targetFrames = 100000;
+            const int kFrames = 240;
+            const int kTail   = 180;
+            // Minimum sampled frames a run must contribute before its mean is
+            // allowed to gate anything.
+            const int kMinSamples = 12;
+
+            // One run at a fixed s_c. `tailMean` is the settled residual (see
+            // above), `contactFrames` how many of the tail's frames it was
+            // averaged over — the guard that the clause measured anything.
+            auto pdRestRun = [&](double sc, int frames,
+                                 double& tailMean, double& peak,
+                                 double& lowY, bool& finite,
+                                 int& contactFrames) {
+                resetScene();
+                sim.usePd = true;
+                sim.pd.sanitizeCount = 0;
+                sim.pd.kContactWeightScale = sc;
+                sim.addPlane(PlaneDirection::XZPlane, tinym::vec3(0, 0, 0), 24,
+                             Precision(3.0), Precision(0.1),
+                             BehaviorType::Float);                  // id 0
+                sim.addCloth(8, 0.6f, tinym::vec3(0.0f, 0.015f, 0.0f),
+                             Precision(1e5), Precision(1e5), Precision(3e5),
+                             Precision(0.01));                      // id 1
+                sim.initialize();
+                sim.pause = false;
+                peak = 0.0; tailMean = 0.0; finite = true; contactFrames = 0;
+                double acc = 0.0;
+                for (int f = 0; f < frames; ++f) {
+                    sim.update();
+                    MetalGlobalContext::commitAndWait();
+                    const double mp = sim.pd.maxPenetrationDepth;
+                    if (!std::isfinite(mp)) { finite = false; break; }
+                    peak = std::max(peak, mp);
+                    // penetrationRowCount is the FRAME's active-row count, so
+                    // this pairs a measurement with the fact that there was
+                    // something to measure — and it sees rows in ANY substep,
+                    // not only the last one.
+                    if (f >= frames - kTail && sim.pd.penetrationRowCount > 0) {
+                        acc += mp; ++contactFrames;
+                    }
+                }
+                sim.pause = true;
+                tailMean = contactFrames ? acc / (double)contactFrames : 0.0;
+                double edgeErr = 0.0; bool fin = true;
+                pdClothStats(1, lowY, edgeErr, fin);
+                finite = finite && fin && sim.pd.sanitizeCount == 0;
+            };
+
+            // ---- PD-15 — monotone in s_c (§9.3 clause 1). ---------------
+            const double scales[3] = { 0.25, 1.0, 4.0 };
+            double tail[3] = {0,0,0}, peak[3] = {0,0,0}, lowY[3] = {0,0,0};
+            int rows[3] = {0,0,0};
+            bool fin[3] = {true,true,true};
+            for (int s = 0; s < 3; ++s)
+                pdRestRun(scales[s], kFrames, tail[s], peak[s], lowY[s],
+                          fin[s], rows[s]);
+
+            const char* n15 = "PD-15 / residual contact penetration does not "
+                              "grow with the contact stiffness scale";
+            // 0.1 mm: a tenth of the sheet's 10 mm contact thickness, i.e. 1%
+            // of the constraint's own length scale. The differences this
+            // clause is about are in millimetres; what the tolerance absorbs
+            // is the residual breathing of an undamped sheet that the
+            // 180-frame mean has not fully averaged out.
+            const double kMonoTol = 1e-4;
+            if (!fin[0] || !fin[1] || !fin[2])
+                fail(n15, "non-finite cloth / sanitize guard fired during the "
+                          "stiffness sweep");
+            // Sample-count guard, not a duty-cycle requirement (see the window
+            // note above): what it forbids is reporting a mean built from one
+            // or two frames, and it is also the clause that catches a
+            // TUNNELLED sheet — those runs report no row at all from the
+            // moment they are through.
+            else if (rows[0] < kMinSamples || rows[1] < kMinSamples
+                     || rows[2] < kMinSamples)
+                fail(n15, "the sheet was in contact for only " + std::to_string(rows[0])
+                     + "/" + std::to_string(rows[1]) + "/" + std::to_string(rows[2])
+                     + " of the last " + std::to_string(kTail) + " frames — a "
+                       "tunnelled or barely-touching sheet measures no residual "
+                       "(design doc §6.2: not a stiffness question)");
+            else if (tail[1] > tail[0] + kMonoTol)
+                fail(n15, "penetration GREW from s_c 0.25 -> 1.0: "
+                     + std::to_string(tail[0]) + " -> " + std::to_string(tail[1])
+                     + " m");
+            else if (tail[2] > tail[1] + kMonoTol)
+                fail(n15, "penetration GREW from s_c 1.0 -> 4.0: "
+                     + std::to_string(tail[1]) + " -> " + std::to_string(tail[2])
+                     + " m");
+            else
+                pass(n15);
+            std::cerr << "[self-test INFO] PD-15 residual penetration (mean of "
+                      << "max over last " << kTail << " frames, mm): s_c 0.25 -> "
+                      << tail[0]*1e3 << ", 1.0 -> " << tail[1]*1e3
+                      << ", 4.0 -> " << tail[2]*1e3
+                      << "; peak (mm) " << peak[0]*1e3 << " / " << peak[1]*1e3
+                      << " / " << peak[2]*1e3
+                      << "; min y " << lowY[0] << " / " << lowY[1] << " / "
+                      << lowY[2] << "; in-contact tail frames " << rows[0]
+                      << " / " << rows[1] << " / " << rows[2] << " of "
+                      << kTail << "\n";
+
+            // ---- PD-16 — runtime change, no re-init (§9.3 clause 2). -----
+            // Same scene, run at the LOW scale, then s_c is written straight
+            // into the live solver mid-run — no resetScene, no initialize, no
+            // factorization thrown away by hand. The epoch key carries s_c, so
+            // the next substep must refactor and the new weight must show up
+            // in the residual.
+            {
+                const char* n16 = "PD-16 / contact stiffness changes take "
+                                  "effect mid-run without a re-init";
+                resetScene();
+                sim.usePd = true;
+                sim.pd.sanitizeCount = 0;
+                sim.pd.kContactWeightScale = scales[0];
+                sim.addPlane(PlaneDirection::XZPlane, tinym::vec3(0, 0, 0), 24,
+                             Precision(3.0), Precision(0.1),
+                             BehaviorType::Float);                  // id 0
+                sim.addCloth(8, 0.6f, tinym::vec3(0.0f, 0.015f, 0.0f),
+                             Precision(1e5), Precision(1e5), Precision(3e5),
+                             Precision(0.01));                      // id 1
+                sim.initialize();
+                sim.pause = false;
+
+                // The weight the CURRENT factorization actually holds, read
+                // off the cloth's epoch vector — the copy of contactW the
+                // factorize() succeeded on. Its smallest non-zero entry is one
+                // vertex's single-row weight s_c·m_i/h², so it is the most
+                // direct statement available of "the new stiffness is IN the
+                // matrix", as opposed to merely "something refactored".
+                // Meaningful only on a frame whose last substep HAD contacts:
+                // a contact-free substep legitimately empties epochW.
+                auto minEpochW = [&]() -> double {
+                    if (sim.pd.cache.size() < 2) return 0.0;
+                    double lo = 1e300;
+                    for (double w : sim.pd.cache[1].epochW)
+                        if (w > 0.0) lo = std::min(lo, w);
+                    return lo < 1e300 ? lo : 0.0;
+                };
+                // Run frames until the LAST substep reports a contact row, so
+                // both the epoch vector and the refactor counter are sampled
+                // at a point where the contact set is live. The predicate is
+                // deliberately the substep-scoped oneSidedContactCount and not
+                // the frame-scoped penetrationRowCount: epochW is emptied by a
+                // contact-free substep, so a frame that had rows in substep 1
+                // only would be sampled after they were already gone.
+                // Returns how many frames that took (0 = never, in budget).
+                auto runToLiveEpoch = [&](int budget) -> int {
+                    for (int f = 1; f <= budget; ++f) {
+                        sim.update();
+                        MetalGlobalContext::commitAndWait();
+                        if (!std::isfinite(sim.pd.maxPenetrationDepth)) return 0;
+                        if (sim.pd.oneSidedContactCount > 0) return f;
+                    }
+                    return 0;
+                };
+
+                bool finite16 = true;
+                // Same measurement PD-15 uses (in-contact tail frames only),
+                // so the two numbers are comparable at all.
+                double accLow = 0.0; int cntLow = 0;
+                // Refactors over the 10 frames BEFORE the switch: the contact
+                // set of a settling sheet churns on its own, so this is the
+                // baseline the switch has to be read against — reported, not
+                // gated, because the epoch-vector check below does not need it.
+                uint32_t rcMark = 0;
+                for (int f = 0; f < kFrames; ++f) {
+                    sim.update();
+                    MetalGlobalContext::commitAndWait();
+                    if (!std::isfinite(sim.pd.maxPenetrationDepth)) finite16 = false;
+                    if (f == kFrames - 10) rcMark = sim.pd.contactRefactorCount;
+                    if (f >= kFrames - kTail && sim.pd.penetrationRowCount > 0) {
+                        accLow += sim.pd.maxPenetrationDepth; ++cntLow;
+                    }
+                }
+                const double penLow = cntLow ? accLow / (double)cntLow : 0.0;
+                const uint32_t rcBaseline = sim.pd.contactRefactorCount - rcMark;
+                // Sample the OLD epoch at a live-contact frame.
+                const int  preFrames = runToLiveEpoch(30);
+                const double wBefore = minEpochW();
+                const uint32_t rcBefore = sim.pd.contactRefactorCount;
+
+                // THE change under test — one assignment, nothing else. No
+                // resetScene, no initialize, no factorization dropped by hand.
+                //
+                // 0.25 -> 1.0, i.e. PD-15's MIDDLE scale, not its top one.
+                // Measured: jumping straight to 4.0 kicks a sheet that settled
+                // at 0.25 up to ~19 mm and phase-locks it — the contact rows
+                // then fire in the EARLY substeps of a frame and are gone by
+                // the last one, which is the only substep the epoch probe can
+                // read. 270 frames produced zero samples that way. A 4x change
+                // moves the epoch weight by a decisive factor and still leaves
+                // the contact duty cycle intact, which is what this clause
+                // needs; how far penetration falls with stiffness is PD-15's
+                // question, not this one.
+                sim.pd.kContactWeightScale = scales[1];
+                // A refactor is OWED on the first substep that has an active
+                // contact (s_c multiplies every entry of the epoch key, so the
+                // new key cannot compare equal to the factorized one) and is
+                // NOT owed on a contact-free substep, where empty == empty is
+                // the intended zero-cost path. So the window runs to the first
+                // frame that reports a row rather than assuming frame 1 has
+                // one — this sheet's contact duty cycle is ~25%.
+                const int switchFrames = runToLiveEpoch(30);
+                const uint32_t rcAfter = sim.pd.contactRefactorCount;
+                const double wAfter = minEpochW();
+
+                double accHigh = 0.0; int cntHigh = 0;
+                for (int f = switchFrames; f < kFrames; ++f) {
+                    sim.update();
+                    MetalGlobalContext::commitAndWait();
+                    if (!std::isfinite(sim.pd.maxPenetrationDepth)) finite16 = false;
+                    if (f >= kFrames - kTail && sim.pd.penetrationRowCount > 0) {
+                        accHigh += sim.pd.maxPenetrationDepth; ++cntHigh;
+                    }
+                }
+                sim.pause = true;
+                const double penHigh = cntHigh ? accHigh / (double)cntHigh : 0.0;
+                double lowY16 = 0.0, edgeErr16 = 0.0; bool fin16 = true;
+                pdClothStats(1, lowY16, edgeErr16, fin16);
+                const double wRatio = wBefore > 0.0 ? wAfter / wBefore : 0.0;
+
+                if (!finite16 || !fin16 || sim.pd.sanitizeCount != 0)
+                    fail(n16, "non-finite state / sanitize guard fired "
+                         + std::to_string(sim.pd.sanitizeCount)
+                         + " times across the stiffness change");
+                else if (preFrames == 0 || switchFrames == 0
+                         || cntLow < kMinSamples || cntHigh < kMinSamples)
+                    fail(n16, "no live-contact frame to sample ("
+                         + std::to_string(preFrames) + "/"
+                         + std::to_string(switchFrames) + " frames to contact, "
+                         + std::to_string(cntLow) + "/" + std::to_string(cntHigh)
+                         + " in-contact tail frames) — nothing to compare");
+                else if (!(rcAfter > rcBefore))
+                    fail(n16, "the contact epoch did not notice the new scale: "
+                              "contactRefactorCount stayed at "
+                         + std::to_string(rcBefore) + " over "
+                         + std::to_string(switchFrames)
+                         + " frame(s) to the first post-change contact");
+                // The counter alone cannot say WHICH refactor happened — a
+                // settling sheet churns its contact set on its own. The epoch
+                // VECTOR can: its smallest non-zero entry is s_c·m_i/h², so it
+                // must move by ~scales[1]/scales[0] = 4x. The band is 2x-8x (a
+                // factor of 2 either way) because the two samples are taken at
+                // different frames and the minimum may be over a different
+                // vertex — a boundary vertex of a grid cloth carries a
+                // different m_i. What it rules out decisively is ratio 1: a
+                // change that never reached the matrix.
+                else if (!(wRatio > 2.0 && wRatio < 8.0))
+                    fail(n16, "the factorized contact weight did not follow the "
+                              "new scale: min non-zero epochW "
+                         + std::to_string(wBefore) + " -> "
+                         + std::to_string(wAfter) + " (ratio "
+                         + std::to_string(wRatio) + ", expected ~4)");
+                // And the physics has to follow the matrix: the residual after
+                // the change must be the one PD-15 measured AT s_c = 1.0. 1 mm
+                // of band on a quantity whose 0.25 -> 1.0 spread is ~2 mm; the
+                // band is the path dependence of an undamped sheet reaching
+                // the same stiffness from a different history (settled at 0.25
+                // first, and PD-15's run never was), not slop.
+                else if (std::fabs(penHigh - tail[1]) > 1e-3)
+                    fail(n16, "penetration after the change ("
+                         + std::to_string(penHigh) + " m) does not match the "
+                           "s_c = 1.0 run measured by PD-15 ("
+                         + std::to_string(tail[1]) + " m)");
+                else
+                    pass(n16);
+                std::cerr << "[self-test INFO] PD-16: penetration (mm) "
+                          << penLow*1e3 << " at s_c " << scales[0] << " -> "
+                          << penHigh*1e3 << " at s_c " << scales[1]
+                          << " (PD-15 reference " << tail[1]*1e3
+                          << ", " << cntLow << "/" << cntHigh << " samples)"
+                          << "; epochW " << wBefore << " -> " << wAfter
+                          << " (x" << wRatio << "); refactors +"
+                          << (rcAfter - rcBefore) << " over the "
+                          << switchFrames << " frame(s) to the first "
+                             "post-change contact, against a " << rcBaseline
+                          << "-per-10-frame churn baseline; final min y "
+                          << lowY16 << ", peak |v| " << pdMaxSpeed(1) << "\n";
+            }
+            // The scale is a live member and every later block inherits it.
+            sim.pd.kContactWeightScale = 1.0;
+            sim.targetFrames = pdStiffSavedTarget;
+        }
+
+        // ---- PD-17 / PD-18 — the COUPLED vertex-triangle contact row
+        // (docs/design/pd-continuum-cloth-contact.md §5.3/§5.4, verification
+        // §9.3 clauses 4, 5 and 7). Both run on PD-5's two-cloth stack, and
+        // both gate the MECHANISM rather than the outcome PD-5 already gates:
+        //
+        //   PD-17  A_cᵀA_c really is assembled, with genuine OFF-DIAGONAL
+        //          entries that CROSS the two meshes' blocks of the merged
+        //          system — the thing §5.4 needs one linear system for, and
+        //          the thing four independent diagonal identity constraints
+        //          (the previous mechanism) could not produce at all. Plus
+        //          the physical half of the same claim: both sheets react.
+        //   PD-18  a SEPARATED contact creates no attraction — the unilateral
+        //          identity branch. §9.3 clause 7.
+        {
+            const bool pdSavedSelf = sim.enableSelfCollisions;
+
+            auto pdComY = [&](int objId) -> double {
+                auto* m = Scene<Backend, Precision>::findById(objId);
+                if (!m || !m->state.x.ptr)
+                    return std::numeric_limits<double>::quiet_NaN();
+                const Index n = m->state.x.size / 3;
+                if (n == 0) return std::numeric_limits<double>::quiet_NaN();
+                double acc = 0.0;
+                for (Index i = 0; i < n; ++i) acc += (double)m->state.x.ptr[i*3+1];
+                return acc / (double)n;
+            };
+            auto pdMinY17 = [&](int objId) -> double {
+                auto* m = Scene<Backend, Precision>::findById(objId);
+                if (!m || !m->state.x.ptr) return std::numeric_limits<double>::quiet_NaN();
+                const Index n = m->state.x.size / 3;
+                double lo = 1e30;
+                for (Index i = 0; i < n; ++i)
+                    lo = std::min(lo, (double)m->state.x.ptr[i*3+1]);
+                return lo;
+            };
+            auto pdMaxY17 = [&](int objId) -> double {
+                auto* m = Scene<Backend, Precision>::findById(objId);
+                if (!m || !m->state.x.ptr) return std::numeric_limits<double>::quiet_NaN();
+                const Index n = m->state.x.size / 3;
+                double hi = -1e30;
+                for (Index i = 0; i < n; ++i)
+                    hi = std::max(hi, (double)m->state.x.ptr[i*3+1]);
+                return hi;
+            };
+            // The pinned 9x9 sheet of PD-5, optionally with its 7x7 free
+            // partner dropped on top. `withTop == false` is the A/B baseline
+            // the reaction clause is read against.
+            const Index kG17 = 9;
+            auto buildStack = [&](bool withTop) {
+                resetScene();
+                sim.usePd = true;
+                sim.enableSelfCollisions = true;
+                sim.addCloth(kG17, 1.0f, tinym::vec3(0.0f, 0.6f, 0.0f),
+                             1e5, 1e5, 3e5, Precision(0.01));            // id 0
+                {
+                    auto& req = Scene<Backend, Precision>::requestsGeneralMeshes.back();
+                    const float hh = 0.5f, yy = 0.6f;
+                    const uint32_t vids[4] = { 0, (uint32_t)kG17 - 1,
+                                               (uint32_t)(kG17 * (kG17 - 1)),
+                                               (uint32_t)(kG17 * kG17 - 1) };
+                    const tinym::vec3 ps[4] = { {-hh, yy, -hh}, {hh, yy, -hh},
+                                                {-hh, yy,  hh}, {hh, yy,  hh} };
+                    for (int i = 0; i < 4; ++i)
+                        req.fixedVertices.push_back(FixedVertex{vids[i], ps[i]});
+                }
+                if (withTop)
+                    sim.addCloth(7, 0.5f, tinym::vec3(0.0f, 0.75f, 0.0f),
+                                 1e5, 1e5, 3e5, Precision(0.01));        // id 1
+                sim.initialize();
+                sim.pause = false;
+            };
+            // Non-zeros of the MERGED matrix whose row and column lie in the
+            // blocks of two DIFFERENT meshes. This reads the matrix the
+            // current factorization actually holds, not a counter that could
+            // be maintained independently of it — so it cannot pass while the
+            // assembly is wrong. Returns -1 if the merged system is not built.
+            auto crossBlockNonzeros = [&]() -> long {
+                const auto& K = sim.pd.Kglob;
+                if (K.rows() == 0 || sim.pd.ctxs.size() < 2) return -1;
+                // column index -> ctx index, built once per call.
+                std::vector<int> owner((size_t)K.rows(), -1);
+                for (size_t ci = 0; ci < sim.pd.ctxs.size(); ++ci) {
+                    const auto& c = sim.pd.ctxs[ci];
+                    for (Index i = 0; i < c.n; ++i)
+                        if ((size_t)(c.solveBase + i) < owner.size())
+                            owner[(size_t)(c.solveBase + i)] = (int)ci;
+                }
+                long cnt = 0;
+                for (int k = 0; k < K.outerSize(); ++k)
+                    for (Eigen::SparseMatrix<double>::InnerIterator it(K, k);
+                         it; ++it) {
+                        if (it.value() == 0.0) continue;
+                        const int a = owner[(size_t)it.row()];
+                        const int b = owner[(size_t)it.col()];
+                        if (a >= 0 && b >= 0 && a != b) ++cnt;
+                    }
+                return cnt;
+            };
+
+            // ---- PD-17 — off-diagonal, cross-block coupling exists. -------
+            {
+                const char* n17 = "PD-17 / a cross-cloth contact assembles "
+                                  "A_cᵀA_c across BOTH meshes' blocks of one "
+                                  "merged system";
+                buildStack(true);
+                long   crossPeak   = -1;
+                uint32_t crossCtr  = 0;
+                uint64_t rowsTotal = 0;
+                bool blew17 = false;
+                for (int f = 0; f < 60; ++f) {
+                    sim.update();
+                    MetalGlobalContext::commitAndWait();
+                    rowsTotal += sim.pd.twoWayContactCount;
+                    crossCtr = std::max(crossCtr, sim.pd.crossBlockEntryCount);
+                    crossPeak = std::max(crossPeak, crossBlockNonzeros());
+                    if (!std::isfinite(pdComY(0)) || !std::isfinite(pdComY(1)))
+                        { blew17 = true; break; }
+                }
+                sim.pause = true;
+                const double stackedC = pdComY(0);
+
+                // A/B: the SAME pinned sheet with nothing on it. A coupled row
+                // that only ever moved the query vertex would leave this
+                // number unchanged; §5.3's Aᵀ A is what makes the triangle
+                // side of every row carry -β_a of the load.
+                buildStack(false);
+                for (int f = 0; f < 60; ++f) {
+                    sim.update();
+                    MetalGlobalContext::commitAndWait();
+                }
+                sim.pause = true;
+                const double bareC = pdComY(0);
+
+                if (blew17 || !std::isfinite(stackedC) || !std::isfinite(bareC))
+                    fail(n17, "non-finite cloth state in the two-cloth stack");
+                else if (rowsTotal == 0)
+                    fail(n17, "no coupled rows at all across 60 frames — the "
+                              "scene never exercised the mechanism");
+                else if (crossPeak <= 0)
+                    fail(n17, "the merged matrix has NO cross-block non-zero: "
+                              "the contact rows were assembled without coupling "
+                              "the two meshes (crossBlockNonzeros = "
+                         + std::to_string(crossPeak) + ")");
+                // The counter and the matrix must agree — a counter that
+                // reports coupling the matrix does not have is exactly the
+                // kind of instrument this clause must not trust.
+                else if (crossCtr == 0)
+                    fail(n17, "crossBlockEntryCount stayed 0 while the matrix "
+                              "carries " + std::to_string(crossPeak)
+                         + " cross-block non-zeros");
+                // 1 mm: the sheets' contact thickness is 10 mm and the loaded
+                // sag is millimetres, so this is a reaction/no-reaction gate,
+                // not a magnitude claim.
+                else if (!(stackedC < bareC - 1e-3))
+                    fail(n17, "the PINNED sheet did not react to the sheet "
+                              "resting on it: centroid y "
+                         + std::to_string(stackedC) + " loaded vs "
+                         + std::to_string(bareC) + " bare");
+                else
+                    pass(n17);
+                std::cerr << "[self-test INFO] PD-17: " << crossPeak
+                          << " cross-block non-zeros in K_glob, counter "
+                          << crossCtr << ", " << rowsTotal
+                          << " coupled rows over 60 frames; pinned-sheet "
+                             "centroid " << bareC << " bare -> " << stackedC
+                          << " loaded\n";
+            }
+
+            // ---- PD-18 — separation creates no attraction (§9.3 clause 7).
+            // The two sheets are brought into contact, then the TOP one is
+            // teleported a metre clear and released with zero velocity. Its
+            // COM must then fall at exactly g·t: internal elasticity cannot
+            // move a centre of mass (PD-3's argument), so ANY deviation is an
+            // external force — i.e. a contact row that kept pulling after it
+            // was satisfied. The unilateral local step (p_c = A_c q when the
+            // half-space holds) is what has to make that deviation zero.
+            {
+                const char* n18 = "PD-18 / a separated coupled contact exerts "
+                                  "no attraction (unilateral identity branch)";
+                buildStack(true);
+                bool blew18 = false;
+                for (int f = 0; f < 60; ++f) {
+                    sim.update();
+                    MetalGlobalContext::commitAndWait();
+                    if (!std::isfinite(pdComY(1))) { blew18 = true; break; }
+                }
+                sim.pause = true;
+
+                // Teleport +1.0 m and release. The buffers are
+                // StorageModeShared and the sim is paused with a completed
+                // command buffer, so this is the same direct write the
+                // bending clauses use to install a rest pose.
+                {
+                    auto* top = Scene<Backend, Precision>::findById(1);
+                    if (!top || !top->state.x.ptr || !top->state.v.ptr)
+                        blew18 = true;
+                    else {
+                        const Index n = top->state.x.size / 3;
+                        for (Index i = 0; i < n; ++i) {
+                            top->state.x.ptr[i*3+1] += Precision(1.0);
+                            for (int c = 0; c < 3; ++c)
+                                top->state.v.ptr[i*3+c] = Precision(0);
+                        }
+                    }
+                }
+
+                const double y0   = pdComY(1);
+                const int    kSep = 20;                 // 1/3 s
+                uint64_t sepRows  = 0;
+                double   minGap   = 1e30;
+                sim.pause = false;
+                for (int f = 0; f < kSep && !blew18; ++f) {
+                    sim.update();
+                    MetalGlobalContext::commitAndWait();
+                    sepRows += sim.pd.twoWayContactCount;
+                    const double gap = pdMinY17(1) - pdMaxY17(0);
+                    if (!std::isfinite(gap) || !std::isfinite(pdComY(1)))
+                        { blew18 = true; break; }
+                    minGap = std::min(minGap, gap);
+                }
+                sim.pause = true;
+
+                const double vy   = pdComVy(1);
+                const double y1   = pdComY(1);
+                const double gy   =
+                    (double)Scene<Backend, Precision>::environment.gravity.y;
+                const double t    = (double)kSep / 60.0;
+                const double vyEx = gy * t;
+
+                if (blew18 || !std::isfinite(vy) || !std::isfinite(y1))
+                    fail(n18, "non-finite cloth state across the separation");
+                // The gate below only means anything while the sheet is
+                // genuinely clear of the other one.
+                else if (!(minGap > 0.0))
+                    fail(n18, "the teleported sheet re-entered contact during "
+                              "the measurement window (min gap "
+                         + std::to_string(minGap) + " m) — nothing was "
+                           "measured about separation");
+                // ONE two-sided band, deliberately: an attraction toward the
+                // sheet it left reads as extra DOWNWARD speed and a lingering
+                // repulsion as less, and §9.3's clause forbids the first while
+                // the identity branch forbids both. 5% is PD-3's own free-fall
+                // tolerance, i.e. the same instrument measuring the same
+                // quantity on the same mesh family.
+                else if (std::fabs(vy - vyEx) > std::fabs(vyEx) * 0.05)
+                    fail(n18, "the separated sheet's COM did not free-fall: vy "
+                         + std::to_string(vy) + " m/s vs g*t "
+                         + std::to_string(vyEx) + " ("
+                         + (vy < vyEx ? "attracted toward the sheet it left"
+                                      : "still being pushed away") + ")");
+                else
+                    pass(n18);
+                std::cerr << "[self-test INFO] PD-18: COM y " << y0 << " -> "
+                          << y1 << " over " << kSep << " frames, vy " << vy
+                          << " vs free fall " << vyEx << "; " << sepRows
+                          << " coupled rows and min gap " << minGap
+                          << " m after separation\n";
+            }
+
+            sim.enableSelfCollisions = pdSavedSelf;
+        }
+
+        // ---- PD-19 / PD-20 — EDGE-EDGE contact (design doc §5.5, §9.3's
+        // edge-edge clause, §10 item 5). Both run on ONE scene, built so that
+        // the vertex-triangle family provably CANNOT see the contact:
+        //
+        //   ribbon A — a horizontal "wire": the plane y = 0, long along X
+        //              (x in [-0.30, 0.30]), only 0.04 m wide in Z. EVERY
+        //              vertex pinned, so it is a fixed obstacle whose own
+        //              solve cannot move it.
+        //   ribbon B — a vertical ribbon in the plane x = 0, long along Z
+        //              (z in [-0.35, 0.35]), only 0.06 m tall in Y, hanging
+        //              `kGap19` above A.
+        //
+        // The two cross like a "+" in projection but their SURFACES are
+        // perpendicular, so the closest features are A's X-running edges (the
+        // cell spanning x = 0) and B's bottom Z-running edge (the cell
+        // spanning z = 0). Their separation is kGap19 = 6 mm, inside the 10 mm
+        // contact thickness.
+        //
+        // The vertex grids are laid out at CELL CENTRES on both long axes, so
+        // no vertex sits on the crossing line: A's nearest vertex to B's plane
+        // is 37.5 mm away in X, and B's nearest vertex to A's ribbon is 24.5
+        // mm away in Z. Both are far outside the 10 mm thickness, at every
+        // height B ever reaches — so no point-triangle pair is ever within
+        // thickness, and the narrow phase this solver reads (vertex-triangle,
+        // end to end) reports NOTHING for this configuration. That is the
+        // whole construction: it isolates §5.5 from §5.3 instead of running
+        // both and hoping the new one mattered. Both clauses MEASURE that
+        // isolation (peak vertex-triangle rows) rather than assuming it.
+        //
+        //   PD-19  the MECHANISM: edge rows are detected, they carry genuine
+        //          cross-block coupling in the merged matrix (the PD-17 scan,
+        //          re-run here), the solve stays finite and the residual
+        //          penetration stays inside the thickness.
+        //   PD-20  the REGRESSION (§10 item 5): gravity presses B onto the
+        //          wire while its pinned ends drag it 100 mm SIDEWAYS along
+        //          the wire, so the contact slides — every row's frozen
+        //          (s, t) has to be re-resolved each substep against a
+        //          crossing point that keeps moving. With edge contacts ON
+        //          the pair must not tunnel; the same run with them OFF is
+        //          recorded as the contrast that gives the clause its
+        //          evidence.
+        {
+            const Index kP19   = 8;
+            const double kThk19 = 0.01;
+            const double kGap19 = 0.006;
+            // Cell-centre layout on the long axes (never a vertex at 0),
+            // even spacing on the short ones.
+            auto axA = [&](Index c) {
+                return -0.30 + ((double)c + 0.5) * (0.60 / (double)kP19);
+            };
+            auto azA = [&](Index r) {
+                return -0.02 + (double)r * (0.04 / (double)(kP19 - 1));
+            };
+            auto azB = [&](Index c) {
+                return -0.35 + ((double)c + 0.5) * (0.70 / (double)kP19);
+            };
+            auto ayB = [&](Index r) {
+                return kGap19 + (double)r * (0.06 / (double)(kP19 - 1));
+            };
+            // Soft enough that B can bend over the wire instead of dragging
+            // it: this scene is about the CONSTRAINT existing, and a ribbon
+            // stiff enough to win against a finite w_c would measure the
+            // stiffness balance instead (that is PD-15's clause).
+            const Precision kS19 = Precision(1e4), kB19 = Precision(3e2);
+
+            // Height of the POINT THAT IS ACTUALLY IN CONTACT: B's bottom edge
+            // interpolated at z = 0, i.e. the midpoint of the one bottom-row
+            // cell (columns 3-4) that spans the wire.
+            //
+            // NOT the minimum y over B's vertices, which was the first thing
+            // measured here and is wrong for this geometry: those two vertices
+            // sit at z = ±43.75 mm, well OUTSIDE the wire's ±20 mm ribbon, so
+            // they hang unsupported below it by construction and read ~-14 mm
+            // even when the contact rows are converged to a 0.4 mm residual.
+            // A gate on them would have been measuring the ribbon's droop
+            // between supports, not whether the contact held.
+            auto bCrossY = [&]() -> double {
+                auto* m = Scene<Backend, Precision>::findById(1);
+                if (!m || !m->state.x.ptr
+                    || m->state.x.size < (Index)(kP19 * 3))
+                    return std::numeric_limits<double>::quiet_NaN();
+                const Index vl = kP19 / 2 - 1, vr = kP19 / 2;  // bottom row
+                return 0.5 * ((double)m->state.x.ptr[vl*3+1]
+                            + (double)m->state.x.ptr[vr*3+1]);
+            };
+            auto finite19 = [&](int id) -> bool {
+                auto* m = Scene<Backend, Precision>::findById(id);
+                if (!m || !m->state.x.ptr) return false;
+                const Index n = m->state.x.size / 3;
+                for (Index i = 0; i < n * 3; ++i)
+                    if (!std::isfinite((double)m->state.x.ptr[i])) return false;
+                return n > 0;
+            };
+            // Same instrument PD-17 uses: cross-block non-zeros read off the
+            // matrix the current factorization actually holds.
+            auto crossBlockNz19 = [&]() -> long {
+                const auto& K = sim.pd.Kglob;
+                if (K.rows() == 0 || sim.pd.ctxs.size() < 2) return -1;
+                std::vector<int> owner((size_t)K.rows(), -1);
+                for (size_t ci = 0; ci < sim.pd.ctxs.size(); ++ci) {
+                    const auto& c = sim.pd.ctxs[ci];
+                    for (Index i = 0; i < c.n; ++i)
+                        if ((size_t)(c.solveBase + i) < owner.size())
+                            owner[(size_t)(c.solveBase + i)] = (int)ci;
+                }
+                long cnt = 0;
+                for (int k = 0; k < K.outerSize(); ++k)
+                    for (Eigen::SparseMatrix<double>::InnerIterator it(K, k);
+                         it; ++it) {
+                        if (it.value() == 0.0) continue;
+                        const int a = owner[(size_t)it.row()];
+                        const int b = owner[(size_t)it.col()];
+                        if (a >= 0 && b >= 0 && a != b) ++cnt;
+                    }
+                return cnt;
+            };
+
+            // NO contact-stiffness override: both clauses run at the shipped
+            // default s_c = 1.0, which is the point of gating them there. An
+            // earlier revision raised it to 4 to chase what looked like a
+            // 14 mm residual; that number turned out to be the ribbon's droop
+            // between supports (see bCrossY) and not a residual at all — at
+            // s_c = 1 the contact itself sits 0.4 mm inside its 10 mm target.
+            auto buildCross19 = [&](bool edgeOn) {
+                resetScene();
+                sim.usePd = true;
+                sim.pd.edgeContactsEnabled = edgeOn;
+                // id 0 — ribbon A, EVERY vertex pinned at its ribbon position.
+                sim.addCloth(kP19, 0.6f, tinym::vec3(0.0f, 0.0f, 0.0f),
+                             kS19, kS19, kB19, Precision(kThk19));
+                {
+                    auto& req = Scene<Backend, Precision>::requestsGeneralMeshes.back();
+                    for (Index r = 0; r < kP19; ++r)
+                        for (Index c = 0; c < kP19; ++c)
+                            req.fixedVertices.push_back(FixedVertex{
+                                (uint32_t)(r * kP19 + c),
+                                tinym::vec3((float)axA(c), 0.0f,
+                                            (float)azA(r)) });
+                }
+                // id 1 — ribbon B, pinned along its two END COLUMNS only.
+                sim.addCloth(kP19, 0.7f, tinym::vec3(0.0f, 0.0f, 0.0f),
+                             kS19, kS19, kB19, Precision(kThk19));
+                {
+                    auto& req = Scene<Backend, Precision>::requestsGeneralMeshes.back();
+                    for (Index r = 0; r < kP19; ++r)
+                        for (Index c = 0; c < kP19; c += (kP19 - 1))
+                            req.fixedVertices.push_back(FixedVertex{
+                                (uint32_t)(r * kP19 + c),
+                                tinym::vec3(0.0f, (float)ayB(r),
+                                            (float)azB(c)) });
+                }
+                sim.initialize();
+                // Install the ribbon geometry directly — the grid initializer
+                // only makes squares. Same StorageModeShared write PD-18's
+                // teleport and the bending clauses' rest poses use, and it
+                // happens BEFORE the first update(), so PD measures its rest
+                // operators from this pose (the "rest = live pose at build"
+                // convention) and the ribbons start unstrained.
+                auto* MA = Scene<Backend, Precision>::findById(0);
+                auto* MB = Scene<Backend, Precision>::findById(1);
+                if (MA && MA->state.x.ptr && MB && MB->state.x.ptr) {
+                    for (Index r = 0; r < kP19; ++r)
+                        for (Index c = 0; c < kP19; ++c) {
+                            const Index v = r * kP19 + c;
+                            const double pa[3] = { axA(c), 0.0,    azA(r) };
+                            const double pb[3] = { 0.0,    ayB(r), azB(c) };
+                            for (int a = 0; a < 3; ++a) {
+                                MA->state.x.ptr[v*3+a] = (Precision)pa[a];
+                                MB->state.x.ptr[v*3+a] = (Precision)pb[a];
+                                if (MA->state.xPrev.ptr)
+                                    MA->state.xPrev.ptr[v*3+a] = (Precision)pa[a];
+                                if (MB->state.xPrev.ptr)
+                                    MB->state.xPrev.ptr[v*3+a] = (Precision)pb[a];
+                                MA->state.v.ptr[v*3+a] = Precision(0);
+                                MB->state.v.ptr[v*3+a] = Precision(0);
+                            }
+                        }
+                }
+                sim.pause = false;
+            };
+
+            // ---- PD-19 — the mechanism fires and is really coupled. -------
+            {
+                const char* n19 = "PD-19 / crossing edges produce §5.5 rows "
+                                  "with cross-block coupling where no "
+                                  "vertex-triangle pair exists";
+                buildCross19(true);
+                uint32_t eePeak = 0, vtPeak = 0, eeCtr = 0;
+                long   crossPeak = -1;
+                double penMax = 0.0;
+                bool   blew19 = false;
+                for (int f = 0; f < 30; ++f) {
+                    sim.update();
+                    MetalGlobalContext::commitAndWait();
+                    eePeak = std::max(eePeak, sim.pd.edgeEdgeContactCount);
+                    vtPeak = std::max(vtPeak, sim.pd.twoWayContactCount);
+                    eeCtr  = std::max(eeCtr,  sim.pd.crossBlockEntryCount);
+                    crossPeak = std::max(crossPeak, crossBlockNz19());
+                    penMax = std::max(penMax, sim.pd.maxPenetrationDepth);
+                    if (!finite19(0) || !finite19(1)) { blew19 = true; break; }
+                }
+                sim.pause = true;
+
+                if (blew19)
+                    fail(n19, "non-finite cloth state in the crossing-ribbon "
+                              "scene");
+                else if (eePeak == 0)
+                    fail(n19, "no edge-edge rows at all across 30 frames — the "
+                              "detection pass never saw a 6 mm crossing inside "
+                              "a 10 mm thickness");
+                else if (crossPeak <= 0)
+                    fail(n19, "the merged matrix has NO cross-block non-zero: "
+                              "the edge rows were assembled without coupling "
+                              "the two ribbons (crossBlockNonzeros = "
+                         + std::to_string(crossPeak) + ")");
+                else if (eeCtr == 0)
+                    fail(n19, "crossBlockEntryCount stayed 0 while the matrix "
+                              "carries " + std::to_string(crossPeak)
+                         + " cross-block non-zeros");
+                // The rows exist AND the solve honours them: a residual that
+                // exceeded the thickness would mean the constraint was
+                // assembled but never resolved anything.
+                else if (!(penMax < kThk19))
+                    fail(n19, "residual penetration "
+                         + std::to_string(penMax * 1e3)
+                         + " mm reached the full contact thickness — the rows "
+                           "exist but the solve is not holding them");
+                else
+                    pass(n19);
+                std::cerr << "[self-test INFO] PD-19: peak edge-edge rows "
+                          << eePeak << ", peak vertex-triangle rows " << vtPeak
+                          << " (0 expected — this scene has no point-triangle "
+                             "pair inside thickness), " << crossPeak
+                          << " cross-block non-zeros, counter " << eeCtr
+                          << ", max residual penetration " << penMax * 1e3
+                          << " mm, dropped edge rows "
+                          << sim.pd.droppedEdgeRowCount << "\n";
+            }
+
+            // ---- PD-20 — grazing regression (§10 item 5). ------------------
+            // B's two pinned end columns are DRIVEN along the wire. A pinned
+            // vertex's position is never written by the solver (step 4) and
+            // its pin term reads the CURRENT x, so writing x here is a genuine
+            // kinematic drive, not a nudge the solve will undo.
+            {
+                const char* n20 = "PD-20 / a ribbon grazing across another's "
+                                  "edge does not tunnel with edge contacts on "
+                                  "(grazing regression)";
+                const int    kF20 = 60;
+                // The ribbon is driven SIDEWAYS (along +X, the wire's long
+                // axis) while gravity presses it onto the wire, so the contact
+                // SLIDES: the crossing point travels 100 mm along A and the
+                // frozen (s, t) of every row have to be re-resolved every
+                // substep. That is the grazing motion — a contact that moves
+                // tangentially while staying inside thickness.
+                //
+                // Sideways and NOT downwards, deliberately. Driving the pins
+                // DOWN through the wire measures pin-vs-contact (kPinWeight is
+                // 1e8 and w_c is finite, so the pin wins by construction and
+                // the ribbon follows its own pins — measured, it does), which
+                // is a statement about the soft-pin weight and not about §5.5.
+                // What presses the ribbon onto the wire here is gravity, which
+                // the contact can and must balance.
+                const double kSlide = 0.10;             // total pin travel, +X
+                const double kStep  = kSlide / (double)kF20;
+                // How far past the wire the crossing point is allowed to
+                // reach. The contact thickness itself, which is the only
+                // number in the scene the constraint has an opinion about: a
+                // row that is holding parks the pair AT +thickness (measured:
+                // +9.6 mm of a 10 mm target, i.e. a 0.4 mm residual), while
+                // one that is not lets the ribbon sink 77 mm through. Those
+                // are 8 thicknesses apart, so the gate is nowhere near either
+                // outcome and does not need to be tight to separate them.
+                const double kTol20 = kThk19;
+
+                auto run20 = [&](bool edgeOn, double& minY, bool& blew) {
+                    buildCross19(edgeOn);
+                    minY = 1e30;
+                    blew = false;
+                    for (int f = 0; f < kF20; ++f) {
+                        auto* MB = Scene<Backend, Precision>::findById(1);
+                        if (MB && MB->state.x.ptr) {
+                            for (Index r = 0; r < kP19; ++r)
+                                for (Index c = 0; c < kP19; c += (kP19 - 1)) {
+                                    const Index v = r * kP19 + c;
+                                    MB->state.x.ptr[v*3+0] += (Precision)kStep;
+                                    if (MB->state.xPrev.ptr)
+                                        MB->state.xPrev.ptr[v*3+0] +=
+                                            (Precision)kStep;
+                                }
+                        }
+                        sim.update();
+                        MetalGlobalContext::commitAndWait();
+                        if (!finite19(0) || !finite19(1)) { blew = true; break; }
+                        minY = std::min(minY, bCrossY());
+                    }
+                    sim.pause = true;
+                };
+
+                double minOn = 0.0, minOff = 0.0;
+                bool blewOn = false, blewOff = false;
+                run20(true,  minOn,  blewOn);
+                const uint32_t eeOn = sim.pd.edgeEdgeContactCount;
+                // The contrast, recorded and NOT gated: what the same scene
+                // does with §5.5 detection switched off is the evidence that
+                // this clause is measuring the edge family and not something
+                // else. Gating it would gate the ABSENCE of a mechanism,
+                // which is a claim about the vertex-triangle narrow phase's
+                // behaviour and not about this slice.
+                run20(false, minOff, blewOff);
+                const uint32_t vtOff = sim.pd.twoWayContactCount;
+
+                if (blewOn)
+                    fail(n20, "non-finite cloth state during the grazing run "
+                              "with edge contacts ON");
+                else if (!std::isfinite(minOn))
+                    fail(n20, "the ribbon's crossing point went non-finite");
+                else if (!(minOn > -kTol20))
+                    fail(n20, "the ribbon TUNNELLED through the wire with edge "
+                              "contacts on: the crossing point reached y = "
+                         + std::to_string(minOn) + " m, past the wire at y = 0 "
+                           "by more than the " + std::to_string(kTol20 * 1e3)
+                         + " mm contact thickness");
+                else
+                    pass(n20);
+                std::cerr << "[self-test INFO] PD-20: pins driven " << kSlide
+                          << " m along the wire over " << kF20
+                          << " frames; B's bottom edge at the crossing reached y = "
+                          << minOn << " m with edge contacts ON ("
+                          << eeOn << " rows in the last substep) vs "
+                          << (blewOff ? std::numeric_limits<double>::quiet_NaN()
+                                      : minOff)
+                          << " m with them OFF (" << vtOff
+                          << " vertex-triangle rows in the last substep) — "
+                          << (minOff < -kTol20 ? "the vertex-triangle-only run "
+                                                 "TUNNELS"
+                                               : "the vertex-triangle-only run "
+                                                 "did NOT tunnel")
+                          << "\n";
+            }
+            sim.pd.edgeContactsEnabled = true;
+        }
+
+        // ---- PD-21 — §7 partitioned rigid coupling: the ball is SUPPORTED
+        // and the cloth CARRIES ITS WEIGHT. pd_cloth_ball replica (Float
+        // floor + corner-pinned 20x20 sheet + 0.1 kg Rigid ball on its
+        // center), run TWICE — with and without the ball, CPSH-5's A/B idiom
+        // — because the two failure modes seen here are opposites and each
+        // is invisible to the other's gate:
+        //   * "realized push" reaction (v1): dries up as the solve converges
+        //     → the ball ratchets THROUGH the sheet at ~0.15 m/s at every
+        //     s_c (support failure; the extra-sag clause alone would pass
+        //     trivially while the ball is still crossing).
+        //   * per-sweep deficit split (v2, PbdSystem transplant): the sweep
+        //     loop pays the same standing deficit 16x per substep, so
+        //     rigidDelta alone holds the ball up and the FABRIC stays
+        //     unloaded — ball-induced extra sag 3 mm vs PBD's 140 mm
+        //     (weight-transfer failure; the support clause alone passes).
+        // Shipped formula (step 3b): once per substep, the NEWTON PAIR of
+        // the cloth-side penalty — share = deficit·min(1, s_c·wB/(wc+wB)) —
+        // which measured 39 mm extra sag with the ball parked at ~0.72/28 mm
+        // standing penetration for its first ~250 frames. Gates at 240
+        // frames, BEFORE the frictionless lateral roll-off that eventually
+        // carries the ball off the sheet (drift crosses the 0.5 m half-size
+        // at ~f=299 at s_c = 1; roll-off is the missing-friction gap, §8
+        // restitution/friction 미구현, and is deliberately not gated).
+        {
+            const char* n21 = "PD-21 / rigid coupling: ball supported AND its "
+                              "weight reaches the fabric (Newton-pair share)";
+            const Index nB = 20;
+            auto buildBall21 = [&](bool withBall) {
+                resetScene();
+                sim.pause = false;
+                sim.usePd = true;
+                sim.pd.kContactWeightScale = 1.0;
+                sim.cdSubstepPeriod = 1;
+                sim.refitSubstepPeriod = 1;
+                system.subSteps = 3; system.subh = system.h / Precision(3);
+                sim.addPlane(PlaneDirection::XZPlane, tinym::vec3(0, 0, 0), 24,
+                             Precision(3.0), Precision(0.1), BehaviorType::Float);
+                sim.addCloth(nB, Precision(1), tinym::vec3(0.0f, 0.6f, 0.0f),
+                             1e5, 1e5, 2e5, Precision(0.01), Precision(0.1));
+                {
+                    auto& req = Scene<Backend, Precision>::requestsGeneralMeshes.back();
+                    const float hh = 0.5f, yy = 0.6f;
+                    const uint32_t vids[4] = { 0, (uint32_t)nB - 1,
+                                               (uint32_t)(nB * (nB - 1)),
+                                               (uint32_t)(nB * nB - 1) };
+                    const tinym::vec3 ps[4] = { {-hh, yy, -hh}, {hh, yy, -hh},
+                                                {-hh, yy,  hh}, {hh, yy,  hh} };
+                    for (int i = 0; i < 4; ++i)
+                        req.fixedVertices.push_back(FixedVertex{ vids[i], ps[i] });
+                }
+                if (withBall)
+                    sim.addSphere(tinym::vec3(0, 1.0, 0), 16, 0.5f,
+                                  Precision(0.1), BehaviorType::Rigid);
+                sim.initialize();
+            };
+            auto centerY21 = [&]() -> double {
+                if (auto* cm = Scene<Backend, Precision>::findById(1)) {
+                    const Index c = (nB / 2) * nB + (nB / 2);
+                    return (double)cm->state.x.ptr[c * 3 + 1];
+                }
+                return std::numeric_limits<double>::quiet_NaN();
+            };
+            const int kF21 = 240;
+            const int prevTarget21 = sim.targetFrames;
+
+            buildBall21(false);
+            sim.targetFrames = 100000;
+            for (int f = 0; f < kF21; ++f) {
+                sim.update();
+                MetalGlobalContext::commitAndWait();
+            }
+            const double cyBare = centerY21();
+            sim.pause = true;
+
+            buildBall21(true);
+            sim.targetFrames = 100000;
+            uint32_t coupleTotal = 0;
+            bool blew21 = false;
+            for (int f = 0; f < kF21 && !blew21; ++f) {
+                sim.update();
+                MetalGlobalContext::commitAndWait();
+                coupleTotal += sim.pd.rigidCoupleCount;
+                auto* bm = Scene<Backend, Precision>::findById(2);
+                if (bm && bm->state.x.ptr
+                    && !std::isfinite((double)bm->state.x.ptr[1]))
+                    blew21 = true;
+            }
+            sim.targetFrames = prevTarget21;
+            sim.pause = true;
+            const double cyLoaded = centerY21();
+            double ballY21 = std::numeric_limits<double>::quiet_NaN();
+            if (auto* bm = Scene<Backend, Precision>::findById(2)) {
+                const Index bn = bm->state.x.size / 3;
+                double acc = 0.0;
+                for (Index k = 0; k < bn; ++k)
+                    acc += (double)bm->state.x.ptr[k * 3 + 1];
+                if (bn) ballY21 = acc / (double)bn;
+            }
+            const double extraSag = cyBare - cyLoaded;
+            std::cerr << "[self-test INFO] PD-21: after " << kF21
+                      << " frames ball centroid y = " << ballY21
+                      << ", sheet center " << cyBare << " bare -> " << cyLoaded
+                      << " loaded (extra sag " << extraSag * 1000.0
+                      << " mm); coupled-row payments = " << coupleTotal << "\n";
+            if (blew21 || !std::isfinite(ballY21) || !std::isfinite(cyLoaded)
+                || !std::isfinite(cyBare))
+                fail(n21, "non-finite state in the ball-drop scene");
+            else if (coupleTotal == 0)
+                fail(n21, "no coupled contact rows ever fired (detection or "
+                          "coupling predicate broke — not a stiffness issue)");
+            else if (ballY21 <= cyLoaded)
+                fail(n21, "ball sank below the sheet's center: ball y = "
+                     + std::to_string(ballY21) + " vs sheet y = "
+                     + std::to_string(cyLoaded)
+                     + " (support failure — the v1 'realized push' mode)");
+            else if (extraSag < 0.015)
+                fail(n21, "ball-induced extra sag is only "
+                     + std::to_string(extraSag * 1000.0)
+                     + " mm (>= 15 mm expected) — the ball's weight is not "
+                       "reaching the fabric (the v2 per-sweep mode measured "
+                       "3 mm here; the shipped Newton pair measures ~39 mm)");
+            else
+                pass(n21);
+        }
+
+
 
         sim.pause = true;
         sim.usePd = false;
@@ -9253,6 +11380,385 @@ static int runSelfTest() {
         sim.usePbd      = false;
         system.subSteps = acSavedSubSteps;
         system.subh     = acSavedSubh;
+    }
+
+    // ---- Block PBT: PBD cloth TEARING (PbdSystem milestone 1 + phase 2) ---
+    // The tear pass breaks an edge whose PREDICTED length exceeds
+    // tearRatio * rest and degenerates the 1-2 facets that used it to
+    // (v0,v0,v0). The clauses separate the four things that can independently
+    // be wrong:
+    //   PBT-1  the pass fires at all, the degeneration lands in
+    //          adjacency.facets AND in the render-side copy (preview.facets —
+    //          the renderer never reads adjacency, so a solver-only tear is
+    //          an INVISIBLE tear), and edgeAlive is monotonic (a dead edge
+    //          must never come back: the geometry it constrained is gone),
+    //   PBT-2  the torn-dirty flag is sticky-once — exactly one consumer sees
+    //          each tear event,
+    //   PBT-3  sustained tearing under load does not produce NaN/Inf (the
+    //          bend cache and the contact rows are both rebuilt around holes
+    //          mid-run, which is where a stale index would blow up),
+    //   PBT-4  the pbd_cloth_flag registry scene builds and runs with tearing
+    //          actually enabled,
+    //   PBT-5  the PER-MESH ClothBehaviorParams::tearable opt-out gates the
+    //          pass on its own, under an unchanged global tearEnabled — and
+    //          flipping it back on resumes tearing (i.e. it is a live gate,
+    //          not a one-way latch baked in at build time).
+    //
+    // Load model: a scene-global wind of 80 N per PARTICLE (mass 0.1 each, so
+    // ~8x its own weight) against a sheet whose left column is pinned. Fixed
+    // particles are NOT advanced by the prediction (pbd_system.hpp step (1)),
+    // so the very first substep predicts an 0.0247 m gap across a 0.1143 m
+    // rest edge — strain 1.22, over the 1.15 ratio these clauses set. That is
+    // deliberately a first-substep tear: a clause that needed 30 frames of
+    // whipping to trigger would be measuring the whip, not the tear rule.
+    {
+        const size_t pbtSavedSubSteps = system.subSteps;
+        const Precision pbtSavedSubh  = system.subh;
+        // Same operating point the PBD/PD scenes run at. subh is what the
+        // predicted overstretch is measured over, so it is part of the setup.
+        system.subSteps = 3;
+        system.subh     = system.h / Precision(3);
+
+        constexpr Index kPbtN = 8;              // 8x8 grid, rest edge 0.1143
+        constexpr float kPbtSize = 0.8f;
+
+        // Degenerate == the (v0,v0,v0) collapse the tear pass writes. Counted
+        // over the mesh's OWN facet range, not the packed scene-wide array.
+        auto degenerateFacets = [&](const Index* F, Index numFacets) -> Index {
+            Index d = 0;
+            if (!F) return 0;
+            for (Index f = 0; f < numFacets; ++f)
+                if (F[f*3+1] == F[f*3+0] && F[f*3+2] == F[f*3+0]) ++d;
+            return d;
+        };
+        auto pbtFinite = [&](int id) -> bool {
+            auto* m = Scene<Backend, Precision>::findById(id);
+            if (!m || !m->state.x.ptr) return false;
+            const Index n = m->state.x.size / 3;
+            for (Index i = 0; i < n * 3; ++i)
+                if (!std::isfinite((double)m->state.x.ptr[i])) return false;
+            return true;
+        };
+        // Left column (col 0 of every row) pinned + a hard cross-wind.
+        // addCloth lays the grid on XZ with vid = row*n + col and x growing
+        // with col, so the wind blows straight away from the pinned edge.
+        auto buildTearScene = [&](Precision tearRatio, int budget) {
+            resetScene();
+            sim.usePbd = true;
+            sim.usePd  = false;
+            sim.addCloth(kPbtN, kPbtSize, tinym::vec3(0.0f, 1.0f, 0.0f));  // id 0
+            sim.initialize();
+            for (Index row = 0; row < kPbtN; ++row)
+                sim.setVertexFixed(0, (int)(row * kPbtN), true);
+            Scene<Backend, Precision>::environment.wind =
+                tinym::vec3(80.0f, 0.0f, 0.0f);
+            sim.pbd.tearEnabled     = true;
+            sim.pbd.tearRatio       = tearRatio;
+            sim.pbd.maxTearsPerStep = budget;
+            sim.pause = false;
+        };
+
+        // ---- PBT-1 ------------------------------------------------------
+        {
+            buildTearScene(Precision(1.15), 4);
+            const auto* cloth0 = Scene<Backend, Precision>::findById(0);
+            const Index numFacets = cloth0
+                ? (Index)(cloth0->adjacency.facets.size / 3) : 0;
+
+            // edgeAlive snapshot per step; a 0 -> 1 transition is a resurrected
+            // edge, which the design forbids outright.
+            std::vector<uint8_t> prevAlive;
+            bool aliveMonotonic = true;
+            uint32_t maxPerStep = 0;
+            bool finite = true;
+            for (int f = 0; f < 20; ++f) {
+                sim.update();
+                MetalGlobalContext::commitAndWait();
+                maxPerStep = std::max(maxPerStep, sim.pbd.tearsThisStep);
+                if (!pbtFinite(0)) { finite = false; break; }
+                if (!sim.pbd.tearStates.empty()) {
+                    const auto& cur = sim.pbd.tearStates[0].edgeAlive;
+                    if (!prevAlive.empty() && prevAlive.size() == cur.size())
+                        for (size_t e = 0; e < cur.size(); ++e)
+                            if (!prevAlive[e] && cur[e]) aliveMonotonic = false;
+                    prevAlive = cur;
+                }
+            }
+            sim.pause = true;
+
+            auto* cloth = Scene<Backend, Precision>::findById(0);
+            const Index deadPhys = cloth
+                ? degenerateFacets(cloth->adjacency.facets.ptr, numFacets) : 0;
+            // The render-side mirror: MeshGL is bound to preview.facets, not
+            // to adjacency.facets, so this is the clause that says the rip is
+            // actually VISIBLE.
+            Index deadPreview = 0;
+            bool  previewFound = false, previewMatches = false;
+            for (auto& req : Scene<Backend, Precision>::requestsGeneralMeshes) {
+                if (req.id != 0) continue;
+                previewFound = true;
+                deadPreview = degenerateFacets(
+                    (const Index*)req.preview.facets.data(), numFacets);
+                previewMatches = cloth && cloth->adjacency.facets.ptr
+                    && req.preview.facets.size()
+                           == (size_t)cloth->adjacency.facets.size
+                    && std::memcmp(req.preview.facets.data(),
+                                   cloth->adjacency.facets.ptr,
+                                   req.preview.facets.size() * sizeof(uint32_t)) == 0;
+                break;
+            }
+
+            const char* n1 = "PBT-1 / overstretched edges tear, degenerate their "
+                             "facets in BOTH the solver and the render copy, and "
+                             "never come back";
+            if (!finite)
+                fail(n1, "non-finite cloth while tearing");
+            else if (sim.pbd.tearCount == 0)
+                fail(n1, "no edge tore in 20 frames under an 80 N/particle wind "
+                         "at ratio 1.15 — the tear pass never fired");
+            else if (maxPerStep == 0)
+                fail(n1, "tearCount moved but tearsThisStep was never non-zero "
+                         "(the per-step counter is dead)");
+            else if (maxPerStep > 4)
+                fail(n1, "tearsThisStep reached " + std::to_string(maxPerStep)
+                     + " > the maxTearsPerStep budget of 4");
+            else if (deadPhys == 0)
+                fail(n1, "tearCount = " + std::to_string(sim.pbd.tearCount)
+                     + " but no facet in adjacency.facets is degenerate");
+            else if (!previewFound)
+                fail(n1, "no request found for mesh id 0 (cannot check the "
+                         "render-side topology copy)");
+            else if (deadPreview != deadPhys || !previewMatches)
+                fail(n1, "render copy out of sync: preview.facets has "
+                     + std::to_string(deadPreview) + " degenerate facets vs "
+                     + std::to_string(deadPhys) + " in adjacency.facets "
+                     "(the tear would be invisible)");
+            else if (!aliveMonotonic)
+                fail(n1, "a dead edge came back alive");
+            else
+                pass(n1);
+            std::cerr << "[PBT info] PBT-1 tearCount=" << sim.pbd.tearCount
+                      << " maxTearsThisStep=" << maxPerStep
+                      << " degenerateFacets=" << deadPhys << "/" << numFacets
+                      << "\n";
+        }
+
+        // ---- PBT-2 ------------------------------------------------------
+        // Sticky-once. Note the first sub-clause: Simulator::update is ITSELF
+        // the phase-2 consumer (syncTornRenderTopology), so after a torn frame
+        // the flag must already be down — that is the wiring check. The
+        // raise-and-consume pair below then pins the contract itself without
+        // depending on which frame happened to tear.
+        {
+            buildTearScene(Precision(1.15), 4);
+            bool tore = false;
+            for (int f = 0; f < 20 && !tore; ++f) {
+                sim.update();
+                MetalGlobalContext::commitAndWait();
+                tore = sim.pbd.tearCount > 0;
+            }
+            sim.pause = true;
+            const bool consumedByUpdate = !sim.pbd.tornDirty(0);
+            sim.pbd.tearStates[0].facetsDirty = true;   // raise by hand
+            const bool first  = sim.pbd.consumeTornDirty(0);
+            const bool second = sim.pbd.consumeTornDirty(0);
+
+            const char* n2 = "PBT-2 / consumeTornDirty reports a tear exactly once";
+            if (!tore)
+                fail(n2, "no tear happened, nothing to consume");
+            else if (!consumedByUpdate)
+                fail(n2, "the flag was still raised after update() — the render "
+                         "propagation is not consuming it");
+            else if (!first)
+                fail(n2, "consumeTornDirty returned false on a raised flag");
+            else if (second)
+                fail(n2, "consumeTornDirty returned true twice for one tear");
+            else
+                pass(n2);
+        }
+
+        // ---- PBT-3 ------------------------------------------------------
+        // 60 frames x 3 substeps of continuous tearing. The bend cache is
+        // rebuilt every time a hole appears and the contact rows are re-derived
+        // from a facet array full of degenerate triangles, so this is where a
+        // stale index or a divide-by-zero-area would surface.
+        {
+            buildTearScene(Precision(1.15), 4);
+            bool finite = true;
+            int  blewAt = -1;
+            for (int f = 0; f < 60; ++f) {
+                sim.update();
+                MetalGlobalContext::commitAndWait();
+                if (!pbtFinite(0)) { finite = false; blewAt = f; break; }
+            }
+            sim.pause = true;
+            const char* n3 = "PBT-3 / 60 frames of sustained tearing stay finite";
+            if (!finite)
+                fail(n3, "non-finite vertex at frame " + std::to_string(blewAt));
+            else if (sim.pbd.sanitizeCount != 0)
+                fail(n3, "sanitize guard fired "
+                     + std::to_string(sim.pbd.sanitizeCount) + " times");
+            else
+                pass(n3);
+            std::cerr << "[PBT info] PBT-3 tearCount=" << sim.pbd.tearCount
+                      << " after 60 frames\n";
+        }
+
+        // ---- PBT-4 ------------------------------------------------------
+        // The registry scene, driven exactly as `--scene pbd_cloth_flag` does
+        // (setup + initialize + postInit). It asserts the tear actually
+        // HAPPENS, because "the wind can tear it" is the whole point of the
+        // scene and a scene that silently stopped tearing would still pass
+        // every other clause here. 120 frames is 1.5x the measured margin
+        // (first tear lands between frame 50 and 100; 24 tears by frame 100 —
+        // the sweep behind the wind magnitude is in scene_registry.hpp).
+        // Deterministic: the jiggle RNG is seeded from the mesh id.
+        {
+            const auto* entry =
+                scene_registry::find<Backend, Precision>("pbd_cloth_flag");
+            const char* n4 = "PBT-4 / pbd_cloth_flag scene builds, runs, and has "
+                             "tearing enabled";
+            if (!entry) {
+                fail(n4, "scene name not in the registry");
+            } else {
+                resetScene();
+                sim.usePbd = false;
+                sim.usePd  = false;
+                sim.pbd.tearEnabled = false;
+                entry->setup(sim, system);
+                sim.initialize();
+                if (entry->postInit) entry->postInit(sim);
+                // The flag is the second request (id 1); id 0 is the floor.
+                auto* flag = Scene<Backend, Precision>::findById(1);
+                const bool isCloth = flag
+                    && flag->behaviorType == BehaviorType::TriangularCloth;
+                Index pinned = 0;
+                if (flag && flag->constraints.fixedParticles.ptr) {
+                    const Index n = flag->state.x.size / 3;
+                    for (Index i = 0; i < n; ++i)
+                        if (flag->constraints.fixedParticles.ptr[i] == Precision(0))
+                            ++pinned;
+                }
+                bool finite = true;
+                int  firstTearFrame = -1;
+                sim.pause = false;
+                for (int f = 0; f < 120; ++f) {
+                    sim.update();
+                    MetalGlobalContext::commitAndWait();
+                    if (firstTearFrame < 0 && sim.pbd.tearCount > 0)
+                        firstTearFrame = f;
+                    if (!pbtFinite(1)) { finite = false; break; }
+                }
+                sim.pause = true;
+
+                if (!flag)
+                    fail(n4, "no mesh id 1 after setup + initialize");
+                else if (!isCloth)
+                    fail(n4, "mesh id 1 is not cloth-tagged — the params retag "
+                             "did not survive pack");
+                else if (!sim.usePbd)
+                    fail(n4, "postInit did not select the PBD solver");
+                else if (!sim.pbd.tearEnabled)
+                    fail(n4, "postInit did not enable tearing");
+                else if (pinned != 20)
+                    fail(n4, "expected the full 20-vertex left column pinned, got "
+                         + std::to_string(pinned));
+                else if (!finite)
+                    fail(n4, "non-finite flag vertex inside 120 frames");
+                else if (sim.pbd.tearCount == 0)
+                    fail(n4, "the flag never tore in 120 frames — the scene's "
+                             "wind no longer reaches its tearRatio");
+                else
+                    pass(n4);
+                std::cerr << "[PBT info] PBT-4 flag tearCount="
+                          << sim.pbd.tearCount << " after 120 frames, first tear "
+                          << "at frame " << firstTearFrame << ", pinned="
+                          << pinned << "\n";
+            }
+        }
+
+        // ---- PBT-5 ------------------------------------------------------
+        // Per-mesh opt-out. Same scene and same wind PBT-1 tears in 20 frames,
+        // with the GLOBAL gate left ON throughout — the only variable is the
+        // fabric's own flag, so a pass cannot be explained by the load or by
+        // tearEnabled. Both halves are asserted: off => nothing tears, then
+        // on => it tears, which is what separates a working gate from a
+        // silently-broken tear pass.
+        {
+            // Writes BOTH copies, exactly as the inspector callback does: the
+            // live mesh drives this step, the request mirror is what survives
+            // the next Scene::pack.
+            auto setTearable = [&](int id, bool v) {
+                if (auto* m = Scene<Backend, Precision>::findById(id))
+                    if (auto* p = std::get_if<ClothBehaviorParams<Precision>>(
+                            &m->behaviorParams))
+                        p->tearable = v;
+                if (auto* r = sim.findRequest(id))
+                    if (auto* p = std::get_if<ClothBehaviorParams<Precision>>(
+                            &r->behaviorParams))
+                        p->tearable = v;
+            };
+            auto tearableOn = [&](int id) -> bool {
+                auto* m = Scene<Backend, Precision>::findById(id);
+                if (!m) return false;
+                auto* p = std::get_if<ClothBehaviorParams<Precision>>(
+                    &m->behaviorParams);
+                return p && p->tearable;
+            };
+
+            buildTearScene(Precision(1.15), 4);
+            sim.pbd.resetTearing();      // counters start from a clean slate
+            setTearable(0, false);
+            const bool wroteOff = !tearableOn(0);
+            bool finite = true;
+            for (int f = 0; f < 20; ++f) {
+                sim.update();
+                MetalGlobalContext::commitAndWait();
+                if (!pbtFinite(0)) { finite = false; break; }
+            }
+            const uint32_t offCount = sim.pbd.tearCount;
+
+            // Flip it back on IN PLACE — no rebuild, no re-initialize.
+            setTearable(0, true);
+            for (int f = 0; f < 20 && finite; ++f) {
+                sim.update();
+                MetalGlobalContext::commitAndWait();
+                if (!pbtFinite(0)) { finite = false; break; }
+            }
+            const uint32_t onCount = sim.pbd.tearCount;
+            sim.pause = true;
+
+            const char* n5 = "PBT-5 / per-mesh tearable gates the tear pass while "
+                             "the global toggle stays on";
+            if (!finite)
+                fail(n5, "non-finite cloth during the per-mesh gate run");
+            else if (!wroteOff)
+                fail(n5, "could not write tearable=false onto the cloth "
+                         "(no ClothBehaviorParams on mesh id 0)");
+            else if (!sim.pbd.tearEnabled)
+                fail(n5, "the global tearEnabled went down — the clause would "
+                         "prove nothing");
+            else if (offCount != 0)
+                fail(n5, "tearable=false but " + std::to_string(offCount)
+                     + " edges tore in 20 frames");
+            else if (onCount == 0)
+                fail(n5, "tearable=true again but nothing tore in the next 20 "
+                         "frames — the gate is a one-way latch, or the load "
+                         "no longer reaches the ratio");
+            else
+                pass(n5);
+            std::cerr << "[PBT info] PBT-5 tearCount off=" << offCount
+                      << " on=" << onCount << "\n";
+        }
+
+        sim.pause  = true;
+        sim.usePbd = false;
+        sim.pbd.tearEnabled = false;
+        sim.pbd.resetTearing();
+        sim.enableSelfCollisions = false;
+        Scene<Backend, Precision>::environment.wind = tinym::vec3(0.0f, 0.0f, 0.0f);
+        system.subSteps = pbtSavedSubSteps;
+        system.subh     = pbtSavedSubh;
     }
 
     if (failures == 0) {

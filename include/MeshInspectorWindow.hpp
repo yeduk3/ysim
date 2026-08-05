@@ -203,6 +203,23 @@ struct MeshInspectorTarget {
     std::function<void(int, float)> on_cloth_shear;
     float* cloth_bend = nullptr;
     std::function<void(int, float)> on_cloth_bend;
+    // "스트레인 한계" — PD continuum strain-limiting band [σmin, σmax].
+    // TriangularCloth only (both pointers + callback set together, same
+    // null-hides convention). A fabric property consumed by the PD solver's
+    // local SVD clamp; the symplectic/PBD paths ignore it, which the row's
+    // caption states. The callback receives BOTH values so production can
+    // mirror them to the request atomically.
+    float* cloth_sigma_min = nullptr;
+    float* cloth_sigma_max = nullptr;
+    std::function<void(int, float /*min*/, float /*max*/)> on_cloth_sigma;
+    // "찢어짐 허용" — per-mesh PBD tear opt-out, sitting under the GLOBAL
+    // 찢어짐 활성화 toggle in the solver panel (this row cannot enable
+    // tearing on its own). TriangularCloth only, same null-hides convention:
+    // no other behavior owns the flag. Reads the live
+    // ClothBehaviorParams::tearable; the callback mirrors mesh + request so
+    // the edit survives Scene::pack.
+    bool* cloth_tearable = nullptr;
+    std::function<void(int, bool)> on_cloth_tearable;
     // "두께" — cloth-only contact thickness (metres). This is the distance
     // the contact response resolves to, so it is the knob that decides how
     // far apart two colliding cloth layers park. Reads the live

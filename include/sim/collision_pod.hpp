@@ -332,6 +332,25 @@ template <typename PR>
 struct ClothBehaviorParams {
     PR stretch, shear, bend;
     PR thickness;
+    // PD continuum strain limiting band [σmin, σmax] (design doc §3.3):
+    // the singular values of each triangle's deformation gradient are
+    // clamped into this interval by the PD local step. 1/1 = corotated
+    // (no free play — see the tunneling calibration in pd_system.hpp).
+    // PER MESH, because it is a fabric property, not a solver setting;
+    // the symplectic and PBD paths ignore it. Default member initializers
+    // keep the aggregate init sites ({stretch, shear, bend, thickness})
+    // compiling unchanged.
+    PR sigmaMin = PR(1);
+    PR sigmaMax = PR(1);
+    // PBD tearing opt-OUT for THIS cloth. The global PbdSystem::tearEnabled
+    // stays the master gate; this only decides whether a mesh participates
+    // once tearing is on scene-wide, so a scene can hang one tearable rag
+    // next to an indestructible curtain. Default true so every pre-existing
+    // scene (and the PBT self-tests) behaves exactly as before.
+    // PER MESH for the same reason as the sigma band: a fabric property,
+    // not a solver setting. Turning it off stops FURTHER tearing only —
+    // holes already torn stay torn (the tear state is still maintained).
+    bool tearable = true;
 };
 
 // FastGridCloth rest lengths are PER DIRECTION (6 values), not 3 scalars.
