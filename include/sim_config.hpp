@@ -101,8 +101,10 @@ inline bool isKnownBackend(const std::string& b) {
     return b == "METAL" || b == "CPU" || b == "CUDA";
 }
 
+// The four sibling solvers Simulator dispatches between. "Explicit" is the
+// SymplecticSystem (historical name, kept so old scene files load).
 inline bool isKnownSystem(const std::string& s) {
-    return s == "Explicit";
+    return s == "Explicit" || s == "PBD" || s == "PD" || s == "LargeSteps";
 }
 
 // ----------------------------------------------------------------- encode ---

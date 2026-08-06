@@ -212,6 +212,16 @@ struct PdSystem<METAL, PR> {
     // (the implicit-Euler solve is already dissipative).
     PR damping = PR(0);
 
+    // Per-section timing. Non-null ONLY at the InFrame profile tier (wired by
+    // main's applyProfilerLevel), so the sections below cost nothing
+    // otherwise. Samples ACCUMULATE per frame: a section's frame value is the
+    // sum over substeps, PD iterations and meshes.
+    profiler::FrameProfiler* profiler = nullptr;
+    profiler::FrameProfiler::ScopedTimer sect(const char* name) {
+        return profiler ? profiler->scoped(name)
+                        : profiler::FrameProfiler::ScopedTimer{};
+    }
+
     // Anomaly (NaN/Inf) counter for the frame; Simulator reads nothing from
     // this today — the guard's job is to keep a blown-up vertex from
     // poisoning the whole mesh. Same role as PbdSystem::sanitizeCount.
@@ -2249,6 +2259,10 @@ struct PdSystem<METAL, PR> {
         // its solveBase in the order the cloths are accepted.
         Index nTotalNew = 0;
 
+        // pd_assemble spans (1) + (1a): the per-mesh block rebuild/momentum
+        // target and the merged base. Finalized explicitly, no brace level.
+        auto scAsm = sect("pd_assemble");
+
         // --- (1) per mesh: cache/rebuild the mesh's contact-free BLOCK of the
         // merged matrix, build the momentum target and warm start. Every
         // active cloth must reach its warm-started iterate before ANY contact
@@ -2650,6 +2664,9 @@ struct PdSystem<METAL, PR> {
             return &ctxs[(size_t)ci];
         };
 
+        scAsm.finalize();
+        auto scCon = sect("pd_contacts");
+
         // --- (1b) resolve this substep's WHOLE contact set — one-sided planes
         // AND coupled §5.3 rows — freezing per §5.6 everything the MATRIX
         // depends on: which vertices, their barycentric coefficients β, and
@@ -2856,6 +2873,8 @@ struct PdSystem<METAL, PR> {
         // step and the same penetration sweep — the whole point of the row
         // being one struct with a kind tag. See resolveEdgeContacts.
         resolveEdgeContacts(sceneObjects, invH2);
+        scCon.finalize();
+        auto scFac = sect("pd_factorize");
 
         // --- (1c) contact EPOCH and the merged factorization (design doc
         // §5.6). The key summarizes everything about the contact set that the
@@ -3010,6 +3029,8 @@ struct PdSystem<METAL, PR> {
             if (!globValid) return;
         }
 
+        scFac.finalize();
+
         // --- (2) local/global block coordinate descent (Liu 2013 §3),
         // ITERATION-OUTER like PbdSystem step (2): sweeping all meshes per
         // iteration is what lets a cross-cloth contact see, and be seen by,
@@ -3031,6 +3052,8 @@ struct PdSystem<METAL, PR> {
             // the probe never re-derives a projection and can never disagree
             // with the one the solve actually used. See debugObjectiveProbe.
             double probeSmooth = 0.0, probeContact = 0.0;
+
+            auto scLoc = sect("pd_local");
 
             // ---- LOCAL, springs.
             for (SolveCtx& c : ctxs) {
@@ -3582,6 +3605,9 @@ struct PdSystem<METAL, PR> {
                 debugObjectiveSmooth.push_back(probeSmooth);
                 debugObjectiveSeq.push_back(probeSmooth + probeContact);
             }
+
+            scLoc.finalize();
+            auto scGlob = sect("pd_global");
 
             // ---- GLOBAL: ONE merged back-substitution over every cloth
             // (design doc §5.4). Gather the per-mesh RHS blocks into the

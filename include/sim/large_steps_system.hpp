@@ -103,6 +103,12 @@ struct LargeStepsSystem<METAL, PR> {
     using Trip  = Eigen::Triplet<double>;
     using Vec3  = tinym::vec3_base<PR>;
 
+    // Per-section timing. Wired by main's applyProfilerLevel, so it is
+    // non-null ONLY at the InFrame tier — every section below is gated on it
+    // and costs nothing at the other tiers. Samples ACCUMULATE per frame, so
+    // a section's frame value is the sum over substeps and meshes.
+    profiler::FrameProfiler* profiler = nullptr;
+
     // ── Knobs (all reachable from the solver panel) ──────────────────────
     // CG budget. BW98 runs "a few" iterations per step; 100 is the reference
     // implementation's cap and effectively never binds on a 20x20 sheet.
@@ -202,16 +208,43 @@ struct LargeStepsSystem<METAL, PR> {
         std::vector<Tri>  tris;
         std::vector<Quad> quads;
         uint32_t degenerate = 0;
+
+        // ── Cached assembly target (buildPattern) ────────────────────────
+        // A = M − h·dfdv − h²·dfdx is assembled IN PLACE: its sparsity is a
+        // pure function of the topology (the element stencils plus the
+        // diagonal), so the pattern is built once per mesh lifetime and only
+        // the values are overwritten per substep. Measured motive: the old
+        // per-substep triplet path (build ~1.6M triplets → setFromTriplets →
+        // three sparse-sparse ops) was 318 ms of a 380 ms frame at 10k
+        // vertices — 82% of the whole solver, against 60 ms for the PCG it
+        // was feeding.
+        Eigen::SparseMatrix<double> A;
+        // (element, m, n, column) → index into A.valuePtr() of the block's
+        // FIRST row. Rows 3r, 3r+1, 3r+2 are consecutive within a column
+        // because the pattern always carries the full 3x3 block, so one index
+        // per column addresses all three. 27 ints per triangle (3x3 pairs),
+        // 48 per bend quad (4x4 pairs).
+        std::vector<int> triSlot, quadSlot;
+        std::vector<int> diagSlot;      // dof → value index of (i,i)
+        bool patValid = false;
     };
     std::vector<MeshCache> cache;    // parallel to Scene::meshes
 
     // Scratch, reused across substeps so the assembly does not re-allocate
-    // every 1/180 s. ponytail: the sparsity pattern is rebuilt via triplets
-    // each substep; if assembly ever shows up in a profile, cache the pattern
-    // and overwrite values in place (the pattern only changes with topology).
-    std::vector<Trip> kTrip, vTrip;
+    // every 1/180 s.
     Eigen::VectorXd f0, vVec, bVec, zVec, dvVec, rVec, cVec, qVec, sVec, precon;
-    Eigen::SparseMatrix<double> Kmat, Vmat, Amat;
+    // dfdx·v, accumulated 3x3 block by 3x3 block during assembly — this is
+    // the ONLY thing the old code kept a separate K matrix for (b = h(f0 +
+    // h·K·v)), so accumulating it inline retires K entirely.
+    Eigen::VectorXd Kv;
+    // Assembly cursor: the mesh's value array, the current element's slot
+    // table, and the substep's h. Members rather than parameters so
+    // accumCondition's signature stays as BW98 writes it.
+    double*    curAv   = nullptr;
+    const int* curSlot = nullptr;
+    double     asmH = 0.0, asmH2 = 0.0;
+    // The matrix the PCG runs against — the active mesh's cached A.
+    const Eigen::SparseMatrix<double>* Aptr = nullptr;
     std::vector<Mat3d> S;
     std::vector<uint8_t> contactCount;
 
@@ -275,26 +308,110 @@ struct LargeStepsSystem<METAL, PR> {
                     K += -k * hess[m][n] * C;
                     if (kd != 0.0) K += -kd * hess[m][n] * Cdot;
                 }
-                addBlock(kTrip, vid[m], vid[n], K);
-                if (kd != 0.0)
-                    addBlock(vTrip, vid[m], vid[n],
-                             -kd * (grad[m] * grad[n].transpose()));
+                // The dfdx block lands in A scaled by −h², and its product
+                // with v is b's second term — both taken here, so neither K
+                // nor a sparse matvec is ever materialized.
+                const int* slot = curSlot + (m * NV + n) * 3;
+                scatterBlock(slot, -asmH2 * K);
+                Kv.segment<3>(vid[m] * 3) += K * v.segment<3>(vid[n] * 3);
+                if (kd != 0.0)   // dfdv block, scaled by −h
+                    scatterBlock(slot,
+                                 (asmH * kd) * (grad[m] * grad[n].transpose()));
             }
         }
     }
 
-    static void addBlock(std::vector<Trip>& out, Index r, Index c,
-                         const Mat3d& blk) {
-        for (int a = 0; a < 3; ++a)
-            for (int b = 0; b < 3; ++b)
-                if (blk(a, b) != 0.0)
-                    out.emplace_back((int)(r*3+a), (int)(c*3+b), blk(a, b));
+    // Add a 3x3 block into A's value array. `slot[c]` is the value index of
+    // the block's first row within column c, and the two rows below it are
+    // contiguous — see MeshCache::triSlot.
+    void scatterBlock(const int* slot, const Mat3d& blk) {
+        for (int c = 0; c < 3; ++c) {
+            double* p = curAv + slot[c];
+            p[0] += blk(0, c);
+            p[1] += blk(1, c);
+            p[2] += blk(2, c);
+        }
+    }
+
+    // ── Sparsity pattern (built once per mesh lifetime) ──────────────────
+    // The pattern is the union of every element stencil plus the full
+    // diagonal, taken UNCONDITIONALLY: a runtime skip (a degenerate triangle,
+    // a fold-flat dihedral, shearOn/bendOn/airDrag toggled off) then only
+    // decides whether a slot is written, never which slots exist. That is
+    // what makes the slot tables valid for the whole mesh lifetime — keying
+    // them on emission order instead would silently mis-assemble the first
+    // time a bend quad went flat.
+    void buildPattern(MeshCache& mc, Index n) {
+        const Index dof = n * 3;
+        // Vertex adjacency (including self) of the assembled stencils.
+        std::vector<std::vector<Index>> adj((size_t)n);
+        auto stencil = [&](const Index* vid, int NV) {
+            for (int m = 0; m < NV; ++m)
+                for (int q = 0; q < NV; ++q)
+                    adj[(size_t)vid[m]].push_back(vid[q]);
+        };
+        for (const Tri& t : mc.tris) stencil(t.v, 3);
+        for (const Quad& q : mc.quads) {
+            const Index vid[4] = { q.i, q.j, q.k, q.p };
+            stencil(vid, 4);
+        }
+        for (Index i = 0; i < n; ++i) adj[(size_t)i].push_back(i);
+        Index nnzBlocks = 0;
+        for (auto& a : adj) {
+            std::sort(a.begin(), a.end());
+            a.erase(std::unique(a.begin(), a.end()), a.end());
+            nnzBlocks += (Index)a.size();
+        }
+
+        // Column-major build: column 3c+cc holds three rows per neighbour of
+        // c, ascending, so inserting in this order never re-sorts. Reserving
+        // the exact per-column count keeps insert() O(1).
+        mc.A.resize((int)dof, (int)dof);
+        mc.A.setZero();
+        Eigen::VectorXi room((int)dof);
+        for (Index c = 0; c < n; ++c)
+            for (int cc = 0; cc < 3; ++cc)
+                room[(int)(c*3+cc)] = 3 * (int)adj[(size_t)c].size();
+        mc.A.reserve(room);
+        for (Index c = 0; c < n; ++c)
+            for (int cc = 0; cc < 3; ++cc)
+                for (Index r : adj[(size_t)c])
+                    for (int rr = 0; rr < 3; ++rr)
+                        mc.A.insert((int)(r*3+rr), (int)(c*3+cc)) = 0.0;
+        mc.A.makeCompressed();
+        (void)nnzBlocks;
+
+        // (row, col) → value index. Inner indices are sorted within a column.
+        const int* outer = mc.A.outerIndexPtr();
+        const int* inner = mc.A.innerIndexPtr();
+        auto slotOf = [&](Index r, Index c) {
+            const int* b = inner + outer[(int)c];
+            const int* e = inner + outer[(int)c + 1];
+            return (int)(std::lower_bound(b, e, (int)r) - inner);
+        };
+        auto fill = [&](std::vector<int>& out, const Index* vid, int NV) {
+            for (int m = 0; m < NV; ++m)
+                for (int q = 0; q < NV; ++q)
+                    for (int cc = 0; cc < 3; ++cc)
+                        out.push_back(slotOf(vid[m]*3, vid[q]*3 + cc));
+        };
+        mc.triSlot.clear();  mc.triSlot.reserve(mc.tris.size() * 27);
+        for (const Tri& t : mc.tris) fill(mc.triSlot, t.v, 3);
+        mc.quadSlot.clear(); mc.quadSlot.reserve(mc.quads.size() * 48);
+        for (const Quad& q : mc.quads) {
+            const Index vid[4] = { q.i, q.j, q.k, q.p };
+            fill(mc.quadSlot, vid, 4);
+        }
+        mc.diagSlot.resize((size_t)dof);
+        for (Index i = 0; i < dof; ++i) mc.diagSlot[(size_t)i] = slotOf(i, i);
+        mc.patValid = true;
     }
 
     // ── Cache build ──────────────────────────────────────────────────────
     void rebuildCache(const GeneralMesh<METAL, PR>& mesh, MeshCache& mc,
                       Index n, Index numFacets) {
         mc.tris.clear(); mc.quads.clear(); mc.degenerate = 0;
+        mc.patValid = false;   // topology moved → every cached slot is stale
         const PR* pos = mesh.state.x.ptr;
         const Index* F = mesh.adjacency.facets.ptr;
         if (!pos || !F) return;
@@ -430,10 +547,18 @@ struct LargeStepsSystem<METAL, PR> {
             a.segment<3>(i*3) = S[(size_t)i] * a.segment<3>(i*3);
     }
 
+    // Null-profiler-safe section helper: a moved-from/default ScopedTimer has
+    // profiler == nullptr and finalizes to nothing.
+    profiler::FrameProfiler::ScopedTimer sect(const char* name) {
+        return profiler ? profiler->scoped(name)
+                        : profiler::FrameProfiler::ScopedTimer{};
+    }
+
     // Solves S·A·Δv = S·b with Δv seeded at z. precon holds P⁻¹ = 1/diag(A).
     void modifiedPCG(Index n) {
         dvVec = zVec;
         computeDelta0(n);
+        const Eigen::SparseMatrix<double>& Amat = *Aptr;
         rVec = bVec - Amat * dvVec;
         filterInPlace(rVec);
         cVec = precon.cwiseProduct(rVec);
@@ -517,22 +642,43 @@ struct LargeStepsSystem<METAL, PR> {
                 || mc.numFacets != numFacets)
                 rebuildCache(mesh, mc, n, numFacets);
             if (mc.tris.empty()) continue;
+            if (!mc.patValid) buildPattern(mc, n);
 
             double kStretch, kShear, kBend;
             stiffnessOf(mesh, kStretch, kShear, kBend);
 
             const Index dof = n * 3;
+            // ls_assemble = force + Jacobian evaluation scattered straight
+            // into A's cached value array. Finalized explicitly (no extra
+            // brace level).
+            auto scAsm = sect("ls_assemble");
             f0.setZero(dof);
+            Kv.setZero(dof);
             vVec.resize(dof);
             for (Index i = 0; i < dof; ++i) vVec[i] = (double)v[i];
-            kTrip.clear(); vTrip.clear();
+            // A := 0, then A += M − h·dfdv − h²·dfdx as the elements are
+            // walked. The mass diagonal goes in first so a mesh with no
+            // surviving element still leaves A non-singular.
+            curAv  = mc.A.valuePtr();
+            asmH   = h;
+            asmH2  = h * h;
+            Aptr   = &mc.A;
+            std::fill(curAv, curAv + mc.A.nonZeros(), 0.0);
+            for (Index i = 0; i < n; ++i) {
+                const double mi3 = (double)m[i*3];
+                const double mm = (mi3 > 0.0) ? mi3 : 1e-9;
+                for (int a = 0; a < 3; ++a)
+                    curAv[mc.diagSlot[(size_t)(i*3+a)]] += mm;
+            }
 
             // --- external forces (gravity + wind, already force units) ---
             if (ext)
                 for (Index i = 0; i < dof; ++i) f0[i] += (double)ext[i];
 
             // --- stretch + shear, per triangle ---
-            for (const Tri& t : mc.tris) {
+            for (size_t ti = 0; ti < mc.tris.size(); ++ti) {
+                const Tri& t = mc.tris[ti];
+                curSlot = mc.triSlot.data() + ti * 27;
                 const Vec3d x0 = posAt(x, t.v[0]);
                 const Vec3d x1 = posAt(x, t.v[1]);
                 const Vec3d x2 = posAt(x, t.v[2]);
@@ -600,7 +746,9 @@ struct LargeStepsSystem<METAL, PR> {
 
             // --- bend, per interior edge (Gauss-Newton: C_mn dropped) ---
             if (bendOn && kBend != 0.0) {
-                for (const Quad& q : mc.quads) {
+                for (size_t qi = 0; qi < mc.quads.size(); ++qi) {
+                    const Quad& q = mc.quads[qi];
+                    curSlot = mc.quadSlot.data() + qi * 48;
                     double theta; Vec3d g[4];
                     if (!dihedral(x, q, theta, &g)) continue;
                     const Index vid[4] = { q.i, q.j, q.k, q.p };
@@ -614,44 +762,42 @@ struct LargeStepsSystem<METAL, PR> {
                 }
             }
 
-            // --- air drag: f += −airDrag·v  (a dfdv diagonal) ---
+            // --- air drag: f += −airDrag·v  (a dfdv diagonal, so A += h·drag) ---
             if (airDrag != 0.0) {
                 for (Index i = 0; i < dof; ++i) f0[i] += -airDrag * vVec[i];
                 for (Index i = 0; i < dof; ++i)
-                    vTrip.emplace_back((int)i, (int)i, -airDrag);
+                    curAv[mc.diagSlot[(size_t)i]] += h * airDrag;
             }
 
-            // --- A = M − h·dfdv − h²·dfdx,  b = h(f0 + h·dfdx·v) ---
-            Kmat.resize((int)dof, (int)dof);
-            Vmat.resize((int)dof, (int)dof);
-            Kmat.setFromTriplets(kTrip.begin(), kTrip.end());
-            Vmat.setFromTriplets(vTrip.begin(), vTrip.end());
-            Eigen::SparseMatrix<double> Mmat((int)dof, (int)dof);
-            {
-                std::vector<Trip> mt; mt.reserve((size_t)dof);
-                for (Index i = 0; i < n; ++i) {
-                    const double mi3 = (double)m[i*3];
-                    const double mm = (mi3 > 0.0) ? mi3 : 1e-9;
-                    for (int a = 0; a < 3; ++a)
-                        mt.emplace_back((int)(i*3+a), (int)(i*3+a), mm);
-                }
-                Mmat.setFromTriplets(mt.begin(), mt.end());
-            }
-            Amat = Mmat - h * Vmat - (h*h) * Kmat;
-            bVec = h * (f0 + h * (Kmat * vVec));
+            // b = h(f0 + h·dfdx·v). A is already complete: the mass diagonal
+            // went in before the element walk, each element scattered its
+            // −h²·dfdx and −h·dfdv, and Kv carries dfdx·v from the same walk.
+            bVec = h * (f0 + h * Kv);
+            scAsm.finalize();
 
             // --- constraint filter S and the seeded velocity z ---
-            buildFilter(sceneObjects, mesh, mi, n, x, v, m, mask,
-                        haveContacts, colFacet, colOff, off, h);
+            {
+                auto scFil = sect("ls_filter");
+                buildFilter(sceneObjects, mesh, mi, n, x, v, m, mask,
+                            haveContacts, colFacet, colOff, off, h);
 
-            // P⁻¹ = 1/diag(A) (deviation 3).
-            precon.resize(dof);
-            for (Index i = 0; i < dof; ++i) {
-                const double d = Amat.coeff((int)i, (int)i);
-                precon[i] = (std::abs(d) > 1e-30) ? 1.0 / d : 1.0;
+                // P⁻¹ = 1/diag(A) (deviation 3).
+                precon.resize(dof);
+                for (Index i = 0; i < dof; ++i) {
+                    const double d = curAv[mc.diagSlot[(size_t)i]];
+                    precon[i] = (std::abs(d) > 1e-30) ? 1.0 / d : 1.0;
+                }
             }
 
-            modifiedPCG(n);
+            {
+                auto scCg = sect("ls_pcg");
+                modifiedPCG(n);
+            }
+            // Iteration count parked in a "timing" column so it lands in the
+            // same CSV — the units are iterations, not ms. Needed to read
+            // ls_pcg: cost/iteration is what a GPU port would actually move.
+            if (profiler) profiler->addSample("ls_cg_iters",
+                                              (double)lastIterations);
 
             // --- integrate; pinned vertices are held outright ---
             for (Index i = 0; i < n; ++i) {

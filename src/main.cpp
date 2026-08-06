@@ -135,15 +135,27 @@ struct SimulatorBuilder {
                          "' but this build is '" + have + "'";
             return false;
         }
-        if (config.engine.system != "Explicit") {
+        if (!sim_config::isKnownSystem(config.engine.system)) {
             if (error)
-                *error = "config requests system '" + config.engine.system +
-                         "' but this build only wires 'Explicit'";
+                *error = "config requests unknown system '" +
+                         config.engine.system + "'";
             return false;
         }
         // applySnapshot sets system timing (h/subSteps), environment, and
         // rebuilds the object set — the exact GUI-load path (req 3).
         sim.applySnapshot(config.scene, sceneDir);
+        // Solver selection, mirroring the registry scenes' postInit: the CPU
+        // siblings rebuild their contact set from the narrow phase every
+        // substep, so a held broad phase would let a sheet drift through
+        // between refreshes (see postInitPdCloth / postInitLsCloth).
+        sim.usePbd = sim.usePd = sim.useLargeSteps = false;
+        if (config.engine.system != "Explicit") {
+            if (config.engine.system == "PBD")        sim.usePbd = true;
+            else if (config.engine.system == "PD")    sim.usePd = true;
+            else                                      sim.useLargeSteps = true;
+            sim.cdSubstepPeriod    = 1;
+            sim.refitSubstepPeriod = 1;
+        }
         return true;
     }
 };
@@ -1016,6 +1028,10 @@ int main(int argc, char** argv) {
         simulator.profiler = p;
         simulator.shBroadPhase.profiler = p;
         simulator.mlBroadPhase.profiler = p;
+        // CPU solver sections (pd_*/ls_*) live inside system_update; same
+        // InFrame-only gate as the broad phases.
+        simulator.pd.profiler = p;
+        simulator.largeSteps.profiler = p;
     };
     applyProfilerLevel();
     std::cout << "[profile] level = "
