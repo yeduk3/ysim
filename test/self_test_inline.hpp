@@ -11761,6 +11761,402 @@ static int runSelfTest() {
         system.subh     = pbtSavedSubh;
     }
 
+    // ---- Block LS: Baraff-Witkin implicit Euler (LargeStepsSystem) -------
+    // The four things that can independently be wrong in this port:
+    //   LS-3  the bend condition's analytic ∂θ/∂x matches a central
+    //         difference of θ — this is the term whose SIGN the reference
+    //         implementation's convention makes easy to get backwards, and a
+    //         flipped sign makes bending ANTI-restoring (it would still look
+    //         "plausible" for a few frames),
+    //   LS-1  a pinned sheet solves, holds its pins, sags, and stays finite,
+    //   LS-2  it is stable at subSteps == 1 (h = 1/60) — the whole point of
+    //         an implicit solver, and the property the symplectic path does
+    //         NOT have at these stiffnesses,
+    //   LS-4  the contact filter stops a free sheet at the floor instead of
+    //         letting it pass through (and without launching it).
+    {
+        using LS = LargeStepsSystem<Backend, Precision>;
+        const size_t lsSavedSubSteps = system.subSteps;
+        const Precision lsSavedSubh  = system.subh;
+
+        // ---- LS-3 — analytic vs numeric ∂θ/∂x on one bend quad ----------
+        {
+            // A clearly bent pair of triangles sharing edge (0,1): sinθ is
+            // far from 0, so the 1/sinθ factor is well conditioned and the
+            // finite difference is meaningful.
+            Precision P4[12] = {
+                0.0f, 0.0f, 0.0f,      // i
+                1.0f, 0.0f, 0.0f,      // j
+                0.2f, 0.9f, 0.3f,      // k
+                0.3f, -0.8f, 0.5f      // p
+            };
+            typename LS::Quad q; q.i = 0; q.j = 1; q.k = 2; q.p = 3;
+            q.theta0 = 0.0; q.weight = 1.0;
+            double th0 = 0.0;
+            typename LS::Vec3d g[4];
+            const bool ok = LS::dihedral(P4, q, th0, &g);
+            double worst = 0.0, worstScale = 0.0;
+            if (ok) {
+                const double eps = 1e-5;
+                for (int m = 0; m < 4; ++m)
+                    for (int c = 0; c < 3; ++c) {
+                        const Precision save = P4[m*3+c];
+                        double tp = 0, tm = 0;
+                        P4[m*3+c] = (Precision)(save + eps);
+                        if (!LS::dihedral(P4, q, tp, nullptr)) { P4[m*3+c] = save; continue; }
+                        P4[m*3+c] = (Precision)(save - eps);
+                        if (!LS::dihedral(P4, q, tm, nullptr)) { P4[m*3+c] = save; continue; }
+                        P4[m*3+c] = save;
+                        const double num = (tp - tm) / (2.0 * eps);
+                        worst = std::max(worst, std::fabs(num - g[m][c]));
+                        worstScale = std::max(worstScale, std::fabs(num));
+                    }
+            }
+            const char* n3 = "LS-3 / bend ∂θ/∂x matches a numeric gradient";
+            if (!ok)
+                fail(n3, "dihedral() refused a well-conditioned bent quad");
+            // Positions are float, so the central difference itself carries
+            // ~1e-2 absolute noise on a gradient of order 1; the bound only
+            // has to catch a WRONG term (sign flip = 2x, missing 1/sinθ =
+            // O(1) relative), not certify 6 digits.
+            else if (!(worst < 0.05 * std::max(1.0, worstScale)))
+                fail(n3, "max |analytic - numeric| = " + std::to_string(worst)
+                     + " against numeric scale " + std::to_string(worstScale));
+            else
+                pass(n3);
+        }
+
+        auto lsClothStats = [&](int id, double& minY, double& meanStrain,
+                                bool& finite) {
+            minY = 1e30; meanStrain = 0.0; finite = true;
+            auto* m = Scene<Backend, Precision>::findById(id);
+            if (!m || !m->state.x.ptr) { finite = false; return; }
+            const Index n = m->state.x.size / 3;
+            for (Index i = 0; i < n; ++i) {
+                for (int c = 0; c < 3; ++c)
+                    if (!std::isfinite((double)m->state.x.ptr[i*3+c])) finite = false;
+                minY = std::min(minY, (double)m->state.x.ptr[i*3+1]);
+            }
+            const Index* E = m->adjacency.edges.ptr;
+            const Precision* R = m->adjacency.restEdgeLengths.ptr;
+            const Index ne = E ? (Index)m->adjacency.edges.size / 2 : 0;
+            if (!E || !R || ne == 0) return;
+            double acc = 0.0; Index cnt = 0;
+            for (Index e = 0; e < ne; ++e) {
+                const Index a = E[e*2], b = E[e*2+1];
+                if (a >= n || b >= n) continue;
+                double d2 = 0.0;
+                for (int c = 0; c < 3; ++c) {
+                    const double dc = (double)m->state.x.ptr[b*3+c]
+                                    - (double)m->state.x.ptr[a*3+c];
+                    d2 += dc * dc;
+                }
+                const double rest = (double)R[e];
+                if (!(rest > 1e-9)) continue;
+                acc += std::fabs(std::sqrt(d2) - rest) / rest;
+                ++cnt;
+            }
+            if (cnt > 0) meanStrain = acc / (double)cnt;
+        };
+
+        // ---- LS-1 — pinned sheet, no collider ---------------------------
+        resetScene();
+        sim.usePbd = false; sim.usePd = false;
+        sim.useLargeSteps = true;
+        sim.largeSteps.anomalyCount = 0;
+        system.subSteps = 3;
+        system.subh     = system.h / Precision(3);
+        sim.addCloth(8, 0.8f, tinym::vec3(0.0f, 1.0f, 0.0f));   // id 0
+        sim.initialize();
+        sim.setVertexFixed(0, 0, true);
+        sim.setVertexFixed(0, 7, true);
+
+        std::vector<Index> lsPinned;
+        std::vector<double> lsPinnedPos;
+        {
+            auto* cloth = Scene<Backend, Precision>::findById(0);
+            if (cloth && cloth->constraints.fixedParticles.ptr) {
+                const Index n = cloth->state.x.size / 3;
+                for (Index i = 0; i < n; ++i)
+                    if (cloth->constraints.fixedParticles.ptr[i] == Precision(0)) {
+                        lsPinned.push_back(i);
+                        for (int c = 0; c < 3; ++c)
+                            lsPinnedPos.push_back((double)cloth->state.x.ptr[i*3+c]);
+                    }
+            }
+        }
+
+        double lsY0 = 0, lsErr0 = 0; bool lsFin0 = true;
+        lsClothStats(0, lsY0, lsErr0, lsFin0);
+        sim.pause = false;
+        for (int f = 0; f < 60; ++f) sim.update();
+        MetalGlobalContext::commitAndWait();
+        sim.pause = true;
+        double lsY1 = 0, lsErr1 = 0; bool lsFin1 = true;
+        lsClothStats(0, lsY1, lsErr1, lsFin1);
+
+        double lsPinDrift = 0.0;
+        {
+            auto* cloth = Scene<Backend, Precision>::findById(0);
+            if (!cloth || lsPinned.empty()) lsPinDrift = 1e30;
+            else for (size_t p = 0; p < lsPinned.size(); ++p)
+                for (int c = 0; c < 3; ++c)
+                    lsPinDrift = std::max(lsPinDrift,
+                        std::fabs((double)cloth->state.x.ptr[lsPinned[p]*3+c]
+                                  - lsPinnedPos[p*3+c]));
+        }
+
+        const char* n1 = "LS-1 / implicit solve holds pins, sags, stays finite";
+        if (lsPinned.empty())
+            fail(n1, "setVertexFixed pinned no vertex");
+        else if (!lsFin1)
+            fail(n1, "non-finite vertex after 60 frames");
+        else if (sim.largeSteps.anomalyCount != 0)
+            fail(n1, "PCG produced NaN/Inf " +
+                 std::to_string(sim.largeSteps.anomalyCount) + " times");
+        else if (lsPinDrift > 1e-6)
+            fail(n1, "pinned vertex moved by " + std::to_string(lsPinDrift) + " m");
+        else if (!(lsY1 < lsY0 - 1e-3))
+            fail(n1, "min y did not drop (" + std::to_string(lsY0) + " -> "
+                 + std::to_string(lsY1) + ") — gravity or the assembly is dead");
+        else if (lsErr1 > 0.20)
+            fail(n1, "mean edge strain " + std::to_string(lsErr1)
+                 + " > 0.20 — the stretch condition is not carrying the load");
+        else
+            pass(n1);
+        std::cerr << "[LS info] LS-1 minY " << lsY0 << " -> " << lsY1
+                  << ", mean strain " << lsErr1
+                  << ", CG iters " << sim.largeSteps.lastIterations << "\n";
+
+        // ---- LS-2 — ONE substep per frame (h = 1/60) --------------------
+        // Same scene, same stiffness, 20x the step the sheet just ran at.
+        // An explicit integrator diverges here; this clause is the reason
+        // the solver exists, so it asserts finiteness AND a bounded strain,
+        // not merely "did not NaN".
+        resetScene();
+        sim.useLargeSteps = true;
+        sim.largeSteps.anomalyCount = 0;
+        system.subSteps = 1;
+        system.subh     = system.h;
+        sim.addCloth(8, 0.8f, tinym::vec3(0.0f, 1.0f, 0.0f));   // id 0
+        sim.initialize();
+        sim.setVertexFixed(0, 0, true);
+        sim.setVertexFixed(0, 7, true);
+        sim.pause = false;
+        for (int f = 0; f < 60; ++f) sim.update();
+        MetalGlobalContext::commitAndWait();
+        sim.pause = true;
+        double bigY = 0, bigErr = 0; bool bigFin = true;
+        lsClothStats(0, bigY, bigErr, bigFin);
+
+        const char* n2 = "LS-2 / stable at subSteps == 1 (h = 1/60)";
+        if (!bigFin)
+            fail(n2, "non-finite vertex after 60 frames at h = 1/60");
+        else if (sim.largeSteps.anomalyCount != 0)
+            fail(n2, "PCG produced NaN/Inf " +
+                 std::to_string(sim.largeSteps.anomalyCount) + " times");
+        else if (!(bigY > -50.0))
+            fail(n2, "sheet escaped to y = " + std::to_string(bigY)
+                 + " — the solve went unstable");
+        else if (bigErr > 0.50)
+            fail(n2, "mean edge strain " + std::to_string(bigErr)
+                 + " > 0.50 at h = 1/60 — the large step is not being taken");
+        else
+            pass(n2);
+        std::cerr << "[LS info] LS-2 minY " << bigY << ", mean strain "
+                  << bigErr << "\n";
+
+        // ---- LS-4 — contact filter against a Float floor ----------------
+        resetScene();
+        sim.useLargeSteps = true;
+        sim.largeSteps.anomalyCount = 0;
+        sim.largeSteps.contactsEnabled = true;
+        system.subSteps = 3;
+        system.subh     = system.h / Precision(3);
+        sim.cdSubstepPeriod    = 1;
+        sim.refitSubstepPeriod = 1;
+        sim.addPlane(PlaneDirection::XZPlane, tinym::vec3(0, 0, 0), 24, 3.0,
+                     0.1, BehaviorType::Float);                     // id 0
+        sim.addCloth(12, 1.0f, tinym::vec3(0.0f, 0.6f, 0.0f));      // id 1
+        sim.initialize();
+        sim.pause = false;
+        for (int f = 0; f < 90; ++f) sim.update();
+        MetalGlobalContext::commitAndWait();
+        sim.pause = true;
+        double floorY = 0, floorErr = 0; bool floorFin = true;
+        lsClothStats(1, floorY, floorErr, floorFin);
+
+        const char* n4 = "LS-4 / contact filter stops the sheet at the floor";
+        if (!floorFin)
+            fail(n4, "non-finite vertex after 90 frames");
+        else if (sim.largeSteps.anomalyCount != 0)
+            fail(n4, "PCG produced NaN/Inf " +
+                 std::to_string(sim.largeSteps.anomalyCount) + " times");
+        else if (floorY < -0.2)
+            fail(n4, "lowest vertex at y = " + std::to_string(floorY)
+                 + " — the sheet went through the floor (filter never fired?)");
+        else if (floorY > 0.5)
+            fail(n4, "lowest vertex still at y = " + std::to_string(floorY)
+                 + " after 1.5 s — the sheet never fell (filter is gluing it)");
+        else
+            pass(n4);
+        std::cerr << "[LS info] LS-4 minY " << floorY << ", contacts "
+                  << sim.largeSteps.lastContacts << "\n";
+
+        // ---- LS-5 — the registry scenes build, select the solver, and run --
+        // Driven exactly as `--scene <name>` does (setup + initialize +
+        // postInit). Registry scenes are otherwise only reachable
+        // interactively, so without this clause a scene could rot into a
+        // build error or a solver that never gets selected and nothing would
+        // catch it. Each is checked for the flag AND for staying finite —
+        // ls_cloth_flag in particular puts a gale on the sheet, which is the
+        // load most likely to blow an unstable assembly up.
+        {
+            struct LsScene { const char* name; int frames; int clothId; };
+            const LsScene scenes[] = {
+                { "ls_cloth_hang",       40, 0 },
+                { "ls_cloth",            40, 1 },
+                { "ls_cloth_ball",       40, 1 },
+                { "ls_cloth_flag",       60, 1 },
+                { "ls_analytic_sphere",  40, 1 },
+            };
+            const char* n5 = "LS-5 / ls_* registry scenes build, select the "
+                             "implicit solver, and stay finite";
+            std::string bad;
+            for (const auto& s : scenes) {
+                const auto* entry = scene_registry::find<Backend, Precision>(s.name);
+                if (!entry) { bad = std::string(s.name) + ": not in the registry"; break; }
+                resetScene();
+                sim.usePbd = false; sim.usePd = false; sim.useLargeSteps = false;
+                sim.largeSteps.anomalyCount = 0;
+                entry->setup(sim, system);
+                sim.initialize();
+                if (entry->postInit) entry->postInit(sim);
+                if (!sim.useLargeSteps) {
+                    bad = std::string(s.name) + ": postInit did not select the "
+                          "implicit solver";
+                    break;
+                }
+                bool finite = true;
+                double y0 = 0, y1 = 0, moved = 0, vPeak = 0;
+                int divergedAt = -1;
+                {
+                    auto* cloth = Scene<Backend, Precision>::findById(s.clothId);
+                    if (cloth && cloth->state.x.ptr) {
+                        y0 = 1e30;
+                        const Index n = cloth->state.x.size / 3;
+                        for (Index i = 0; i < n; ++i)
+                            y0 = std::min(y0, (double)cloth->state.x.ptr[i*3+1]);
+                    }
+                }
+                sim.pause = false;
+                for (int f = 0; f < s.frames && finite; ++f) {
+                    sim.update();
+                    MetalGlobalContext::commitAndWait();
+                    auto* cloth = Scene<Backend, Precision>::findById(s.clothId);
+                    if (!cloth || !cloth->state.x.ptr) { finite = false; break; }
+                    const Index n = cloth->state.x.size / 3;
+                    for (Index i = 0; i < n * 3 && finite; ++i)
+                        if (!std::isfinite((double)cloth->state.x.ptr[i]))
+                            finite = false;
+                    // Speed ceiling, checked EVERY frame. Finiteness alone
+                    // does not catch a divergence: the run that exposed the
+                    // indefinite-A bug reached |v| 2.9e4 at frame 23 and
+                    // 9.4e16 by frame 30 while staying finite the whole way,
+                    // and the end-of-run snapshot could not tell that from a
+                    // fast scene. 50 m/s is ~4x the fastest legitimate number
+                    // these scenes produce (the flag's gale peaks at 12.5).
+                    for (Index i = 0; i < n * 3 && vPeak < 50.0; ++i)
+                        vPeak = std::max(vPeak,
+                                         std::fabs((double)cloth->state.v.ptr[i]));
+                    if (vPeak >= 50.0) { divergedAt = f; break; }
+                }
+                sim.pause = true;
+                {
+                    auto* cloth = Scene<Backend, Precision>::findById(s.clothId);
+                    if (cloth && cloth->state.x.ptr) {
+                        y1 = 1e30;
+                        const Index n = cloth->state.x.size / 3;
+                        for (Index i = 0; i < n; ++i) {
+                            y1 = std::min(y1, (double)cloth->state.x.ptr[i*3+1]);
+                            for (int c = 0; c < 3; ++c)
+                                moved = std::max(moved,
+                                    std::fabs((double)cloth->state.v.ptr[i*3+c]));
+                        }
+                    }
+                }
+                if (!finite) {
+                    bad = std::string(s.name) + ": non-finite cloth vertex inside "
+                          + std::to_string(s.frames) + " frames";
+                    break;
+                }
+                if (divergedAt >= 0) {
+                    bad = std::string(s.name) + ": |v| hit "
+                          + std::to_string(vPeak) + " m/s at frame "
+                          + std::to_string(divergedAt) + " — the solve diverged";
+                    break;
+                }
+                // A scene the solver silently SKIPS (empty element cache, a
+                // behavior tag it does not accept, a mesh index it never
+                // reaches) looks identical to a passing one if the only
+                // assertion is finiteness — the cloth just sits there. Any
+                // real motion is enough: these scenes all start under gravity.
+                if (!(std::fabs(y1 - y0) > 1e-4 || moved > 1e-4)) {
+                    bad = std::string(s.name) + ": cloth never moved in "
+                          + std::to_string(s.frames)
+                          + " frames (minY " + std::to_string(y0) + " -> "
+                          + std::to_string(y1) + ") — the solver skipped it";
+                    break;
+                }
+                if (sim.largeSteps.anomalyCount != 0) {
+                    bad = std::string(s.name) + ": PCG produced NaN/Inf "
+                          + std::to_string(sim.largeSteps.anomalyCount) + " times";
+                    break;
+                }
+                // ls_cloth_ball's whole point: the sheet must HOLD the ball.
+                // The filter alone cannot — it constrains cloth velocity and
+                // gives the body nothing back — so this clause is what proves
+                // the rigidDelta writeback and the relative-velocity target
+                // are both live. Ball is mesh id 2, spawned at y = 1.0 with
+                // radius 0.25 over a sheet pinned at y = 0.6; without the
+                // coupling it fell to y ≈ −177.
+                if (std::string(s.name) == "ls_cloth_ball") {
+                    auto* ball = Scene<Backend, Precision>::findById(2);
+                    double by = -1e30;
+                    if (ball && ball->state.x.ptr) {
+                        const Index bn = ball->state.x.size / 3;
+                        by = 0.0;
+                        for (Index i = 0; i < bn; ++i)
+                            by += (double)ball->state.x.ptr[i*3+1];
+                        if (bn > 0) by /= (double)bn;
+                    }
+                    if (!(by > 0.3)) {
+                        bad = "ls_cloth_ball: ball centroid fell to y = "
+                              + std::to_string(by)
+                              + " — the cloth did not hold it (cloth→rigid "
+                                "coupling dead?)";
+                        break;
+                    }
+                    std::cerr << "[LS info] LS-5 ls_cloth_ball ball centroid y "
+                              << by << ", coupled rows "
+                              << sim.largeSteps.lastCoupledRows << "\n";
+                }
+                std::cerr << "[LS info] LS-5 " << s.name << " ok, minY "
+                          << y0 << " -> " << y1 << ", peak|v| " << vPeak
+                          << ", end|v| " << moved
+                          << ", contacts " << sim.largeSteps.lastContacts
+                          << ", CG iters " << sim.largeSteps.lastIterations << "\n";
+            }
+            if (!bad.empty()) fail(n5, bad); else pass(n5);
+        }
+
+        sim.pause = true;
+        sim.useLargeSteps = false;
+        Scene<Backend, Precision>::environment.wind = tinym::vec3(0.0f, 0.0f, 0.0f);
+        system.subSteps = lsSavedSubSteps;
+        system.subh     = lsSavedSubh;
+    }
+
     if (failures == 0) {
         std::cerr << "[self-test] all checks passed\n";
         return 0;

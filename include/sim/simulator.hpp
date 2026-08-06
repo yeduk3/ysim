@@ -25,6 +25,13 @@ struct Simulator {
     PdSystem<BE, PR> pd;
     bool usePd = false;
 
+    // Sibling CPU implicit-Euler solver (Baraff & Witkin 1998), wired exactly
+    // like `pbd` / `pd` above and for the same reasons. Highest priority in
+    // the dispatch chain below, so the four flags stay a total order and no
+    // substep is ever stepped twice.
+    LargeStepsSystem<BE, PR> largeSteps;
+    bool useLargeSteps = false;
+
     //using BroadPhase = BVH<BVHMODE::LINEAR, BVHPRIMITIVE::TRIANGLE, PR>;
     using BroadPhase = BVH<BE, PR, BVHMODE::SCENE, BVHPRIMITIVE::OBJECT>;
     using NarrowPhase = BruteForce<METAL, PR>;
@@ -3248,6 +3255,8 @@ struct Simulator {
             // and stays at the authorial spawn during sim (acceptable —
             // the live position is shown by the render itself).
             m.rigidLastBodyPos = now;
+            // Mirror for the CPU solvers (see GeneralMesh::rigidLinearVel).
+            m.rigidLinearVel = rigid_.getLinearVelocity(m.rigidBodyHandle);
         }
 
         // CPU-solver (PBD/PD) cloth→rigid coupling: open a new accumulation
@@ -3260,6 +3269,8 @@ struct Simulator {
         // indexing it, so a mid-run solver toggle is safe either way.
         if (usePbd) pbd.beginFrameRigid((Index)Scene<BE, PR>::meshes.size());
         if (usePd)  pd.beginFrameRigid((Index)Scene<BE, PR>::meshes.size());
+        if (useLargeSteps)
+            largeSteps.beginFrameRigid((Index)Scene<BE, PR>::meshes.size());
         // Same window, different quantity: PD's residual-penetration
         // diagnostics are per FRAME (design doc §6.3), while step() is one
         // substep — a resting contact fires rows in some substeps and not
@@ -3595,20 +3606,23 @@ struct Simulator {
             // old CPU memcpy loop. Rides the current encoder (no sync).
             system.snapshotXPrev(scene);
 
-            // Solver dispatch. `usePd` picks the CPU Projective Dynamics
-            // sibling, `usePbd` the CPU PBD one; PD wins when both are set so
-            // the priority is a total order and no substep is stepped twice.
+            // Solver dispatch. `useLargeSteps` picks the CPU Baraff-Witkin
+            // implicit-Euler sibling, `usePd` the Projective Dynamics one,
+            // `usePbd` the PBD one; the chain below is a total order so no
+            // substep is ever stepped twice.
             // The symplectic System still owns timing (subh) and the xPrev
             // snapshot above, so switching mid-run needs no re-init.
             if (profiler) {
                 auto scope = profiler->scoped("system_update");
-                if (usePd)       pd.step(scene, system.subh);
-                else if (usePbd) pbd.step(scene, system.subh);
-                else             system.update(scene);
+                if (useLargeSteps) largeSteps.step(scene, system.subh);
+                else if (usePd)    pd.step(scene, system.subh);
+                else if (usePbd)   pbd.step(scene, system.subh);
+                else               system.update(scene);
             } else {
-                if (usePd)       pd.step(scene, system.subh);
-                else if (usePbd) pbd.step(scene, system.subh);
-                else             system.update(scene);
+                if (useLargeSteps) largeSteps.step(scene, system.subh);
+                else if (usePd)    pd.step(scene, system.subh);
+                else if (usePbd)   pbd.step(scene, system.subh);
+                else               system.update(scene);
             }
 
             // Experiment: PerFrame + perFrameSubstepCommit → flush this substep's
@@ -3700,6 +3714,8 @@ struct Simulator {
         };
         if (usePd  && !pd.rigidDelta.empty())  applyClothRigidDeltas(pd.rigidDelta);
         if (usePbd && !pbd.rigidDelta.empty()) applyClothRigidDeltas(pbd.rigidDelta);
+        if (useLargeSteps && !largeSteps.rigidDelta.empty())
+            applyClothRigidDeltas(largeSteps.rigidDelta);
 
         system.acctime += system.h;
         frame++;

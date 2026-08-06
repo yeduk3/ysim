@@ -392,6 +392,121 @@ void postInitPbdClothFlag(SimOf<BE, PR>& simulator) {
                  "(ratio 1.30, budget 3/step, subSteps=3)\n";
 }
 
+// "ls_cloth_hang": a corner-pinned sheet with NO collider, solved by the
+// Baraff-Witkin implicit-Euler sibling. Deliberately collision-free — this is
+// the scene that isolates the material model and the modified-PCG solve, so a
+// wrong condition force shows up here instead of hiding behind contact
+// response. The subStep budget is 3, not the symplectic default's 60: taking
+// a large stable step is the ONLY reason this solver exists.
+template <typename BE, typename PR>
+void setupLsClothHang(SimOf<BE, PR>& simulator, SysOf<BE, PR>& system) {
+    const PR kstretch = 1e5, kshear = 1e5, kbend = 2e5;
+    const PR mass = 0.1, thickness = 0.01;
+    const Index n = 20;
+    const PR size = 1, y = 0.6;
+    simulator.addCloth(n, size, tinym::vec3(0, (float)y, 0), kstretch, kshear,
+                       kbend, thickness, mass);                          // id 0
+    {
+        // Two adjacent corners only, so the sheet hangs and sags instead of
+        // staying a taut plane — sag is what the stretch/bend model is read
+        // off, and a 4-corner pin would make gravity a nearly pure membrane
+        // load.
+        auto& req = Scene<BE, PR>::requestsGeneralMeshes.back();
+        const float h = (float)(size / 2);
+        const uint32_t vids[2] = { 0, (uint32_t)n - 1 };
+        const tinym::vec3 pos[2] = { { -h, (float)y, -h }, { h, (float)y, -h } };
+        for (int i = 0; i < 2; ++i)
+            req.fixedVertices.push_back(FixedVertex{ vids[i], pos[i] });
+    }
+    system.subSteps = 3;
+    system.subh     = system.h / PR(3);
+}
+
+template <typename BE, typename PR>
+void postInitLsClothHang(SimOf<BE, PR>& simulator) {
+    simulator.useLargeSteps = true;
+    std::cout << "[Main] --scene ls_cloth_hang: CPU Baraff-Witkin implicit "
+                 "solver, 2-corner pinned sheet, no collider, subSteps=3\n";
+}
+
+// "ls_cloth": the pbd_cloth/pd_cloth geometry (floor + free sheet) under the
+// same solver, so the contact FILTER (BW98 §5.3) is exercised on identical
+// geometry — a one-flag A/B against the other three solvers.
+template <typename BE, typename PR>
+void setupLsCloth(SimOf<BE, PR>& simulator, SysOf<BE, PR>& system) {
+    setupPbdCloth<BE, PR>(simulator, system);
+    system.subSteps = 3;
+    system.subh     = system.h / PR(3);
+}
+
+template <typename BE, typename PR>
+void postInitLsCloth(SimOf<BE, PR>& simulator) {
+    simulator.useLargeSteps = true;
+    // Same reason the PBD/PD scenes force it: the filter is rebuilt from the
+    // CONTACT SET every substep, so a held broad phase would let the sheet
+    // drift through between refreshes.
+    simulator.cdSubstepPeriod    = 1;
+    simulator.refitSubstepPeriod = 1;
+    std::cout << "[Main] --scene ls_cloth: CPU Baraff-Witkin implicit solver, "
+                 "floor contact filter ON, subSteps=3\n";
+}
+
+// The three scenes below are EXISTING scenes re-solved by LargeStepsSystem —
+// geometry comes from the SAME setup function, so each is a one-flag A/B
+// against its PBD/symplectic twin (the pd_cloth principle). Only one-sided
+// contact scenes are cloned: the BW98 constraint filter is a per-vertex
+// operator and cannot express a two-way cloth-cloth or self row at all, so
+// `pbd_cloth_stack` (cross-cloth) and `pbd_cloth_xyfold` (self-collision test
+// bed) have NO ls_ twin — cloning them would ship two scenes whose whole
+// point this solver silently drops. Those stay PD's.
+
+// "ls_cloth_ball": pbd_cloth_ball geometry — corner-pinned sheet, 0.5 m Rigid
+// ball dropped through it. Exercises the filter against a MOVING analytic
+// Sphere collider. Caveat this scene makes visible: LargeStepsSystem has no
+// cloth→rigid writeback (no rigidDelta), so the ball is not supported by the
+// sheet — it drives the cloth and keeps falling.
+template <typename BE, typename PR>
+void setupLsClothBall(SimOf<BE, PR>& simulator, SysOf<BE, PR>& system) {
+    setupPbdClothBall<BE, PR>(simulator, system);
+    system.subSteps = 3;
+    system.subh     = system.h / PR(3);
+}
+
+template <typename BE, typename PR>
+void postInitLsClothBall(SimOf<BE, PR>& simulator) {
+    simulator.useLargeSteps = true;
+    simulator.cdSubstepPeriod    = 1;   // same rationale as postInitLsCloth
+    simulator.refitSubstepPeriod = 1;
+    std::cout << "[Main] --scene ls_cloth_ball: CPU Baraff-Witkin implicit "
+                 "solver, corner-pinned cloth, Rigid ball drop "
+                 "(no cloth→rigid coupling yet — the ball is not held up)\n";
+}
+
+// "ls_cloth_flag": pbd_cloth_flag geometry — left-column pinned 2.5x1 m sheet
+// in the same gale. TEARING IS OFF and cannot be turned on here: tearing is a
+// PbdSystem pass, so this scene is the flag's dynamics only. What it shows
+// that the hanging scene cannot: a large wind load carried by the implicit
+// solve without the substep budget the explicit path needs.
+template <typename BE, typename PR>
+void setupLsClothFlag(SimOf<BE, PR>& simulator, SysOf<BE, PR>& system) {
+    setupPbdClothFlag<BE, PR>(simulator, system);
+    system.subSteps = 3;
+    system.subh     = system.h / PR(3);
+}
+
+template <typename BE, typename PR>
+void postInitLsClothFlag(SimOf<BE, PR>& simulator) {
+    simulator.useLargeSteps = true;
+    simulator.cdSubstepPeriod    = 1;
+    simulator.refitSubstepPeriod = 1;
+    std::cout << "[Main] --scene ls_cloth_flag: CPU Baraff-Witkin implicit "
+                 "solver, left-edge pinned 2.5x1 m flag in a cross-wind, "
+                 "NO tearing (PBD-only pass), subSteps=3\n";
+}
+
+// ls_analytic_sphere lives further down, next to the analytic scenes it
+// clones — setupAnalyticSphere is declared after this point.
+
 // "pd_cloth": the pbd_cloth scene solved by the CPU Projective Dynamics
 // sibling instead. Identical geometry on purpose — the two CPU solvers are
 // only comparable if the scene is byte-identical, so `--scene pbd_cloth` vs
@@ -585,6 +700,32 @@ void postInitAnalyticZoo(SimOf<BE, PR>& simulator) {
                  "sphere/box/cylinder keep their initializer colliders\n";
 }
 
+// "ls_analytic_sphere": analytic_sphere geometry — a 24x24 sheet released on a
+// static 1.2 m Sphere collider, solved by LargeStepsSystem. The purest read of
+// the contact filter: one analytic target, no rigid body, no pins, so a drape
+// that slides off or a sheet that sticks is the filter's doing and nothing
+// else's.
+//
+// Deliberately the SPHERE scene and not analytic_zoo: the zoo's sheet is
+// 48x48 (6912 DOF) and this solver assembles + CG-solves on the CPU per
+// substep, so the zoo is a perf experiment, not a correctness scene.
+template <typename BE, typename PR>
+void setupLsAnalyticSphere(SimOf<BE, PR>& simulator, SysOf<BE, PR>& system) {
+    setupAnalyticSphere<BE, PR>(simulator, system);
+    system.subSteps = 3;
+    system.subh     = system.h / PR(3);
+}
+
+template <typename BE, typename PR>
+void postInitLsAnalyticSphere(SimOf<BE, PR>& simulator) {
+    simulator.useLargeSteps = true;
+    simulator.cdSubstepPeriod    = 1;
+    simulator.refitSubstepPeriod = 1;
+    std::cout << "[Main] --scene ls_analytic_sphere: CPU Baraff-Witkin "
+                 "implicit solver, sheet draped on a Sphere collider, "
+                 "subSteps=3\n";
+}
+
 template <typename BE, typename PR>
 struct Entry {
     const char* name;
@@ -627,6 +768,21 @@ inline const std::vector<Entry<BE, PR>>& registry() {
         { "pd_cloth_xyfold", "pbd_cloth_xyfold geometry under PD; self-collision "
                              "toggle test bed (subSteps 3, PD iters 10)",
           &setupPdClothXYFold<BE, PR>, &postInitPdClothXYFold<BE, PR> },
+        { "ls_cloth_hang", "2-corner pinned sheet, no collider, solved by the "
+                           "CPU Baraff-Witkin (1998) implicit system",
+          &setupLsClothHang<BE, PR>, &postInitLsClothHang<BE, PR> },
+        { "ls_cloth", "pbd_cloth geometry under the Baraff-Witkin implicit "
+                      "system; contact filter on the floor",
+          &setupLsCloth<BE, PR>, &postInitLsCloth<BE, PR> },
+        { "ls_cloth_ball", "pbd_cloth_ball geometry under the implicit system; "
+                           "moving Sphere collider (no cloth→rigid coupling)",
+          &setupLsClothBall<BE, PR>, &postInitLsClothBall<BE, PR> },
+        { "ls_cloth_flag", "pbd_cloth_flag geometry under the implicit system; "
+                           "cross-wind load, NO tearing",
+          &setupLsClothFlag<BE, PR>, &postInitLsClothFlag<BE, PR> },
+        { "ls_analytic_sphere", "analytic_sphere geometry under the implicit "
+                                "system; pure one-sided contact filter",
+          &setupLsAnalyticSphere<BE, PR>, &postInitLsAnalyticSphere<BE, PR> },
         { "analytic_sphere", "cloth dropped on a Sphere analytic collider",
           &setupAnalyticSphere<BE, PR>, nullptr },
         { "analytic_box", "cloth dropped on a Box analytic collider",

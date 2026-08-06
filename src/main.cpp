@@ -68,6 +68,11 @@ using Index = uint32_t;
 // Same slot, same constraint: PdSystem is a sibling CPU solver that only
 // needs Scene/GeneralMesh as declared template names.
 #include "sim/pd_system.hpp"
+// Same slot again: LargeStepsSystem (Baraff-Witkin 1998 implicit Euler) is the
+// fourth sibling solver and, like PdSystem, only needs Scene/GeneralMesh as
+// declared template names. Must precede simulator.hpp — Simulator holds one
+// by value.
+#include "sim/large_steps_system.hpp"
 #include "sim/material_quat.hpp"
 #include "sim/scene.hpp"
 #include "sim/spatial_hash.hpp"
@@ -2371,13 +2376,106 @@ int main(int argc, char** argv) {
                     // writes an exclusive pair so the two flags can never
                     // both be set from here.
                     const char* solverNames[] = { "Symplectic (GPU)", "PBD (CPU)",
-                                                  "PD (CPU)" };
-                    int solverIdx = simulator.usePd ? 2 : (simulator.usePbd ? 1 : 0);
+                                                  "PD (CPU)",
+                                                  "Large Steps / implicit (CPU)" };
+                    int solverIdx = simulator.useLargeSteps ? 3
+                                  : (simulator.usePd ? 2
+                                  : (simulator.usePbd ? 1 : 0));
                     if (ImGui::Combo("##solver", &solverIdx, solverNames,
                                      IM_ARRAYSIZE(solverNames))) {
-                        simulator.usePbd = (solverIdx == 1);
-                        simulator.usePd  = (solverIdx == 2);
+                        simulator.usePbd        = (solverIdx == 1);
+                        simulator.usePd         = (solverIdx == 2);
+                        simulator.useLargeSteps = (solverIdx == 3);
                     }
+                }
+
+                // Baraff-Witkin panel. Every knob here is a calibration one:
+                // the inspector's k values are spring constants, and BW98's
+                // condition energies are area/angle based, so the mapping
+                // needs a scale per family (see large_steps_system.hpp
+                // "deviation 4"). Logarithmic sliders — the useful range of
+                // the bending one alone spans several decades.
+                if (simulator.useLargeSteps) {
+                    auto& ls = simulator.largeSteps;
+                    ImGui::Dummy({0, 12});
+                    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.420f, 0.463f, 0.518f, 1.0f));
+                    ImGui::TextUnformatted("CG 반복 상한 / 허용오차");
+                    ImGui::PopStyleColor();
+                    ImGui::Dummy({0, 4});
+                    ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - P);
+                    if (ImGui::InputInt("##lsIter", &ls.maxCGIter) && ls.maxCGIter < 1)
+                        ls.maxCGIter = 1;
+                    ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - P);
+                    {
+                        float tol = (float)ls.cgTol2;
+                        if (ImGui::SliderFloat("##lsTol", &tol, 1e-8f, 1e-1f, "%.1e",
+                                               ImGuiSliderFlags_Logarithmic))
+                            ls.cgTol2 = (double)tol;
+                    }
+
+                    ImGui::Dummy({0, 12});
+                    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.420f, 0.463f, 0.518f, 1.0f));
+                    ImGui::TextUnformatted("강성 스케일 (stretch / shear / bend)");
+                    ImGui::PopStyleColor();
+                    ImGui::Dummy({0, 4});
+                    {
+                        float st = (float)ls.stretchScale, sh = (float)ls.shearScale,
+                              bd = (float)ls.bendScale;
+                        ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - P);
+                        if (ImGui::SliderFloat("##lsStretch", &st, 1e-3f, 1e2f, "%.3e",
+                                               ImGuiSliderFlags_Logarithmic))
+                            ls.stretchScale = (double)st;
+                        ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - P);
+                        if (ImGui::SliderFloat("##lsShear", &sh, 1e-3f, 1e2f, "%.3e",
+                                               ImGuiSliderFlags_Logarithmic))
+                            ls.shearScale = (double)sh;
+                        ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - P);
+                        if (ImGui::SliderFloat("##lsBend", &bd, 1e-10f, 1e-2f, "%.3e",
+                                               ImGuiSliderFlags_Logarithmic))
+                            ls.bendScale = (double)bd;
+                    }
+                    ImGui::Checkbox("shear", &ls.shearOn);
+                    ImGui::SameLine();
+                    ImGui::Checkbox("bend", &ls.bendOn);
+
+                    ImGui::Dummy({0, 12});
+                    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.420f, 0.463f, 0.518f, 1.0f));
+                    ImGui::TextUnformatted("감쇠 (조건 감쇠 비 / 공기 저항)");
+                    ImGui::PopStyleColor();
+                    ImGui::Dummy({0, 4});
+                    {
+                        float dr = (float)ls.dampRatio, ad = (float)ls.airDrag;
+                        ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - P);
+                        if (ImGui::SliderFloat("##lsDamp", &dr, 1e-5f, 1e-1f, "%.3e",
+                                               ImGuiSliderFlags_Logarithmic))
+                            ls.dampRatio = (double)dr;
+                        ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - P);
+                        if (ImGui::SliderFloat("##lsAir", &ad, 0.0f, 1.0f, "%.3f"))
+                            ls.airDrag = (double)ad;
+                    }
+
+                    ImGui::Dummy({0, 12});
+                    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.420f, 0.463f, 0.518f, 1.0f));
+                    ImGui::TextUnformatted("접촉 필터");
+                    ImGui::PopStyleColor();
+                    ImGui::Dummy({0, 4});
+                    ImGui::Checkbox("접촉 필터 사용##lsContacts", &ls.contactsEnabled);
+                    {
+                        float rec = (float)ls.contactRecovery,
+                              cap = (float)ls.maxRecoverySpeed;
+                        ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - P);
+                        if (ImGui::SliderFloat("##lsRecovery", &rec, 0.01f, 1.0f, "%.2f"))
+                            ls.contactRecovery = (double)rec;
+                        ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - P);
+                        if (ImGui::SliderFloat("##lsCap", &cap, 0.01f, 10.0f, "%.2f m/s",
+                                               ImGuiSliderFlags_Logarithmic))
+                            ls.maxRecoverySpeed = (double)cap;
+                    }
+                    ImGui::Dummy({0, 6});
+                    ImGui::Text("CG %d회, 잔차 %.2e, 접촉 %d (강체 %d), 이상 %u",
+                                ls.lastIterations, ls.lastResidual,
+                                ls.lastContacts, ls.lastCoupledRows,
+                                ls.anomalyCount);
                 }
 
                 if (simulator.usePd) {

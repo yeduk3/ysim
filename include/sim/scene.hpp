@@ -107,6 +107,15 @@ struct GeneralMesh {
     // with whatever mass the body actually has: every path that changes the
     // Bullet mass goes through recreateRigidBackendBody.
     PR rigidBodyMass = PR(0);
+    // Live linear velocity of the backend body, mirrored from the rigid
+    // backend once per frame in the same preamble loop that snaps the mesh
+    // to rigidLastBodyPos. Bullet stays the source of truth; this is a
+    // read-only copy for the CPU solvers, which have no access to the
+    // backend. LargeStepsSystem's contact filter needs it: its constraint
+    // is on VELOCITY, so a moving collider has to be entered in the
+    // relative frame or the cloth simply gets passed through by a body
+    // descending faster than the filter's penetration recovery.
+    tinym::vec3 rigidLinearVel = {};
 
     // Render-side GL state lives in MeshRenderState, keyed by id (D-011).
     // GeneralMesh no longer owns OpenGL handles, so initialize() is safe to
