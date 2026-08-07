@@ -10239,7 +10239,100 @@ static int runSelfTest() {
                 pass(n21);
         }
 
-
+        // ---- PD-22 — projectStrain's CLOSED FORM agrees with the thin
+        // Eigen::JacobiSVD it replaced. The Jacobi sweep was 87% of the local
+        // step at 10k verts (201 ns vs 10 ns per call), so the projection is
+        // now written out by hand: FᵀF's 2x2 eigendecomposition gives V and
+        // Σ, U = F·V·Σ⁻¹. PD-10 already pins the ANALYTIC answer on three
+        // hand-built F's; this clause is the regression net over a RANDOM
+        // sweep — including the sign/ordering conventions the two paths are
+        // free to differ in, and the near-degenerate F where they must not.
+        {
+            const char* n22 = "PD-22 / closed-form strain projection matches "
+                              "the JacobiSVD reference";
+            auto jacobiRef = [](const double F[6], double lo, double hi,
+                                double P[6]) -> bool {
+                Eigen::Matrix<double, 3, 2> Fm;
+                for (int ax = 0; ax < 3; ++ax)
+                    for (int r = 0; r < 2; ++r) Fm(ax, r) = F[ax * 2 + r];
+                if (!Fm.allFinite()) return false;
+                Eigen::JacobiSVD<Eigen::Matrix<double, 3, 2>,
+                                 Eigen::ComputeThinU | Eigen::ComputeThinV>
+                    svd(Fm);
+                if (svd.info() != Eigen::Success) return false;
+                Eigen::Vector2d s = svd.singularValues();
+                for (int r = 0; r < 2; ++r)
+                    s[r] = std::min(std::max(s[r], lo), hi);
+                const Eigen::Matrix<double, 3, 2> Pm =
+                    svd.matrixU() * s.asDiagonal() * svd.matrixV().transpose();
+                for (int ax = 0; ax < 3; ++ax)
+                    for (int r = 0; r < 2; ++r) P[ax * 2 + r] = Pm(ax, r);
+                return true;
+            };
+            // Deterministic pseudo-random F's: a LCG, so the sweep is the same
+            // on every machine and a failure is reproducible from the seed.
+            uint64_t rng = 0x9E3779B97F4A7C15ull;
+            auto nextU = [&]() {
+                rng = rng * 6364136223846793005ull + 1442695040888963407ull;
+                return (double)((rng >> 11) & ((1ull << 53) - 1))
+                       / (double)(1ull << 53);
+            };
+            // Three bands: corotation (the shipped default), a tight limiter,
+            // and a wide one that leaves both singular values untouched.
+            const double bands[3][2] = { {1.0, 1.0}, {0.95, 1.05}, {0.1, 10.0} };
+            double worst = 0.0;
+            int    cases = 0, disagreeOk = 0;
+            for (int b = 0; b < 3; ++b) {
+                for (int t = 0; t < 400; ++t) {
+                    double F[6];
+                    // Near-rest columns (F ~ a rotated frame) plus noise, which
+                    // is the regime the solver actually visits.
+                    for (int k = 0; k < 6; ++k) F[k] = (nextU() - 0.5) * 0.8;
+                    F[0] += 1.0; F[3] += 1.0;
+                    // Every 17th case is driven to rank deficiency: column 1
+                    // is made a multiple of column 0, so σ1 == 0.
+                    const bool degen = (t % 17) == 0;
+                    if (degen)
+                        for (int ax = 0; ax < 3; ++ax)
+                            F[ax * 2 + 1] = 0.5 * F[ax * 2 + 0];
+                    double Pc[6], Pj[6];
+                    for (int k = 0; k < 6; ++k) { Pc[k] = -7.0; Pj[k] = -7.0; }
+                    const bool okc = decltype(sim.pd)::projectStrain(
+                        F, bands[b][0], bands[b][1], Pc);
+                    const bool okj = jacobiRef(F, bands[b][0], bands[b][1], Pj);
+                    if (degen) {
+                        // The documented §3.3 fallback: closed form REFUSES a
+                        // rank-deficient element (U's second column is
+                        // arbitrary there) and must leave P untouched.
+                        if (!okc && Pc[0] == -7.0) ++disagreeOk;
+                        continue;
+                    }
+                    if (!okj) continue;          // reference itself declined
+                    ++cases;
+                    if (!okc) { worst = 1e30; continue; }
+                    for (int k = 0; k < 6; ++k)
+                        worst = std::max(worst, std::abs(Pc[k] - Pj[k]));
+                }
+            }
+            std::cerr << "[self-test INFO] PD-22: " << cases
+                      << " well-conditioned cases, max |closed - jacobi| = "
+                      << worst << "; " << disagreeOk
+                      << " rank-deficient cases took the fallback\n";
+            if (cases < 900)
+                fail(n22, "only " + std::to_string(cases)
+                     + " well-conditioned cases ran (>= 900 expected) — the "
+                       "sweep is not exercising the projection");
+            else if (disagreeOk < 60)
+                fail(n22, "only " + std::to_string(disagreeOk)
+                     + " rank-deficient cases took the fallback (>= 60 "
+                       "expected) — a collapsed element is being projected "
+                       "along an arbitrary direction");
+            else if (!(worst < 1e-12))
+                fail(n22, "closed form disagrees with JacobiSVD by "
+                     + std::to_string(worst) + " (max 1e-12)");
+            else
+                pass(n22);
+        }
 
         sim.pause = true;
         sim.usePd = false;
