@@ -21,6 +21,7 @@ uml/
 docs/references/**/*.pdf
 docs/references/**/*.html
 docs/*
+!docs/pd-system-audit-20260730.md
 !docs/design/
 docs/design/*
 !docs/design/pd-continuum-cloth-contact.md
