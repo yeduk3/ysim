@@ -77,6 +77,17 @@ struct FixedParticle {
     Vec3 pos{0, 0, 0};
 };
 
+// A spline-follow dynamic constraint: vertex `vid` (physics index) rides
+// a Catmull-Rom path through `points` (world space). closed loops
+// forever, open stops at the last point. Persisted per object as the
+// "spline_constraints" array; playback state is runtime-only.
+struct SplineConstraint {
+    int vid = 0;
+    bool closed = false;
+    double duration = 4.0;
+    std::vector<Vec3> points;
+};
+
 struct Object {
     int id = 0;
     std::string name;
@@ -107,6 +118,9 @@ struct Object {
     // Point-selection panel constraints. Optional in JSON — older
     // snapshots simply have no pinned vertices.
     std::vector<FixedParticle> fixedParticles;
+    // Spline-follow dynamic constraints. Optional in JSON — older
+    // snapshots simply have none.
+    std::vector<SplineConstraint> splineConstraints;
 };
 
 struct Environment {
@@ -342,6 +356,20 @@ inline nlohmann::json toJson(const Object& o) {
             fp.push_back(std::move(e));
         }
         j["fixed_particles"] = std::move(fp);
+    }
+    if (!o.splineConstraints.empty()) {
+        nlohmann::json scs = nlohmann::json::array();
+        for (const auto& s : o.splineConstraints) {
+            nlohmann::json e;
+            e["vid"] = s.vid;
+            e["closed"] = s.closed;
+            e["duration"] = s.duration;
+            nlohmann::json pts = nlohmann::json::array();
+            for (const auto& p : s.points) pts.push_back(detail::vec3ToJson(p));
+            e["points"] = std::move(pts);
+            scs.push_back(std::move(e));
+        }
+        j["spline_constraints"] = std::move(scs);
     }
     return j;
 }
@@ -592,6 +620,34 @@ inline Result<Object> objectFromJson(const nlohmann::json& j, int idx,
             std::string perr;
             if (!detail::readVec3(*p, f.pos, perr, path)) continue;
             o.fixedParticles.push_back(f);
+        }
+    }
+    // spline_constraints is optional (backward compat). Malformed
+    // entries are skipped rather than failing the whole load.
+    if (auto it = j.find("spline_constraints");
+        it != j.end() && it->is_array()) {
+        for (const auto& e : *it) {
+            SplineConstraint s;
+            if (auto v = e.find("vid");
+                v != e.end() && v->is_number_integer())
+                s.vid = v->get<int>();
+            else
+                continue;
+            if (auto c = e.find("closed"); c != e.end() && c->is_boolean())
+                s.closed = c->get<bool>();
+            if (auto d = e.find("duration"); d != e.end() && d->is_number())
+                s.duration = d->get<double>();
+            auto ps = e.find("points");
+            if (ps == e.end() || !ps->is_array()) continue;
+            bool ok = true;
+            for (const auto& pj : *ps) {
+                Vec3 p{0, 0, 0};
+                std::string perr;
+                if (!detail::readVec3(pj, p, perr, path)) { ok = false; break; }
+                s.points.push_back(p);
+            }
+            if (!ok || s.points.size() < 2) continue;
+            o.splineConstraints.push_back(std::move(s));
         }
     }
     return R::success(std::move(o));

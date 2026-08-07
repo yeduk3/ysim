@@ -227,6 +227,37 @@ void drawMeshInspectorWindow(MeshInspectorWindowState& st, const MeshInspectorTa
         if(ImGui::Button(ra?"참조점 선택 중...":"다른 점 위치 참조",{CW(),40})&&t.on_point_ref_toggle)t.on_point_ref_toggle();
         if(ra)ImGui::PopStyleColor(2);
         ImGui::PushStyleColor(ImGuiCol_Text,kG60);ImGui::TextWrapped("다른 점을 클릭하면 이 점이 따라갑니다.");ImGui::PopStyleColor();}
+        // ── 경로 따라가기 (spline-follow dynamic constraint) ──────────
+        ImGui::Unindent(kP);ImGui::Separator();ImGui::Dummy({0,kP});ImGui::Indent(kP);
+        {
+            bool en=t.point_spline_exists;
+            if(ImGui::Checkbox("경로 따라가기",&en)&&t.on_point_spline_enable)t.on_point_spline_enable(en);
+            if(t.point_spline_exists){
+                ImGui::Dummy({0,4});
+                bool cl=t.point_spline_closed;
+                if(ImGui::Checkbox("닫힌 경로 (반복)",&cl)&&t.on_point_spline_closed)t.on_point_spline_closed(cl);
+                float dur=t.point_spline_duration;
+                ImGui::SetNextItemWidth(CW());
+                if(ImGui::DragFloat("주기(초)##spdur",&dur,0.05f,0.1f,120.0f,"%.2f")&&t.on_point_spline_duration)t.on_point_spline_duration(dur);
+                bool pl=t.point_spline_playing;
+                if(ImGui::Button(pl?"일시정지##sp":"재생##sp",{(CW()-4)/2,28})&&t.on_point_spline_playing)t.on_point_spline_playing(!pl);
+                ImGui::SameLine(0,4);
+                if(ImGui::Button("처음부터##sp",{(CW()-4)/2,28})&&t.on_point_spline_reset)t.on_point_spline_reset();
+                ImGui::Dummy({0,8});
+                ImGui::PushStyleColor(ImGuiCol_Text,kG60);ImGui::TextUnformatted("제어점");ImGui::PopStyleColor();ImGui::Dummy({0,4});
+                for(size_t i=0;i<t.point_spline_points.size();++i){
+                    ImGui::PushID((int)i+1000);
+                    float cp[3]={t.point_spline_points[i][0],t.point_spline_points[i][1],t.point_spline_points[i][2]};
+                    if(InputXYZ("spcp",cp)&&t.on_point_spline_set_point)t.on_point_spline_set_point((int)i,cp[0],cp[1],cp[2]);
+                    if(t.point_spline_points.size()>2){
+                        ImGui::SameLine();
+                        if(ImGui::SmallButton("제거")&&t.on_point_spline_remove_point)t.on_point_spline_remove_point((int)i);
+                    }
+                    ImGui::PopID();
+                }
+                if(ImGui::Button("+ 제어점 추가",{CW(),28})&&t.on_point_spline_add_point)t.on_point_spline_add_point();
+            }
+        }
         ImGui::Unindent(kP);ImGui::Separator();ImGui::Dummy({0,kP});ImGui::Indent(kP);
         ImGui::PushStyleColor(ImGuiCol_Text,kG60);ImGui::TextUnformatted("연결된 참조점");ImGui::PopStyleColor();
         if(t.point_ref_constraints.empty()){ImGui::PushStyleColor(ImGuiCol_Text,kG50);ImGui::TextUnformatted("(없음)");ImGui::PopStyleColor();}

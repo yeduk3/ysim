@@ -292,6 +292,14 @@ struct Scene {
         // setVertexFixed / translateVertexTo keep this in sync with the
         // live mesh. vid is the PHYSICS vertex index.
         std::vector<FixedVertex> fixedVertices;
+        // Spline-follow dynamic constraints (point panel "경로 따라가기").
+        // Same ownership story as fixedVertices: request-owned source of
+        // truth, re-applied by Scene::pack (held position re-SAMPLED from
+        // the spline at the constraint's current localTime — never a
+        // frozen pos, unlike fixedVertices), round-tripped through
+        // scene_format. The per-frame update loop advances localTime and
+        // drives state.x along the path.
+        std::vector<SplineConstraint> splineConstraints;
         // D-042 R-1: heap-owned vertex/facet/normal preview, populated by
         // initializer->populatePreview() at addGeneralMesh time. Stays
         // alive across Scene::pack / pool-reset cycles. R-2 will point
@@ -1050,31 +1058,45 @@ struct Scene {
             // is what makes a pin survive Scene::pack AND loadScene
             // (loadScene rebuilds preview flat from the initializer; the
             // request list restores both the pin and its location).
-            for (const auto& fv : req.fixedVertices) {
-                if ((Index)fv.vid >= (Index)curNumPoints) continue;
-                Index b = (Index)fv.vid * 3;
-                meshes[i].state.x.ptr[b+0] = (PR)fv.pos.x;
-                meshes[i].state.x.ptr[b+1] = (PR)fv.pos.y;
-                meshes[i].state.x.ptr[b+2] = (PR)fv.pos.z;
-                meshes[i].state.xPrev.ptr[b+0] = (PR)fv.pos.x;
-                meshes[i].state.xPrev.ptr[b+1] = (PR)fv.pos.y;
-                meshes[i].state.xPrev.ptr[b+2] = (PR)fv.pos.z;
+            auto applyHeldVertex = [&](uint32_t vid, tinym::vec3 pos) {
+                if ((Index)vid >= (Index)curNumPoints) return;
+                Index b = (Index)vid * 3;
+                meshes[i].state.x.ptr[b+0] = (PR)pos.x;
+                meshes[i].state.x.ptr[b+1] = (PR)pos.y;
+                meshes[i].state.x.ptr[b+2] = (PR)pos.z;
+                meshes[i].state.xPrev.ptr[b+0] = (PR)pos.x;
+                meshes[i].state.xPrev.ptr[b+1] = (PR)pos.y;
+                meshes[i].state.xPrev.ptr[b+2] = (PR)pos.z;
                 if (meshes[i].constraints.fixedParticles.ptr
-                    && (Index)fv.vid < meshes[i].constraints.fixedParticles.size)
-                    meshes[i].constraints.fixedParticles[fv.vid] = PR(0);
-                if (fv.vid * 3 + 2 < req.preview.x.size()) {
-                    req.preview.x[b+0] = (PR)fv.pos.x;
-                    req.preview.x[b+1] = (PR)fv.pos.y;
-                    req.preview.x[b+2] = (PR)fv.pos.z;
+                    && (Index)vid < meshes[i].constraints.fixedParticles.size)
+                    meshes[i].constraints.fixedParticles[vid] = PR(0);
+                if (vid * 3 + 2 < req.preview.x.size()) {
+                    req.preview.x[b+0] = (PR)pos.x;
+                    req.preview.x[b+1] = (PR)pos.y;
+                    req.preview.x[b+2] = (PR)pos.z;
                 }
                 if (req.preview.hasRender()) {
                     for (size_t rv = 0; rv < req.preview.renderToPhysics.size(); ++rv)
-                        if (req.preview.renderToPhysics[rv] == fv.vid) {
-                            req.preview.renderX[rv*3+0] = (PR)fv.pos.x;
-                            req.preview.renderX[rv*3+1] = (PR)fv.pos.y;
-                            req.preview.renderX[rv*3+2] = (PR)fv.pos.z;
+                        if (req.preview.renderToPhysics[rv] == vid) {
+                            req.preview.renderX[rv*3+0] = (PR)pos.x;
+                            req.preview.renderX[rv*3+1] = (PR)pos.y;
+                            req.preview.renderX[rv*3+2] = (PR)pos.z;
                         }
                 }
+            };
+            for (const auto& fv : req.fixedVertices)
+                applyHeldVertex(fv.vid, fv.pos);
+            // Spline-follow constraints hold their vertex too, but the
+            // held position is re-SAMPLED at the constraint's current
+            // localTime — a repack must not rewind a mid-flight vertex
+            // to a stale frozen position (the one place "pinned ==
+            // frozen" would otherwise be assumed).
+            for (const auto& sc : req.splineConstraints) {
+                if (sc.points.size() < 2) continue;
+                const float u = sc.duration > 0.0f
+                    ? (float)(sc.localTime / (double)sc.duration) : 0.0f;
+                applyHeldVertex(sc.vid,
+                    spline_path::sampleArcLength(sc.points, sc.closed, u));
             }
 
             for(int j = 0; j < curNumPoints; ++j) {

@@ -604,6 +604,24 @@ struct MeshInspectorTarget {
     };
     std::vector<PointRefEntry> point_ref_constraints;
     std::function<void(int /*entryIndex*/)> on_point_ref_remove;
+
+    // Spline-follow dynamic constraint on the selected vertex ("경로
+    // 따라가기"). exists gates the editor; the rest mirrors the live
+    // SplineConstraint each frame. Callbacks re-resolve the constraint
+    // through the Simulator on every call (no pointers held here).
+    bool point_spline_exists = false;
+    bool point_spline_closed = false;
+    bool point_spline_playing = false;
+    float point_spline_duration = 4.0f;
+    std::vector<std::array<float, 3>> point_spline_points;
+    std::function<void(bool)> on_point_spline_enable;    // create / remove
+    std::function<void(bool)> on_point_spline_closed;
+    std::function<void(bool)> on_point_spline_playing;
+    std::function<void(float)> on_point_spline_duration;
+    std::function<void(int, float, float, float)> on_point_spline_set_point;
+    std::function<void()> on_point_spline_add_point;
+    std::function<void(int)> on_point_spline_remove_point;
+    std::function<void()> on_point_spline_reset;         // localTime -> 0
 };
 
 void drawMeshInspectorWindow(

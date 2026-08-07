@@ -59,6 +59,10 @@ using Index = uint32_t;
 #include "sim/mesh_state.hpp"
 #include "sim/initializers.hpp"
 #include "sim/collision_pod.hpp"
+// Standalone (tinym + STL only): Catmull-Rom sampling for the
+// spline-follow dynamic constraint. Scene::pack and the Simulator
+// update hook both call into it.
+#include "sim/spline_path.hpp"
 // Must sit here, not next to simulator.hpp: scene/spatial_hash/bvh/bruteforce
 // each END with a dangling `template <...>` line that heads the NEXT fragment,
 // so nothing can be inserted between them. collision_pod.hpp closes cleanly,
@@ -1207,6 +1211,64 @@ int main(int argc, char** argv) {
                     }
                     target.on_point_ref_remove = [&simulator, o, v](int i) {
                         simulator.removeReferenceConstraintForPoint(o, v, i);
+                    };
+                    // Spline-follow constraint editor. Every callback
+                    // re-resolves the live constraint (no pointer held
+                    // across frames — add/remove reallocates the list).
+                    if (auto* sc = simulator.findSplineConstraint(o, v)) {
+                        target.point_spline_exists   = true;
+                        target.point_spline_closed   = sc->closed;
+                        target.point_spline_playing  = sc->playing;
+                        target.point_spline_duration = sc->duration;
+                        for (const auto& p : sc->points)
+                            target.point_spline_points.push_back({p.x, p.y, p.z});
+                    }
+                    target.on_point_spline_enable = [&simulator, o, v](bool on) {
+                        if (on) simulator.addSplineConstraint(o, v);
+                        else    simulator.removeSplineConstraint(o, v);
+                    };
+                    target.on_point_spline_closed = [&simulator, o, v](bool c) {
+                        if (auto* sc = simulator.findSplineConstraint(o, v))
+                            sc->closed = c;
+                    };
+                    target.on_point_spline_playing = [&simulator, o, v](bool p) {
+                        if (auto* sc = simulator.findSplineConstraint(o, v)) {
+                            // Re-arming a finished open path from the
+                            // play button restarts it from the top.
+                            if (p && !sc->closed
+                                && sc->localTime >= (double)sc->duration)
+                                sc->localTime = 0.0;
+                            sc->playing = p;
+                        }
+                    };
+                    target.on_point_spline_duration = [&simulator, o, v](float d) {
+                        if (auto* sc = simulator.findSplineConstraint(o, v))
+                            sc->duration = std::max(0.1f, d);
+                    };
+                    target.on_point_spline_set_point =
+                        [&simulator, o, v](int i, float x, float y, float z) {
+                        if (auto* sc = simulator.findSplineConstraint(o, v))
+                            if (i >= 0 && i < (int)sc->points.size())
+                                sc->points[i] = tinym::vec3(x, y, z);
+                    };
+                    target.on_point_spline_add_point = [&simulator, o, v]() {
+                        if (auto* sc = simulator.findSplineConstraint(o, v)) {
+                            tinym::vec3 last = sc->points.empty()
+                                ? tinym::vec3(0, 0, 0) : sc->points.back();
+                            sc->points.push_back(last + tinym::vec3(0.3f, 0.0f, 0.0f));
+                        }
+                    };
+                    target.on_point_spline_remove_point = [&simulator, o, v](int i) {
+                        if (auto* sc = simulator.findSplineConstraint(o, v))
+                            if (sc->points.size() > 2 && i >= 0
+                                && i < (int)sc->points.size())
+                                sc->points.erase(sc->points.begin() + i);
+                    };
+                    target.on_point_spline_reset = [&simulator, o, v]() {
+                        if (auto* sc = simulator.findSplineConstraint(o, v)) {
+                            sc->localTime = 0.0;
+                            sc->playing = true;
+                        }
                     };
                 }
                 // No vertex selected → mesh_id stays -1 so the same
@@ -3444,6 +3506,9 @@ int main(int argc, char** argv) {
             if(debugCollisions) {
                 simulator.debugCollisions(V, P);
             }
+            // Spline paths repopulate the debug-line buffer every frame
+            // (their control points / playback are live-editable).
+            simulator.prepareSplineDebugLines();
             simulator.showDebugLines(V, P);
         }
 

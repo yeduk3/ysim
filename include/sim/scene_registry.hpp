@@ -726,6 +726,59 @@ void postInitLsAnalyticSphere(SimOf<BE, PR>& simulator) {
                  "subSteps=3\n";
 }
 
+// "spline_cloth": the pbd_cloth floor + sheet under the default symplectic
+// solver, with two spline-follow dynamic constraints authored in code the
+// same way the point panel would: corner vid 0 rides a CLOSED circle
+// (loops forever), corner vid n-1 rides an OPEN 3-point lift (arrives and
+// stops). The circle's first control point coincides with the corner's
+// spawn position so playback starts without a snap.
+template <typename BE, typename PR>
+void setupSplineCloth(SimOf<BE, PR>& simulator, SysOf<BE, PR>& /*system*/) {
+    const PR kstretch = 1e5, kshear = 1e5, kbend = 2e5;
+    const PR mass = 0.1, thickness = 0.01;
+    const Index n = 20;
+    const PR size = 1, y = 0.6;
+    simulator.addPlane(PlaneDirection::XZPlane, tinym::vec3(0, 0, 0), 24, 3.0,
+                       0.1, BehaviorType::Float);                        // id 0
+    simulator.addCloth(n, size, tinym::vec3(0, (float)y, 0), kstretch, kshear,
+                       kbend, thickness, mass);                          // id 1
+    auto& req = Scene<BE, PR>::requestsGeneralMeshes.back();
+    const float h = (float)(size / 2);
+    {   // closed circle through corner vid 0 at (-h, y, -h), radius 0.3, XZ.
+        SplineConstraint sc;
+        sc.vid = 0;
+        sc.closed = true;
+        sc.duration = 4.0f;
+        const tinym::vec3 corner(-h, (float)y, -h);
+        const float r = 0.3f;
+        const tinym::vec3 center = corner - tinym::vec3(r, 0.0f, 0.0f);
+        for (int k = 0; k < 8; ++k) {
+            const float a = (float)(2.0 * M_PI * k / 8.0);
+            sc.points.push_back(center
+                + tinym::vec3(r * std::cos(a), 0.0f, r * std::sin(a)));
+        }
+        req.splineConstraints.push_back(std::move(sc));
+    }
+    {   // open lift from corner vid n-1 at (h, y, -h): up 0.3, then over.
+        SplineConstraint sc;
+        sc.vid = (uint32_t)(n - 1);
+        sc.closed = false;
+        sc.duration = 3.0f;
+        const tinym::vec3 corner(h, (float)y, -h);
+        sc.points = { corner,
+                      corner + tinym::vec3(0.0f, 0.3f, 0.0f),
+                      corner + tinym::vec3(0.2f, 0.5f, 0.0f) };
+        req.splineConstraints.push_back(std::move(sc));
+    }
+    simulator.mlBroadPhase.floorExcludeDiag = 1e9f;   // exclude NOTHING
+}
+
+template <typename BE, typename PR>
+void postInitSplineCloth(SimOf<BE, PR>& /*simulator*/) {
+    std::cout << "[Main] --scene spline_cloth: symplectic solver, corner 0 on "
+                 "a CLOSED circle (loops), corner n-1 on an OPEN lift (stops)\n";
+}
+
 template <typename BE, typename PR>
 struct Entry {
     const char* name;
@@ -783,6 +836,9 @@ inline const std::vector<Entry<BE, PR>>& registry() {
         { "ls_analytic_sphere", "analytic_sphere geometry under the implicit "
                                 "system; pure one-sided contact filter",
           &setupLsAnalyticSphere<BE, PR>, &postInitLsAnalyticSphere<BE, PR> },
+        { "spline_cloth", "sheet with two spline-follow corners: closed "
+                          "circle (loops) + open lift (stops)",
+          &setupSplineCloth<BE, PR>, &postInitSplineCloth<BE, PR> },
         { "analytic_sphere", "cloth dropped on a Sphere analytic collider",
           &setupAnalyticSphere<BE, PR>, nullptr },
         { "analytic_box", "cloth dropped on a Box analytic collider",
