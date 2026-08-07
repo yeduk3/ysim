@@ -12157,6 +12157,438 @@ static int runSelfTest() {
         system.subh     = lsSavedSubh;
     }
 
+    // ---- Block SPL: spline-follow dynamic constraint --------------------
+    // What can independently be wrong:
+    //   SPL-1  the Catmull-Rom sampler doesn't interpolate its control
+    //          points (a coefficient typo still draws a plausible curve),
+    //   SPL-2  a closed path doesn't close (u=0 and u=1 disagree),
+    //   SPL-3  arc-length reparameterization isn't near-constant speed,
+    //   SPL-4  the per-frame hook doesn't drive the vertex along the path
+    //          (or forgets to hold the mask at 0),
+    //   SPL-5  an open path fails to clamp+stop at the end,
+    //   SPL-6  the JSON round-trip drops or mangles the constraint.
+    {
+        // ---- SPL-1 — open path interpolates control points ----------------
+        {
+            const std::vector<tinym::vec3> pts = {
+                {0, 0, 0}, {1, 0, 0}, {1, 1, 0}, {0, 1, 0} };
+            double worst = 0.0;
+            for (int i = 0; i < 4; ++i) {
+                const tinym::vec3 s = spline_path::sampleUniform(
+                    pts, false, (float)i / 3.0f);
+                worst = std::max(worst, (double)(s - pts[i]).norm());
+            }
+            const char* n1 = "SPL-1 / Catmull-Rom interpolates control points";
+            if (worst > 1e-5)
+                fail(n1, "max |sample - control| = " + std::to_string(worst));
+            else pass(n1);
+        }
+
+        // ---- SPL-2 — closed path closes -----------------------------------
+        {
+            const std::vector<tinym::vec3> pts = {
+                {0, 0, 0}, {1, 0, 0}, {1, 1, 0}, {0, 1, 0} };
+            const tinym::vec3 a = spline_path::sampleUniform(pts, true, 0.0f);
+            const tinym::vec3 b = spline_path::sampleUniform(pts, true, 1.0f);
+            const char* n2 = "SPL-2 / closed path: u=1 wraps back onto u=0";
+            if ((a - b).norm() > 1e-5)
+                fail(n2, "gap " + std::to_string((a - b).norm()));
+            else pass(n2);
+        }
+
+        // ---- SPL-3 — arc-length sampling is near-constant speed -----------
+        {
+            // Deliberately UNEVEN control spacing (0.5 / 1.5 / 2 / ~2.4) but
+            // no doubled-back S-loops: chord distance is only a fair proxy
+            // for arc distance while the curve stays locally monotone
+            // (tightly clustered collinear points make Catmull-Rom fold
+            // back on itself and the chord test reads a false failure).
+            const std::vector<tinym::vec3> pts = {
+                {0, 0, 0}, {0.5f, 0, 0}, {2, 0, 0}, {2, 2, 0}, {0, 2, 1} };
+            const int N = 64;
+            auto spread = [&](auto sampler) {
+                double dmin = 1e30, dmax = 0.0;
+                tinym::vec3 prev = sampler(0.0f);
+                for (int i = 1; i <= N; ++i) {
+                    const tinym::vec3 cur = sampler((float)i / (float)N);
+                    const double d = (cur - prev).norm();
+                    dmin = std::min(dmin, d); dmax = std::max(dmax, d);
+                    prev = cur;
+                }
+                return dmin > 0.0 ? dmax / dmin : 1e30;
+            };
+            const double arcSpread = spread([&](float u) {
+                return spline_path::sampleArcLength(pts, false, u); });
+            const double uniSpread = spread([&](float u) {
+                return spline_path::sampleUniform(pts, false, u); });
+            const char* n3 = "SPL-3 / arc-length sampling is near-constant speed";
+            // Measured: arc ~1.01, uniform ~11 on this path. The uniform
+            // clause proves the path is uneven enough for the test to mean
+            // anything; the arc clause proves the reparameterization works.
+            if (arcSpread > 1.5 || uniSpread < 3.0)
+                fail(n3, "arc spread " + std::to_string(arcSpread)
+                     + ", uniform spread " + std::to_string(uniSpread));
+            else pass(n3);
+        }
+
+        // ---- SPL-4 — closed path drives the vertex, holds the mask --------
+        // Under PBD, not the symplectic default: this 8x8 cloth at default
+        // stiffness EXPLODES under the symplectic integrator at the
+        // self-test's subSteps=8 (that's the NAN-GUARD block's premise),
+        // and the world-bounds guard then auto-pauses the sim — which
+        // silently freezes the spline clock too (localTime stuck after
+        // frame 1). PBD keeps the identical scene bounded AND exercises
+        // the constraint under a non-default solver (the hook must live
+        // in the shared preamble, not a solver branch).
+        {
+            resetScene();
+            sim.usePbd = true;
+            sim.addGround(PlaneDirection::XZPlane, tinym::vec3(0, 0, 0), 4.0f); // id 0
+            sim.addCloth(8, 0.8f, tinym::vec3(0.0f, 0.4f, 0.0f));               // id 1
+            auto& req = Scene<Backend, Precision>::requestsGeneralMeshes.back();
+            SplineConstraint scIn;
+            scIn.vid = 0;
+            scIn.closed = true;
+            scIn.duration = 1.0f;
+            const tinym::vec3 corner(-0.4f, 0.4f, -0.4f);
+            for (int k = 0; k < 6; ++k) {
+                const float a = (float)(2.0 * M_PI * k / 6.0);
+                scIn.points.push_back(corner
+                    + tinym::vec3(0.2f * std::cos(a) - 0.2f, 0.0f,
+                                  0.2f * std::sin(a)));
+            }
+            req.splineConstraints.push_back(scIn);
+            sim.initialize();
+            sim.pause = false;
+            for (int f = 0; f < 30; ++f) sim.update();
+            MetalGlobalContext::commitAndWait();
+
+            const char* n4 = "SPL-4 / closed spline drives the vertex each frame";
+            auto* cloth = Scene<Backend, Precision>::findById(1);
+            auto* rq = &Scene<Backend, Precision>::requestsGeneralMeshes.back();
+            const auto& sc = rq->splineConstraints[0];
+            if (!cloth || !cloth->state.x.ptr || rq->splineConstraints.empty())
+                fail(n4, "scene lost the cloth or the constraint");
+            else {
+                const tinym::vec3 want = spline_path::sampleArcLength(
+                    sc.points, true,
+                    (float)(sc.localTime / (double)sc.duration));
+                const tinym::vec3 got((float)cloth->state.x.ptr[0],
+                                      (float)cloth->state.x.ptr[1],
+                                      (float)cloth->state.x.ptr[2]);
+                const bool maskHeld =
+                    cloth->constraints.fixedParticles.ptr
+                    && cloth->constraints.fixedParticles[0] == Precision(0);
+                if (!(sc.localTime > 0.0))
+                    fail(n4, "localTime never advanced");
+                else if ((got - want).norm() > 1e-4)
+                    fail(n4, "vertex is " + std::to_string((got - want).norm())
+                         + " away from the spline sample");
+                else if (!maskHeld)
+                    fail(n4, "fixedParticles[0] != 0 — solvers would move it");
+                else if (!sc.playing)
+                    fail(n4, "closed path stopped playing (must loop forever)");
+                else pass(n4);
+            }
+        }
+
+        // ---- SPL-5 — open path arrives at the end and stops ---------------
+        // PBD for the same stability reason as SPL-4.
+        {
+            resetScene();
+            sim.usePbd = true;
+            sim.addGround(PlaneDirection::XZPlane, tinym::vec3(0, 0, 0), 4.0f); // id 0
+            sim.addCloth(8, 0.8f, tinym::vec3(0.0f, 0.4f, 0.0f));               // id 1
+            auto& req = Scene<Backend, Precision>::requestsGeneralMeshes.back();
+            SplineConstraint scIn;
+            scIn.vid = 0;
+            scIn.closed = false;
+            scIn.duration = 0.2f;  // 12 frames at h=1/60 — well inside the run
+            scIn.points = { {-0.4f, 0.4f, -0.4f},
+                            {-0.4f, 0.7f, -0.4f},
+                            {-0.1f, 0.9f, -0.4f} };
+            req.splineConstraints.push_back(scIn);
+            sim.initialize();
+            sim.pause = false;
+            for (int f = 0; f < 30; ++f) sim.update();
+            MetalGlobalContext::commitAndWait();
+
+            const char* n5 = "SPL-5 / open spline clamps at the end and stops";
+            auto* cloth = Scene<Backend, Precision>::findById(1);
+            auto* rq = &Scene<Backend, Precision>::requestsGeneralMeshes.back();
+            if (!cloth || !cloth->state.x.ptr || rq->splineConstraints.empty())
+                fail(n5, "scene lost the cloth or the constraint");
+            else {
+                const auto& sc = rq->splineConstraints[0];
+                const tinym::vec3 got((float)cloth->state.x.ptr[0],
+                                      (float)cloth->state.x.ptr[1],
+                                      (float)cloth->state.x.ptr[2]);
+                const tinym::vec3 end = sc.points.back();
+                if (sc.playing)
+                    fail(n5, "still playing after 30 frames on a 0.2 s open "
+                         "path (localTime " + std::to_string(sc.localTime)
+                         + ", duration " + std::to_string(sc.duration)
+                         + ", system.h " + std::to_string((double)system.h)
+                         + ")");
+                else if (std::fabs(sc.localTime - (double)sc.duration) > 1e-9)
+                    fail(n5, "localTime " + std::to_string(sc.localTime)
+                         + " != duration " + std::to_string(sc.duration));
+                else if ((got - end).norm() > 1e-4)
+                    fail(n5, "vertex ended " + std::to_string((got - end).norm())
+                         + " away from the last control point");
+                else pass(n5);
+            }
+        }
+
+        // ---- SPL-6 — scene JSON round-trips the constraint ----------------
+        {
+            // SPL-5's scene is still live; toSnapshot must carry the
+            // constraint and parseString must bring it back intact.
+            const char* n6 = "SPL-6 / spline constraint survives the JSON round-trip";
+            auto snap = sim.toSnapshot();
+            auto r = scene_format::parseString(scene_format::toString(snap));
+            const scene_format::Object* clothObj = nullptr;
+            if (r.ok)
+                for (const auto& o : r.value.objects)
+                    if (o.id == 1) clothObj = &o;
+            if (!r.ok)
+                fail(n6, "re-parse failed: " + r.error.message);
+            else if (!clothObj || clothObj->splineConstraints.size() != 1)
+                fail(n6, "cloth object lost its spline_constraints entry");
+            else {
+                const auto& s = clothObj->splineConstraints[0];
+                if (s.vid != 0 || s.closed != false
+                    || std::fabs(s.duration - 0.2) > 1e-6
+                    || s.points.size() != 3
+                    || std::fabs(s.points[2][1] - 0.9) > 1e-6)
+                    fail(n6, "fields mangled (vid " + std::to_string(s.vid)
+                         + ", closed " + std::to_string((int)s.closed)
+                         + ", duration " + std::to_string(s.duration)
+                         + ", points " + std::to_string(s.points.size()) + ")");
+                else pass(n6);
+            }
+        }
+
+        // ---- SPL-7 — reset() rewinds the spline playback clock ------------
+        // '0' reset means "fresh run": rewindKinematicClocks must rewind the
+        // spline clock too, or the following pack re-samples the path at the
+        // mid-flight localTime and the vertex restarts wherever it happened
+        // to be. PBD for the same stability reason as SPL-4.
+        {
+            resetScene();
+            sim.usePbd = true;
+            sim.addGround(PlaneDirection::XZPlane, tinym::vec3(0, 0, 0), 4.0f); // id 0
+            sim.addCloth(8, 0.8f, tinym::vec3(0.0f, 0.4f, 0.0f));               // id 1
+            auto& req = Scene<Backend, Precision>::requestsGeneralMeshes.back();
+            SplineConstraint scIn;
+            scIn.vid = 0;
+            scIn.closed = true;
+            scIn.duration = 1.0f;
+            const tinym::vec3 corner(-0.4f, 0.4f, -0.4f);
+            for (int k = 0; k < 6; ++k) {
+                const float a = (float)(2.0 * M_PI * k / 6.0);
+                scIn.points.push_back(corner
+                    + tinym::vec3(0.2f * std::cos(a) - 0.2f, 0.0f,
+                                  0.2f * std::sin(a)));
+            }
+            req.splineConstraints.push_back(scIn);
+            sim.initialize();
+            sim.pause = false;
+            for (int f = 0; f < 10; ++f) sim.update();
+            MetalGlobalContext::commitAndWait();
+
+            const char* n7 = "SPL-7 / reset rewinds the spline clock to the path start";
+            auto* rqPre = &Scene<Backend, Precision>::requestsGeneralMeshes.back();
+            if (rqPre->splineConstraints.empty())
+                fail(n7, "scene lost the constraint before reset");
+            else if (!(rqPre->splineConstraints[0].localTime > 0.0))
+                fail(n7, "localTime never advanced — nothing to rewind");
+            else {
+                sim.reset();
+                MetalGlobalContext::commitAndWait();
+                auto* cloth = Scene<Backend, Precision>::findById(1);
+                auto* rq = &Scene<Backend, Precision>::requestsGeneralMeshes.back();
+                if (!cloth || !cloth->state.x.ptr || rq->splineConstraints.empty())
+                    fail(n7, "reset lost the cloth or the constraint");
+                else {
+                    const auto& sc = rq->splineConstraints[0];
+                    const tinym::vec3 got((float)cloth->state.x.ptr[0],
+                                          (float)cloth->state.x.ptr[1],
+                                          (float)cloth->state.x.ptr[2]);
+                    const double d0 = (got - sc.points[0]).norm();
+                    if (sc.localTime != 0.0)
+                        fail(n7, "localTime after reset is "
+                             + std::to_string(sc.localTime) + ", want 0");
+                    else if (!sc.playing)
+                        fail(n7, "playing == false after reset");
+                    else if (d0 > 1e-4)
+                        fail(n7, "vertex restarted " + std::to_string(d0)
+                             + " away from points[0]");
+                    else pass(n7);
+                }
+            }
+        }
+
+        // ---- SPL-8 — pins + spline paths follow translateObject -----------
+        // Pin data is world-space; a transform that moves every live vertex
+        // but leaves the stored pin behind makes the next pack/reset snap the
+        // pinned vertex back to the spot the object no longer occupies.
+        {
+            resetScene();
+            sim.usePbd = true;
+            sim.pause = true;
+            sim.addGround(PlaneDirection::XZPlane, tinym::vec3(0, 0, 0), 4.0f); // id 0
+            sim.addCloth(8, 0.8f, tinym::vec3(0.0f, 0.4f, 0.0f));               // id 1
+            const tinym::vec3 pos0(-0.4f, 0.4f, -0.4f);   // vertex 0 corner
+            const tinym::vec3 far0( 0.4f, 0.4f,  0.4f);   // vertex 63 corner
+            {
+                auto& req = Scene<Backend, Precision>::requestsGeneralMeshes.back();
+                req.fixedVertices.push_back(FixedVertex{0, pos0});
+                SplineConstraint scIn;
+                scIn.vid = 63;
+                scIn.closed = false;
+                scIn.duration = 4.0f;
+                scIn.points = { far0,
+                                far0 + tinym::vec3(0.0f, 0.3f, 0.0f),
+                                far0 + tinym::vec3(0.3f, 0.5f, 0.0f) };
+                req.splineConstraints.push_back(scIn);
+            }
+            sim.initialize();
+
+            const char* n8 = "SPL-8 / pin + spline path follow translateObject across reset";
+            auto* clothPre = Scene<Backend, Precision>::findById(1);
+            if (!clothPre || !clothPre->state.x.ptr)
+                fail(n8, "cloth id 1 missing after initialize");
+            else {
+                const tinym::vec3 pivot = clothPre->transformPosition;
+                const tinym::vec3 newPos(0.5f, 0.4f, 0.2f);
+                const tinym::vec3 delta = newPos - pivot;
+                const std::vector<tinym::vec3> ptsBefore =
+                    Scene<Backend, Precision>::requestsGeneralMeshes.back()
+                        .splineConstraints[0].points;
+                sim.translateObject(1, newPos);
+
+                auto* rq = &Scene<Backend, Precision>::requestsGeneralMeshes.back();
+                double pinErr = 1e30, pathErr = 0.0;
+                if (!rq->fixedVertices.empty())
+                    pinErr = (rq->fixedVertices[0].pos - (pos0 + delta)).norm();
+                if (!rq->splineConstraints.empty()) {
+                    const auto& p = rq->splineConstraints[0].points;
+                    for (size_t k = 0; k < p.size() && k < ptsBefore.size(); ++k)
+                        pathErr = std::max(pathErr,
+                            (double)(p[k] - (ptsBefore[k] + delta)).norm());
+                }
+                if (pinErr > 1e-5)
+                    fail(n8, "stored pin is " + std::to_string(pinErr)
+                         + " from the translated spot");
+                else if (pathErr > 1e-5)
+                    fail(n8, "spline control points are " + std::to_string(pathErr)
+                         + " from the translated path");
+                else {
+                    sim.reset();
+                    MetalGlobalContext::commitAndWait();
+                    auto* cloth = Scene<Backend, Precision>::findById(1);
+                    if (!cloth || !cloth->state.x.ptr)
+                        fail(n8, "reset lost the cloth");
+                    else {
+                        const tinym::vec3 got((float)cloth->state.x.ptr[0],
+                                              (float)cloth->state.x.ptr[1],
+                                              (float)cloth->state.x.ptr[2]);
+                        const double d = (got - (pos0 + delta)).norm();
+                        if (d > 1e-4)
+                            fail(n8, "after reset the pinned vertex is "
+                                 + std::to_string(d)
+                                 + " from the transformed spot (stale-world "
+                                   "distance would be "
+                                 + std::to_string((double)delta.norm()) + ")");
+                        else pass(n8);
+                    }
+                }
+            }
+        }
+
+        // ---- SPL-9 — rotate/scale compose into the stored pin -------------
+        // Request-side composition only (no reset): the D-042 R-4 preview
+        // path has a known pre-existing failure, so this asserts the same
+        // pivot math the state.x loops use lands on fv.pos and the path.
+        {
+            resetScene();
+            sim.usePbd = true;
+            sim.pause = true;
+            sim.addGround(PlaneDirection::XZPlane, tinym::vec3(0, 0, 0), 4.0f); // id 0
+            sim.addCloth(8, 0.8f, tinym::vec3(0.0f, 0.4f, 0.0f));               // id 1
+            const tinym::vec3 pos0(-0.4f, 0.4f, -0.4f);
+            const tinym::vec3 far0( 0.4f, 0.4f,  0.4f);
+            {
+                auto& req = Scene<Backend, Precision>::requestsGeneralMeshes.back();
+                req.fixedVertices.push_back(FixedVertex{0, pos0});
+                SplineConstraint scIn;
+                scIn.vid = 63;
+                scIn.closed = false;
+                scIn.duration = 4.0f;
+                scIn.points = { far0,
+                                far0 + tinym::vec3(0.0f, 0.3f, 0.0f),
+                                far0 + tinym::vec3(0.3f, 0.5f, 0.0f) };
+                req.splineConstraints.push_back(scIn);
+            }
+            sim.initialize();
+
+            const char* n9 = "SPL-9 / rotateObject + scaleObject compose into the stored pin";
+            auto* cloth = Scene<Backend, Precision>::findById(1);
+            if (!cloth || !cloth->state.x.ptr)
+                fail(n9, "cloth id 1 missing after initialize");
+            else {
+                const tinym::vec3 pivot = cloth->transformPosition;
+                const float s = (float)std::sqrt(0.5);   // cos45 == sin45
+                const ::Quat newAbs = quatNormalize(::Quat{s, 0.0f, s, 0.0f});
+                const ::Quat dq = quatNormalize(newAbs
+                                                * quatConjugate(cloth->rotationQuat));
+                const tinym::vec3 wantRot = pivot + rotateVector(dq, pos0 - pivot);
+                const tinym::vec3 pathBefore =
+                    Scene<Backend, Precision>::requestsGeneralMeshes.back()
+                        .splineConstraints[0].points[0];
+                const tinym::vec3 wantPathRot =
+                    pivot + rotateVector(dq, pathBefore - pivot);
+                sim.rotateObject(1, newAbs);
+
+                auto* rq = &Scene<Backend, Precision>::requestsGeneralMeshes.back();
+                const double rotErr =
+                    (rq->fixedVertices[0].pos - wantRot).norm();
+                const double rotPathErr =
+                    (rq->splineConstraints[0].points[0] - wantPathRot).norm();
+
+                // Scale composes on top of the already-rotated stored pin,
+                // about the same pivot, componentwise by absS/cur.
+                const tinym::vec3 curS = cloth->scale;
+                const tinym::vec3 absS(2.0f, 1.0f, 1.0f);
+                const tinym::vec3 dS(absS.x / curS.x, absS.y / curS.y,
+                                     absS.z / curS.z);
+                const tinym::vec3 q = wantRot - pivot;
+                const tinym::vec3 wantScl(pivot.x + q.x * dS.x,
+                                          pivot.y + q.y * dS.y,
+                                          pivot.z + q.z * dS.z);
+                sim.scaleObject(1, absS);
+                rq = &Scene<Backend, Precision>::requestsGeneralMeshes.back();
+                const double sclErr =
+                    (rq->fixedVertices[0].pos - wantScl).norm();
+
+                if (rotErr > 1e-4)
+                    fail(n9, "after rotate the stored pin is "
+                         + std::to_string(rotErr) + " from the rotated spot");
+                else if (rotPathErr > 1e-4)
+                    fail(n9, "after rotate the spline path start is "
+                         + std::to_string(rotPathErr) + " from the rotated spot");
+                else if (sclErr > 1e-4)
+                    fail(n9, "after scale the stored pin is "
+                         + std::to_string(sclErr) + " from the scaled spot");
+                else pass(n9);
+            }
+        }
+
+        sim.usePbd = false;
+        sim.pause = true;
+    }
+
     if (failures == 0) {
         std::cerr << "[self-test] all checks passed\n";
         return 0;

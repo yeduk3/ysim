@@ -1873,6 +1873,18 @@ struct Simulator {
             // instead of the stale (0,0,0) import offset.
             a->params.offset = newPos;
         }
+        // Pins + spline paths ride along with the transform, so a re-pack /
+        // reset rebuilds them at the TRANSFORMED pose instead of snapping
+        // back to the stale world spot the object no longer occupies
+        // (FixedVertex::pos and the spline control points are world-space
+        // and are otherwise never touched by a transform).
+        for (auto& req : Scene<BE, PR>::requestsGeneralMeshes) {
+            if (req.id != meshId) continue;
+            for (auto& fv : req.fixedVertices) fv.pos = fv.pos + delta;
+            for (auto& sc : req.splineConstraints)
+                for (auto& p : sc.points) p = p + delta;
+            break;
+        }
         // D-023: refit the BVH so click-pick reads the new pose
         // immediately, even on a paused sim before the next sim.update().
         // refit() covers per-mesh tree refit AND the SCENE-level rebuild
@@ -1942,6 +1954,15 @@ struct Simulator {
                 req.rotationQuat = newAbs;
                 if (req.initializer)
                     req.initializer->getParams()->rotationQuat = newAbs;
+                // Pins + spline paths ride along with the transform (same
+                // pivot, same delta as the state.x loop above), so a
+                // re-pack / reset rebuilds them at the ROTATED pose
+                // instead of the stale world spot.
+                for (auto& fv : req.fixedVertices)
+                    fv.pos = pivot + rotateVector(delta, fv.pos - pivot);
+                for (auto& sc : req.splineConstraints)
+                    for (auto& p : sc.points)
+                        p = pivot + rotateVector(delta, p - pivot);
                 break;
             }
         }
@@ -2018,6 +2039,19 @@ struct Simulator {
                 req.scale = absS;
                 if (req.initializer)
                     req.initializer->getParams()->scale = absS;
+                // Pins + spline paths ride along with the transform (same
+                // pivot, same componentwise delta as scaleAbout above), so
+                // a re-pack / reset rebuilds them at the SCALED pose
+                // instead of the stale world spot.
+                auto scalePoint = [&](tinym::vec3 p) {
+                    tinym::vec3 q = p - pivot;
+                    return tinym::vec3(pivot.x + q.x * d.x,
+                                       pivot.y + q.y * d.y,
+                                       pivot.z + q.z * d.z);
+                };
+                for (auto& fv : req.fixedVertices) fv.pos = scalePoint(fv.pos);
+                for (auto& sc : req.splineConstraints)
+                    for (auto& p : sc.points) p = scalePoint(p);
                 break;
             }
         }
@@ -2228,6 +2262,94 @@ struct Simulator {
             (fixed ? "점 고정: obj " : "점 고정 해제: obj ")
             + std::to_string(objId) + ", 점 "
             + std::to_string(renderVert));
+    }
+
+    // ── Spline-follow dynamic constraints (point panel) ──────────────
+    // The constraint lives on the request (splineConstraints, pack-
+    // surviving source of truth). find returns a live pointer for the
+    // GUI to mutate points/closed/duration/playing in place — valid
+    // until the next add/remove on the same request; the panel
+    // re-resolves every callback so it never holds one across frames.
+    SplineConstraint* findSplineConstraint(int objId, int renderVert) {
+        auto* req = findRequest(objId);
+        if (!req) return nullptr;
+        Index pvid = renderToPhysicsVid(*req, renderVert);
+        if (pvid == (Index)-1) return nullptr;
+        for (auto& sc : req->splineConstraints)
+            if (sc.vid == (uint32_t)pvid) return &sc;
+        return nullptr;
+    }
+
+    // Create a default open 2-point path starting at the vertex's
+    // current position. Pins the vertex (mask 0) and marks the scene
+    // dirty so the PD/LS prefactorizations see the new pin at re-init.
+    void addSplineConstraint(int objId, int renderVert) {
+        auto* mesh = Scene<BE, PR>::findById(objId);
+        auto* req  = findRequest(objId);
+        if (!mesh || !req) return;
+        Index pvid = renderToPhysicsVid(*req, renderVert);
+        if (pvid == (Index)-1) return;
+        if (findSplineConstraint(objId, renderVert)) return;
+        tinym::vec3 p;
+        if (!vertexWorldPos(objId, renderVert, p)) return;
+        SplineConstraint sc;
+        sc.vid = (uint32_t)pvid;
+        sc.points = { p, p + tinym::vec3(0.3f, 0.0f, 0.0f) };
+        req->splineConstraints.push_back(std::move(sc));
+        if (mesh->constraints.fixedParticles.ptr
+            && pvid < (Index)mesh->constraints.fixedParticles.size)
+            mesh->constraints.fixedParticles[pvid] = PR(0);
+        Scene<BE, PR>::dirty = true;
+        scene_log::logConstraint("경로 제약 추가: obj " + std::to_string(objId)
+                                 + ", 점 " + std::to_string(renderVert));
+    }
+
+    // Remove the constraint; release the pin unless the vertex is ALSO
+    // plain-pinned through fixedVertices.
+    void removeSplineConstraint(int objId, int renderVert) {
+        auto* mesh = Scene<BE, PR>::findById(objId);
+        auto* req  = findRequest(objId);
+        if (!mesh || !req) return;
+        Index pvid = renderToPhysicsVid(*req, renderVert);
+        if (pvid == (Index)-1) return;
+        auto& list = req->splineConstraints;
+        auto it = std::find_if(list.begin(), list.end(),
+            [pvid](const SplineConstraint& s){ return s.vid == (uint32_t)pvid; });
+        if (it == list.end()) return;
+        list.erase(it);
+        const bool alsoFixed = std::any_of(
+            req->fixedVertices.begin(), req->fixedVertices.end(),
+            [pvid](const FixedVertex& f){ return f.vid == (uint32_t)pvid; });
+        if (!alsoFixed && mesh->constraints.fixedParticles.ptr
+            && pvid < (Index)mesh->constraints.fixedParticles.size)
+            mesh->constraints.fixedParticles[pvid] = PR(1);
+        Scene<BE, PR>::dirty = true;
+        scene_log::logConstraint("경로 제약 제거: obj " + std::to_string(objId)
+                                 + ", 점 " + std::to_string(renderVert));
+    }
+
+    // Rebuild the debug-line buffer from every spline constraint in the
+    // scene: the sampled curve plus a small 3-axis cross per control
+    // point. Called once per render frame right before showDebugLines
+    // (the buffer has no other producer today).
+    void prepareSplineDebugLines() {
+        debugLines.clear();
+        for (auto& req : Scene<BE, PR>::requestsGeneralMeshes) {
+            for (auto& sc : req.splineConstraints) {
+                if (sc.points.size() < 2) continue;
+                auto poly = spline_path::samplePolyline(sc.points, sc.closed, 16);
+                for (size_t k = 0; k + 1 < poly.size(); ++k)
+                    addDebugLines(poly[k], poly[k + 1]);
+                const float r = 0.02f;
+                for (auto& cp : sc.points)
+                    for (int ax = 0; ax < 3; ++ax) {
+                        tinym::vec3 d(0, 0, 0);
+                        (&d.x)[ax] = r;
+                        tinym::vec3 a = cp - d, b = cp + d;
+                        addDebugLines(a, b);
+                    }
+            }
+        }
     }
 
     // Register a reference-point coincidence constraint: the follower
@@ -2762,15 +2884,26 @@ struct Simulator {
     // the request IS the reset (sim state returns to the authored
     // configuration; transforms/pins/constraints are preserved because
     // they live on the request).
-    // Rewind every kinematic body's playback clock to frame 0. The clock
-    // lives on the initializer precisely so it SURVIVES ordinary re-packs
-    // (file swap, mesh add) — so initialize() must NOT do this. The two
-    // callers that DO mean "fresh run" (reset, target-frame restart) call
-    // this explicitly; a following initialize() then bakes the t=0 pose.
+    // Rewind every PRESCRIBED-MOTION playback clock to frame 0 — both
+    // kinematic bodies (clock on the initializer) and spline-follow
+    // constraints (clock on the request). These clocks live outside the
+    // packed state precisely so they SURVIVE ordinary re-packs (file swap,
+    // mesh add) — so initialize() must NOT do this. The two callers that DO
+    // mean "fresh run" (reset, target-frame restart) call this explicitly;
+    // the following initialize() then bakes the t=0 pose (Scene::pack
+    // re-samples each spline at localTime, so a missed rewind would restore
+    // a mid-flight vertex instead of the path start).
     void rewindKinematicClocks() {
-        for (auto& req : Scene<BE, PR>::requestsGeneralMeshes)
+        for (auto& req : Scene<BE, PR>::requestsGeneralMeshes) {
             if (auto* kin = dynamic_cast<MeshKinematicInitializer<BE, PR>*>(req.initializer))
                 kin->localTime = 0.0;
+            // playing=true too: an open path that already reached its end
+            // has latched playing=false, and a fresh run must ride again.
+            for (auto& sc : req.splineConstraints) {
+                sc.localTime = 0.0;
+                sc.playing = true;
+            }
+        }
     }
 
     void reset() {
@@ -3317,6 +3450,52 @@ struct Simulator {
                             m.state.x.size * sizeof(PR));
             kin->writePose(kin->localTime, m.scale, m.rotationQuat,
                            m.transformPosition, m.state.x.ptr);
+        }
+
+        // Spline-follow dynamic constraints: prescribed per-vertex motion,
+        // one-way, same per-frame clock discipline as the Kinematic block
+        // above (pause freezes playback, slow sim slows the ride vertex in
+        // lockstep). Closed paths wrap; open paths clamp at the end and
+        // stop. xPrev takes the PREVIOUS target before x moves on, so the
+        // first substep's swept narrow phase sees the true frame motion.
+        // The mask is re-asserted each frame so every solver keeps
+        // treating the vertex as held — this must stay HERE (shared
+        // preamble), not in any solver branch, or it silently dies on a
+        // solver switch (the ReferencePointConstraint trap).
+        for (auto& req : Scene<BE, PR>::requestsGeneralMeshes) {
+            if (req.splineConstraints.empty()) continue;
+            auto* m = Scene<BE, PR>::findById(req.id);
+            if (!m || !m->state.x.ptr) continue;
+            for (auto& sc : req.splineConstraints) {
+                if (sc.points.size() < 2) continue;
+                const Index b = (Index)sc.vid * 3;
+                if (b + 2 >= (Index)m->state.x.size) continue;
+                if (sc.playing) {
+                    sc.localTime += (double)system.h;
+                    const double dur = (double)sc.duration;
+                    if (sc.closed) {
+                        if (dur > 0.0) sc.localTime = std::fmod(sc.localTime, dur);
+                    } else if (sc.localTime >= dur) {
+                        sc.localTime = dur;
+                        sc.playing = false;   // open path: arrived, stop
+                    }
+                }
+                const float u = sc.duration > 0.0f
+                    ? (float)(sc.localTime / (double)sc.duration) : 0.0f;
+                const tinym::vec3 p =
+                    spline_path::sampleArcLength(sc.points, sc.closed, u);
+                if (m->state.xPrev.ptr) {
+                    m->state.xPrev.ptr[b+0] = m->state.x.ptr[b+0];
+                    m->state.xPrev.ptr[b+1] = m->state.x.ptr[b+1];
+                    m->state.xPrev.ptr[b+2] = m->state.x.ptr[b+2];
+                }
+                m->state.x.ptr[b+0] = (PR)p.x;
+                m->state.x.ptr[b+1] = (PR)p.y;
+                m->state.x.ptr[b+2] = (PR)p.z;
+                if (m->constraints.fixedParticles.ptr
+                    && (Index)sc.vid < m->constraints.fixedParticles.size)
+                    m->constraints.fixedParticles[sc.vid] = PR(0);
+            }
         }
 
         } // end per-frame preamble (substepCursor == 0)
@@ -4332,6 +4511,15 @@ struct Simulator {
                     f.pos = {fv.pos.x, fv.pos.y, fv.pos.z};
                     o.fixedParticles.push_back(f);
                 }
+                for (const auto& sc : r.splineConstraints) {
+                    scene_format::SplineConstraint s;
+                    s.vid = (int)sc.vid;
+                    s.closed = sc.closed;
+                    s.duration = (double)sc.duration;
+                    for (const auto& p : sc.points)
+                        s.points.push_back({p.x, p.y, p.z});
+                    o.splineConstraints.push_back(std::move(s));
+                }
                 break;
             }
         }
@@ -4626,6 +4814,22 @@ struct Simulator {
                                              (float)f.pos[1],
                                              (float)f.pos[2]);
                         reqFV.push_back(fv);
+                    }
+                    // Spline-follow constraints: geometry + timing come
+                    // back from the snapshot; playback state restarts
+                    // (localTime 0, playing) — a loaded scene begins its
+                    // ride from the first control point.
+                    auto& reqSC = Scene<BE,PR>::requestsGeneralMeshes[idx].splineConstraints;
+                    reqSC.clear();
+                    for (const auto& s : o.splineConstraints) {
+                        SplineConstraint sc;
+                        sc.vid = (uint32_t)s.vid;
+                        sc.closed = s.closed;
+                        sc.duration = (float)s.duration;
+                        for (const auto& p : s.points)
+                            sc.points.push_back(tinym::vec3(
+                                (float)p[0], (float)p[1], (float)p[2]));
+                        reqSC.push_back(std::move(sc));
                     }
                 }
             }

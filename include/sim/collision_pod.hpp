@@ -69,6 +69,24 @@ struct ReferencePointConstraint {
     IndexPair vertexPair;
 };
 
+// A spline-follow dynamic constraint (point panel "경로 따라가기").
+// The vertex `vid` (PHYSICS index, same space as FixedVertex::vid) is
+// held (fixedParticles[vid] = 0) and its held position is driven along
+// a Catmull-Rom path through `points` (world space, >= 2 to be active).
+// closed: the path wraps and playback loops forever; open: playback
+// clamps at the last point and stops (`playing` flips false). Stored on
+// RequestGeneralMesh (pack-surviving) and round-tripped through
+// scene_format; localTime/playing are runtime playback state and reset
+// on load.
+struct SplineConstraint {
+    uint32_t vid = 0;
+    bool closed = false;
+    float duration = 4.0f;            // seconds per full traversal
+    std::vector<tinym::vec3> points;  // control points, world space
+    double localTime = 0.0;
+    bool playing = true;
+};
+
 const char* behaviorTypeName(BehaviorType behaviorType) {
     switch (behaviorType) {
         case BehaviorType::TriangularCloth: return "TriangularCloth";
