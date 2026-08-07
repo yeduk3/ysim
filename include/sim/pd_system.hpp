@@ -1731,30 +1731,78 @@ struct PdSystem<METAL, PR> {
     //
     // Both F and P are the ROW-MAJOR 3x2 layout MeshCache::strainP uses:
     // m[a*2 + r]. Returns false and leaves `P` UNTOUCHED when F is not finite
-    // or the SVD did not converge — the caller's slot then still holds the
-    // previous iteration's P_t (or, on the first iteration, the rest frame),
-    // which is the "never let NaN reach the global RHS" rule of §3.3.
+    // or the decomposition is not usable — the caller's slot then still holds
+    // the previous iteration's P_t (or, on the first iteration, the rest
+    // frame), which is the "never let NaN reach the global RHS" rule of §3.3.
+    //
+    // CLOSED FORM, not Eigen::JacobiSVD. The iterative Jacobi sweep measured
+    // 201 ns/call against 10 ns here (24k calls/frame at 100x100 x 3 substeps
+    // x 10 iterations), and it was 87% of the whole local step. The thin SVD
+    // of a 3x2 is small enough to write out: FᵀF is 2x2 symmetric, its
+    // eigendecomposition gives V and Σ² in closed form, and U = F·V·Σ⁻¹
+    // completes it. Agreement with the Jacobi path is 1.3e-15 max componentwise
+    // (see PD-22) — P = U·clamp(Σ)·Vᵀ is invariant under a simultaneous column
+    // sign flip of U and V, which is the only freedom the two differ by, and
+    // both order the singular values descending so a BAND clamp lands on the
+    // same index.
     static bool projectStrain(const double F[6], double sigMin, double sigMax,
                               double P[6]) {
-        Eigen::Matrix<double, 3, 2> Fm;
-        for (int ax = 0; ax < 3; ++ax)
-            for (int r = 0; r < 2; ++r) Fm(ax, r) = F[ax * 2 + r];
-        if (!Fm.allFinite()) return false;
-        // Options as a TEMPLATE parameter, not a runtime flag: for a
-        // fixed-size 3x2 Eigen only permits thin U statically (the runtime
-        // path asserts cols >= rows). Fixed size keeps this allocation-free,
-        // which matters — this runs once per triangle per iteration.
-        Eigen::JacobiSVD<Eigen::Matrix<double, 3, 2>,
-                         Eigen::ComputeThinU | Eigen::ComputeThinV> svd(Fm);
-        if (svd.info() != Eigen::Success) return false;
-        Eigen::Vector2d s = svd.singularValues();
-        for (int r = 0; r < 2; ++r)
-            s[r] = std::min(std::max(s[r], sigMin), sigMax);
-        const Eigen::Matrix<double, 3, 2> Pm =
-            svd.matrixU() * s.asDiagonal() * svd.matrixV().transpose();
-        if (!Pm.allFinite()) return false;
-        for (int ax = 0; ax < 3; ++ax)
-            for (int r = 0; r < 2; ++r) P[ax * 2 + r] = Pm(ax, r);
+        for (int k = 0; k < 6; ++k)
+            if (!std::isfinite(F[k])) return false;
+
+        // FᵀF = [a b; b c], symmetric positive semi-definite.
+        double a = 0.0, b = 0.0, c = 0.0;
+        for (int ax = 0; ax < 3; ++ax) {
+            const double f0 = F[ax * 2 + 0], f1 = F[ax * 2 + 1];
+            a += f0 * f0; b += f0 * f1; c += f1 * f1;
+        }
+        // Eigenvalues λ = ½(tr ± √(diff² + 4b²)); λ0 >= λ1 >= 0 because rt >= 0
+        // and the matrix is PSD. The max() clamps away a round-off-negative
+        // radicand / eigenvalue on a near-degenerate element.
+        const double tr = a + c, diff = a - c;
+        const double rt = std::sqrt(std::max(0.0, diff * diff + 4.0 * b * b));
+        const double s0 = std::sqrt(std::max(0.0, 0.5 * (tr + rt)));
+        const double s1 = std::sqrt(std::max(0.0, 0.5 * (tr - rt)));
+
+        // RANK DEFICIENT: a collapsed element leaves U's second column
+        // undefined (any unit vector orthogonal to u0 in R³ is a valid
+        // completion), so clamping σ1 up to sigMin would inflate the element
+        // along an arbitrary direction. Take §3.3's fallback instead and keep
+        // the previous P_t. kSigEps is RELATIVE so it scales with the element.
+        constexpr double kSigEps = 1e-12;
+        if (!(s1 > kSigEps * s0) || !(s0 > 0.0)) return false;
+
+        // V's first column, the eigenvector for λ0. (diff + rt, 2b) is the
+        // unnormalised eigenvector; it degenerates only when both components
+        // vanish, i.e. b == 0 and diff == -rt <= 0, which is the already
+        // diagonal a <= c case where e0 = (0, 1).
+        double v0x = diff + rt, v0y = 2.0 * b;
+        const double vn = std::sqrt(v0x * v0x + v0y * v0y);
+        if (vn > 0.0) { v0x /= vn; v0y /= vn; } else { v0x = 0.0; v0y = 1.0; }
+        // Second column: the 2x2 rotation of the first, which is orthonormal
+        // to it by construction — no second eigen solve.
+        const double v1x = -v0y, v1y = v0x;
+
+        // U = F·V·Σ⁻¹, one column each. Both σ are above kSigEps here.
+        const double i0 = 1.0 / s0, i1 = 1.0 / s1;
+        double u0[3], u1[3];
+        for (int ax = 0; ax < 3; ++ax) {
+            const double f0 = F[ax * 2 + 0], f1 = F[ax * 2 + 1];
+            u0[ax] = (f0 * v0x + f1 * v0y) * i0;
+            u1[ax] = (f0 * v1x + f1 * v1y) * i1;
+        }
+
+        const double c0 = std::min(std::max(s0, sigMin), sigMax);
+        const double c1 = std::min(std::max(s1, sigMin), sigMax);
+        double out[6];
+        for (int ax = 0; ax < 3; ++ax) {
+            const double p0 = c0 * u0[ax], p1 = c1 * u1[ax];
+            out[ax * 2 + 0] = p0 * v0x + p1 * v1x;
+            out[ax * 2 + 1] = p0 * v0y + p1 * v1y;
+        }
+        for (int k = 0; k < 6; ++k)
+            if (!std::isfinite(out[k])) return false;
+        for (int k = 0; k < 6; ++k) P[k] = out[k];
         return true;
     }
 

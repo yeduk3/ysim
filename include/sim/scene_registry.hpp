@@ -541,6 +541,35 @@ void postInitPdCloth(SimOf<BE, PR>& simulator) {
                  "subSteps=3, PD iterations=10\n";
 }
 
+// "pd_cloth_10k": pd_cloth at a solver-relevant vertex count. The 20x20 sheet
+// pd_cloth carries (441 verts) sits BELOW PdSystem::kParallelMinVerts, so it
+// exercises the serial schedule and says nothing about how the local/global
+// steps scale. 100x100 = 10201 verts puts every sweep on the parallel
+// schedule and makes the per-element costs (strain projection, back
+// substitution) the thing being measured instead of dispatch overhead.
+// Geometry and material are otherwise byte-identical to pd_cloth.
+template <typename BE, typename PR>
+void setupPdCloth10k(SimOf<BE, PR>& simulator, SysOf<BE, PR>& system) {
+    const PR kstretch = 1e5, kshear = 1e5, kbend = 2e5;
+    const PR mass = 0.1, thickness = 0.01;
+    simulator.addPlane(PlaneDirection::XZPlane, tinym::vec3(0, 0, 0), 24, 3.0,
+                       0.1, BehaviorType::Float);
+    simulator.addCloth(100, 1, tinym::vec3(0, 0.6, 0), kstretch, kshear, kbend,
+                       thickness, mass);
+    system.subSteps = 3;
+    system.subh     = system.h / PR(3);
+    simulator.mlBroadPhase.floorExcludeDiag = 1e9f;   // exclude NOTHING
+}
+
+template <typename BE, typename PR>
+void postInitPdCloth10k(SimOf<BE, PR>& simulator) {
+    simulator.usePd = true;
+    simulator.cdSubstepPeriod    = 1;
+    simulator.refitSubstepPeriod = 1;
+    std::cout << "[Main] --scene pd_cloth_10k: CPU Projective Dynamics solver, "
+                 "100x100 sheet (10201 verts), subSteps=3, PD iterations=10\n";
+}
+
 // "pd_cloth_ball" / "pd_cloth_stack" / "pd_cloth_xyfold": the three PBD
 // contact scenes solved by PD instead — geometry comes from the SAME setup
 // function (byte-identical A/B, the pd_cloth principle), the wrapper only
@@ -812,6 +841,9 @@ inline const std::vector<Entry<BE, PR>>& registry() {
           &setupPbdClothFlag<BE, PR>, &postInitPbdClothFlag<BE, PR> },
         { "pd_cloth", "pbd_cloth geometry solved by the CPU PD (Liu 2013) system",
           &setupPdCloth<BE, PR>, &postInitPdCloth<BE, PR> },
+        { "pd_cloth_10k", "pd_cloth geometry at 100x100 (10201 verts); the PD "
+                          "scene above kParallelMinVerts, for solver scaling",
+          &setupPdCloth10k<BE, PR>, &postInitPdCloth10k<BE, PR> },
         { "pd_cloth_ball", "pbd_cloth_ball geometry under PD; one-sided "
                            "in-energy contacts + rigid coupling",
           &setupPdClothBall<BE, PR>, &postInitPdClothBall<BE, PR> },
